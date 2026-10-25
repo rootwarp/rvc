@@ -4282,6 +4282,7 @@ dependencies = [
  "rvc-observability",
  "rvc-telemetry",
  "serde_json",
+ "syn 2.0.117",
  "tracing",
  "tracing-subscriber",
 ]

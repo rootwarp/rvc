@@ -12,6 +12,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 ra-ap-rustc_lexer = "=0.178.0"
+syn = { version = "=2.0.117", features = ["full", "visit", "extra-traits"] }
 observability.workspace = true
 # DAG-neutral: build_edge_map / architecture_no_cycles filter production edges only
 # (`kind` null — architecture_no_cycles.rs:132). Dev-deps do not add production

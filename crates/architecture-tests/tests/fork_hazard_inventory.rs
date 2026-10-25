@@ -7,8 +7,9 @@
 //! this file is the machine copy. The two must agree.
 //!
 //! Classes: (1) `>= ForkName::X` (2) `.index = 0` / `.index = "0"` (3) `match`
-//! on `ForkName` exhaustive vs `_ =>` (4) string-literal fork dispatch
-//! (5) `.entries()` call sites.
+//! on `ForkName` exhaustive vs catch-all (4) string-literal fork dispatch
+//! (5) `.entries()` call sites. A catch-all arm is `_ =>` or an irrefutable
+//! binding such as `other =>` or `x @ _ =>`, with no guard.
 //!
 //! Identity is `(path, class, item, fingerprint)`. The fingerprint is the
 //! normalised source line. Issue and verdict are bound to that key, so two
@@ -19,9 +20,17 @@
 //! (`kat_policy.rs:381-386` precedent).
 //!
 //! Spans come from `ra_ap_rustc_lexer`. An untrusted file keeps every raw hit.
+//! `syn` parses each `match` and `matches!` site, so the parser decides the
+//! scrutinee, the arms, the patterns and the guards. A site or a file that syn
+//! does not parse gives failing hits (fail closed).
 
 use ra_ap_rustc_lexer::{strip_shebang, tokenize, FrontmatterAllowed, LiteralKind, TokenKind};
 use rvc_architecture_tests::{byte_in_code, is_rust_ws, non_code_spans, ResolveError, SourceItems};
+use syn::buffer::Cursor;
+use syn::ext::IdentExt;
+use syn::parse::{ParseStream, Parser};
+use syn::visit::{self, Visit};
+use syn::{braced, Arm, Attribute, Expr, LitByteStr, LitStr, Pat, Token, Type, UseTree};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -488,7 +497,7 @@ const INVENTORY: &[Inv] = &[
         "crates/beacon/src/prepare_check.rs",
         "compute_preparable",
         Class::MatchForkName,
-        false,
+        true,
         "match ForkName::from_str(&response.consensus_version) {",
         Verdict::InheritIntentionally,
         "—",
@@ -542,7 +551,7 @@ const INVENTORY: &[Inv] = &[
         "crates/rvc/tests/gloas_data_index_round_trip.rs",
         "epoch_for",
         Class::MatchForkName,
-        false,
+        true,
         "match fork {",
         Verdict::TestOnly,
         "—",
@@ -570,7 +579,7 @@ const INVENTORY: &[Inv] = &[
         "crates/block-service/src/service/tests/mocks.rs",
         "test_body_ssz_for_version",
         Class::StringDispatch,
-        false,
+        true,
         "match consensus_version {",
         Verdict::TestOnly,
         "—",
@@ -633,7 +642,7 @@ const INVENTORY: &[Inv] = &[
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
         "test_gloas_slot_dispatches_produce_block_v4",
         Class::StringDispatch,
-        false,
+        true,
         "match &envelopes[0] {",
         Verdict::TestOnly,
         "—",
@@ -642,7 +651,7 @@ const INVENTORY: &[Inv] = &[
         "crates/rvc/src/orchestrator/sync_committee.rs",
         "tests::contribution_kat",
         Class::StringDispatch,
-        false,
+        true,
         "match name {",
         Verdict::TestOnly,
         "—",
@@ -733,6 +742,39 @@ const INVENTORY: &[Inv] = &[
 
 const SCANNER_REL: &str = "crates/architecture-tests/tests/fork_hazard_inventory.rs";
 const AUDIT_DOC: &str = "docs/gloas-fork-hazard-audit.md";
+
+/// Alias-gate findings allowed at the definition site in `impl ForkName`: the
+/// variant list `ALL` (syn) and the name table `NAMES` (syn and the token
+/// check). Each is anchored on its type text and must occur exactly once.
+const ALIAS_EXEMPT: &[(&str, &str)] = &[
+    ("crates/eth-types/src/fork.rs", "impl ForkName: const ALL: [Self; 8]"),
+    (
+        "crates/eth-types/src/fork.rs",
+        "impl ForkName: const NAMES: [(ForkName, &str, u32); Self::COUNT]",
+    ),
+    ("crates/eth-types/src/fork.rs", "const NAMES: [(ForkName, &str, u32); Self::COUNT]"),
+];
+
+/// Alias-gate errors for `(path, source)` files. An exempt finding that does
+/// not occur exactly once is an error too.
+fn alias_gate(files: &[(String, String)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut exempt_seen = vec![0usize; ALIAS_EXEMPT.len()];
+    for (rel, src) in files {
+        for line in fork_name_aliases(src) {
+            match ALIAS_EXEMPT.iter().position(|&(p, f)| p == rel && f == line) {
+                Some(k) => exempt_seen[k] += 1,
+                None => errors.push(format!("{rel}: {line}")),
+            }
+        }
+    }
+    for (&(path, finding), n) in ALIAS_EXEMPT.iter().zip(exempt_seen) {
+        if n != 1 {
+            errors.push(format!("{path}: exemption `{finding}` matched {n} times, not once"));
+        }
+    }
+    errors
+}
 const BEGIN_INVENTORY: &str = "<!-- BEGIN INVENTORY -->";
 const END_INVENTORY: &str = "<!-- END INVENTORY -->";
 
@@ -746,9 +788,6 @@ const FORK_STRINGS: &[&str] = &[
     "\"fulu\"",
     "\"gloas\"",
 ];
-
-const SELF_FORK_VARIANTS: &[&str] =
-    &["Phase0", "Altair", "Bellatrix", "Capella", "Deneb", "Electra", "Fulu", "Gloas"];
 
 // ---------------------------------------------------------------------------
 // Workspace walk
@@ -800,10 +839,6 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn ident_boundary_before(src: &str, at: usize) -> bool {
-    at == 0 || !is_ident_char(src.as_bytes()[at - 1])
-}
-
 fn ident_boundary_after(src: &str, after: usize) -> bool {
     after >= src.len() || !is_ident_char(src.as_bytes()[after])
 }
@@ -842,181 +877,713 @@ fn skip_ws(src: &str, mut i: usize) -> usize {
     i
 }
 
-fn skip_ws_comments(src: &str, mut i: usize) -> usize {
-    let b = src.as_bytes();
-    let n = b.len();
-    loop {
-        while i < n && is_rust_ws(b[i]) {
+/// One code token of a delimiter walk. Comments are dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeKind {
+    Ident,
+    Lit,
+    Punct,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodeTok {
+    start: usize,
+    end: usize,
+    kind: CodeKind,
+}
+
+fn is_comment_span(src: &str, start: usize) -> bool {
+    src[start..].starts_with("//") || src[start..].starts_with("/*")
+}
+
+fn is_word_char(c: char) -> bool {
+    c == '_' || c.is_alphanumeric()
+}
+
+fn word_end(src: &str, from: usize) -> usize {
+    src[from..].find(|c| !is_word_char(c)).map_or(src.len(), |n| from + n)
+}
+
+/// Code tokens of `src` under one non-code mask. A masked span is one literal
+/// token or a dropped comment, so a delimiter in a string, char or comment never counts.
+fn code_tokens(src: &str, non_code: &[(usize, usize)]) -> Vec<CodeTok> {
+    let mut spans = non_code.iter().copied().peekable();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        if !src.is_char_boundary(i) {
             i += 1;
-        }
-        if i + 1 < n && b[i] == b'/' && b[i + 1] == b'/' {
-            while i < n && b[i] != b'\n' {
-                i += 1;
-            }
             continue;
         }
-        if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
+        while spans.next_if(|&(_, end)| end <= i).is_some() {}
+        if let Some(&(start, end)) = spans.peek() {
+            if start <= i {
+                if !is_comment_span(src, start) {
+                    out.push(CodeTok { start: i, end, kind: CodeKind::Lit });
+                }
+                i = end;
+                continue;
             }
-            i = (i + 2).min(n);
+        }
+        let ch = src[i..].chars().next().expect("i is a char boundary");
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
             continue;
         }
-        return i;
+        if !is_word_char(ch) {
+            out.push(CodeTok { start: i, end: i + ch.len_utf8(), kind: CodeKind::Punct });
+            i += ch.len_utf8();
+            continue;
+        }
+        let mut end = word_end(src, i);
+        let raw = &src[i..end] == "r" && src[end..].starts_with('#');
+        if raw && src[end + 1..].starts_with(|c: char| c == '_' || c.is_alphabetic()) {
+            end = word_end(src, end + 1);
+        }
+        out.push(CodeTok { start: i, end, kind: CodeKind::Ident });
+        i = end;
     }
+    out
 }
 
-fn close_brace(src: &str, open: usize) -> Option<usize> {
-    if open >= src.len() || src.as_bytes()[open] != b'{' {
+fn is_punct(src: &str, t: &CodeTok, c: u8) -> bool {
+    t.kind == CodeKind::Punct && src.as_bytes()[t.start] == c
+}
+
+fn is_word(src: &str, t: &CodeTok, word: &str) -> bool {
+    t.kind == CodeKind::Ident && &src[t.start..t.end] == word
+}
+
+fn is_open(src: &str, t: &CodeTok) -> bool {
+    b"([{".iter().any(|c| is_punct(src, t, *c))
+}
+
+fn is_close(src: &str, t: &CodeTok) -> bool {
+    b")]}".iter().any(|c| is_punct(src, t, *c))
+}
+
+/// Index of the token that closes the group that `toks[open]` opens.
+fn close_group(src: &str, toks: &[CodeTok], open: usize) -> Option<usize> {
+    if !toks.get(open).is_some_and(|t| is_open(src, t)) {
         return None;
     }
-    let b = src.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < b.len() {
-        match b[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
+    let mut depth = 0;
+    for (i, t) in toks.iter().enumerate().skip(open) {
+        if is_open(src, t) {
+            depth += 1;
+        } else if is_close(src, t) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
             }
-            _ => {}
         }
-        i += 1;
     }
     None
 }
 
-fn close_paren(src: &str, open: usize) -> Option<usize> {
-    if open >= src.len() || src.as_bytes()[open] != b'(' {
-        return None;
-    }
-    let b = src.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < b.len() {
-        match b[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// An identifier token equal to `name` after `r#` is removed.
+fn is_name(src: &str, t: &CodeTok, name: &str) -> bool {
+    let text = &src[t.start..t.end];
+    t.kind == CodeKind::Ident && text.strip_prefix("r#").unwrap_or(text) == name
 }
 
-/// `{` that opens a `match` body, skipping parens so closures in the scrutinee
-/// are not mistaken for the body.
-fn match_body_span(src: &str, match_kw: usize) -> Option<(usize, usize)> {
-    let mut i = skip_ws_comments(src, match_kw + "match".len());
-    let b = src.as_bytes();
-    let mut paren = 0i32;
-    let mut brack = 0i32;
-    while i < b.len() {
-        i = skip_ws_comments(src, i);
-        if i >= b.len() {
+/// Start byte of the token that closes the delimiter group around token `i`.
+fn group_end(src: &str, toks: &[CodeTok], i: usize) -> usize {
+    let mut depth = 0usize;
+    for t in &toks[i..] {
+        if is_open(src, t) {
+            depth += 1;
+        } else if is_close(src, t) {
+            if depth == 0 {
+                return t.start;
+            }
+            depth -= 1;
+        }
+    }
+    src.len()
+}
+
+// ---------------------------------------------------------------------------
+// Match sites (syn)
+// ---------------------------------------------------------------------------
+
+/// Fork string literals and `ForkName::` paths in a token cursor, macro bodies included.
+#[derive(Default)]
+struct TokenScan {
+    fork_string: bool,
+    fork_path: bool,
+}
+
+fn lit_is_fork_string(text: &str) -> bool {
+    let value = syn::parse_str::<LitStr>(text).map(|l| l.value()).or_else(|_| {
+        syn::parse_str::<LitByteStr>(text).map(|l| String::from_utf8_lossy(&l.value()).into_owned())
+    });
+    value.is_ok_and(|v| FORK_STRINGS.iter().any(|s| s.trim_matches('"') == v))
+}
+
+fn scan_cursor(mut c: Cursor<'_>, out: &mut TokenScan) {
+    while !c.eof() {
+        if let Some((lit, next)) = c.literal() {
+            out.fork_string |= lit_is_fork_string(&lit.to_string());
+            c = next;
+        } else if let Some((ident, next)) = c.ident() {
+            out.fork_path |= ident.unraw() == "ForkName"
+                && next.punct().is_some_and(|(p, _)| p.as_char() == ':');
+            c = next;
+        } else if let Some((inner, _, _, next)) = c.any_group() {
+            scan_cursor(inner, out);
+            c = next;
+        } else if let Some((_, next)) = c.token_tree() {
+            c = next;
+        } else {
             break;
         }
-        match b[i] {
-            b'(' => paren += 1,
-            b')' => paren -= 1,
-            b'[' => brack += 1,
-            b']' => brack -= 1,
-            b'{' if paren == 0 && brack == 0 => {
-                let close = close_brace(src, i)?;
-                return Some((i, close));
-            }
-            _ => {}
-        }
-        i += 1;
     }
-    None
 }
 
-fn matches_macro_span(src: &str, at: usize) -> Option<(usize, usize)> {
-    let i = skip_ws_comments(src, at + "matches!".len());
-    let close = close_paren(src, i)?;
-    Some((i, close))
-}
-
-fn has_bare_underscore_token(body: &str) -> bool {
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'_' && ident_boundary_before(body, i) && ident_boundary_after(body, i + 1) {
-            return true;
+fn skip_rest(input: ParseStream) -> syn::Result<()> {
+    input.step(|c| {
+        let mut rest = *c;
+        while let Some((_, next)) = rest.token_tree() {
+            rest = next;
         }
-        i += 1;
+        Ok(((), rest))
+    })
+}
+
+/// Paths that name a fork in arm patterns and guards: a `ForkName` segment
+/// with a segment after it, a `<…ForkName>::` qualified self, or `Self::…`.
+#[derive(Default)]
+struct ArmPaths {
+    fork: bool,
+    self_path: bool,
+}
+
+impl<'ast> Visit<'ast> for ArmPaths {
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        let segs: Vec<_> = p.segments.iter().collect();
+        self.fork |= segs.iter().rev().skip(1).any(|s| s.ident.unraw() == "ForkName");
+        self.self_path |=
+            segs.len() > 1 && segs[0].ident == "Self" && is_fork_variant(&segs[1].ident);
+        visit::visit_path(self, p);
     }
-    false
-}
 
-fn top_level_wildcard(body: &str) -> bool {
-    let mut depth = 0i32;
-    for line in body.lines() {
-        let start_depth = depth;
-        let t = line.trim_start();
-        if start_depth == 1 && (t.starts_with("_ =>") || t.starts_with("_=>")) {
-            return true;
-        }
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
+    fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
+        self.qualified_self(e.qself.as_ref(), &e.path);
+        visit::visit_expr_path(self, e);
     }
-    false
+
+    fn visit_pat_tuple_struct(&mut self, p: &'ast syn::PatTupleStruct) {
+        self.qualified_self(p.qself.as_ref(), &p.path);
+        visit::visit_pat_tuple_struct(self, p);
+    }
+
+    fn visit_pat_struct(&mut self, p: &'ast syn::PatStruct) {
+        self.qualified_self(p.qself.as_ref(), &p.path);
+        visit::visit_pat_struct(self, p);
+    }
+
+    fn visit_qself(&mut self, q: &'ast syn::QSelf) {
+        if let Type::Path(tp) = strip_type(&q.ty) {
+            self.fork |= tp.path.segments.last().is_some_and(|s| s.ident.unraw() == "ForkName");
+        }
+        visit::visit_qself(self, q);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let mut scan = TokenScan::default();
+        let _ = m.parse_body_with(|input: ParseStream| {
+            scan_cursor(input.cursor(), &mut scan);
+            skip_rest(input)
+        });
+        self.fork |= scan.fork_path;
+        visit::visit_macro(self, m);
+    }
 }
 
-fn line_has_forkname_pattern(line: &str) -> bool {
-    let Some(idx) = line.find("ForkName::") else {
-        return false;
+impl ArmPaths {
+    /// `<Self>::X`, `<(Self)>::X` or `<Self as Tr>::X` where `X` is a fork variant.
+    fn qualified_self(&mut self, qself: Option<&syn::QSelf>, path: &syn::Path) {
+        let Some(q) = qself else {
+            return;
+        };
+        let is_self = matches!(strip_type(&q.ty), Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self"));
+        self.self_path |=
+            is_self && path.segments.get(q.position).is_some_and(|s| is_fork_variant(&s.ident));
+    }
+}
+
+/// `ty` without its `( … )` and invisible-group layers.
+fn strip_type(mut ty: &Type) -> &Type {
+    while let Type::Paren(syn::TypeParen { elem, .. }) | Type::Group(syn::TypeGroup { elem, .. }) =
+        ty
+    {
+        ty = elem;
+    }
+    ty
+}
+
+/// Variant names of `pub enum ForkName` in `crates/eth-types/src/fork.rs`,
+/// read with syn at test time so a new fork is picked up.
+fn fork_variants() -> &'static HashSet<String> {
+    static VARIANTS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    VARIANTS.get_or_init(|| {
+        let path = workspace_root().join("crates/eth-types/src/fork.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let file =
+            syn::parse_file(&src).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let variants: HashSet<String> = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(e) if e.ident.unraw() == "ForkName" => {
+                    Some(e.variants.iter().map(|v| v.ident.unraw().to_string()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no `enum ForkName` in {}", path.display()));
+        assert!(!variants.is_empty(), "`enum ForkName` has no variants");
+        variants
+    })
+}
+
+fn is_fork_variant(ident: &syn::Ident) -> bool {
+    fork_variants().contains(&ident.unraw().to_string())
+}
+
+/// Last path segments of the tuple-struct and struct patterns in a pattern.
+#[derive(Default)]
+struct WrapperNames(HashSet<String>);
+
+fn wrapper_names(p: &Pat) -> HashSet<String> {
+    let mut names = WrapperNames::default();
+    names.visit_pat(p);
+    names.0
+}
+
+impl<'ast> Visit<'ast> for WrapperNames {
+    fn visit_pat_tuple_struct(&mut self, p: &'ast syn::PatTupleStruct) {
+        self.0.extend(p.path.segments.last().map(|s| s.ident.unraw().to_string()));
+        visit::visit_pat_tuple_struct(self, p);
+    }
+
+    fn visit_pat_struct(&mut self, p: &'ast syn::PatStruct) {
+        self.0.extend(p.path.segments.last().map(|s| s.ident.unraw().to_string()));
+        visit::visit_pat_struct(self, p);
+    }
+}
+
+/// Wrappers whose catch-all form takes every fork value only next to the same wrapper.
+const SIBLING_WRAPPERS: &[&str] = &["Ok", "Err", "Some", "None"];
+
+/// `true` if a pattern holds an or-pattern, so the wrapper around it has its own sibling case.
+#[derive(Default)]
+struct HasOr(bool);
+
+impl<'ast> Visit<'ast> for HasOr {
+    fn visit_pat_or(&mut self, _: &'ast syn::PatOr) {
+        self.0 = true;
+    }
+}
+
+/// A pattern that catches every fork value: `_`, `..`, a binding (any
+/// identifier except `None`; a bare `Phase0` is a binding because source
+/// must not import the variants), `name @ <catch-all>`, `&p`, a macro, a
+/// tuple, slice or group of catch-alls, and an or-pattern with one catch-all
+/// case. A tuple-struct or struct pattern whose fields are all catch-alls is a
+/// catch-all. For `Ok`, `Err`, `Some` and `None` (last path segment) one more
+/// condition applies: another arm, another case of an enclosing or-pattern
+/// (at any depth), or an or-pattern in its own fields uses the same wrapper. Thus `Ok(got)` after
+/// `Ok(ForkName::Fulu)` is a catch-all, but `Err(_)` next to `Ok(…)` arms is not.
+fn pat_catch_all(p: &Pat, siblings: &HashSet<String>) -> bool {
+    let all = |pats: Vec<&Pat>| pats.into_iter().all(|p| pat_catch_all(p, siblings));
+    let shared = |path: &syn::Path, inner: &Pat| {
+        let name = path.segments.last().map(|s| s.ident.unraw().to_string()).unwrap_or_default();
+        let mut or = HasOr::default();
+        or.visit_pat(inner);
+        !SIBLING_WRAPPERS.contains(&name.as_str()) || siblings.contains(&name) || or.0
     };
-    match line.find("=>") {
-        Some(arrow) => idx < arrow,
-        None => line[idx..].contains('|'),
+    match p {
+        Pat::Wild(_) | Pat::Rest(_) | Pat::Macro(_) | Pat::Verbatim(_) => true,
+        Pat::Ident(i) => match &i.subpat {
+            Some((_, sub)) => pat_catch_all(sub, siblings),
+            None => i.ident.unraw() != "None",
+        },
+        Pat::Reference(r) => pat_catch_all(&r.pat, siblings),
+        Pat::Paren(g) => pat_catch_all(&g.pat, siblings),
+        Pat::Type(t) => pat_catch_all(&t.pat, siblings),
+        Pat::Or(o) => o.cases.iter().enumerate().any(|(c, case)| {
+            let mut own = siblings.clone();
+            own.extend(
+                o.cases
+                    .iter()
+                    .enumerate()
+                    .filter(|(d, _)| *d != c)
+                    .flat_map(|(_, p)| wrapper_names(p)),
+            );
+            pat_catch_all(case, &own)
+        }),
+        Pat::Tuple(t) => all(t.elems.iter().collect()),
+        Pat::Slice(s) => all(s.elems.iter().collect()),
+        Pat::TupleStruct(t) => shared(&t.path, p) && all(t.elems.iter().collect()),
+        Pat::Struct(s) => shared(&s.path, p) && all(s.fields.iter().map(|f| &*f.pat).collect()),
+        Pat::Lit(_) | Pat::Range(_) | Pat::Path(_) | Pat::Const(_) => false,
+        _ => true,
     }
 }
 
-fn line_has_self_fork_pattern(line: &str) -> bool {
-    for v in SELF_FORK_VARIANTS {
-        let pat = format!("Self::{v}");
-        let Some(idx) = line.find(&pat) else {
+/// Alternatives of a const-only arm: a bare name, a one-segment path, a macro or `_`.
+fn pat_const_names(p: &Pat) -> Option<usize> {
+    match p {
+        Pat::Or(o) => o.cases.iter().map(pat_const_names).sum(),
+        Pat::Wild(_) => Some(0),
+        Pat::Ident(i) if i.subpat.is_none() => Some(1),
+        Pat::Path(e) if e.qself.is_none() && e.path.segments.len() == 1 => Some(1),
+        Pat::Macro(_) => Some(1),
+        _ => None,
+    }
+}
+
+struct MatchFacts {
+    fork: bool,
+    self_path: bool,
+    const_only: bool,
+    catch_all: bool,
+    fork_string: bool,
+}
+
+fn match_facts(arms: &[Arm], fork_string: bool) -> MatchFacts {
+    let mut paths = ArmPaths::default();
+    for arm in arms {
+        paths.visit_pat(&arm.pat);
+        if let Some((_, guard)) = &arm.guard {
+            paths.visit_expr(guard);
+        }
+    }
+    let names: Option<usize> = arms.iter().map(|a| pat_const_names(&a.pat)).sum();
+    let wrappers: Vec<HashSet<String>> = arms.iter().map(|a| wrapper_names(&a.pat)).collect();
+    let catch_all = arms.iter().enumerate().any(|(k, a)| {
+        let siblings: HashSet<String> = wrappers
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != k)
+            .flat_map(|(_, w)| w.clone())
+            .collect();
+        a.guard.is_none() && pat_catch_all(&a.pat, &siblings)
+    });
+    MatchFacts {
+        fork: paths.fork,
+        self_path: paths.self_path,
+        const_only: names.is_some_and(|n| n > 0),
+        catch_all,
+        fork_string,
+    }
+}
+
+/// Arms of `match <scrutinee> { … }` that starts `text`, and if the body has a fork string.
+fn parse_match_site(text: &str) -> syn::Result<(Vec<Arm>, bool)> {
+    let parser = |input: ParseStream| {
+        input.parse::<Token![match]>()?;
+        Expr::parse_without_eager_brace(input)?;
+        let content;
+        braced!(content in input);
+        let mut scan = TokenScan::default();
+        scan_cursor(content.cursor(), &mut scan);
+        content.call(Attribute::parse_inner)?;
+        let mut arms = Vec::new();
+        while !content.is_empty() {
+            arms.push(content.parse::<Arm>()?);
+        }
+        skip_rest(input)?;
+        Ok((arms, scan.fork_string))
+    };
+    parser.parse_str(text)
+}
+
+/// Pattern and guard of a `matches!` body (`expr, pat (if guard)?`) as one arm.
+fn parse_matches_body(text: &str) -> syn::Result<(Arm, bool)> {
+    let parser = |input: ParseStream| {
+        let mut scan = TokenScan::default();
+        scan_cursor(input.cursor(), &mut scan);
+        input.parse::<Expr>()?;
+        input.parse::<Token![,]>()?;
+        let pat = Pat::parse_multi_with_leading_vert(input)?;
+        let guard = match input.parse::<Option<Token![if]>>()? {
+            Some(kw) => Some((kw, Box::new(input.parse::<Expr>()?))),
+            None => None,
+        };
+        input.parse::<Option<Token![,]>>()?;
+        let body = Box::new(syn::parse_quote!(()));
+        let arm = Arm {
+            attrs: Vec::new(),
+            pat,
+            guard,
+            fat_arrow_token: Default::default(),
+            body,
+            comma: None,
+        };
+        Ok((arm, scan.fork_string))
+    };
+    parser.parse_str(text)
+}
+
+/// Alias, rename and variant-import findings of a parsed file.
+#[derive(Default)]
+struct AliasFinder {
+    found: Vec<String>,
+    /// For each enclosing `impl`, `true` if its self type ends in `ForkName`.
+    impls: Vec<bool>,
+}
+
+fn use_tree_aliases(tree: &UseTree, prefix: &str, after_fork: bool, out: &mut Vec<String>) {
+    let name = |ident: &syn::Ident| format!("use {prefix}{}", ident.unraw());
+    match tree {
+        UseTree::Path(p) if after_fork => out.push(name(&p.ident)),
+        UseTree::Path(p) => {
+            let next = format!("{prefix}{}::", p.ident.unraw());
+            use_tree_aliases(&p.tree, &next, p.ident.unraw() == "ForkName", out);
+        }
+        UseTree::Name(n) if after_fork => out.push(name(&n.ident)),
+        UseTree::Rename(r) if after_fork || r.ident.unraw() == "ForkName" => {
+            out.push(name(&r.ident))
+        }
+        UseTree::Glob(_) if after_fork => out.push(format!("use {prefix}*")),
+        UseTree::Group(g) => {
+            g.items.iter().for_each(|t| use_tree_aliases(t, prefix, after_fork, out))
+        }
+        _ => {}
+    }
+}
+
+/// A `ForkName` path segment that no `::` follows. With `self_is_fork`, a path
+/// that starts with `Self` also counts. An array length is not read, so
+/// `[u32; Self::N]` is not a finding.
+#[derive(Default)]
+struct TypeNamesFork {
+    found: bool,
+    /// Count a `Self` path too: inside an impl of `ForkName`, or in a trait.
+    self_is_fork: bool,
+}
+
+impl<'ast> Visit<'ast> for TypeNamesFork {
+    fn visit_type_array(&mut self, a: &'ast syn::TypeArray) {
+        self.visit_type(&a.elem);
+    }
+
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        self.found |= p.segments.last().is_some_and(|s| s.ident.unraw() == "ForkName");
+        self.found |= self.self_is_fork && p.segments.first().is_some_and(|s| s.ident == "Self");
+        visit::visit_path(self, p);
+    }
+}
+
+/// Source-like text of a type for an anchored exemption: paths, generic
+/// arguments, arrays, tuples, references and slices. Other parts print as `?`.
+fn render_type(ty: &Type) -> String {
+    let list =
+        |tys: &mut dyn Iterator<Item = &Type>| tys.map(render_type).collect::<Vec<_>>().join(", ");
+    match ty {
+        Type::Path(tp) if tp.qself.is_none() => render_path(&tp.path),
+        Type::Array(a) => format!("[{}; {}]", render_type(&a.elem), render_expr(&a.len)),
+        Type::Slice(s) => format!("[{}]", render_type(&s.elem)),
+        Type::Tuple(t) => format!("({})", list(&mut t.elems.iter())),
+        Type::Paren(p) => format!("({})", render_type(&p.elem)),
+        Type::Reference(r) => {
+            format!("&{}{}", if r.mutability.is_some() { "mut " } else { "" }, render_type(&r.elem))
+        }
+        _ => "?".to_string(),
+    }
+}
+
+fn render_path(p: &syn::Path) -> String {
+    let segment = |s: &syn::PathSegment| match &s.arguments {
+        syn::PathArguments::None => s.ident.unraw().to_string(),
+        syn::PathArguments::AngleBracketed(a) => {
+            let args: Vec<String> = a
+                .args
+                .iter()
+                .map(|g| match g {
+                    syn::GenericArgument::Type(t) => render_type(t),
+                    _ => "?".to_string(),
+                })
+                .collect();
+            format!("{}<{}>", s.ident.unraw(), args.join(", "))
+        }
+        syn::PathArguments::Parenthesized(_) => format!("{}(?)", s.ident.unraw()),
+    };
+    p.segments.iter().map(segment).collect::<Vec<_>>().join("::")
+}
+
+fn render_expr(e: &Expr) -> String {
+    match e {
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(i), .. }) => i.base10_digits().to_string(),
+        Expr::Path(p) if p.qself.is_none() => render_path(&p.path),
+        _ => "?".to_string(),
+    }
+}
+
+impl<'ast> Visit<'ast> for AliasFinder {
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        use_tree_aliases(&u.tree, "", false, &mut self.found);
+    }
+
+    fn visit_item_type(&mut self, t: &'ast syn::ItemType) {
+        let defaults = t.generics.type_params().filter_map(|p| p.default.as_ref());
+        for ty in std::iter::once(&*t.ty).chain(defaults) {
+            self.names_fork("type", &t.ident, ty);
+        }
+        visit::visit_item_type(self, t);
+    }
+
+    fn visit_impl_item_type(&mut self, t: &'ast syn::ImplItemType) {
+        self.names_fork("type", &t.ident, &t.ty);
+        visit::visit_impl_item_type(self, t);
+    }
+
+    fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+        self.names_fork("const", &c.ident, &c.ty);
+        visit::visit_item_const(self, c);
+    }
+
+    fn visit_item_static(&mut self, c: &'ast syn::ItemStatic) {
+        self.names_fork("static", &c.ident, &c.ty);
+        visit::visit_item_static(self, c);
+    }
+
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        let mut names = TypeNamesFork { found: false, self_is_fork: false };
+        names.visit_type(&i.self_ty);
+        self.impls.push(names.found);
+        visit::visit_item_impl(self, i);
+        self.impls.pop();
+    }
+
+    fn visit_impl_item_const(&mut self, c: &'ast syn::ImplItemConst) {
+        let in_fork = self.impls.last() == Some(&true);
+        let kw = if in_fork { "impl ForkName: const" } else { "const" };
+        self.names_fork_or_self(kw, &c.ident, &c.ty, in_fork);
+        visit::visit_impl_item_const(self, c);
+    }
+
+    fn visit_trait_item_const(&mut self, c: &'ast syn::TraitItemConst) {
+        self.names_fork_or_self("trait const", &c.ident, &c.ty, true);
+        visit::visit_trait_item_const(self, c);
+    }
+}
+
+impl AliasFinder {
+    fn names_fork(&mut self, kw: &str, ident: &syn::Ident, ty: &Type) {
+        self.names_fork_or_self(kw, ident, ty, false);
+    }
+
+    /// A finding `<kw> <name>: <type>` if `ty` names `ForkName`, or `Self`
+    /// when `self_is_fork` is set.
+    fn names_fork_or_self(&mut self, kw: &str, ident: &syn::Ident, ty: &Type, self_is_fork: bool) {
+        let mut names = TypeNamesFork { found: false, self_is_fork };
+        names.visit_type(ty);
+        if names.found {
+            self.found.push(format!("{kw} {}: {}", ident.unraw(), render_type(ty)));
+        }
+    }
+}
+
+/// End of a type range that starts at `from`: the first top-level `;`, or
+/// with `item` also a top-level `=`, `,` or `{`, or a close that leaves the range.
+fn type_range_end(src: &str, toks: &[CodeTok], from: usize, item: bool) -> usize {
+    let mut depth = 0i32;
+    for (j, t) in toks.iter().enumerate().skip(from) {
+        let arrow = j > 0 && is_punct(src, &toks[j - 1], b'-');
+        if is_open(src, t) || is_punct(src, t, b'<') {
+            depth += 1;
+        } else if is_close(src, t) || (is_punct(src, t, b'>') && !arrow) {
+            depth -= 1;
+            if depth < 0 {
+                return j;
+            }
+        } else if depth == 0
+            && (is_punct(src, t, b';') || (item && b"=,{".iter().any(|c| is_punct(src, t, *c))))
+        {
+            return j;
+        }
+    }
+    toks.len()
+}
+
+/// Token check of every `use`, `type`, `const` and `static` in the lexer view,
+/// macro bodies included.
+/// In macro bodies (`name! { … }`, `macro_rules! name { … }`, not `if !x {`),
+/// or in the whole file when `self_everywhere` is set, a `Self` type in a
+/// `const` or `static` counts as `ForkName`, because syn cannot see the impl
+/// around it. In a macro body, a `$` metavariable in the type also counts.
+fn token_aliases(src: &str, self_everywhere: bool) -> Vec<String> {
+    let toks = code_tokens(src, &lex_file(src).non_code);
+    let fork = |j: usize| toks.get(j).is_some_and(|t| is_name(src, t, "ForkName"));
+    let sep = |j: usize| toks.get(j).is_some_and(|n| is_punct(src, n, b':'));
+    let named = |from: usize, to: usize| (from..to).any(|j| fork(j) && !sep(j + 1));
+    let keyword = ["if", "while", "match", "return", "let", "in", "else", "break"];
+    let macros: Vec<(usize, usize)> = (1..toks.len())
+        .filter(|&j| is_punct(src, &toks[j], b'!') && toks[j - 1].kind == CodeKind::Ident)
+        .filter(|&j| !keyword.iter().any(|k| is_word(src, &toks[j - 1], k)))
+        .filter_map(|j| {
+            let open = j + 1 + usize::from(is_word(src, &toks[j - 1], "macro_rules"));
+            Some((open, close_group(src, &toks, open)?))
+        })
+        .collect();
+    let in_macro = |j: usize| macros.iter().any(|&(o, c)| o < j && j < c);
+    let self_type = |j: usize| is_word(src, &toks[j], "Self") && (self_everywhere || in_macro(j));
+    let metavar = |j: usize| is_punct(src, &toks[j], b'$') && in_macro(j);
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if is_word(src, t, "use") {
+            let end = type_range_end(src, &toks, i + 1, false);
+            let as_kw = |j: usize| toks.get(j).is_some_and(|n| is_word(src, n, "as"));
+            if (i..end).any(|j| fork(j) && (sep(j + 1) || as_kw(j + 1))) {
+                out.push(normalise_line(&src[line_start(src, t.start)..line_end(src, t.start)]));
+            }
+            continue;
+        }
+        let kw = ["type", "const", "static"].into_iter().find(|k| is_word(src, t, k));
+        let Some(kw) = kw else {
             continue;
         };
-        let before_arrow = match line.find("=>") {
-            Some(arrow) => idx < arrow,
-            None => line[idx..].contains('|'),
+        let name = i + 1 + usize::from(toks.get(i + 1).is_some_and(|n| is_word(src, n, "mut")));
+        let name = name + usize::from(toks.get(name).is_some_and(|n| is_punct(src, n, b'$')));
+        let Some(ident) = toks.get(name).filter(|n| n.kind == CodeKind::Ident) else {
+            continue;
         };
-        if before_arrow {
-            return true;
+        let text = &src[ident.start..ident.end];
+        let text = text.strip_prefix("r#").unwrap_or(text);
+        if kw == "type" {
+            if named(name + 1, type_range_end(src, &toks, name + 1, false)) {
+                out.push(format!("type {text}"));
+            }
+        } else if sep(name + 1) && !sep(name + 2) {
+            let end = type_range_end(src, &toks, name + 2, true);
+            let hidden = (name + 2..end).any(|j| self_type(j) || metavar(j));
+            if (named(name + 2, end) || hidden) && end > name + 2 {
+                let ty = normalise_line(&src[toks[name + 2].start..toks[end - 1].end]);
+                out.push(format!("{kw} {text}: {ty}"));
+            }
         }
     }
-    false
+    out
 }
 
-fn body_is_forkname_match(path: &str, body: &str) -> bool {
-    let mut forkname = false;
-    let mut self_hits = 0usize;
-    for line in body.lines() {
-        if line_has_forkname_pattern(line) {
-            forkname = true;
-        }
-        if path.ends_with("eth-types/src/fork.rs") && line_has_self_fork_pattern(line) {
-            self_hits += 1;
-        }
+/// Findings that alias `ForkName`, rename it, import its variants, or give a
+/// `const`, `static` or associated const a type that names `ForkName`. syn
+/// reads each file that it parses, and a token check reads every file, macro
+/// bodies included.
+fn fork_name_aliases(src: &str) -> Vec<String> {
+    let parsed = syn::parse_file(src);
+    let mut found = token_aliases(src, parsed.is_err());
+    if let Ok(file) = parsed {
+        let mut finder = AliasFinder::default();
+        finder.visit_file(&file);
+        found.extend(finder.found);
     }
-    forkname || self_hits >= 2
+    found.sort();
+    found
 }
 
 fn body_has_fork_string(body: &str) -> bool {
@@ -1045,6 +1612,7 @@ struct Scan<'a> {
     src: &'a str,
     parsed: &'a Result<SourceItems, ResolveError>,
     non_code: &'a [(usize, usize)],
+    hand: &'a [(usize, usize)],
     uncertain: bool,
     covered: bool,
     toks: &'a [(u32, u32, u8)],
@@ -1087,6 +1655,7 @@ const T_COL: u8 = 4;
 
 struct Lex {
     non_code: Vec<(usize, usize)>,
+    hand: Vec<(usize, usize)>,
     uncertain: bool,
     covered: bool,
     toks: Vec<(u32, u32, u8)>,
@@ -1164,7 +1733,7 @@ fn lex_file(src: &str) -> Lex {
     if non_code != hand {
         uncertain = true;
     }
-    Lex { non_code, uncertain, covered, toks }
+    Lex { non_code, hand, uncertain, covered, toks }
 }
 
 fn tok_at(toks: &[(u32, u32, u8)], pos: usize) -> Option<(usize, u8)> {
@@ -1302,38 +1871,96 @@ fn scan_entries(scan: &Scan<'_>, out: &mut Vec<Hit>) {
     }
 }
 
+fn push_red_hit(out: &mut Vec<Hit>, scan: &Scan<'_>, at: usize, class: Class, why: &str) {
+    let before = out.len();
+    push_hit(out, scan, at, class, true);
+    for hit in &mut out[before..] {
+        hit.resolve_error.get_or_insert_with(|| why.to_string());
+    }
+}
+
+/// Class 4 hit of the `matches!` site at token `i`, or `None` if syn does not parse it.
+fn syn_macro_hits(src: &str, toks: &[CodeTok], i: usize) -> Option<Vec<(Class, bool)>> {
+    let close = close_group(src, toks, i + 2)?;
+    let (arm, fork_string) = parse_matches_body(&src[toks[i + 2].end..toks[close].start]).ok()?;
+    let facts = match_facts(std::slice::from_ref(&arm), fork_string);
+    Some(if facts.fork_string {
+        vec![(Class::StringDispatch, facts.catch_all)]
+    } else {
+        Vec::new()
+    })
+}
+
+/// Class 3 and class 4 hits of the `match` site at token `i`, or `None` if
+/// syn does not parse the site.
+fn syn_match_hits(
+    src: &str,
+    toks: &[CodeTok],
+    i: usize,
+    names_fork: bool,
+) -> Option<Vec<(Class, bool)>> {
+    let (arms, fork_string) =
+        parse_match_site(&src[toks[i].start..group_end(src, toks, i + 1)]).ok()?;
+    let facts = match_facts(&arms, fork_string);
+    let self_scope = facts.self_path && names_fork;
+    let mut hits = Vec::new();
+    if facts.fork || self_scope || (facts.const_only && names_fork) {
+        hits.push((Class::MatchForkName, facts.catch_all));
+    }
+    if facts.fork_string {
+        hits.push((Class::StringDispatch, facts.catch_all));
+    }
+    Some(hits)
+}
+
+/// Each `match` and `matches!` site. syn decides the scrutinee, the arms, the
+/// patterns and the guards. If the lexer is uncertain or syn rejects the file
+/// or the site, the site is a failing class 3 hit when the file names
+/// `ForkName` and a failing class 4 hit when the file has a fork string. An
+/// uncertain file also walks the hand mask and no mask (fail closed).
 fn scan_match_sites(scan: &Scan<'_>, out: &mut Vec<Hit>) {
     let src = scan.src;
-    let mut from = 0;
-    while let Some(rel) = src[from..].find("match") {
-        let at = from + rel;
-        from = at + 5;
-        if !ident_boundary_before(src, at) {
-            continue;
-        }
-        if src[at..].starts_with("matches!") {
-            if let Some((open, close)) = matches_macro_span(src, at) {
-                let body = &src[open..=close];
-                if body_has_fork_string(body) {
-                    let wildcard = has_bare_underscore_token(body);
-                    push_hit(out, scan, at, Class::StringDispatch, wildcard);
+    let parsed = !scan.uncertain && syn::parse_file(src).is_ok();
+    let masks = if parsed { vec![scan.non_code] } else { vec![scan.non_code, scan.hand, &[]] };
+    let crude_fork = src.contains("ForkName");
+    let crude_string = body_has_fork_string(src);
+    let mut seen = HashSet::new();
+    for mask in masks {
+        let toks = code_tokens(src, mask);
+        let names_fork = toks.iter().any(|t| is_name(src, t, "ForkName"));
+        for (i, t) in toks.iter().enumerate() {
+            let is_macro = is_name(src, t, "matches")
+                && toks.get(i + 1).is_some_and(|n| is_punct(src, n, b'!'))
+                && toks.get(i + 2).is_some_and(|n| is_open(src, n));
+            if !is_macro && !is_word(src, t, "match") && !(is_name(src, t, "matches") && !parsed) {
+                continue;
+            }
+            let site = match (parsed, is_macro) {
+                (false, _) => None,
+                (true, true) => syn_macro_hits(src, &toks, i),
+                (true, false) => syn_match_hits(src, &toks, i, names_fork),
+            };
+            let why = if parsed { "syn rejected the match site" } else { "syn rejected the file" };
+            let hits = site
+                .map(|h| h.into_iter().map(|(c, w)| (c, w, false)).collect::<Vec<_>>())
+                .unwrap_or_else(|| {
+                    let fork = crude_fork && is_word(src, t, "match");
+                    [(fork, Class::MatchForkName), (crude_string, Class::StringDispatch)]
+                        .into_iter()
+                        .filter(|(on, _)| *on)
+                        .map(|(_, c)| (c, true, true))
+                        .collect()
+                });
+            for (class, wildcard, red) in hits {
+                if !seen.insert((t.start, class)) {
+                    continue;
+                }
+                if red {
+                    push_red_hit(out, scan, t.start, class, why);
+                } else {
+                    push_hit(out, scan, t.start, class, wildcard);
                 }
             }
-            continue;
-        }
-        if !ident_boundary_after(src, at + 5) {
-            continue;
-        }
-        let Some((open, close)) = match_body_span(src, at) else {
-            continue;
-        };
-        let body = &src[open..=close];
-        let wildcard = top_level_wildcard(body);
-        if body_is_forkname_match(scan.path, body) {
-            push_hit(out, scan, at, Class::MatchForkName, wildcard);
-        }
-        if body_has_fork_string(body) {
-            push_hit(out, scan, at, Class::StringDispatch, wildcard);
         }
     }
 }
@@ -1351,6 +1978,7 @@ fn scan_source(path: &str, src: &str) -> Vec<Hit> {
         src,
         parsed: &parsed,
         non_code: &lexed.non_code,
+        hand: &lexed.hand,
         uncertain: lexed.uncertain,
         covered: lexed.covered,
         toks: &lexed.toks,
@@ -1814,6 +2442,7 @@ fn class_matchers_on_synthetic_snippets() {
 #[test]
 fn self_fork_match_in_fork_rs_is_class_three() {
     let src = r#"
+impl ForkName {
     pub fn id(self) -> u32 {
         match self {
             Self::Phase0 => 0,
@@ -1821,6 +2450,7 @@ fn self_fork_match_in_fork_rs_is_class_three() {
             Self::Fulu => 6,
         }
     }
+}
 "#;
     let hits = scan_source("crates/eth-types/src/fork.rs", src);
     let m: Vec<_> = hits.iter().filter(|h| h.class == Class::MatchForkName).collect();
@@ -2226,4 +2856,775 @@ fn broken_token_gap_treats_comment_and_non_ascii_as_hits() {
     assert!(broken_ge(hi, hi.find(">=").unwrap()));
     let plain = "if s >= Other::Gloas {}";
     assert!(!broken_ge(plain, plain.find(">=").unwrap()));
+}
+
+// ---------------------------------------------------------------------------
+// Delimiter walkers and arm patterns (code-only view)
+// ---------------------------------------------------------------------------
+
+fn class_hits(hits: &[Hit], class: Class) -> Vec<Hit> {
+    hits.iter().filter(|h| h.class == class).cloned().collect()
+}
+
+fn one_class_hit(name: &str, path: &str, src: &str, class: Class) -> Hit {
+    let hits = scan_source(path, src);
+    let found = class_hits(&hits, class);
+    assert_eq!(found.len(), 1, "{name}: {hits:?}");
+    let err = reconcile(&hits, &[]).unwrap_err();
+    assert!(err.contains("extra") || err.contains("resolver failed"), "{name}: {err}");
+    found[0].clone()
+}
+
+fn fork_enum_prog(body: &str) -> String {
+    format!(
+        "#[derive(Clone, Copy, PartialEq, PartialOrd)]\npub enum ForkName {{ Fulu, Gloas }}\n{body}"
+    )
+}
+
+#[test]
+fn string_paren_after_a_guarded_prefix_is_a_hit() {
+    let src =
+        "fn f(s:&str)->bool{ let _ = stringify!(#\"a\"); matches!(s, \")\" | \"gloas\") }\n// \"\n";
+    assert_rustc_lib_accepts("e01", src);
+    assert!(lex_file(src).uncertain, "the guarded prefix makes e01 an uncertain file");
+    let hit = one_class_hit("e01", "crates/t/src/e01.rs", src, Class::StringDispatch);
+    assert!(hit.fp.contains("matches!(s, \")\" | \"gloas\")"), "{}", hit.fp);
+}
+
+#[test]
+fn string_paren_in_a_trusted_matches_macro_is_a_clean_hit() {
+    let src = "pub fn f(s: &str) -> bool {\n    matches!(s, \")\" | \"gloas\")\n}\n";
+    assert_rustc_lib_accepts("e01b", src);
+    assert!(!lex_file(src).uncertain, "e01b must be a trusted file");
+    let hit = one_class_hit("e01b", "crates/t/src/e01b.rs", src, Class::StringDispatch);
+    assert!(hit.resolve_error.is_none(), "{:?}", hit.resolve_error);
+    assert_eq!(hit.item, "f");
+    assert_eq!(hit.wildcard, Some(false));
+}
+
+#[test]
+fn string_paren_in_a_trusted_match_is_a_clean_hit() {
+    let src = "pub fn f(s: &str) -> u8 {\n    match (s, \")\") {\n        (\")\", _) => 0,\n        (\"gloas\", _) => 1,\n        _ => 2,\n    }\n}\n";
+    assert_rustc_lib_accepts("e01c", src);
+    assert!(!lex_file(src).uncertain, "e01c must be a trusted file");
+    let hit = one_class_hit("e01c", "crates/t/src/e01c.rs", src, Class::StringDispatch);
+    assert!(hit.resolve_error.is_none(), "{:?}", hit.resolve_error);
+    assert_eq!(hit.fp, "match (s, \")\") {");
+    assert_eq!(hit.wildcard, Some(true));
+}
+
+#[test]
+fn matches_macro_with_bracket_or_brace_delimiters_is_a_hit() {
+    for (name, call) in
+        [("bracket", "matches![s, \"gloas\"]"), ("brace", "matches! { s, \"gloas\" }")]
+    {
+        let src = format!("pub fn f(s: &str) -> bool {{\n    {call}\n}}\n");
+        assert_rustc_lib_accepts(name, &src);
+        let hit = one_class_hit(name, "crates/t/src/m.rs", &src, Class::StringDispatch);
+        assert_eq!(hit.wildcard, Some(false), "{name}");
+    }
+    let src = "pub fn f(p: (&str, u8)) -> bool {\n    matches!(p, (\"gloas\", _))\n}\n";
+    assert_rustc_lib_accepts("macro-wildcard", src);
+    let hit = one_class_hit("macro-wildcard", "crates/t/src/m.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(false), "`(\"gloas\", _)` is refutable");
+}
+
+#[test]
+fn brace_in_a_comment_before_an_arm_keeps_the_wildcard() {
+    let src = fork_enum_prog(
+        "pub fn f(fork: ForkName) -> u8 {\n    match fork {\n        ForkName::Fulu => 1,\n        // }\n        _ => 0,\n    }\n}\n",
+    );
+    assert_rustc_lib_accepts("brace-cmt", &src);
+    let hit = one_class_hit("brace-cmt", "crates/t/src/b.rs", &src, Class::MatchForkName);
+    assert_eq!(hit.wildcard, Some(true), "the `_ =>` arm after the comment brace is in the body");
+}
+
+#[test]
+fn paren_in_a_char_in_the_scrutinee_is_a_hit() {
+    let src = fork_enum_prog(
+        "pub fn f(fork: ForkName, c: char) -> u8 {\n    match (fork, c == '(') {\n        (ForkName::Gloas, true) => 1,\n        _ => 0,\n    }\n}\n",
+    );
+    assert_rustc_lib_accepts("paren-char", &src);
+    let hit = one_class_hit("paren-char", "crates/t/src/p.rs", &src, Class::MatchForkName);
+    assert_eq!(hit.fp, "match (fork, c == '(') {");
+    assert_eq!(hit.wildcard, Some(true));
+}
+
+#[test]
+fn brace_string_arm_keeps_the_string_dispatch() {
+    let src = "pub fn f(v: &str) -> u8 {\n    match v {\n        \"}\" => 0,\n        \"gloas\" => 1,\n        _ => 2,\n    }\n}\n";
+    assert_rustc_lib_accepts("brace-str", src);
+    let hit = one_class_hit("brace-str", "crates/t/src/s.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(true));
+}
+
+#[test]
+fn block_scrutinee_is_not_the_match_body() {
+    let src = "pub fn f(s: &str) -> u8 {\n    match unsafe { s } {\n        \"gloas\" => 1,\n        _ => 0,\n    }\n}\n";
+    assert_rustc_lib_accepts("block-scrutinee", src);
+    let hit = one_class_hit("block-scrutinee", "crates/t/src/u.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(true));
+
+    let src = "pub fn f(c: bool, s: &str, t: &str) -> u8 {\n    match if c { s } else { t } {\n        \"gloas\" => 1,\n        _ => 0,\n    }\n}\n";
+    assert_rustc_lib_accepts("if-scrutinee", src);
+    let hit = one_class_hit("if-scrutinee", "crates/t/src/u.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(true));
+}
+
+#[test]
+fn uncertain_file_keeps_a_match_that_only_the_raw_walk_sees() {
+    let src = "fn f(fork: ForkName) -> u8 {\n    let _ = \"open\n    match fork {\n        ForkName::Gloas => 1,\n        _ => 0,\n    }\n}\n";
+    let lexed = lex_file(src);
+    assert!(lexed.uncertain, "an unterminated string makes the file uncertain");
+    let at = src.find("match fork").unwrap();
+    assert!(!byte_in_code(&lexed.non_code, at), "the lexer mask hides the match");
+    let hit = one_class_hit("raw-walk", "crates/t/src/o.rs", src, Class::MatchForkName);
+    assert!(hit.resolve_error.is_some(), "{hit:?}");
+    assert_eq!(hit.fp, "match fork {");
+}
+
+fn fork_arm_wildcard(name: &str, arm: &str) -> Option<bool> {
+    let src = format!(
+        "#![allow(unused, unreachable_patterns, non_snake_case)]\n#[derive(Clone, Copy, PartialEq)]\npub enum ForkName {{ Fulu, Gloas }}\nuse crate::ForkName::*;\nmacro_rules! any {{ () => {{ _ }}; }}\npub fn f(mut fork: ForkName, c: bool) -> u8 {{\n    match fork {{\n        ForkName::Fulu => 1,\n        {arm} => 2,\n        ForkName::Gloas => 3,\n    }}\n}}\n"
+    );
+    assert_rustc_lib_accepts(&format!("arm-{name}"), &src);
+    let hits = scan_source("crates/t/src/w.rs", &src);
+    let m = class_hits(&hits, Class::MatchForkName);
+    assert_eq!(m.len(), 1, "{name}: {hits:?}");
+    m[0].wildcard
+}
+
+#[test]
+fn binding_catch_all_arms_are_wildcards() {
+    let catch_all = [
+        ("bare", "_"),
+        ("binding", "other"),
+        ("underscore-binding", "_other"),
+        ("at-wildcard", "x @ _"),
+        ("ref", "ref other"),
+        ("mut", "mut other"),
+        ("ref-mut", "ref mut other"),
+        ("paren", "(other)"),
+        ("or-wildcard", "ForkName::Gloas | _"),
+        ("raw-ident", "r#other"),
+        ("attr", "#[allow(unused_variables)] other"),
+        ("multi-line", "other\n       "),
+        ("comment", "/* c */ other"),
+        ("upper-camel-binding", "#[allow(non_snake_case)] Other"),
+        ("screaming-binding", "MAX_FORK"),
+        ("pattern-macro", "any!()"),
+        ("glob-variant", "Gloas"),
+    ];
+    for (name, arm) in catch_all {
+        assert_eq!(fork_arm_wildcard(name, arm), Some(true), "{name}: `{arm}` is a catch-all");
+    }
+    let refutable = [
+        ("guard", "other if c"),
+        ("guard-at", "x @ _ if c"),
+        ("fork-path", "ForkName::Gloas"),
+        ("qualified-path", "<ForkName>::Gloas"),
+        ("at-path", "x @ ForkName::Gloas"),
+    ];
+    for (name, arm) in refutable {
+        assert_eq!(fork_arm_wildcard(name, arm), Some(false), "{name}: `{arm}` is not a catch-all");
+    }
+}
+
+#[test]
+fn tuple_and_reference_bindings_are_wildcards() {
+    let src = "pub fn f(s: &str, t: &str) -> u8 {\n    match (s, t) {\n        (\"gloas\", _) => 1,\n        (a, ..) => { let _ = a; 0 }\n    }\n}\n";
+    assert_rustc_lib_accepts("tuple-binding", src);
+    let hit = one_class_hit("tuple-binding", "crates/t/src/t.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(true));
+
+    let src = "pub fn f(s: &&str) -> u8 {\n    match s {\n        &\"gloas\" => 1,\n        &other => other.len() as u8,\n    }\n}\n";
+    assert_rustc_lib_accepts("ref-binding", src);
+    let hit = one_class_hit("ref-binding", "crates/t/src/r.rs", src, Class::StringDispatch);
+    assert_eq!(hit.wildcard, Some(true));
+}
+
+fn kzg_mutant(src: &str, arm: &str) -> String {
+    let fn_at = src.find("fn expected_kzg_proof_count").expect("expected_kzg_proof_count");
+    let first = fn_at + src[fn_at..].find("ForkName::Phase0").expect("Phase0 arm");
+    let arrow = first + src[first..].find("=>").expect("arm arrow");
+    format!("{}{arm} {}", &src[..first], &src[arrow..])
+}
+
+#[test]
+fn binding_catch_all_on_an_inventoried_match_fails_reconcile() {
+    let path = "crates/eth-types/src/block.rs";
+    let src = std::fs::read_to_string(workspace_root().join(path)).expect("read block.rs");
+    let rows: Vec<Inv> = INVENTORY.iter().copied().filter(|r| r.path == path).collect();
+    assert!(rows.iter().any(|r| r.item == "expected_kzg_proof_count" && !r.wildcard));
+    reconcile(&scan_source(path, &src), &rows).unwrap_or_else(|e| panic!("live block.rs:\n{e}"));
+    let catch_all = [
+        "_",
+        "other",
+        "x @ _",
+        "ref other",
+        "fork_name @ _",
+        "#[allow(non_snake_case)] Other",
+        "Phase0",
+        "any!()",
+    ];
+    for arm in catch_all {
+        let err = reconcile(&scan_source(path, &kzg_mutant(&src, arm)), &rows).unwrap_err();
+        assert!(err.contains("wildcard mismatch"), "`{arm}`: {err}");
+        assert!(err.contains("expected_kzg_proof_count"), "`{arm}`: {err}");
+    }
+    let guarded = kzg_mutant(&src, "other if blobs > 0");
+    reconcile(&scan_source(path, &guarded), &rows)
+        .unwrap_or_else(|e| panic!("a guarded binding is not a catch-all:\n{e}"));
+}
+
+#[test]
+fn fork_name_arm_split_across_lines_is_class_three() {
+    let arms = [
+        ("leading-vert", "        | ForkName::Fulu\n        => 1,\n        | ForkName::Gloas\n        => 2,"),
+        ("split-path", "        ForkName\n            ::Fulu => 1,\n        ForkName\n            ::Gloas => 2,"),
+        ("spaced-path", "        ForkName :: Fulu => 1,\n        ForkName :: Gloas => 2,"),
+    ];
+    for (name, body) in arms {
+        let src = fork_enum_prog(&format!(
+            "pub fn f(fork: ForkName) -> u8 {{\n    match fork {{\n{body}\n    }}\n}}\n"
+        ));
+        assert_rustc_lib_accepts(name, &src);
+        let hit = one_class_hit(name, "crates/t/src/f.rs", &src, Class::MatchForkName);
+        assert_eq!(hit.wildcard, Some(false), "{name}");
+        assert_eq!(hit.fp, "match fork {", "{name}");
+    }
+}
+
+#[test]
+fn struct_pattern_brace_does_not_end_the_arm() {
+    let src = fork_enum_prog(
+        "pub struct S { pub f: ForkName }\npub fn f(s: S) -> u8 {\n    match s {\n        S { f: ForkName::Fulu } => 1,\n        S { f: ForkName::Gloas } | S { f: ForkName::Fulu } if false => 2,\n        S { f: ForkName::Gloas } => 3,\n    }\n}\n",
+    );
+    assert_rustc_lib_accepts("struct-pattern", &src);
+    let hit = one_class_hit("struct-pattern", "crates/t/src/s.rs", &src, Class::MatchForkName);
+    assert_eq!(hit.wildcard, Some(false));
+    assert_eq!(hit.fp, "match s {");
+}
+
+#[test]
+fn fork_name_outside_an_arm_pattern_is_not_class_three() {
+    let cases = [
+        ("comment", "pub fn f(x: u8) -> u8 {\n    match x {\n        // ForkName::Gloas => 9,\n        1 => 1,\n        _ => 0,\n    }\n}\n"),
+        ("arm-body", "pub fn f(x: u8) -> ForkName {\n    match x {\n        1 => ForkName::Gloas,\n        _ => ForkName::Fulu,\n    }\n}\n"),
+    ];
+    for (name, body) in cases {
+        let src = fork_enum_prog(body);
+        assert_rustc_lib_accepts(name, &src);
+        let hits = scan_source("crates/t/src/n.rs", &src);
+        assert!(class_hits(&hits, Class::MatchForkName).is_empty(), "{name}: {hits:?}");
+    }
+}
+
+const ALL_FORKS_PROG: &str = "#[derive(Clone, Copy, PartialEq)]\npub enum ForkName { Phase0, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas }\n#[derive(Clone, Copy)]\npub enum BodyForkLayout { Deneb, Electra, Gloas }\n";
+
+#[test]
+fn self_fork_rule_applies_to_impls_of_fork_name() {
+    let one_arm = "impl ForkName {\n    pub fn last(self) -> bool {\n        match self {\n            Self::Gloas => true,\n            _ => false,\n        }\n    }\n}\n";
+    let trait_impl = "impl std::fmt::Display for ForkName {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Gloas => f.write_str(\"g\"),\n            _ => f.write_str(\"o\"),\n        }\n    }\n}\n";
+    for (name, body, path) in [
+        ("self-one-arm", one_arm, "crates/eth-types/src/fork.rs"),
+        ("self-other-file", one_arm, "crates/eth-types/src/other.rs"),
+        ("self-trait-impl", trait_impl, "crates/eth-types/src/display.rs"),
+        ("self-trait-impl-outside", trait_impl, "crates/beacon/src/display.rs"),
+    ] {
+        let src = format!("{ALL_FORKS_PROG}{body}");
+        assert_rustc_lib_accepts(name, &src);
+        let hit = one_class_hit(name, path, &src, Class::MatchForkName);
+        assert_eq!(hit.wildcard, Some(true), "{name}");
+        assert_eq!(hit.fp, "match self {", "{name}");
+    }
+    let layout = "impl BodyForkLayout {\n    pub fn last(self) -> bool {\n        match self {\n            Self::Deneb | Self::Electra => false,\n            Self::Gloas => true,\n        }\n    }\n}\n";
+    let src = format!(
+        "#[derive(Clone, Copy)]\npub enum BodyForkLayout {{ Deneb, Electra, Gloas }}\n{layout}"
+    );
+    assert_rustc_lib_accepts("self-layout", &src);
+    let hits = scan_source("crates/eth-types/src/block.rs", &src);
+    assert!(class_hits(&hits, Class::MatchForkName).is_empty(), "no ForkName token: {hits:?}");
+}
+
+fn assert_hits(name: &str, src: &str, class: Class, n: usize) -> Vec<Hit> {
+    assert_rustc_lib_accepts(name, src);
+    let hits = class_hits(&scan_source("crates/t/src/x.rs", src), class);
+    assert_eq!(hits.len(), n, "{name}: {hits:?}");
+    hits
+}
+
+#[test]
+fn match_body_before_a_following_block_is_found() {
+    let exhaustive = "match fork { ForkName::Fulu => true, ForkName::Gloas => false }";
+    let cases = [
+        ("if-cond", format!("pub fn a(fork: ForkName) -> u8 {{ if {exhaustive} {{ 1 }} else {{ 0 }} }}\n")),
+        ("while-cond", format!("pub fn b(fork: ForkName) {{ while {exhaustive} {{}} }}\n")),
+        ("stmt-then-block", "pub fn e(fork: ForkName) { match fork { ForkName::Fulu => {}, ForkName::Gloas => {} } { let _ = 1; } }\n".to_string()),
+        ("async-await", "pub async fn f(fork: ForkName) -> u8 { match async { fork }.await { ForkName::Fulu => 1, ForkName::Gloas => 2 } }\n".to_string()),
+    ];
+    for (name, body) in cases {
+        let hits = assert_hits(name, &fork_enum_prog(&body), Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(false), "{name}");
+    }
+    let nested = fork_enum_prog("pub fn c(fork: ForkName, s: &str) -> u8 { match match fork { ForkName::Fulu => s, ForkName::Gloas => \"x\" } { \"gloas\" => 1, _ => 0 } }\n");
+    assert_hits("match-match", &nested, Class::MatchForkName, 1);
+    assert_eq!(
+        assert_hits("match-match", &nested, Class::StringDispatch, 1)[0].wildcard,
+        Some(true)
+    );
+    let for_in = "pub fn d(s: &str) { for _ in match s { \"gloas\" => 0..1, _ => 0..0 } {} }\n";
+    assert_hits("for-in", for_in, Class::StringDispatch, 1);
+}
+
+#[test]
+fn guard_commas_and_braces_do_not_start_an_arm() {
+    let header = "use std::collections::HashMap;\npub struct Cfg { pub on: bool }\npub fn g<A, B>() -> bool { true }\n";
+    let guards = [
+        ("turbofish-call", "g::<u8, u8>()"),
+        ("turbofish-type", "HashMap::<u8, u8>::new().is_empty()"),
+        ("struct-literal", "Cfg { on: c }.on"),
+        ("block-guard", "{ c } && c"),
+    ];
+    for (name, guard) in guards {
+        let src = fork_enum_prog(&format!(
+            "{header}pub fn f(fork: ForkName, c: bool) -> u8 {{\n    match fork {{\n        ForkName::Gloas if {guard} => 1,\n        _ => 0,\n    }}\n}}\n"
+        ));
+        let hits = assert_hits(name, &src, Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(true), "{name}");
+    }
+    let vert = fork_enum_prog("pub fn v(fork: ForkName, c: bool) -> u8 {\n    match fork {\n        ForkName::Fulu => if c { 1 } else { 2 }\n        | other => { let _ = other; 3 }\n    }\n}\n");
+    let hits = assert_hits("vert-after-if", &vert, Class::MatchForkName, 1);
+    assert_eq!(hits[0].wildcard, Some(true), "`| other` after an if-else arm body is a catch-all");
+}
+
+#[test]
+fn inner_attribute_does_not_join_the_first_arm() {
+    let src = fork_enum_prog("pub fn f(fork: ForkName) -> u8 {\n    match fork {\n        #![allow(unreachable_patterns)]\n        _ => 0,\n        ForkName::Fulu => 1,\n    }\n}\n");
+    let hits = assert_hits("inner-attr", &src, Class::MatchForkName, 1);
+    assert_eq!(hits[0].wildcard, Some(true));
+}
+
+#[test]
+fn catch_all_inside_a_wrapper_pattern_is_a_wildcard() {
+    let header = "#[derive(Clone, Copy)]\npub struct S { pub f: ForkName, pub n: u8 }\n";
+    let cases = [
+        ("ok-binding", "r: Result<ForkName, ()>", "r", "Ok(ForkName::Gloas) => 1,\n        Ok(got) => { let _ = got; 2 }\n        Err(()) => 0,"),
+        ("ok-wildcard", "r: Result<ForkName, ()>", "r", "Ok(ForkName::Gloas) => 1,\n        Ok(_) => 2,\n        Err(()) => 0,"),
+        ("some-binding", "o: Option<ForkName>", "o", "Some(ForkName::Gloas) => 1,\n        Some(x) => { let _ = x; 2 }\n        None => 0,"),
+        ("struct-rest", "s: S", "s", "S { f: ForkName::Gloas, .. } => 1,\n        S { .. } => 2,"),
+        ("struct-fields", "s: S", "s", "S { f: ForkName::Gloas, .. } => 1,\n        S { f, n: _ } => { let _ = f; 2 }"),
+    ];
+    for (name, arg, scrutinee, arms) in cases {
+        let src = fork_enum_prog(&format!(
+            "{header}pub fn f({arg}) -> u8 {{\n    match {scrutinee} {{\n        {arms}\n    }}\n}}\n"
+        ));
+        let hits = assert_hits(name, &src, Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(true), "{name}");
+    }
+    let exhaustive = fork_enum_prog("pub fn f(o: Option<ForkName>) -> u8 {\n    match o {\n        Some(ForkName::Fulu) => 1,\n        Some(ForkName::Gloas) => 2,\n        None => 0,\n    }\n}\n");
+    let hits = assert_hits("some-exhaustive", &exhaustive, Class::MatchForkName, 1);
+    assert_eq!(hits[0].wildcard, Some(false));
+}
+
+#[test]
+fn glob_and_qualified_fork_paths_are_class_three() {
+    let glob = "#[derive(Clone, Copy, PartialEq)]\npub enum ForkName { Fulu, Gloas }\nuse crate::ForkName::*;\npub fn f(fork: ForkName) -> u8 {\n    match fork {\n        Fulu => 1,\n        Gloas => 2,\n    }\n}\n";
+    let hits = assert_hits("glob-bare", glob, Class::MatchForkName, 1);
+    assert_eq!(hits[0].wildcard, Some(true), "a bare variant name is a binding");
+    let qualified = fork_enum_prog("pub fn f(fork: ForkName) -> u8 {\n    match fork {\n        <ForkName>::Fulu => 1,\n        <ForkName>::Gloas => 2,\n    }\n}\n");
+    let hits = assert_hits("qualified", &qualified, Class::MatchForkName, 1);
+    assert_eq!(hits[0].wildcard, Some(false));
+    let layout = "#[derive(Clone, Copy)]\npub enum BodyForkLayout { Deneb, Gloas }\npub fn f(l: BodyForkLayout) -> u8 {\n    match l {\n        BodyForkLayout::Deneb => 1,\n        BodyForkLayout::Gloas => 2,\n    }\n}\n";
+    assert_hits("other-enum-path", layout, Class::MatchForkName, 0);
+}
+
+#[test]
+fn fork_name_alias_finder_sees_glob_alias_and_rename() {
+    let cases = [
+        ("alias-glob", "use crate::ForkName::*;\n", true),
+        ("alias-list", "use crate::ForkName::{Fulu, Gloas};\n", true),
+        ("alias-variant-rename", "use crate::ForkName::Gloas as G;\n", true),
+        ("alias-raw-glob", "use crate::r#ForkName::*;\n", true),
+        ("alias-rename", "use crate::ForkName as Fork;\n", true),
+        ("alias-type", "pub type Fork = ForkName;\n", true),
+        ("alias-type-path", "pub type Fork = crate::ForkName;\n", true),
+        ("alias-type-paren", "#[allow(unused_parens)]\npub type Fork = (ForkName);\n", true),
+        ("alias-type-empty-args", "pub type Fork = ForkName<>;\n", true),
+        ("alias-type-raw", "pub type Fork = r#ForkName;\n", true),
+        ("alias-type-default", "pub type Fork<T = ForkName> = T;\n", true),
+        (
+            "alias-macro-type",
+            "macro_rules! a {\n    () => { pub type F = crate::ForkName; };\n}\n",
+            true,
+        ),
+        ("alias-macro-use", "macro_rules! b {\n    () => { use crate::ForkName::*; };\n}\n", true),
+        ("alias-const", "pub const EARLY: ForkName = ForkName::Fulu;\n", true),
+        ("alias-static", "pub static LAST: Option<ForkName> = None;\n", true),
+        (
+            "alias-assoc-const",
+            "impl ForkName {\n    pub const LAST: ForkName = ForkName::Gloas;\n}\n",
+            true,
+        ),
+        ("alias-trait-const", "pub trait T {\n    const F: ForkName;\n}\n", true),
+        ("alias-const-fn", "pub const fn f(x: ForkName) -> ForkName { x }\n", false),
+        ("alias-const-generic", "pub fn g<const N: usize>(x: ForkName) -> ForkName { x }\n", false),
+        ("alias-other-const", "pub const N: usize = 1;\n", false),
+        ("alias-plain-use", "mod m {\n    pub use crate::ForkName;\n}\n", false),
+        ("alias-comment", "// use crate::ForkName::*;\npub type Other = u8;\n", false),
+        ("alias-path-use", "pub fn f() -> ForkName { crate::ForkName::Gloas }\n", false),
+    ];
+    for (name, body, flagged) in cases {
+        let src = format!("#![allow(unused)]\n{}{body}", fork_enum_prog(""));
+        assert_rustc_lib_accepts(name, &src);
+        let found = fork_name_aliases(&src);
+        assert_eq!(!found.is_empty(), flagged, "{name}: {found:?}");
+        let broken = format!("{src}fn broken( {{\n");
+        assert_eq!(!fork_name_aliases(&broken).is_empty(), flagged, "{name}: token fallback");
+    }
+}
+
+#[test]
+fn source_has_no_fork_name_alias_or_variant_import() {
+    let root = workspace_root();
+    let files: Vec<(String, String)> = crates_and_bin_rs(&root)
+        .into_iter()
+        .map(|file| {
+            let rel = file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+            (rel, std::fs::read_to_string(&file).unwrap_or_default())
+        })
+        .collect();
+    assert!(
+        files.iter().filter(|(rel, _)| rel.contains("/tests/")).count() > 10,
+        "scan tests/ too"
+    );
+    let errors = alias_gate(&files);
+    assert!(
+        errors.is_empty(),
+        "a ForkName alias, rename, variant import or fork constant hides class 3 arms:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn alias_exemption_is_the_name_table_in_impl_fork_name_once() {
+    let all = "    pub const ALL: [Self; 8] = [Self::Phase0, Self::Altair, Self::Bellatrix, Self::Capella, Self::Deneb, Self::Electra, Self::Fulu, Self::Gloas];\n";
+    let names = "    const NAMES: [(ForkName, &str, u32); Self::COUNT] = [(Self::Phase0, \"phase0\", 0), (Self::Altair, \"altair\", 1), (Self::Bellatrix, \"bellatrix\", 2), (Self::Capella, \"capella\", 3), (Self::Deneb, \"deneb\", 4), (Self::Electra, \"electra\", 5), (Self::Fulu, \"fulu\", 6), (Self::Gloas, \"gloas\", 7)];\n";
+    let table = format!(
+        "impl ForkName {{\n{all}    pub const COUNT: usize = Self::ALL.len();\n{names}}}\n"
+    );
+    let no_all = format!("impl ForkName {{\n    pub const COUNT: usize = 8;\n{names}}}\n");
+    let shadow = "pub mod n {\n    use super::ForkName;\n    pub const NAMES: ForkName = ForkName::Gloas;\n}\n";
+    let next = "impl ForkName {\n    pub const NEXT: Option<Self> = None;\n}\n";
+    let cases = [
+        ("exempt-table", table.clone(), true),
+        ("exempt-shadow", format!("{table}{shadow}"), false),
+        ("exempt-next", format!("{table}{next}"), false),
+        ("exempt-no-all", no_all, false),
+        ("exempt-missing", String::new(), false),
+    ];
+    for (name, body, clean) in cases {
+        let src = format!("#![allow(unused)]\n{ALL_FORKS_PROG}{body}");
+        assert_rustc_lib_accepts(name, &src);
+        let errors = alias_gate(&[("crates/eth-types/src/fork.rs".to_string(), src)]);
+        assert_eq!(errors.is_empty(), clean, "{name}: {errors:?}");
+    }
+}
+
+#[test]
+fn matches_macro_binding_pattern_is_a_wildcard() {
+    for (name, call) in [
+        ("macro-at-group", "matches!(v, x @ (\"gloas\" | _))"),
+        ("macro-at-binding", "matches!(v, x @ \"gloas\" | x)"),
+    ] {
+        let src = format!("pub fn f(v: &str) -> bool {{\n    {call}\n}}\n");
+        let hits = assert_hits(name, &src, Class::StringDispatch, 1);
+        assert_eq!(hits[0].wildcard, Some(true), "{name}");
+    }
+    let guarded =
+        "pub fn f(v: &str, c: bool) -> bool {\n    matches!(v, x @ \"gloas\" | x if c)\n}\n";
+    let hits = assert_hits("macro-guarded", guarded, Class::StringDispatch, 1);
+    assert_eq!(hits[0].wildcard, Some(false));
+}
+
+#[test]
+fn syn_decides_the_scrutinee_and_the_arm_bodies() {
+    let header = "#[derive(Clone, Copy)]\npub struct S { pub f: u8 }\n";
+    let cases = [
+        ("if-let-struct", "ForkName::Fulu => if let S { f: 0 } = s { }"),
+        ("while-let-struct", "ForkName::Fulu => while let S { f: 0 } = s { break }"),
+        ("for-struct", "ForkName::Fulu => for S { f } in [s] { let _ = f; }"),
+        ("for-open-range", "ForkName::Fulu => for _ in 0.. { break }"),
+    ];
+    for (name, arm) in cases {
+        let src = fork_enum_prog(&format!(
+            "{header}pub fn f(fork: ForkName, s: S) {{\n    match fork {{\n        {arm}\n        other => {{ let _ = other; }}\n    }}\n}}\n"
+        ));
+        let hits = assert_hits(name, &src, Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(true), "{name}: the `other` arm is a catch-all");
+    }
+    let cast = "pub fn f(s: &str) -> u8 {\n    match s.as_ptr() as *const u8 as usize {\n        _ if s == \"gloas\" => 1,\n        _ => 0,\n    }\n}\n";
+    assert_eq!(assert_hits("const-cast", cast, Class::StringDispatch, 1)[0].wildcard, Some(true));
+    let block = fork_enum_prog("pub fn f(fork: ForkName) -> u8 {\n    match &mut { fork } {\n        ForkName::Fulu => 1,\n        ForkName::Gloas => 2,\n    }\n}\n");
+    assert_eq!(assert_hits("mut-block", &block, Class::MatchForkName, 1)[0].wildcard, Some(false));
+}
+
+#[test]
+fn self_rule_follows_the_impl_self_type() {
+    let body = "    pub fn last(self) -> bool {\n        match self {\n            Self::Gloas => true,\n            _ => false,\n        }\n    }\n";
+    for (name, header) in [
+        ("impl-crate-path", "impl crate::ForkName {\n"),
+        ("impl-raw", "impl r#ForkName {\n"),
+        ("impl-module-path", "mod m {\n    pub use crate::ForkName;\n}\nimpl m::ForkName {\n"),
+    ] {
+        let src = format!("{ALL_FORKS_PROG}{header}{body}}}\n");
+        let hits = assert_hits(name, &src, Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(true), "{name}");
+    }
+}
+
+#[test]
+fn raw_and_qualified_fork_paths_are_class_three() {
+    let cases = [
+        ("raw-path", "r#ForkName::Fulu => 1,\n        r#ForkName::Gloas => 2,"),
+        (
+            "qualified-crate",
+            "<crate::ForkName>::Fulu => 1,\n        <crate::ForkName>::Gloas => 2,",
+        ),
+        ("prefix-path", "crate::ForkName::Fulu => 1,\n        self::ForkName::Gloas => 2,"),
+    ];
+    for (name, arms) in cases {
+        let src = fork_enum_prog(&format!(
+            "pub fn f(fork: ForkName) -> u8 {{\n    match fork {{\n        {arms}\n    }}\n}}\n"
+        ));
+        let hits = assert_hits(name, &src, Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(false), "{name}");
+    }
+}
+
+#[test]
+fn kzg_shaped_mutants_compile_and_are_catch_alls() {
+    let prog = |arm: &str| {
+        format!(
+            "#![allow(unused, non_snake_case, bindings_with_variant_name, unreachable_patterns)]\n{ALL_FORKS_PROG}macro_rules! any {{ () => {{ _ }}; }}\npub fn expected_kzg_proof_count(fork: ForkName, blobs: usize) -> Result<usize, ()> {{\n    match fork {{\n        ForkName::Deneb | ForkName::Electra => Ok(blobs),\n        ForkName::Fulu => {{\n            blobs.checked_mul(128).ok_or(())\n        }}\n        {arm} => Err(()),\n    }}\n}}\n"
+        )
+    };
+    let original = "ForkName::Phase0\n        | ForkName::Altair\n        | ForkName::Bellatrix\n        | ForkName::Capella\n        | ForkName::Gloas";
+    let guarded = format!("other if blobs > 0 => Err(()),\n        {original}");
+    let cases = [
+        ("kzg-original", original.to_string(), false),
+        ("kzg-guarded", guarded, false),
+        ("kzg-wild", "_".to_string(), true),
+        ("kzg-binding", "other".to_string(), true),
+        ("kzg-at", "fork_name @ _".to_string(), true),
+        ("kzg-upper", "#[allow(non_snake_case)] Other".to_string(), true),
+        ("kzg-macro", "any!()".to_string(), true),
+        ("kzg-variant-binding", "Phase0".to_string(), true),
+    ];
+    for (name, arm, catch_all) in cases {
+        let hits = assert_hits(name, &prog(&arm), Class::MatchForkName, 1);
+        assert_eq!(hits[0].wildcard, Some(catch_all), "{name}");
+    }
+}
+
+#[test]
+fn turbofish_wrapper_with_a_binding_is_a_wildcard() {
+    let src = fork_enum_prog("pub struct Wrap<T>(pub T);\npub fn f(w: Wrap<ForkName>) -> u8 {\n    match w {\n        Wrap::<ForkName>(ForkName::Gloas) => 1,\n        Wrap::<ForkName>(x) => { let _ = x; 2 }\n    }\n}\n");
+    assert_eq!(
+        assert_hits("turbofish-wrap", &src, Class::MatchForkName, 1)[0].wildcard,
+        Some(true)
+    );
+}
+
+#[test]
+fn const_only_match_in_a_fork_file_is_class_three() {
+    let fork = "#[derive(Clone, Copy, PartialEq, Eq)]\npub enum ForkName { Fulu, Gloas }\npub const EARLY: ForkName = ForkName::Fulu;\npub fn f(fork: ForkName) -> u8 {\n    match fork {\n        EARLY => 1,\n        _ => 0,\n    }\n}\n";
+    assert_eq!(assert_hits("const-only", fork, Class::MatchForkName, 1)[0].wildcard, Some(true));
+    let other = "pub const A: u8 = 1;\npub fn f(x: u8) -> u8 {\n    match x {\n        A => 1,\n        _ => 0,\n    }\n}\n";
+    assert_hits("const-only-other", other, Class::MatchForkName, 0);
+}
+
+#[test]
+fn match_site_that_syn_rejects_fails_closed() {
+    let src = fork_enum_prog(
+        "macro_rules! pick {\n    ($fork:expr) => {\n        match $fork {\n            ForkName::Gloas => 1,\n            _ => 0,\n        }\n    };\n}\npub fn f(fork: ForkName) -> u8 {\n    pick!(fork)\n}\n",
+    );
+    let hits = assert_hits("macro-rules-site", &src, Class::MatchForkName, 1);
+    assert_eq!(hits[0].resolve_error.as_deref(), Some("syn rejected the match site"));
+}
+
+#[test]
+fn self_rule_reads_the_impl_around_an_associated_const() {
+    let body = "impl ForkName {\n    pub const LAST: Self = Self::Gloas;\n    pub const LAST_IS_GLOAS: bool = match Self::LAST {\n        Self::Gloas => true,\n        Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella | Self::Deneb | Self::Electra | Self::Fulu => false,\n    };\n}\n";
+    let src = format!("{ALL_FORKS_PROG}{body}");
+    assert_rustc_lib_accepts("assoc-const-match", &src);
+    for path in ["crates/eth-types/src/x.rs", "crates/beacon/src/x.rs"] {
+        let hits = class_hits(&scan_source(path, &src), Class::MatchForkName);
+        assert_eq!(hits.len(), 1, "{path}: {hits:?}");
+        assert_eq!(hits[0].wildcard, Some(false), "{path}");
+    }
+}
+
+#[test]
+fn raw_matches_macro_is_a_site() {
+    let src = "pub fn f(s: &str) -> bool {\n    r#matches!(s, \"gloas\")\n}\n";
+    assert_eq!(assert_hits("raw-matches", src, Class::StringDispatch, 1)[0].wildcard, Some(false));
+}
+
+#[test]
+fn qualified_self_paths_count_inside_an_impl_of_fork_name() {
+    let header = "#[derive(Clone, Copy, PartialEq, Eq)]\npub enum ForkName { Fulu, Gloas }\npub trait Tr {\n    const X: Self;\n}\nimpl Tr for ForkName {\n    const X: Self = Self::Fulu;\n}\n";
+    let method = |arms: &str| {
+        format!("{header}impl ForkName {{\n    pub fn f(self) -> u8 {{\n        match self {{\n            {arms}\n        }}\n    }}\n}}\n")
+    };
+    let qself = method("<Self>::Fulu => 1,\n            <Self>::Gloas => 2,");
+    assert_eq!(assert_hits("qself-self", &qself, Class::MatchForkName, 1)[0].wildcard, Some(false));
+    let assoc = method("<Self as Tr>::X => 1,\n            _ => 0,");
+    assert_rustc_lib_accepts("qself-self-as", &assoc);
+    let found = fork_name_aliases(&assoc);
+    assert!(
+        found.iter().any(|e| e.contains("const X")),
+        "a Self-typed const hides the arm: {found:?}"
+    );
+}
+
+#[test]
+fn self_typed_consts_fail_the_alias_gate() {
+    let cases = [
+        ("self-const-last", "impl ForkName {\n    pub const LAST: Self = Self::Gloas;\n    pub fn f(self) -> u8 {\n        match self {\n            Self::LAST => 1,\n            _ => 0,\n        }\n    }\n}\n", "const LAST"),
+        ("self-const-next", "impl ForkName {\n    pub const NEXT: Option<Self> = None;\n}\n", "const NEXT"),
+        ("self-trait-const", "pub trait Tr {\n    const X: Self;\n}\n", "const X"),
+        ("self-macro-const", "macro_rules! m {\n    () => { pub const LAST: Self = Self::Gloas; };\n}\nimpl ForkName {\n    m!();\n    pub fn f(self) -> u8 {\n        match self {\n            Self::LAST => 1,\n            _ => 0,\n        }\n    }\n}\n", "const LAST"),
+        ("self-macro-impl", "macro_rules! m {\n    () => { impl ForkName { pub const LAST: Self = Self::Gloas; } };\n}\nm!();\n", "const LAST"),
+        ("self-macro-trait", "macro_rules! m {\n    () => { pub trait Tr { const X: Self; } impl Tr for ForkName { const X: Self = Self::Fulu; } };\n}\nm!();\n", "const X"),
+        ("self-impl-option", "pub trait Tr {\n    const X: Self;\n}\nimpl Tr for Option<ForkName> {\n    const X: Self = None;\n}\n", "impl ForkName: const X"),
+        ("self-macro-metavar-name", "macro_rules! mm {\n    ($n:ident) => { pub const $n: Self = Self::Gloas; };\n}\nimpl ForkName {\n    mm!(LAST);\n    pub fn f(self) -> u8 {\n        match self {\n            Self::LAST => 1,\n            _ => 0,\n        }\n    }\n}\n", "const n: Self"),
+        ("fork-macro-metavar-name", "macro_rules! mf {\n    ($n:ident) => { pub const $n: ForkName = ForkName::Gloas; };\n}\nmf!(EARLY);\n", "const n: ForkName"),
+        ("self-macro-assoc", "macro_rules! m {\n    () => { pub trait Tr { type Me; const X: Self::Me; } impl Tr for ForkName { type Me = Self; const X: Self::Me = Self::Gloas; } };\n}\nm!();\nimpl ForkName {\n    pub fn f(self) -> u8 {\n        match self {\n            <Self as Tr>::X => 1,\n            _ => 0,\n        }\n    }\n}\n", "const X: Self::Me"),
+        ("macro-dollar-type", "macro_rules! mt {\n    ($t:ty) => { pub const LAST: $t = <$t>::Gloas; };\n}\nimpl ForkName {\n    mt!(Self);\n}\n", "const LAST: $t"),
+    ];
+    for (name, body, finding) in cases {
+        let src = format!("#![allow(unused)]\n#[derive(Clone, Copy, PartialEq, Eq)]\npub enum ForkName {{ Fulu, Gloas }}\n{body}");
+        assert_rustc_lib_accepts(name, &src);
+        let found = fork_name_aliases(&src);
+        assert!(found.iter().any(|e| e.contains(finding)), "{name}: {found:?}");
+    }
+    let ids = "#[derive(Clone, Copy)]\npub enum ForkName { Fulu, Gloas }\nimpl ForkName {\n    pub const N: usize = 2;\n    pub const IDS: [u32; Self::N] = [6, 7];\n}\n";
+    let other = "#[derive(Clone, Copy)]\npub struct Mode;\nimpl Mode {\n    pub const DEFAULT: Self = Mode;\n}\n";
+    let not_macro = "pub fn g(x: bool) {\n    if !x {\n        struct Mode;\n        impl Mode {\n            const D: Self = Mode;\n        }\n    }\n}\n";
+    for (name, src) in
+        [("self-const-other", other), ("self-array-len", ids), ("self-not-macro", not_macro)]
+    {
+        assert_rustc_lib_accepts(name, src);
+        assert!(fork_name_aliases(src).is_empty(), "{name}: {:?}", fork_name_aliases(src));
+    }
+}
+
+#[test]
+fn a_wrapper_is_a_catch_all_only_next_to_the_same_wrapper() {
+    let arms = [
+        (
+            "ok-err-exhaustive",
+            "Ok(ForkName::Fulu) => 1,\n        Ok(ForkName::Gloas) => 2,\n        Err(_) => 0,",
+            false,
+        ),
+        ("ok-err-wild-mutant", "Ok(ForkName::Fulu) => 1,\n        _ => 2,", true),
+        (
+            "ok-binding-sibling",
+            "Ok(ForkName::Fulu) => 1,\n        Ok(got) => { let _ = got; 2 }\n        Err(_) => 0,",
+            true,
+        ),
+    ];
+    for (name, arms, wildcard) in arms {
+        let src = fork_enum_prog(&format!(
+            "pub fn f(r: Result<ForkName, ()>) -> u8 {{\n    match r {{\n        {arms}\n    }}\n}}\n"
+        ));
+        assert_eq!(
+            assert_hits(name, &src, Class::MatchForkName, 1)[0].wildcard,
+            Some(wildcard),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn self_path_counts_in_a_file_that_names_fork_name() {
+    let arms = "Self::Gloas => 1,\n            _ => 0,";
+    let tr = "pub trait Tr<const N: usize> {\n    fn f(self) -> u8;\n}\n";
+    let tp = "pub trait Tp {\n    fn f(self) -> u8;\n}\n";
+    let tq = "pub trait Tq<const N: usize> {}\nimpl Tq<0> for ForkName {}\n";
+    let pubf = "pub fn f(self) -> u8";
+    let cases = [
+        ("self-const-arg", tr, "impl Tr<{ 0 }> for ForkName", "fn f(self) -> u8", arms),
+        ("self-where-const", tq, "impl ForkName where Self: Tq<{ 0 }>", pubf, arms),
+        ("self-paren-impl", "", "impl (ForkName)", pubf, arms),
+        ("self-paren-trait", tp, "impl Tp for (ForkName)", "fn f(self) -> u8", arms),
+        (
+            "self-paren-qself",
+            "",
+            "impl ForkName",
+            pubf,
+            "<(Self)>::Gloas => 1,\n            _ => 0,",
+        ),
+    ];
+    for (name, extra, header, f, arms) in cases {
+        let src = format!(
+            "#![allow(unused_parens, unused_braces)]\n{ALL_FORKS_PROG}{extra}{header} {{\n    {f} {{\n        match self {{\n            {arms}\n        }}\n    }}\n}}\n"
+        );
+        assert_rustc_lib_accepts(name, &src);
+        let hits =
+            class_hits(&scan_source("crates/eth-types/src/fork.rs", &src), Class::MatchForkName);
+        assert_eq!(hits.len(), 1, "{name}: {hits:?}");
+    }
+}
+
+#[test]
+fn or_cases_and_plain_wrappers_are_catch_alls() {
+    let result = [
+        (
+            "or-ok-binding",
+            "Ok(other @ ForkName::Fulu) | Ok(other) => { let _ = other; 1 }\n        Err(_) => 0,",
+        ),
+        ("or-ok-wild", "Ok(ForkName::Fulu) | Ok(_) => 1,\n        Err(_) => 0,"),
+        ("nested-or", "Ok(ForkName::Fulu | _) => 1,\n        Err(_) => 0,"),
+    ];
+    for (name, arms) in result {
+        let src = fork_enum_prog(&format!(
+            "pub fn f(r: Result<ForkName, ()>) -> u8 {{\n    match r {{\n        {arms}\n    }}\n}}\n"
+        ));
+        assert_eq!(
+            assert_hits(name, &src, Class::MatchForkName, 1)[0].wildcard,
+            Some(true),
+            "{name}"
+        );
+    }
+    let wrappers = [
+        ("self-tuple", "pub struct W(pub ForkName);\nimpl W {\n    pub fn f(self) -> u8 {\n        match self {\n            Self(ForkName::Gloas) => 1,\n            Self(_) => 0,\n        }\n    }\n}\n"),
+        ("self-struct", "pub struct W { pub f: ForkName }\nimpl W {\n    pub fn f(self) -> u8 {\n        match self {\n            Self { f: ForkName::Gloas } => 1,\n            Self { .. } => 0,\n        }\n    }\n}\n"),
+        ("alias-struct", "pub struct S { pub f: ForkName }\npub type A = S;\npub fn f(s: S) -> u8 {\n    match s {\n        S { f: ForkName::Gloas } => 1,\n        A { .. } => 0,\n    }\n}\n"),
+        ("renamed-ok", "use Result::Ok as Good;\npub fn f(r: Result<ForkName, ()>) -> u8 {\n    match r {\n        Ok(ForkName::Gloas) => 1,\n        Good(_) => 2,\n        Err(_) => 0,\n    }\n}\n"),
+        ("paren-or", "pub fn f(r: Result<ForkName, ()>) -> u8 {\n    match r {\n        (Ok(ForkName::Fulu) | Ok(_)) => 1,\n        Err(_) => 0,\n    }\n}\n"),
+        ("ref-paren-or", "pub fn f(o: &Option<ForkName>) -> u8 {\n    match o {\n        &(Some(ForkName::Fulu) | Some(_)) => 1,\n        &None => 0,\n    }\n}\n"),
+        ("at-paren-or", "pub fn f(r: Result<ForkName, ()>) -> u8 {\n    match r {\n        v @ (Ok(ForkName::Fulu) | Ok(_)) => { let _ = v; 1 }\n        Err(_) => 0,\n    }\n}\n"),
+        ("tuple-or", "pub fn f(r: Result<ForkName, ()>) -> u8 {\n    match (r, 0u8) {\n        (Ok(ForkName::Fulu) | Ok(_), _x) => 1,\n        (Err(_), _x) => 0,\n    }\n}\n"),
+    ];
+    for (name, body) in wrappers {
+        let src = format!("#![allow(unreachable_patterns)]\n{}", fork_enum_prog(body));
+        assert_eq!(
+            assert_hits(name, &src, Class::MatchForkName, 1)[0].wildcard,
+            Some(true),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn self_path_of_another_enum_is_not_class_three() {
+    let src = fork_enum_prog("#[derive(Clone, Copy)]\npub enum Mode { A, B }\nimpl Mode {\n    pub fn f(self) -> u8 {\n        match self {\n            Self::A => 1,\n            Self::B => 2,\n        }\n    }\n}\n");
+    assert_hits("self-other-enum", &src, Class::MatchForkName, 0);
+    assert!(
+        fork_variants().contains("Gloas") && fork_variants().len() >= 8,
+        "{:?}",
+        fork_variants()
+    );
 }
