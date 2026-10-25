@@ -7,6 +7,15 @@
 # would make the extended default pattern for the words true, false, and null
 # skip any line that contains those words, including a real secret.
 #
+# `useDefault` also appends the default global allowlist, and gitleaks has no
+# key that removes it. In 8.21.2 that list hides a secret that starts with
+# true, contains false, or ends with null. It also hides each file whose path
+# contains gitleaks.toml or ends in bin.
+# CI does not scan with this file directly. scripts/gitleaks_strict_config.py
+# writes a copy that extends the pinned default config with a strict global
+# allowlist. Only the useDefault line changes. A local scan with this file
+# is weaker than CI.
+#
 # Intentional fixture findings are allow-listed per rule, per file, and per
 # exact captured value. Each [[rules.allowlists]] entry uses condition AND,
 # one anchored path, and anchored regexes. A regex equals one captured
@@ -32,8 +41,9 @@
 # crates/crypto/src/key_manager.rs is the next value close to a boundary
 # (63 bytes of slack).
 #
-# Adding a fixture: from the repo root, run
-#   gitleaks detect --no-git --source . --config .gitleaks.toml \
+# Adding a fixture: from the repo root, build the strict copy (see AGENTS.md)
+# and run
+#   gitleaks detect --no-git --source . --config target/gitleaks/gitleaks.toml \
 #     --ignore-gitleaks-allow --no-banner --report-format json --report-path -
 # without --redact. Escape the captured value as a fully anchored literal
 # (escape regex punctuation, and escape '-' so the text has no private-key
@@ -470,6 +480,18 @@ paths = [
 ]
 regexes = [
   '''^0x93247f2209\.\.\.611df74a$''',
+]
+
+# A shell flag, not a secret. The default allowlist hid it only because the
+# value contains the word false.
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^scripts/create_validator_keys\.sh$''',
+]
+regexes = [
+  '''^PBKDF2=false$''',
 ]
 
 [[rules.allowlists]]

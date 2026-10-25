@@ -10,7 +10,8 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 gitleaks=${GITLEAKS_BIN:-gitleaks}
-config="$root/.gitleaks.toml"
+# CI sets RVC_GITLEAKS_CONFIG to the strict copy of .gitleaks.toml.
+config="${RVC_GITLEAKS_CONFIG:-$root/.gitleaks.toml}"
 
 if ! command -v "$gitleaks" >/dev/null 2>&1; then
   echo "gitleaks is not on PATH (set GITLEAKS_BIN to override)" >&2

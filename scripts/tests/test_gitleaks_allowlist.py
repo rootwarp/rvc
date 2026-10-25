@@ -25,6 +25,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from conftest import load_script
+
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT / ".gitleaks.toml"
 IGNORE_PATH = ROOT / ".gitleaksignore"
@@ -41,14 +43,13 @@ _GLOBAL_PATHS = [
     r"(^|/)tests/",
 ]
 
+_BUILD = "python3 scripts/gitleaks_strict_config.py --out-dir target/gitleaks"
 _SCAN = (
-    "gitleaks detect --no-git --source . --config .gitleaks.toml "
+    "gitleaks detect --no-git --source . --config target/gitleaks/gitleaks.toml "
     "--ignore-gitleaks-allow --redact --no-banner --exit-code 1"
 )
-_HISTORY = (
-    "gitleaks detect --source . --config .gitleaks.toml "
-    "--ignore-gitleaks-allow --redact --no-banner --exit-code 1"
-)
+_HISTORY = './scripts/gitleaks_range_scan.sh "$PWD/target/gitleaks/gitleaks.toml" --history'
+_CANARY_ENV = 'RVC_GITLEAKS_CONFIG="$PWD/target/gitleaks/gitleaks.toml"'
 
 # Keys gitleaks will honor, folded to lowercase. Anything else is rejected,
 # including a singular rule allowlist and a second global allowlist table.
@@ -502,7 +503,7 @@ def test_secret_scan_job_pins_content_allowlist():
     source = runs["Gitleaks — source tree"]
     assert "--ignore-gitleaks-allow" in source
     assert "--no-git" in source
-    assert ".gitleaks.toml" in source
+    assert '--config "$RVC_GITLEAKS_CONFIG"' in source
     canary = runs["Gitleaks — line-shift canary"]
     assert "gitleaks_line_shift_canary.py" in canary
     script = ROOT / "scripts" / "gitleaks_line_shift_canary.py"
@@ -511,9 +512,25 @@ def test_secret_scan_job_pins_content_allowlist():
 
 def test_agents_md_documents_gitleaks_command_and_size_cap():
     text = AGENTS_PATH.read_text(encoding="utf-8")
+    assert _BUILD in text
     assert _SCAN in text
     assert _HISTORY in text
+    assert _CANARY_ENV in text
+    assert "--config .gitleaks.toml" not in text
     assert "History scan:" in text
     assert "git diff --shortstat develop...HEAD" in text
     assert "2,000" in text
     assert "1,800" in text
+
+
+def test_line_shift_canary_reads_the_strict_config_from_env(monkeypatch, tmp_path):
+    strict = tmp_path / "gitleaks.toml"
+    monkeypatch.setenv("RVC_GITLEAKS_CONFIG", str(strict))
+    assert load_script("gitleaks_line_shift_canary").CONFIG == strict
+    monkeypatch.delenv("RVC_GITLEAKS_CONFIG")
+    assert load_script("gitleaks_line_shift_canary").CONFIG == CONFIG_PATH
+
+
+def test_verify_false_canary_reads_the_strict_config_from_env():
+    verify = (ROOT / "scripts" / "gitleaks_verify_false_canary.sh").read_text(encoding="utf-8")
+    assert 'config="${RVC_GITLEAKS_CONFIG:-$root/.gitleaks.toml}"' in verify

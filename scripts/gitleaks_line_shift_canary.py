@@ -5,9 +5,13 @@ Gitleaks reports paths relative to ``--source`` when that source is ``.``.
 The scans below run from a temporary directory so ``^crates/...$`` matches.
 ``--source canary`` would prefix every path with ``canary/`` and miss those anchors.
 
-Each scan uses ``--ignore-gitleaks-allow`` and the real ``.gitleaks.toml``.
-An inline allow comment is not a pass. A rebuilt config would force condition
-AND and hide an OR entry that viper still reads from the real file.
+Each scan uses ``--ignore-gitleaks-allow`` and the strict copy of
+``.gitleaks.toml`` that ``scripts/gitleaks_strict_config.py`` writes. Set
+``RVC_GITLEAKS_CONFIG`` to it. That copy changes only the ``useDefault`` line.
+The canary refuses ``.gitleaks.toml`` itself, because the default allowlist
+hides a removed entry. An inline allow comment is not a pass. A rebuilt
+config would force condition AND and hide an OR entry that viper still reads
+from the real file.
 """
 
 from __future__ import annotations
@@ -20,8 +24,10 @@ import tempfile
 import tomllib
 from pathlib import Path
 
+from gitleaks_strict_config import require_strict_config
+
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / ".gitleaks.toml"
+CONFIG = Path(os.environ.get("RVC_GITLEAKS_CONFIG") or str(ROOT / ".gitleaks.toml")).resolve()
 GITLEAKS = os.environ.get("GITLEAKS_BIN", "gitleaks")
 
 # Not an allowlisted path. A copied fixture value here must still be a finding.
@@ -173,14 +179,19 @@ def shifted(rel: str) -> bytes:
     return b"\n\n\n" + (ROOT / rel).read_bytes()
 
 
+def pem_marker(kind: str) -> str:
+    """Return a PEM marker. A call, so no .pyc holds a folded header."""
+    return "-----" + kind + " RSA PRIVATE KEY-----"
+
+
 def synthetic_pem() -> bytes:
     """A private-key match that is not an allowlisted fixture.
 
     The begin marker is assembled so this source file does not itself contain
     the private-key keyword.
     """
-    begin = "-----" + "BEGIN RSA PRIVATE KEY" + "-----"
-    end = "-----" + "END RSA PRIVATE KEY" + "-----"
+    begin = pem_marker("BEGIN")
+    end = pem_marker("END")
     body = "MIIB" + "OgIB" + "AAJB" + "AL7s" + "ynth" + "etic" + "CANA" + "RYKe" + "yMat" + "eria" + "l99"
     return f"{begin}\n{body}\n{end}\n".encode()
 
@@ -188,6 +199,7 @@ def synthetic_pem() -> bytes:
 def main() -> None:
     if shutil.which(GITLEAKS) is None and not Path(GITLEAKS).is_file():
         raise SystemExit(f"gitleaks is not runnable ({GITLEAKS})")
+    require_strict_config(CONFIG)
     rows = load_allowlists()
     by_path = {unescape_anchored(path): (rule, path, regexes) for rule, path, regexes in rows}
     if GRAFT_FILE not in by_path:

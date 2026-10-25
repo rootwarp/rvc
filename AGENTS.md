@@ -15,8 +15,10 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test` (workspace, or `-p` for touched crates plus dependents)
-- `gitleaks detect --no-git --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
-- History scan: `gitleaks detect --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
+- `python3 scripts/gitleaks_strict_config.py --out-dir target/gitleaks` writes the strict configs that CI scans with. `useDefault` alone merges default allowlist entries that hide real secrets, so do not scan with `.gitleaks.toml` directly.
+- `gitleaks detect --no-git --source . --config target/gitleaks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
+- History scan: `./scripts/gitleaks_range_scan.sh "$PWD/target/gitleaks/gitleaks.toml" --history`. Run it in a full clone, not a shallow or `blob:none` clone. CI runs it weekly in `secret-history-scan.yml`.
+- Canary scripts: set `RVC_GITLEAKS_CONFIG="$PWD/target/gitleaks/gitleaks.toml"`. They refuse a config that is not strict.
 - `git diff --shortstat develop...HEAD` = N gross lines; cap 2,000 including tests and generated content; stop at 1,800 and report.
 - Self-check (paste into PR body):
   - [ ] Red check: each new acceptance test shown failing on base or with the fix removed.

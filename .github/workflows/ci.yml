@@ -222,29 +222,44 @@ jobs:
       - name: Run workspace tests (all features)
         run: cargo nextest run --workspace --all-features --locked
 
+  # Runs on pull requests and on pushes to develop and main.
   secret-scan:
     name: Secret Scan
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the git-mode scan can read the pull request or push range.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install gitleaks
+        run: ./scripts/install_gitleaks.sh
+
+      # useDefault merges a default global allowlist that hides real secrets.
+      # Every scan below uses the strict copies. See .gitleaks.toml.
+      - name: Build the strict gitleaks configs
         run: |
-          GITLEAKS_VERSION=8.21.2
-          GITLEAKS_SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
-          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
-          sudo tar -xz -C /usr/local/bin -f gitleaks.tar.gz gitleaks
-          rm -f gitleaks.tar.gz
-          gitleaks version
+          set -euo pipefail
+          python3 scripts/gitleaks_strict_config.py --out-dir "$RUNNER_TEMP/gitleaks"
+          {
+            echo "RVC_GITLEAKS_CONFIG=$RUNNER_TEMP/gitleaks/gitleaks.toml"
+            echo "RVC_GITLEAKS_EMITTED_CONFIG=$RUNNER_TEMP/gitleaks/gitleaks-emitted.toml"
+          } >> "$GITHUB_ENV"
 
       # Gate 2a: scan the source tree (working files); fail closed on any finding.
       # --ignore-gitleaks-allow: an inline allow comment is not a baseline.
       - name: Gitleaks — source tree
-        run: gitleaks detect --no-git --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1
+        run: gitleaks detect --no-git --source . --config "$RVC_GITLEAKS_CONFIG" --ignore-gitleaks-allow --redact --no-banner --exit-code 1
+
+      # The no-git scan misses a secret across a 10000-byte chunk boundary.
+      # Git mode reads each added hunk whole, merge commits included. A force
+      # push scans from the merge base. A base that is not in the clone scans
+      # the full history in git mode.
+      - name: Gitleaks — commits in the pull request or push range
+        env:
+          RANGE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: ./scripts/gitleaks_range_scan.sh "$RVC_GITLEAKS_CONFIG" "$RANGE_BASE"
 
       # A line that contains the word false must still surface a synthetic key.
       # The running-guide allow is path-and-value, so the same value elsewhere fails too.
@@ -256,6 +271,11 @@ jobs:
       # Each of those must still fail. Removing any one allowlist entry must fail too.
       - name: Gitleaks — line-shift canary
         run: python3 scripts/gitleaks_line_shift_canary.py
+
+      # Synthetic secrets that the default allowlist or the no-git chunking
+      # hides. The strict config and the git-mode range scan must find each one.
+      - name: Gitleaks — allowlist and chunk-boundary canary
+        run: python3 scripts/gitleaks_scope_canary.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -274,6 +294,13 @@ jobs:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The arch-gates job has no gitleaks, so this test skips its scan there.
+      # Here gitleaks is installed, and REQUIRE_GITLEAKS makes a skip a failure.
+      - name: Gitleaks — architecture gate with gitleaks required
+        env:
+          REQUIRE_GITLEAKS: "1"
+        run: cargo test --locked -p rvc-architecture-tests --test gitleaks_allow_scope
+
       # Gate 2b: emit a representative trace-level log sample through the redaction primitives,
       # then defend it two ways — (i) gitleaks over the emitted output catches a raw hex
       # pubkey/root/key regression; (ii) an explicit content assertion catches ANY raw-secret
@@ -286,7 +313,7 @@ jobs:
           test -s emitted-sample/emitted-trace.log
 
       - name: Gitleaks — emitted trace-level log sample
-        run: gitleaks detect --no-git --source emitted-sample --config .gitleaks-emitted.toml --redact --no-banner --exit-code 1
+        run: gitleaks detect --no-git --source emitted-sample --config "$RVC_GITLEAKS_EMITTED_CONFIG" --redact --no-banner --exit-code 1
 
       - name: Assert redaction on the emitted sample (raw absent, redacted present)
         run: |
