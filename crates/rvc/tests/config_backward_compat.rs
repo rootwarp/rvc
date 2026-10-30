@@ -222,17 +222,12 @@ fn test_default_config_field_values_unchanged() {
 }
 
 #[test]
-fn test_unknown_key_behavior_unchanged() {
-    // Serde default for toml: unknown keys are ignored (not deny_unknown_fields).
-    let toml = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "./keystores"
-slashing_db_path = "./slashing.sqlite"
-network = "mainnet"
-this_key_has_never_existed = "still-ok"
-"#;
-    let config: Config = toml::from_str(toml).expect("unknown keys must still be ignored");
-    assert_eq!(config.beacon_url, "http://localhost:5052");
+fn test_unknown_top_level_key_is_rejected() {
+    let toml = "x = 1\n";
+    let err = toml::from_str::<Config>(toml).expect_err("unknown top-level key must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains('x'), "{msg}");
+    assert!(!msg.contains(" in "), "{msg}");
 }
 
 const REMOVED_GRPC_TOML: &str = r#"
@@ -295,6 +290,23 @@ grpc_port = 50051
     );
     let err = Config::from_file(file.path()).expect_err("nested [server] grpc_port must fail");
     assert_removed_grpc_key(err, "grpc_port");
+
+    let file = write_toml(
+        r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+network = "mainnet"
+
+[server]
+grpc_address = "127.0.0.1"
+"#,
+    );
+    let err = Config::from_file(file.path()).expect_err("nested [server] grpc_address must fail");
+    assert_removed_grpc_key(err, "grpc_address");
+    let err = Config::load(Some(file.path()), StartArgs::default())
+        .expect_err("Config::load must not wrap nested grpc_address");
+    assert_removed_grpc_key(err, "grpc_address");
 }
 
 #[test]

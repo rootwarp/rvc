@@ -118,7 +118,7 @@ impl TracingArgs {
 /// [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
 /// built-in default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TracingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,

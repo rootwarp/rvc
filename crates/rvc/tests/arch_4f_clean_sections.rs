@@ -22,22 +22,19 @@ endpoint = "http://x"
 
 #[test]
 fn nested_table_flat_legacy_names_do_not_bind() {
-    let nested: Config = toml::from_str(
-        r#"
-[keymanager]
-keymanager_enabled = true
-keymanager_address = "0.0.0.0:5062"
-keymanager_body_limit = 104857600
-
-[tracing]
-tracing_endpoint = "http://nested-must-not-bind:4318"
-"#,
-    )
-    .expect("unknown keys inside nested tables are ignored (no deny_unknown_fields)");
-    assert!(!nested.keymanager.enabled, "prefixed names inside [keymanager] must not bind");
-    assert!(nested.keymanager.address.is_none());
-    assert_eq!(nested.keymanager.body_limit, 10 * 1024 * 1024);
-    assert!(nested.tracing.endpoint.is_none());
+    for (doc, key) in [
+        ("[keymanager]\nkeymanager_enabled = true\n", "keymanager_enabled"),
+        ("[keymanager]\nkeymanager_address = \"0.0.0.0:5062\"\n", "keymanager_address"),
+        ("[keymanager]\nkeymanager_body_limit = 104857600\n", "keymanager_body_limit"),
+        (
+            "[tracing]\ntracing_endpoint = \"http://nested-must-not-bind:4318\"\n",
+            "tracing_endpoint",
+        ),
+    ] {
+        let err = toml::from_str::<Config>(doc).expect_err(key);
+        let msg = err.to_string();
+        assert!(msg.contains(key), "{key} must be rejected, got {msg}");
+    }
 
     let flat: Config = toml::from_str(
         r#"

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use rvc::config::{BlockSelectionMode, Config, ConfigError, ServiceBuilder, StartArgs};
+use rvc::config::{BlockSelectionMode, Config, ConfigError, ParseKind, ServiceBuilder, StartArgs};
 use tempfile::TempDir;
 use validator_store::ValidatorStore;
 
@@ -118,16 +118,31 @@ fn unset_block_selection_mode_stays_max_profit() {
 
 #[test]
 fn unknown_block_selection_mode_is_rejected() {
-    let err = toml::from_str::<Config>(
-        r#"
-beacon_url = "http://127.0.0.1:5052"
-block_selection_mode = "not-a-mode"
-"#,
+    let mut file = tempfile::NamedTempFile::new().expect("temp config");
+    std::io::Write::write_all(
+        &mut file,
+        b"beacon_url = \"http://127.0.0.1:5052\"\nblock_selection_mode = \"not-a-mode\"\n",
     )
-    .expect_err("unknown mode");
+    .expect("write");
+    let err = Config::load(Some(file.path()), StartArgs::default()).expect_err("unknown mode");
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse {
+                kind: ParseKind::UnknownVariant { expected },
+                path: Some(path),
+                file: Some(p),
+                ..
+            } if path == "block_selection_mode"
+                && !expected.contains("not-a-mode")
+                && p == file.path()
+        ),
+        "{err:?}"
+    );
     let msg = err.to_string();
-    assert!(msg.contains("not-a-mode"), "{msg}");
     assert!(msg.contains("block_selection_mode"), "{msg}");
+    assert!(msg.contains("unknown variant"), "{msg}");
+    assert!(!msg.contains("not-a-mode"), "{msg}");
 }
 
 #[test]

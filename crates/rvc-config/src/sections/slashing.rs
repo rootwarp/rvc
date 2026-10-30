@@ -67,7 +67,7 @@ impl SlashingArgs {
 
 /// `[slashing]` table (section-relative names only; no flat aliases).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SlashingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slashing_db_path: Option<PathBuf>,

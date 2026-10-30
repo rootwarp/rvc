@@ -72,7 +72,7 @@ impl BuilderLimitsArgs {
 /// No flat-legacy `#[serde(alias)]` here: those bind inside `[builder_limits]`
 /// (4f SEC).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BuilderLimits {
     #[serde(default = "default_circuit_breaker_consecutive_limit")]
     pub circuit_breaker_consecutive_limit: u32,

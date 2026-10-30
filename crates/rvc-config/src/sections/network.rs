@@ -54,7 +54,7 @@ impl NetworkArgs {
 
 /// `[network]` table (section-relative names only; no flat aliases).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,

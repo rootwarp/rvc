@@ -53,7 +53,7 @@ impl MonitoringArgs {
 
 /// Monitoring push-endpoint settings (resolved / `Config` field).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitoringConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,

@@ -38,7 +38,7 @@ impl ServerArgs {
 
 /// `[server]` table (section-relative names only; no flat aliases).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_address: Option<IpAddr>,

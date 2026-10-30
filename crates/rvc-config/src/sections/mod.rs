@@ -331,6 +331,34 @@ mod tests {
         );
     }
 
+    fn assert_section_rejects_unknown_key<T>(label: &str)
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        let err = toml::from_str::<T>("not_a_key = 1").expect_err(label);
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_key"), "{label} must name not_a_key, got {msg}");
+    }
+
+    #[test]
+    fn every_config_section_rejects_an_unknown_key() {
+        assert_section_rejects_unknown_key::<BeaconConfig>("BeaconConfig");
+        assert_section_rejects_unknown_key::<KeysConfig>("KeysConfig");
+        assert_section_rejects_unknown_key::<ServerConfig>("ServerConfig");
+        assert_section_rejects_unknown_key::<NetworkConfig>("NetworkConfig");
+        assert_section_rejects_unknown_key::<SafetyConfig>("SafetyConfig");
+        assert_section_rejects_unknown_key::<SlashingConfig>("SlashingConfig");
+        assert_section_rejects_unknown_key::<LogfileConfig>("LogfileConfig");
+        assert_section_rejects_unknown_key::<TracingConfig>("TracingConfig");
+        assert_section_rejects_unknown_key::<KeymanagerConfig>("KeymanagerConfig");
+        assert_section_rejects_unknown_key::<GrpcSignerConfig>("GrpcSignerConfig");
+        assert_section_rejects_unknown_key::<ProposerConfigSource>("ProposerConfigSource");
+        assert_section_rejects_unknown_key::<MonitoringConfig>("MonitoringConfig");
+        assert_section_rejects_unknown_key::<BuilderLimits>("BuilderLimits");
+        assert_section_rejects_unknown_key::<SecretProviderConfig>("SecretProviderConfig");
+        assert_section_rejects_unknown_key::<GcpSecretConfig>("GcpSecretConfig");
+    }
+
     fn otel_env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

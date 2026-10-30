@@ -4213,6 +4213,7 @@ dependencies = [
 name = "rvc"
 version = "0.8.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.7.9",
  "beacon",
@@ -4255,6 +4256,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
