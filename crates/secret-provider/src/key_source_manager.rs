@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crypto::{KeyManager, Keystore, SecretKey};
 use observability::logging::TruncatedPubkey;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{info, info_span, warn, Instrument};
 
 use crate::metrics::{
@@ -22,6 +23,87 @@ pub const DEFAULT_KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds provider thundering-herd risk on boot and especially on the lifetime
 /// refresh loop (RF4-14 Finding 2 / F72 concurrency axis).
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
+
+/// At most this many keystore conversions run at once on one [`DecryptLimiter`].
+///
+/// Boot and refresh each own a limiter. A task acquires the permit on the async
+/// side and moves it into `spawn_blocking`, so the cap still holds if that task
+/// is dropped while the conversion runs.
+pub const DEFAULT_DECRYPT_CONCURRENCY: usize = 2;
+
+/// Test-only counters for the decrypt cap harness. Not a process-wide static.
+#[cfg(test)]
+pub(crate) trait DecryptProbe: Send + Sync {
+    fn fetch_queued(&self, _delta: isize) {}
+    fn queued(&self, _delta: isize) {}
+    fn before_convert(&self) {}
+}
+
+/// Bounds concurrent secret-provider conversions (raw keys and keystore KDF).
+///
+/// [`Self::acquire`] waits on the async task. The owned permit moves into the
+/// `spawn_blocking` closure and drops only when that body returns, including
+/// unwind. A closed pool is [`SecretProviderError::Provider`], not a panic.
+#[derive(Clone)]
+pub struct DecryptLimiter {
+    inner: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    probe: Option<Arc<dyn DecryptProbe>>,
+}
+
+impl DecryptLimiter {
+    /// Build a pool. `permits` below 1 is raised to 1 so a load cannot park forever.
+    pub fn new(permits: usize) -> Self {
+        let permits = permits.max(1);
+        Self {
+            inner: Arc::new(tokio::sync::Semaphore::new(permits)),
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    /// Take one decrypt permit.
+    ///
+    /// A closed semaphore returns [`SecretProviderError::Provider`].
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, SecretProviderError> {
+        self.inner
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| SecretProviderError::Provider("decrypt limiter is closed".to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: Arc<dyn DecryptProbe>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Permits not currently held. The count is exact only when no acquire or
+    /// release is in progress.
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        self.inner.available_permits()
+    }
+
+    fn note_fetch_queued(&self, delta: isize) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.fetch_queued(delta);
+        }
+        #[cfg(not(test))]
+        let _ = delta;
+    }
+
+    fn note_queued(&self, delta: isize) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.queued(delta);
+        }
+        #[cfg(not(test))]
+        let _ = delta;
+    }
+}
 
 /// How [`fetch_provider_keys`] updates `RVC_SECRET_PROVIDER_KEYS_LOADED`.
 ///
@@ -58,9 +140,12 @@ pub struct ProviderFetchResult {
 }
 
 enum FetchOutcome {
-    Material(KeyMaterial),
+    /// `convert_key_material` finished on a blocking thread.
+    Converted(Result<SecretKey, SecretProviderError>),
     Error(SecretProviderError),
     Timeout,
+    /// `spawn_blocking` panicked or was cancelled. Same skip path as a `JoinSet` panic.
+    TaskPanic(tokio::task::JoinError),
 }
 
 /// Denylist / skip predicate for the shared fetch pipeline (`Send + Sync` so the
@@ -86,6 +171,9 @@ pub fn record_list_keys_failure(provider_name: &str, err: &SecretProviderError, 
 /// `load_started` is used for the duration histogram (callers may start it before
 /// `list_keys` so list latency is included).
 /// `concurrency` caps in-flight `fetch_key` tasks (minimum 1).
+/// `decrypt_limiter` caps conversions. The fetch permit is dropped before that
+/// wait, and `convert_key_material` runs inside `spawn_blocking`.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_provider_keys(
     provider: Arc<dyn SecretProvider>,
     entries: &[SecretKeyEntry],
@@ -94,6 +182,7 @@ pub async fn fetch_provider_keys(
     concurrency: usize,
     load_started: Instant,
     keys_loaded_update: KeysLoadedUpdate,
+    decrypt_limiter: &DecryptLimiter,
 ) -> ProviderFetchResult {
     let provider_name = provider.name().to_string();
     let mut loaded = 0usize;
@@ -127,6 +216,7 @@ pub async fn fetch_provider_keys(
         let prov = Arc::clone(&provider);
         let prov_name = provider_name.clone();
         let permit = Arc::clone(&semaphore);
+        let limiter = decrypt_limiter.clone();
         let fetch_span = info_span!(
             "secret_provider.fetch_key",
             key.id = %id,
@@ -136,12 +226,18 @@ pub async fn fetch_provider_keys(
             async move {
                 // Bound in-flight fetches; acquire before the timed fetch so the
                 // timeout does not count queue wait against the provider SLA.
-                let _permit = permit
+                limiter.note_fetch_queued(1);
+                let fetch_permit = permit
                     .acquire_owned()
                     .await
                     .expect("fetch concurrency semaphore is never closed");
-                let outcome = match tokio::time::timeout(timeout, prov.fetch_key(&id)).await {
-                    Ok(Ok(material)) => FetchOutcome::Material(material),
+                limiter.note_fetch_queued(-1);
+                let fetched = tokio::time::timeout(timeout, prov.fetch_key(&id)).await;
+                // Drop the fetch permit before the decrypt wait. A task never
+                // holds a fetch permit and a decrypt permit together.
+                drop(fetch_permit);
+                let outcome = match fetched {
+                    Ok(Ok(material)) => convert_with_decrypt_permit(&limiter, &id, material).await,
                     Ok(Err(e)) => FetchOutcome::Error(e),
                     Err(_elapsed) => FetchOutcome::Timeout,
                 };
@@ -154,54 +250,46 @@ pub async fn fetch_provider_keys(
     while let Some(join_result) = join_set.join_next().await {
         let (entry_id, outcome) = match join_result {
             Ok(pair) => pair,
-            Err(e) => {
-                warn!(
-                    provider = %provider_name,
-                    error = %e,
-                    "JoinSet task panicked, skipping"
-                );
-                RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                    .with_label_values(&[provider_name.as_str(), "task_panic"])
-                    .inc();
-                skipped += 1;
-                errors.push(format!("task panic: {}", e));
+            Err(err) => {
+                record_task_panic(&provider_name, &err, &mut skipped, &mut errors);
                 continue;
             }
         };
 
         match outcome {
-            FetchOutcome::Material(material) => match convert_key_material(&entry_id, material) {
-                Ok(secret_key) => {
-                    let pubkey_bytes = secret_key.public_key().to_bytes();
-                    if is_denied.as_ref().is_some_and(|deny| deny(&pubkey_bytes)) {
-                        let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
-                        info!(
-                            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                            source = %provider_name,
-                            "Skipping denylisted secret-provider key"
-                        );
-                        skipped += 1;
-                        // Pubkey only. `secret_key` drops here and zeroizes.
-                        denied.push((entry_id, pubkey_bytes));
-                        continue;
-                    }
-                    loaded += 1;
-                    keys.push((entry_id, secret_key));
-                }
-                Err(e) => {
-                    warn!(
-                        key_id = %entry_id,
+            FetchOutcome::Converted(Ok(secret_key)) => {
+                let pubkey_bytes = secret_key.public_key().to_bytes();
+                if is_denied.as_ref().is_some_and(|deny| deny(&pubkey_bytes)) {
+                    let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
                         source = %provider_name,
-                        error = %e,
-                        "Key fetch failure"
+                        "Skipping denylisted secret-provider key"
                     );
-                    RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                        .with_label_values(&[provider_name.as_str(), classify_error(&e)])
-                        .inc();
                     skipped += 1;
-                    errors.push(format!("{}: {}", entry_id, e));
+                    // Pubkey only. `secret_key` drops here and zeroizes.
+                    denied.push((entry_id, pubkey_bytes));
+                    continue;
                 }
-            },
+                loaded += 1;
+                keys.push((entry_id, secret_key));
+            }
+            FetchOutcome::Converted(Err(e)) => {
+                warn!(
+                    key_id = %entry_id,
+                    source = %provider_name,
+                    error = %e,
+                    "Key fetch failure"
+                );
+                RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                    .with_label_values(&[provider_name.as_str(), classify_error(&e)])
+                    .inc();
+                skipped += 1;
+                errors.push(format!("{}: {}", entry_id, e));
+            }
+            FetchOutcome::TaskPanic(err) => {
+                record_task_panic(&provider_name, &err, &mut skipped, &mut errors);
+            }
             FetchOutcome::Error(e) => {
                 tracing::Span::current().in_scope(|| {
                     tracing::error!(
@@ -248,6 +336,65 @@ pub async fn fetch_provider_keys(
     ProviderFetchResult { name: provider_name, loaded, skipped, errors, keys, denied }
 }
 
+/// Existing `task_panic` skip: the key is counted and never loaded.
+fn record_task_panic(
+    provider_name: &str,
+    err: &tokio::task::JoinError,
+    skipped: &mut usize,
+    errors: &mut Vec<String>,
+) {
+    warn!(
+        provider = %provider_name,
+        error = %err,
+        "JoinSet task panicked, skipping"
+    );
+    RVC_SECRET_PROVIDER_ERRORS_TOTAL.with_label_values(&[provider_name, "task_panic"]).inc();
+    *skipped += 1;
+    errors.push(format!("task panic: {err}"));
+}
+
+/// Acquire a decrypt permit, then run [`convert_key_material`] on the blocking pool.
+///
+/// The permit is moved into the closure (`let _permit = permit`) and drops when
+/// the body returns or unwinds. The fetch permit is already gone. The current
+/// `secret_provider.fetch_key` span is entered inside the closure; its fields
+/// stay `key.id` and `provider.name`.
+async fn convert_with_decrypt_permit(
+    limiter: &DecryptLimiter,
+    id: &str,
+    material: KeyMaterial,
+) -> FetchOutcome {
+    limiter.note_queued(1);
+    let permit = match limiter.acquire().await {
+        Ok(permit) => permit,
+        Err(err) => {
+            limiter.note_queued(-1);
+            return FetchOutcome::Error(err);
+        }
+    };
+    limiter.note_queued(-1);
+
+    let span = tracing::Span::current();
+    let id = id.to_owned();
+    #[cfg(test)]
+    let probe = limiter.probe.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _entered = span.enter();
+        #[cfg(test)]
+        if let Some(probe) = probe.as_ref() {
+            probe.before_convert();
+        }
+        convert_key_material(&id, material)
+    })
+    .await;
+
+    match joined {
+        Ok(result) => FetchOutcome::Converted(result),
+        Err(err) => FetchOutcome::TaskPanic(err),
+    }
+}
+
 pub struct KeySourceManager {
     providers: Vec<Arc<dyn SecretProvider>>,
     /// When true, any provider `list_keys` failure aborts the load (SEC-9 / M-9).
@@ -257,6 +404,8 @@ pub struct KeySourceManager {
     fetch_timeout: Duration,
     /// Max concurrent `fetch_key` tasks per provider (default [`DEFAULT_FETCH_CONCURRENCY`]).
     fetch_concurrency: usize,
+    /// Conversions for this manager. Not shared with [`crate::RefreshService`].
+    decrypt_limiter: DecryptLimiter,
 }
 
 impl KeySourceManager {
@@ -266,6 +415,7 @@ impl KeySourceManager {
             strict: false,
             fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            decrypt_limiter: DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY),
         }
     }
 
@@ -275,6 +425,7 @@ impl KeySourceManager {
             strict: false,
             fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            decrypt_limiter: DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY),
         }
     }
 
@@ -293,6 +444,19 @@ impl KeySourceManager {
     /// Override max concurrent `fetch_key` calls per provider.
     pub fn with_fetch_concurrency(mut self, concurrency: usize) -> Self {
         self.fetch_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Replace this manager's decrypt pool. `permits` below 1 is raised to 1.
+    pub fn with_decrypt_concurrency(mut self, permits: usize) -> Self {
+        self.decrypt_limiter = DecryptLimiter::new(permits);
+        self
+    }
+
+    /// Install a per-limiter probe. The probe is not a process-wide static.
+    #[cfg(test)]
+    pub(crate) fn with_decrypt_probe(mut self, probe: Arc<dyn DecryptProbe>) -> Self {
+        self.decrypt_limiter.probe = Some(probe);
         self
     }
 
@@ -378,6 +542,7 @@ impl KeySourceManager {
                 self.fetch_concurrency,
                 timer,
                 KeysLoadedUpdate::SetAbsolute,
+                &self.decrypt_limiter,
             )
             .await;
 
@@ -510,6 +675,9 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::thread::ThreadId;
     use std::time::{Duration, Instant};
 
     use parking_lot::Mutex;
@@ -1455,5 +1623,389 @@ mod tests {
         assert_eq!(refresh_keys[0].public_key().to_bytes(), sk1.public_key().to_bytes());
         assert_eq!(km.len(), 1);
         assert!(km.contains(&sk1.public_key().to_bytes()));
+    }
+
+    // ── W4-K3c: decrypts leave the runtime, capped at two ────────────────
+
+    const CAP_HANG: Duration = Duration::from_secs(30);
+    const CAP_ENTRIES: usize = 4;
+
+    #[derive(Clone, Copy, Default)]
+    struct Tally {
+        arrived: usize,
+        queued: usize,
+        fetch_waiting: usize,
+        in_flight: usize,
+        peak: usize,
+    }
+
+    struct Observed {
+        arrived: usize,
+        queued: usize,
+        fetch_waiting: usize,
+        peak: usize,
+        loaded: usize,
+    }
+
+    struct CapProbe {
+        tx: tokio::sync::watch::Sender<Tally>,
+        gate: Arc<(StdMutex<bool>, Condvar)>,
+        runtime_thread: ThreadId,
+    }
+
+    fn adjust(slot: &mut usize, delta: isize) {
+        if delta >= 0 {
+            *slot += usize::try_from(delta).unwrap_or(0);
+        } else {
+            *slot = slot.saturating_sub(usize::try_from(-delta).unwrap_or(0));
+        }
+    }
+
+    impl DecryptProbe for CapProbe {
+        fn fetch_queued(&self, delta: isize) {
+            self.tx.send_modify(|tally| adjust(&mut tally.fetch_waiting, delta));
+        }
+
+        fn queued(&self, delta: isize) {
+            self.tx.send_modify(|tally| adjust(&mut tally.queued, delta));
+        }
+
+        fn before_convert(&self) {
+            // An inline conversion (runtime thread) is not a parked arrival.
+            // Parking it would block the runtime and hang the harness.
+            if std::thread::current().id() == self.runtime_thread {
+                return;
+            }
+            self.tx.send_modify(|tally| {
+                tally.arrived += 1;
+                tally.in_flight += 1;
+                tally.peak = tally.peak.max(tally.in_flight);
+            });
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(|err| err.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|err| err.into_inner());
+            }
+            drop(open);
+            self.tx.send_modify(|tally| {
+                tally.in_flight = tally.in_flight.saturating_sub(1);
+            });
+        }
+    }
+
+    /// Opens the gate on drop, including panic and the hang-guard timeout.
+    struct GateGuard {
+        gate: Arc<(StdMutex<bool>, Condvar)>,
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(|err| err.into_inner());
+            *open = true;
+            cv.notify_all();
+        }
+    }
+
+    fn cap_manager(
+        name: &str,
+        keys: Vec<(SecretKeyEntry, Result<KeyMaterial, SecretProviderError>)>,
+    ) -> KeySourceManager {
+        KeySourceManager::new(vec![Box::new(MockSecretProvider {
+            name: name.to_string(),
+            keys,
+            list_error: None,
+        })])
+    }
+
+    async fn run_cap_probe<F>(build: F, submitted: usize) -> Observed
+    where
+        F: FnOnce(
+            Vec<(SecretKeyEntry, Result<KeyMaterial, SecretProviderError>)>,
+        ) -> KeySourceManager,
+    {
+        let runtime_thread = std::thread::current().id();
+        let (tx, mut rx) = tokio::sync::watch::channel(Tally::default());
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let probe = Arc::new(CapProbe { tx, gate: Arc::clone(&gate), runtime_thread });
+        let guard = GateGuard { gate };
+
+        let mut entries = Vec::with_capacity(submitted);
+        for index in 0..submitted {
+            let sk = SecretKey::generate();
+            entries.push(make_raw_key_entry(&format!("cap-{index}"), &sk));
+        }
+        let manager = build(entries).with_decrypt_probe(probe);
+        let mut km = KeyManager::new();
+        let (tally, summary_loaded) = {
+            let load = manager.load_all(&mut km);
+            tokio::pin!(load);
+
+            // First time every entry is parked, queued for a decrypt permit, or
+            // waiting for a fetch permit. That state is stable: parked threads
+            // cannot leave, and a queued task cannot take a permit, until the gate
+            // opens. Inline conversions never park, so the load finishes first.
+            let finished = tokio::select! {
+                result = load.as_mut() => Some(result),
+                _ = rx.wait_for(move |tally| {
+                    tally.arrived + tally.queued + tally.fetch_waiting == submitted
+                }) => None,
+            };
+            let tally = *rx.borrow();
+            drop(guard);
+            let summary = match finished {
+                Some(result) => result.expect("load"),
+                None => load.await.expect("load"),
+            };
+            let summary_loaded =
+                summary.per_provider.iter().map(|provider| provider.loaded).sum::<usize>();
+            (tally, summary_loaded)
+        };
+        assert_eq!(km.len(), summary_loaded);
+        Observed {
+            arrived: tally.arrived,
+            queued: tally.queued,
+            fetch_waiting: tally.fetch_waiting,
+            peak: tally.peak,
+            loaded: km.len(),
+        }
+    }
+
+    async fn observe_cap<F>(build: F) -> Observed
+    where
+        F: FnOnce(
+            Vec<(SecretKeyEntry, Result<KeyMaterial, SecretProviderError>)>,
+        ) -> KeySourceManager,
+    {
+        match tokio::time::timeout(CAP_HANG, run_cap_probe(build, CAP_ENTRIES)).await {
+            Ok(observed) => observed,
+            Err(_elapsed) => panic!("cap harness hang guard"),
+        }
+    }
+
+    struct ThreadProbe {
+        ids: Arc<StdMutex<Vec<ThreadId>>>,
+    }
+
+    impl DecryptProbe for ThreadProbe {
+        fn before_convert(&self) {
+            self.ids
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(std::thread::current().id());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypts_run_off_the_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+        let ids = Arc::new(StdMutex::new(Vec::new()));
+        let mut keys = Vec::new();
+        for index in 0..3 {
+            let sk = SecretKey::generate();
+            keys.push(make_raw_key_entry(&format!("off-thread-{index}"), &sk));
+        }
+        let ksm = cap_manager("off-thread", keys)
+            .with_decrypt_probe(Arc::new(ThreadProbe { ids: Arc::clone(&ids) }));
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("load");
+
+        assert_eq!(summary.per_provider[0].loaded, 3);
+        assert_eq!(km.len(), 3);
+        let recorded = ids.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(recorded.len(), 3);
+        assert!(recorded.iter().all(|id| *id != runtime_thread));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keystore_material_converts_off_the_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+        let ids = Arc::new(StdMutex::new(Vec::new()));
+        let password = Zeroizing::new("not-logged".to_string());
+        let provider = MockSecretProvider {
+            name: "keystore-thread".to_string(),
+            keys: vec![(
+                SecretKeyEntry { id: "ks".to_string(), pubkey_hex: None },
+                Ok(KeyMaterial::Keystore { keystore_json: "{".to_string(), password }),
+            )],
+            list_error: None,
+        };
+        let ksm = KeySourceManager::new(vec![Box::new(provider)])
+            .with_decrypt_probe(Arc::new(ThreadProbe { ids: Arc::clone(&ids) }));
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("load");
+
+        assert_eq!(summary.per_provider[0].loaded, 0);
+        assert_eq!(summary.per_provider[0].skipped, 1);
+        assert!(km.is_empty());
+        let recorded = ids.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(recorded.len(), 1);
+        assert_ne!(recorded[0], runtime_thread);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sibling_task_runs_while_a_decrypt_is_in_flight() {
+        match tokio::time::timeout(CAP_HANG, sibling_during_decrypt()).await {
+            Ok(()) => {}
+            Err(_elapsed) => panic!("cap harness hang guard"),
+        }
+    }
+
+    async fn sibling_during_decrypt() {
+        let runtime_thread = std::thread::current().id();
+        let (tx, mut rx) = tokio::sync::watch::channel(Tally::default());
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let probe = Arc::new(CapProbe { tx, gate: Arc::clone(&gate), runtime_thread });
+        let guard = GateGuard { gate };
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let ksm = cap_manager("sibling-decrypt", vec![make_raw_key_entry("only", &sk)])
+            .with_decrypt_probe(probe);
+        let mut km = KeyManager::new();
+        let summary = {
+            let load = ksm.load_all(&mut km);
+            tokio::pin!(load);
+
+            tokio::select! {
+                _ = rx.wait_for(|tally| tally.arrived >= 1 && tally.in_flight >= 1) => {}
+                _ = load.as_mut() => panic!("load finished before a decrypt parked off the runtime"),
+            }
+            let progressed = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&progressed);
+            let sibling = tokio::spawn(async move {
+                flag.store(true, Ordering::SeqCst);
+            });
+            sibling.await.expect("sibling joins");
+            assert!(progressed.load(Ordering::SeqCst));
+            assert!(rx.borrow().in_flight >= 1);
+            drop(guard);
+            load.await.expect("load")
+        };
+        assert_eq!(summary.per_provider[0].loaded, 1);
+        assert_eq!(km.len(), 1);
+        assert!(km.contains(&pk));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_concurrency_is_capped_at_two() {
+        let observed = observe_cap(|keys| cap_manager("cap-two", keys)).await;
+        assert_eq!(
+            (
+                observed.arrived,
+                observed.queued,
+                observed.fetch_waiting,
+                observed.peak,
+                observed.loaded
+            ),
+            (2, 2, 0, 2, CAP_ENTRIES),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cap_probe_reports_the_configured_cap() {
+        for cap in [1usize, 3, 4] {
+            let observed = observe_cap(|keys| {
+                cap_manager(&format!("cap-{cap}"), keys).with_decrypt_concurrency(cap)
+            })
+            .await;
+            let parked = cap.min(CAP_ENTRIES);
+            assert_eq!(
+                (observed.arrived, observed.queued, observed.peak, observed.loaded),
+                (parked, CAP_ENTRIES - parked, parked, CAP_ENTRIES),
+                "cap {cap}",
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_permit_is_released_before_the_decrypt_wait() {
+        let observed =
+            observe_cap(|keys| cap_manager("cap-fetch", keys).with_fetch_concurrency(2)).await;
+        assert_eq!(
+            (
+                observed.arrived,
+                observed.queued,
+                observed.fetch_waiting,
+                observed.peak,
+                observed.loaded
+            ),
+            (2, 2, 0, 2, CAP_ENTRIES),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_limiter_has_a_floor_and_maps_a_closed_pool() {
+        let limiter = DecryptLimiter::new(0);
+        assert_eq!(limiter.inner.available_permits(), 1);
+        limiter.inner.close();
+        let err = limiter.acquire().await.expect_err("closed pool returns");
+        assert!(matches!(err, SecretProviderError::Provider(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_decrypt_pool_skips_the_key_without_panic() {
+        let sk = SecretKey::generate();
+        let ksm = cap_manager("decrypt-closed", vec![make_raw_key_entry("closed-key", &sk)]);
+        ksm.decrypt_limiter.inner.close();
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("closed pool is a typed error");
+        assert_eq!(summary.per_provider[0].loaded, 0);
+        assert_eq!(summary.per_provider[0].skipped, 1);
+        assert!(km.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_error_releases_the_permit_and_stays_typed() {
+        let password = Zeroizing::new("not-a-logged-password".to_string());
+        let err = convert_key_material(
+            "bad-keystore",
+            KeyMaterial::Keystore { keystore_json: "{".to_string(), password: password.clone() },
+        )
+        .expect_err("malformed keystore");
+        assert!(matches!(
+            err,
+            SecretProviderError::DecryptionFailed { ref id, .. } if id == "bad-keystore"
+        ));
+
+        let provider = MockSecretProvider {
+            name: "decrypt-err".to_string(),
+            keys: vec![(
+                SecretKeyEntry { id: "bad-keystore".to_string(), pubkey_hex: None },
+                Ok(KeyMaterial::Keystore { keystore_json: "{".to_string(), password }),
+            )],
+            list_error: None,
+        };
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let before = ksm.decrypt_limiter.inner.available_permits();
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("decrypt error is skipped");
+        assert_eq!(summary.per_provider[0].loaded, 0);
+        assert_eq!(summary.per_provider[0].skipped, 1);
+        assert!(km.is_empty());
+        assert_eq!(ksm.decrypt_limiter.inner.available_permits(), before);
+        assert_eq!(before, DEFAULT_DECRYPT_CONCURRENCY);
+    }
+
+    struct PanicProbe;
+
+    impl DecryptProbe for PanicProbe {
+        fn before_convert(&self) {
+            panic!("decrypt blocked");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_panic_releases_the_permit_and_skips_the_key() {
+        let sk = SecretKey::generate();
+        let ksm = cap_manager("decrypt-panic", vec![make_raw_key_entry("panic-key", &sk)])
+            .with_decrypt_probe(Arc::new(PanicProbe));
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("blocking panic stays off the runtime");
+        assert_eq!(summary.per_provider[0].loaded, 0);
+        assert_eq!(summary.per_provider[0].skipped, 1);
+        assert_eq!(summary.per_provider[0].errors.len(), 1);
+        assert!(km.is_empty());
+        assert!(!km.contains(&sk.public_key().to_bytes()));
+        assert_eq!(ksm.decrypt_limiter.inner.available_permits(), DEFAULT_DECRYPT_CONCURRENCY);
     }
 }

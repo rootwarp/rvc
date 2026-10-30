@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::key_source_manager::{
-    fetch_provider_keys, record_list_keys_failure, KeysLoadedUpdate, DEFAULT_FETCH_CONCURRENCY,
-    DEFAULT_KEY_FETCH_TIMEOUT,
+    fetch_provider_keys, record_list_keys_failure, DecryptLimiter, KeysLoadedUpdate,
+    DEFAULT_DECRYPT_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY, DEFAULT_KEY_FETCH_TIMEOUT,
 };
 use crate::metrics::RVC_SECRET_PROVIDER_KEYS_LOADED;
 use crate::SecretKeyEntry;
@@ -41,6 +41,8 @@ pub struct RefreshService {
     interval: Duration,
     fetch_timeout: Duration,
     fetch_concurrency: usize,
+    /// Conversions for this service. Not shared with [`crate::KeySourceManager`].
+    decrypt_limiter: DecryptLimiter,
     cancel_token: CancellationToken,
 }
 
@@ -70,6 +72,7 @@ impl RefreshService {
             interval,
             fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            decrypt_limiter: DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY),
             cancel_token,
         }
     }
@@ -83,6 +86,12 @@ impl RefreshService {
     /// Override max concurrent `fetch_key` calls per provider.
     pub fn with_fetch_concurrency(mut self, concurrency: usize) -> Self {
         self.fetch_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Use `limiter` for this service's conversions. Callers can share one pool later.
+    pub fn with_decrypt_limiter(mut self, limiter: DecryptLimiter) -> Self {
+        self.decrypt_limiter = limiter;
         self
     }
 
@@ -136,6 +145,7 @@ impl RefreshService {
                 timer,
                 // Never .set the source-level gauge from a refresh delta.
                 KeysLoadedUpdate::LeaveUnchanged,
+                &self.decrypt_limiter,
             )
             .await;
 
@@ -261,6 +271,7 @@ mod tests {
 
     use super::*;
     use crate::key_source_manager::mock::MockSecretProvider;
+    use crate::key_source_manager::{DecryptLimiter, DecryptProbe, DEFAULT_DECRYPT_CONCURRENCY};
     use crate::{KeyMaterial, SecretKeyEntry, SecretProvider, SecretProviderError};
 
     fn make_raw_key_entry(
@@ -1533,5 +1544,279 @@ mod tests {
         let relisted = service.refresh().await;
         assert!(relisted.is_empty(), "re-listing a cached id does not fetch");
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    // ── W4-K3c: decrypt cap interacts with the id cache ───────────────────
+
+    struct CountProbe(Arc<AtomicUsize>);
+
+    impl DecryptProbe for CountProbe {
+        fn before_convert(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ParkProbe {
+        arrived: tokio::sync::watch::Sender<usize>,
+        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        runtime_thread: std::thread::ThreadId,
+    }
+
+    impl DecryptProbe for ParkProbe {
+        fn before_convert(&self) {
+            if std::thread::current().id() == self.runtime_thread {
+                return;
+            }
+            self.arrived.send_modify(|count| *count += 1);
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(|err| err.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|err| err.into_inner());
+            }
+        }
+    }
+
+    struct RefreshGate {
+        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Drop for RefreshGate {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(|err| err.into_inner());
+            *open = true;
+            cv.notify_all();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cached_id_skips_decrypt() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let converts = Arc::new(AtomicUsize::new(0));
+        let provider = counting_raw("cache-skip-decrypt", "validator-7", &sk, Arc::clone(&fetches));
+        let limiter = DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY)
+            .with_probe(Arc::new(CountProbe(Arc::clone(&converts))));
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None)
+            .with_decrypt_limiter(limiter);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(pubkey_of(&first[0]), pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(converts.load(Ordering::SeqCst), 1);
+
+        let second = service.refresh().await;
+        assert!(second.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(converts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+    }
+
+    struct MixEntry {
+        id: String,
+        body: MixBody,
+    }
+
+    enum MixBody {
+        Raw(Zeroizing<[u8; 32]>),
+        Broken,
+    }
+
+    struct MixProvider {
+        entries: Arc<Mutex<Vec<MixEntry>>>,
+        fetched: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for MixProvider {
+        fn name(&self) -> &str {
+            "mix-cycle"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .entries
+                .lock()
+                .iter()
+                .map(|entry| SecretKeyEntry { id: entry.id.clone(), pubkey_hex: None })
+                .collect())
+        }
+
+        async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetched.lock().push(id.to_string());
+            let body = self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| match &entry.body {
+                    MixBody::Raw(bytes) => KeyMaterial::RawKey(bytes.clone()),
+                    MixBody::Broken => KeyMaterial::Keystore {
+                        keystore_json: "{".to_string(),
+                        password: Zeroizing::new("mix-not-logged".to_string()),
+                    },
+                })
+                .expect("listed id is fetchable");
+            Ok(body)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_cycle_mixes_cached_new_and_failing_ids() {
+        let sk_cached = SecretKey::generate();
+        let sk_new = SecretKey::generate();
+        let pk_cached = pubkey_of(&sk_cached);
+        let pk_new = pubkey_of(&sk_new);
+        let entries = Arc::new(Mutex::new(vec![MixEntry {
+            id: "cached-id".to_string(),
+            body: MixBody::Raw(Zeroizing::new(sk_cached.to_bytes())),
+        }]));
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let converts = Arc::new(AtomicUsize::new(0));
+        let provider = MixProvider { entries: Arc::clone(&entries), fetched: Arc::clone(&fetched) };
+        let limiter = DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY)
+            .with_probe(Arc::new(CountProbe(Arc::clone(&converts))));
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None)
+            .with_decrypt_limiter(limiter);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(converts.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "cached-id"), Some(pk_cached));
+
+        entries.lock().push(MixEntry {
+            id: "new-id".to_string(),
+            body: MixBody::Raw(Zeroizing::new(sk_new.to_bytes())),
+        });
+        entries.lock().push(MixEntry { id: "broken-id".to_string(), body: MixBody::Broken });
+        fetched.lock().clear();
+
+        let second = service.refresh().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(pubkey_of(&second[0]), pk_new);
+        let fetched_ids: HashSet<String> = fetched.lock().iter().cloned().collect();
+        assert_eq!(fetched_ids, HashSet::from(["new-id".to_string(), "broken-id".to_string()]));
+        assert_eq!(converts.load(Ordering::SeqCst), 3);
+        assert_eq!(service.cached_pubkey(0, "cached-id"), Some(pk_cached));
+        assert_eq!(service.cached_pubkey(0, "new-id"), Some(pk_new));
+        assert_eq!(service.cached_pubkey(0, "broken-id"), None);
+        assert!(service.known_pubkeys.contains(&pk_cached));
+        assert!(service.known_pubkeys.contains(&pk_new));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_refresh_during_decrypt_releases_permits_without_admission() {
+        let runtime_thread = std::thread::current().id();
+        let (tx, mut rx) = tokio::sync::watch::channel(0usize);
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let probe = ParkProbe { arrived: tx, gate: Arc::clone(&gate), runtime_thread };
+        let limiter = DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY).with_probe(Arc::new(probe));
+        let observed = limiter.clone();
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "drop-refresh".to_string(),
+            keys: vec![make_raw_key_entry("a", &sk_a), make_raw_key_entry("b", &sk_b)],
+            list_error: None,
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None)
+            .with_decrypt_limiter(limiter);
+        let guard = RefreshGate { gate };
+
+        let parked = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut refresh = std::pin::pin!(service.refresh());
+            tokio::select! {
+                _ = rx.wait_for(|count| *count >= 2) => {}
+                _ = refresh.as_mut() => panic!("refresh finished before decrypts parked"),
+            }
+            assert!(*rx.borrow() >= 2);
+            // `refresh` drops with this block, before `guard` opens the gate.
+        })
+        .await;
+        drop(guard);
+        parked.expect("refresh park hang guard");
+
+        let released = tokio::time::timeout(Duration::from_secs(30), async {
+            let first = observed.acquire().await.expect("pool stays open");
+            let second = observed.acquire().await.expect("pool stays open");
+            drop(first);
+            drop(second);
+        })
+        .await;
+        assert!(released.is_ok());
+        assert!(service.known_ids.is_empty());
+        assert!(service.known_pubkeys.is_empty());
+
+        let admitted = service.refresh().await;
+        let got: HashSet<_> = admitted.iter().map(pubkey_of).collect();
+        assert_eq!(got, HashSet::from([pubkey_of(&sk_a), pubkey_of(&sk_b)]),);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_refresh_keeps_decrypt_permits_until_the_blocking_body_returns() {
+        let runtime_thread = std::thread::current().id();
+        let (tx, mut rx) = tokio::sync::watch::channel(0usize);
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let probe = ParkProbe { arrived: tx, gate: Arc::clone(&gate), runtime_thread };
+        let limiter = DecryptLimiter::new(DEFAULT_DECRYPT_CONCURRENCY).with_probe(Arc::new(probe));
+        let observed = limiter.clone();
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "permit-held-across-abort".to_string(),
+            keys: vec![make_raw_key_entry("a", &sk_a), make_raw_key_entry("b", &sk_b)],
+            list_error: None,
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None)
+            .with_decrypt_limiter(limiter);
+        let guard = RefreshGate { gate: Arc::clone(&gate) };
+
+        // The refresh future drops with this block, while `guard` still holds the
+        // gate shut. The per-entry tasks abort here; they are not dropped yet.
+        {
+            let refresh = service.refresh();
+            tokio::pin!(refresh);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::select! {
+                    _ = rx.wait_for(|count| *count >= DEFAULT_DECRYPT_CONCURRENCY) => {}
+                    _ = refresh.as_mut() => panic!("refresh finished before decrypts parked"),
+                }
+            })
+            .await
+            .expect("refresh park hang guard");
+            assert!(*rx.borrow() >= DEFAULT_DECRYPT_CONCURRENCY);
+            assert_eq!(observed.available_permits(), 0);
+        }
+
+        // current_thread: yield so the aborted tasks are polled and dropped
+        // before the permit check. Not a timer.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        {
+            let (lock, _) = &*gate;
+            let open = lock.lock().unwrap_or_else(|err| err.into_inner());
+            assert!(!*open);
+        }
+        assert_eq!(
+            observed.available_permits(),
+            0,
+            "decrypt permit stays in the blocking closure after the refresh is dropped"
+        );
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut held = Vec::with_capacity(DEFAULT_DECRYPT_CONCURRENCY);
+            for _ in 0..DEFAULT_DECRYPT_CONCURRENCY {
+                held.push(observed.acquire().await.expect("pool stays open"));
+            }
+            drop(held);
+        })
+        .await
+        .expect("permits return after the blocking body finishes");
+        assert_eq!(observed.available_permits(), DEFAULT_DECRYPT_CONCURRENCY);
     }
 }
