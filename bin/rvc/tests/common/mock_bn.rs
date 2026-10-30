@@ -4,6 +4,8 @@
 //! validation, fork-schedule fetch, and fork-compat check. Optional duty /
 //! block-root stubs keep the post-ready duty loop from spamming hard failures.
 
+use std::collections::BTreeMap;
+
 use eth_types::{ForkName, NetworkPreset};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -38,6 +40,9 @@ pub struct MockBn {
     genesis_validators_root: String,
     genesis_time: u64,
     head_fork_version: String,
+    /// `Some` emits `SLOT_DURATION_MS` and drops `SECONDS_PER_SLOT`.
+    slot_duration_ms: Option<u64>,
+    spec_overrides: BTreeMap<String, String>,
 }
 
 /// Builder for [`MockBn`]. Prefer [`MockBn::start`] for defaults.
@@ -48,6 +53,9 @@ pub struct MockBnBuilder {
     head_fork: ForkName,
     /// When set, overrides the head-fork `current_version` (for mismatch tests).
     head_fork_version_override: Option<String>,
+    /// Replaces `SECONDS_PER_SLOT` with `SLOT_DURATION_MS` so the two keys cannot conflict.
+    slot_duration_ms: Option<u64>,
+    spec_overrides: BTreeMap<String, String>,
 }
 
 impl Default for MockBnBuilder {
@@ -57,6 +65,8 @@ impl Default for MockBnBuilder {
             genesis_time: NetworkPreset::MAINNET.genesis_time,
             head_fork: ForkName::Electra,
             head_fork_version_override: None,
+            slot_duration_ms: None,
+            spec_overrides: BTreeMap::new(),
         }
     }
 }
@@ -81,6 +91,27 @@ impl MockBnBuilder {
         self
     }
 
+    /// Genesis time the mock advertises. The default stays the mainnet preset.
+    #[allow(dead_code)]
+    pub fn with_genesis_time(mut self, genesis_time: u64) -> Self {
+        self.genesis_time = genesis_time;
+        self
+    }
+
+    /// Emit `SLOT_DURATION_MS` and drop `SECONDS_PER_SLOT`.
+    #[allow(dead_code)]
+    pub fn with_slot_duration_ms(mut self, slot_duration_ms: u64) -> Self {
+        self.slot_duration_ms = Some(slot_duration_ms);
+        self
+    }
+
+    /// Override one `/eth/v1/config/spec` value. Defaults are unchanged until this is set.
+    #[allow(dead_code)]
+    pub fn with_spec_value(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.spec_overrides.insert(key.into(), value.into());
+        self
+    }
+
     /// Start the mock server and mount startup endpoints.
     pub async fn start(self) -> MockBn {
         let server = MockServer::start().await;
@@ -92,6 +123,8 @@ impl MockBnBuilder {
             genesis_validators_root: self.genesis_validators_root,
             genesis_time: self.genesis_time,
             head_fork_version,
+            slot_duration_ms: self.slot_duration_ms,
+            spec_overrides: self.spec_overrides,
         };
         bn.mount_endpoints().await;
         bn
@@ -125,6 +158,22 @@ impl MockBn {
         &self.genesis_validators_root
     }
 
+    /// How many requests hit `path` exactly (`url.path()`, no query).
+    #[allow(dead_code)]
+    pub async fn requests_to(&self, path: &str) -> usize {
+        self.received().await.iter().filter(|request| request.url.path() == path).count()
+    }
+
+    /// Every request the mock has seen, on any path.
+    #[allow(dead_code)]
+    pub async fn request_count(&self) -> usize {
+        self.received().await.len()
+    }
+
+    async fn received(&self) -> Vec<wiremock::Request> {
+        self.server.received_requests().await.unwrap_or_default()
+    }
+
     async fn mount_endpoints(&self) {
         let gvr = &self.genesis_validators_root;
         let genesis_time = self.genesis_time.to_string();
@@ -143,30 +192,12 @@ impl MockBn {
             .mount(&self.server)
             .await;
 
-        // /eth/v1/config/spec — full enough for ForkSchedule parsing
+        // /eth/v1/config/spec — full enough for ForkSchedule parsing.
+        // The no-override body is the historical default (`SECONDS_PER_SLOT`, not
+        // `SLOT_DURATION_MS`). Overrides are applied on a copy of that map.
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "GENESIS_FORK_VERSION": "0x00000000",
-                    "ALTAIR_FORK_EPOCH": "74240",
-                    "ALTAIR_FORK_VERSION": "0x01000000",
-                    "BELLATRIX_FORK_EPOCH": "144896",
-                    "BELLATRIX_FORK_VERSION": "0x02000000",
-                    "CAPELLA_FORK_EPOCH": "194048",
-                    "CAPELLA_FORK_VERSION": "0x03000000",
-                    "DENEB_FORK_EPOCH": "269568",
-                    "DENEB_FORK_VERSION": "0x04000000",
-                    "ELECTRA_FORK_EPOCH": "364544",
-                    "ELECTRA_FORK_VERSION": "0x05000000",
-                    "FULU_FORK_EPOCH": "18446744073709551615",
-                    "FULU_FORK_VERSION": "0x06000000",
-                    "GLOAS_FORK_EPOCH": "18446744073709551615",
-                    "GLOAS_FORK_VERSION": "0x07000000",
-                    "SECONDS_PER_SLOT": "12",
-                    "SLOTS_PER_EPOCH": "32"
-                }
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(self.spec_body()))
             .mount(&self.server)
             .await;
 
@@ -347,6 +378,45 @@ impl MockBn {
             .mount(&self.server)
             .await;
     }
+
+    fn spec_body(&self) -> serde_json::Value {
+        let mut data = default_spec_map();
+        if let Some(ms) = self.slot_duration_ms {
+            data.remove("SECONDS_PER_SLOT");
+            data.insert("SLOT_DURATION_MS".to_string(), serde_json::Value::String(ms.to_string()));
+        }
+        for (key, value) in &self.spec_overrides {
+            data.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
+        serde_json::json!({ "data": data })
+    }
+}
+
+/// Historical default spec. Key order matches the body this stub served before
+/// the override knobs existed, so an untouched builder stays value-identical.
+fn default_spec_map() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({
+        "GENESIS_FORK_VERSION": "0x00000000",
+        "ALTAIR_FORK_EPOCH": "74240",
+        "ALTAIR_FORK_VERSION": "0x01000000",
+        "BELLATRIX_FORK_EPOCH": "144896",
+        "BELLATRIX_FORK_VERSION": "0x02000000",
+        "CAPELLA_FORK_EPOCH": "194048",
+        "CAPELLA_FORK_VERSION": "0x03000000",
+        "DENEB_FORK_EPOCH": "269568",
+        "DENEB_FORK_VERSION": "0x04000000",
+        "ELECTRA_FORK_EPOCH": "364544",
+        "ELECTRA_FORK_VERSION": "0x05000000",
+        "FULU_FORK_EPOCH": "18446744073709551615",
+        "FULU_FORK_VERSION": "0x06000000",
+        "GLOAS_FORK_EPOCH": "18446744073709551615",
+        "GLOAS_FORK_VERSION": "0x07000000",
+        "SECONDS_PER_SLOT": "12",
+        "SLOTS_PER_EPOCH": "32"
+    })
+    .as_object()
+    .expect("spec object")
+    .clone()
 }
 
 fn fork_version_hex(fork: ForkName) -> String {

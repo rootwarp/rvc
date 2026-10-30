@@ -157,8 +157,8 @@ You will be prompted for your mnemonic. The tool:
 
 1. Derives the withdrawal key at `m/12381/3600/0/0` (4-level path)
 2. Builds a `BLSToExecutionChange` message
-3. Signs it with `DOMAIN_BLS_TO_EXECUTION_CHANGE` using the network's Capella fork version
-4. Writes the signed message to `./bls_to_execution_changes/`
+3. Signs it with `DOMAIN_BLS_TO_EXECUTION_CHANGE` using the network's genesis fork version
+4. Writes a JSON array of one signed message to `./bls_to_execution_changes/`
 
 If your validator's withdrawal key was derived at a non-zero index:
 

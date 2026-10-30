@@ -46,6 +46,14 @@ impl Network {
         self.preset().map(|p| p.genesis_fork_version)
     }
 
+    /// Capella fork version for named networks. `Custom` has none.
+    ///
+    /// The exit CLI compares this with the beacon node's `CAPELLA_FORK_VERSION`.
+    /// `None` means the beacon value is used as-is.
+    pub fn capella_fork_version(&self) -> Option<[u8; 4]> {
+        self.preset().map(|p| p.capella_fork_version)
+    }
+
     /// Genesis validators root hex for named networks.
     pub fn genesis_validators_root(&self) -> Option<String> {
         self.preset().map(NetworkPreset::genesis_validators_root_hex)

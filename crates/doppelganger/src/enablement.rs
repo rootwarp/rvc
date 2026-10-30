@@ -83,7 +83,11 @@ pub enum SigningDuty {
 ///
 /// The signed exit is the epoch and the validator index, so that duty does not
 /// require a beacon admission scope. The keymanager may still read the index
-/// from a beacon node. That read is not an admission fence.
+/// from a beacon node. The offline CLI exit (`prepare-exit` and
+/// `voluntary-exit`) also reads the index and the fork schedule from one BN.
+/// That read is not an admission fence. The CLI checks the BN's genesis
+/// validators root and, on a named network, its Capella version against local
+/// values.
 #[must_use]
 pub fn duty_requires_beacon_admission(duty: SigningDuty) -> bool {
     match duty {
