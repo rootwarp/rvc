@@ -10,6 +10,7 @@
 use eth_types::{Epoch, Slot};
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::db::to_sql_i64;
 use crate::error::SlashingError;
 use crate::rules::{AttestationHistory, BlockHistory, ExistingAtt};
 
@@ -60,6 +61,7 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
     fn conflicting_at_target(&self, target: Epoch) -> Result<Option<ExistingAtt>, SlashingError> {
         // At most one row per (pubkey, gvr, target) under the v3 unique index.
         // No ORDER BY: a point lookup must not force a TEMP B-TREE.
+        let target = to_sql_i64(target, "target_epoch")?;
         let row = self
             .conn
             .query_row(
@@ -67,7 +69,7 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
                  FROM attestations \
                  WHERE pubkey = ?1 AND target_epoch = ?2 \
                  LIMIT 1",
-                (self.pubkey, target as i64),
+                (self.pubkey, target),
                 |row| {
                     Ok(ExistingAtt {
                         source_epoch: row.get::<_, i64>(0)? as Epoch,
@@ -89,9 +91,11 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
         // ⇔ existing.source > source && existing.target < target.
         //
         // EXISTS-style: any matching witness is enough for the violation payload.
+        let source = to_sql_i64(source, "source_epoch")?;
+        let target = to_sql_i64(target, "target_epoch")?;
         let row = self
             .conn
-            .query_row(SURROUNDING_EXISTS_SQL, (self.pubkey, source as i64, target as i64), |row| {
+            .query_row(SURROUNDING_EXISTS_SQL, (self.pubkey, source, target), |row| {
                 Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
             })
             .optional()?;
@@ -105,6 +109,8 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
     ) -> Result<Option<(Epoch, Epoch)>, SlashingError> {
         // Candidate is surrounded: existing.source < source && existing.target > target.
         // Same EXISTS-style rule as surrounding_exists — no ORDER BY.
+        let source = to_sql_i64(source, "source_epoch")?;
+        let target = to_sql_i64(target, "target_epoch")?;
         let row = self
             .conn
             .query_row(
@@ -112,7 +118,7 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
                  FROM attestations \
                  WHERE pubkey = ?1 AND source_epoch < ?2 AND target_epoch > ?3 \
                  LIMIT 1",
-                (self.pubkey, source as i64, target as i64),
+                (self.pubkey, source, target),
                 |row| Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch)),
             )
             .optional()?;
@@ -157,7 +163,7 @@ impl BlockHistory for TargetedSqlBlockHistory<'_> {
                 "SELECT signing_root FROM blocks \
                  WHERE pubkey = ?1 AND slot = ?2 \
                  LIMIT 1",
-                (self.pubkey, slot as i64),
+                (self.pubkey, to_sql_i64(slot, "slot")?),
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?;
@@ -208,7 +214,13 @@ mod tests {
             "INSERT INTO attestations \
              (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
              VALUES ('local-vc', ?1, ?2, ?3, ?4, ?5)",
-            (pubkey, source as i64, target as i64, root, GVR),
+            (
+                pubkey,
+                i64::try_from(source).expect("test source fits i64"),
+                i64::try_from(target).expect("test target fits i64"),
+                root,
+                GVR,
+            ),
         )
         .expect("insert attestation");
     }
@@ -218,7 +230,7 @@ mod tests {
             "INSERT INTO blocks \
              (client_cn, pubkey, slot, signing_root, genesis_validators_root) \
              VALUES ('local-vc', ?1, ?2, ?3, ?4)",
-            (pubkey, slot as i64, root, GVR),
+            (pubkey, i64::try_from(slot).expect("test slot fits i64"), root, GVR),
         )
         .expect("insert block");
     }
@@ -701,7 +713,7 @@ mod tests {
 
             let conn = db.conn.lock();
             let cand_source = 0i64;
-            let cand_target = (non_matching as i64) + 10;
+            let cand_target = i64::try_from(non_matching).expect("non_matching fits i64") + 10;
             let mut surrounding = conn.prepare(SURROUNDING_EXISTS_SQL).unwrap();
             let hit = surrounding
                 .query_row((PK, cand_source, cand_target), |row| {
@@ -709,7 +721,11 @@ mod tests {
                 })
                 .optional()
                 .unwrap();
-            assert_eq!(hit, Some((1, (non_matching as i64) + 1)), "late witness must be found");
+            assert_eq!(
+                hit,
+                Some((1, i64::try_from(non_matching).expect("non_matching fits i64") + 1)),
+                "late witness must be found"
+            );
 
             let surrounding_vm = surrounding.get_status(StatementStatus::VmStep);
             let surrounding_filter = surrounding.get_status(StatementStatus::FilterHit)
@@ -778,5 +794,126 @@ mod tests {
             "production surrounding_exists work not bounded: small={small:?}, large={large:?} \
              (vm_factor={vm_factor}, filter_factor={filter_factor})"
         );
+    }
+
+    /// A value wrapped by the old `as i64` bind is not migrated.
+    ///
+    /// A wrapped target reads back at 2^63 and a later ordinary surround is refused.
+    /// A wrapped slot row refuses a later ordinary slot (`min_slot` reads back at 2^63).
+    /// A wrapped block watermark does the same via the unsigned floor.
+    /// A source-only wrapped row `(i64::MIN, 101)` does not block `(99, 102)`.
+    #[test]
+    fn legacy_wrapped_target_and_slot_refuse_later_signs_source_only_wrap_does_not() {
+        let gvr = [0u8; 32];
+        let gvr_hex = SlashingDb::root_to_hex(&gvr);
+        let stored = crate::db::normalize_pubkey(PK).expect("pubkey");
+        let pk = stored.as_ref();
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            {
+                let conn = db.conn.lock();
+                conn.execute(
+                    "INSERT INTO attestations \
+                     (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+                     VALUES ('local-vc', ?1, ?2, ?3, '0xleg', ?4)",
+                    (pk, 100i64, i64::MIN, gvr_hex.as_str()),
+                )
+                .expect("seed wrapped target");
+            }
+            let err = db
+                .reserve_attestation(PK, 99, 101, Some("0xnext".into()), &gvr)
+                .expect_err("wrapped target must refuse (99, 101)");
+            assert!(
+                matches!(
+                    err,
+                    SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::SurroundingVote {
+                            new_source: 99,
+                            new_target: 101,
+                            existing_source: 100,
+                            existing_target,
+                        }
+                    ) if existing_target == 1 << 63
+                ),
+                "wrapped target stays a surround refusal, got {err:?}"
+            );
+            assert_eq!(db.get_attestations(PK).expect("rows").len(), 1);
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            {
+                let conn = db.conn.lock();
+                conn.execute(
+                    "INSERT INTO blocks \
+                     (client_cn, pubkey, slot, signing_root, genesis_validators_root) \
+                     VALUES ('local-vc', ?1, ?2, '0xleg', ?3)",
+                    (pk, i64::MIN, gvr_hex.as_str()),
+                )
+                .expect("seed wrapped slot");
+            }
+            let err = db
+                .reserve_block(PK, 100, Some("0xnext".into()), &gvr)
+                .expect_err("wrapped slot must refuse an ordinary slot");
+            assert!(
+                matches!(
+                    err,
+                    SlashingError::SlashableBlock(BlockSlashingViolation::SlotBelowMinimum {
+                        slot: 100,
+                        min_slot,
+                    }) if min_slot == 1 << 63
+                ),
+                "wrapped slot stays a refusal, got {err:?}"
+            );
+            assert!(db.get_blocks(PK).expect("rows").iter().all(|block| block.slot != 100));
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            {
+                let conn = db.conn.lock();
+                conn.execute(
+                    "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'block', ?2)",
+                    (pk, i64::MIN),
+                )
+                .expect("seed wrapped block watermark");
+            }
+            let err = db
+                .reserve_block(PK, 100, Some("0xnext".into()), &gvr)
+                .expect_err("wrapped block watermark must refuse an ordinary slot");
+            assert!(
+                matches!(
+                    err,
+                    SlashingError::BelowBlockWatermark { slot: 100, watermark_slot, .. }
+                        if watermark_slot == 1 << 63
+                ),
+                "wrapped block watermark stays a refusal, got {err:?}"
+            );
+            assert!(db.get_blocks(PK).expect("rows").is_empty());
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            {
+                let conn = db.conn.lock();
+                conn.execute(
+                    "INSERT INTO attestations \
+                     (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+                     VALUES ('local-vc', ?1, ?2, ?3, '0xleg', ?4)",
+                    (pk, i64::MIN, 101i64, gvr_hex.as_str()),
+                )
+                .expect("seed source-only wrap");
+            }
+            let reserved = db
+                .reserve_attestation(PK, 99, 102, Some("0xnext".into()), &gvr)
+                .expect("source-only wrap must not block (99, 102)");
+            assert!(reserved.inserted);
+            let rows = db.get_attestations(PK).expect("rows");
+            assert!(
+                rows.iter().any(|row| row.source_epoch == 99 && row.target_epoch == 102),
+                "got {rows:?}"
+            );
+        }
     }
 }

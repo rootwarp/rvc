@@ -8,7 +8,7 @@ use observability::logging::TruncatedPubkey;
 use observability::pubkey::CanonicalPubkey;
 
 use super::watermarks::{read_watermark, WatermarkKind};
-use super::{normalize_pubkey, SlashingDb};
+use super::{normalize_pubkey, to_sql_i64, SlashingDb};
 use crate::error::SlashingError;
 use crate::metrics;
 use crate::types::{
@@ -239,12 +239,14 @@ fn parse_interchange(
                     attestation.source_epoch
                 ))
             })?;
+            to_sql_i64(source_epoch, "source_epoch")?;
             let target_epoch: Epoch = attestation.target_epoch.parse().map_err(|_| {
                 SlashingError::InvalidInterchangeFormat(format!(
                     "invalid target_epoch: {}",
                     attestation.target_epoch
                 ))
             })?;
+            to_sql_i64(target_epoch, "target_epoch")?;
             max_source = Some(max_source.map_or(source_epoch, |current| current.max(source_epoch)));
             max_target = Some(max_target.map_or(target_epoch, |current| current.max(target_epoch)));
             attestations.push(ParsedAttestation {
@@ -258,6 +260,7 @@ fn parse_interchange(
             let slot: Slot = block.slot.parse().map_err(|_| {
                 SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
             })?;
+            to_sql_i64(slot, "slot")?;
             max_slot = Some(max_slot.map_or(slot, |current| current.max(slot)));
             blocks.push(ParsedBlock { slot, signing_root: &block.signing_root });
         }
@@ -451,6 +454,17 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Range check for every slot and epoch in `interchange`, with no connection lock.
+    ///
+    /// Same parse as [`Self::import`]. A value above `i64::MAX` is
+    /// [`SlashingError::OutOfRange`]. Callers that admit an import into a slot
+    /// window run this before admission so a rejected file does not wait.
+    pub fn validate_interchange_ranges(
+        interchange: &InterchangeFormat,
+    ) -> Result<(), SlashingError> {
+        parse_interchange(interchange).map(|_| ())
+    }
+
     #[tracing::instrument(name = "slashing.db.import", skip_all)]
     /// Import an EIP-3076 interchange into the history tables and raise per-pubkey
     /// watermarks to the interchange maxima.
@@ -513,8 +527,8 @@ impl SlashingDb {
                 for attestation in &validator.attestations {
                     let inserted = insert_attestation.execute((
                         pubkey,
-                        attestation.source_epoch as i64,
-                        attestation.target_epoch as i64,
+                        to_sql_i64(attestation.source_epoch, "source_epoch")?,
+                        to_sql_i64(attestation.target_epoch, "target_epoch")?,
                         attestation.signing_root,
                         &gvr_hex,
                     ))?;
@@ -534,7 +548,7 @@ impl SlashingDb {
                 for block in &validator.blocks {
                     let inserted = insert_block.execute((
                         pubkey,
-                        block.slot as i64,
+                        to_sql_i64(block.slot, "slot")?,
                         block.signing_root,
                         &gvr_hex,
                     ))?;
@@ -555,19 +569,19 @@ impl SlashingDb {
                     raise_watermark.execute((
                         pubkey,
                         WatermarkKind::Block.as_sql_str(),
-                        slot as i64,
+                        to_sql_i64(slot, "slot")?,
                     ))?;
                 }
                 if let (Some(source), Some(target)) = (validator.max_source, validator.max_target) {
                     raise_watermark.execute((
                         pubkey,
                         WatermarkKind::AttestationSource.as_sql_str(),
-                        source as i64,
+                        to_sql_i64(source, "source_epoch")?,
                     ))?;
                     raise_watermark.execute((
                         pubkey,
                         WatermarkKind::AttestationTarget.as_sql_str(),
-                        target as i64,
+                        to_sql_i64(target, "target_epoch")?,
                     ))?;
                 }
             }
@@ -1547,7 +1561,10 @@ mod tests {
             let conn = db.conn.lock();
             conn.query_row(
                 "SELECT genesis_validators_root FROM attestations WHERE pubkey = ?1 AND target_epoch = ?2",
-                (normalize_pubkey(pubkey).expect("valid hex pubkey").as_ref(), target_epoch as i64),
+                (
+                    normalize_pubkey(pubkey).expect("valid hex pubkey").as_ref(),
+                    i64::try_from(target_epoch).expect("test target fits i64"),
+                ),
                 |row| row.get(0),
             )
             .expect("import row must exist")

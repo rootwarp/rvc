@@ -1182,3 +1182,94 @@ fn conn_hold_for_10mb_import_stays_within_budget() {
          {TEN_MB_HISTORY_ROWS} history rows)"
     );
 }
+
+/// An interchange value above `i64::MAX` is `OutOfRange` before BEGIN.
+/// Rows and watermarks already in the database stay as they were, including
+/// when a valid record precedes the bad one in the same file.
+#[test]
+fn import_rejects_an_epoch_above_i64_max_before_begin() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    let above = (1_u64 << 63).to_string();
+    let cases = [
+        ("target_epoch", interchange(vec![att("1", &above, None)], vec![])),
+        ("source_epoch", interchange(vec![att(&above, "2", None)], vec![])),
+        (
+            "slot",
+            interchange(vec![], vec![InterchangeBlock { slot: above.clone(), signing_root: None }]),
+        ),
+    ];
+
+    for (field, file) in cases {
+        let db = seeded_import_db();
+        let hold_before = hold_samples();
+        let err = db.import(&file, &chain_gvr()).expect_err(field);
+        match err {
+            SlashingError::OutOfRange { field: got, value } => {
+                assert_eq!(got, field, "{field}");
+                assert_eq!(value, 1 << 63, "{field}");
+            }
+            other => panic!("{field}: expected OutOfRange, got {other:?}"),
+        }
+        assert_eq!(
+            hold_samples(),
+            hold_before,
+            "{field} must return before conn.lock() (conn_hold_ms sample count unchanged)"
+        );
+        assert_seed_unchanged(&db);
+    }
+
+    let db = seeded_import_db();
+    let hold_before = hold_samples();
+    let prefixed = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".to_string(),
+            genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+        },
+        data: vec![
+            ValidatorRecord {
+                pubkey: PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("1", "2", None)],
+            },
+            ValidatorRecord {
+                pubkey: OTHER_PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("4", &above, None)],
+            },
+        ],
+    };
+    let err = db.import(&prefixed, &chain_gvr()).expect_err("bad record after a valid one");
+    let msg = err.to_string();
+    match err {
+        SlashingError::OutOfRange { field, value } => {
+            assert_eq!(field, "target_epoch");
+            assert_eq!(value, 1 << 63);
+            assert!(msg.contains("target_epoch") && msg.contains(&i64::MAX.to_string()), "{msg}");
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
+    assert_eq!(hold_samples(), hold_before, "a later bad record must return before conn.lock()");
+    assert_seed_unchanged(&db);
+    assert!(
+        db.get_attestations(OTHER_PUBKEY).expect("other").is_empty(),
+        "a later bad record must not keep the valid prefix"
+    );
+}
+
+fn seeded_import_db() -> SlashingDb {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let gvr = chain_gvr();
+    db.reserve_block(PUBKEY, 9, Some("0xpre".into()), &gvr).expect("seed block");
+    db.set_block_watermark(PUBKEY, 4).expect("block watermark");
+    db.set_attestation_watermark(PUBKEY, 3, 8).expect("attestation watermark");
+    db
+}
+
+fn assert_seed_unchanged(db: &SlashingDb) {
+    let blocks = db.get_blocks(PUBKEY).expect("blocks");
+    assert_eq!(blocks.len(), 1, "pre-existing block row must stay");
+    assert_eq!(blocks[0].slot, 9);
+    assert!(db.get_attestations(PUBKEY).expect("atts").is_empty(), "import must not add a row");
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("block wm"), Some(4));
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), Some((3, 8)));
+}

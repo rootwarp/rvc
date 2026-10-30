@@ -11,7 +11,7 @@
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use super::{normalize_pubkey, SlashingDb};
+use super::{normalize_pubkey, to_sql_i64, SlashingDb};
 use crate::error::SlashingError;
 use crate::metrics;
 use crate::types::PruneStats;
@@ -46,6 +46,15 @@ impl WatermarkKind {
     /// All kinds, in a stable order for round-trip / exhaustiveness tests.
     pub const fn all() -> [Self; 3] {
         [Self::Block, Self::AttestationSource, Self::AttestationTarget]
+    }
+
+    /// Column name used by [`crate::db::to_sql_i64`] for this watermark.
+    const fn range_field(self) -> &'static str {
+        match self {
+            Self::Block => "slot",
+            Self::AttestationSource => "source_epoch",
+            Self::AttestationTarget => "target_epoch",
+        }
     }
 }
 
@@ -91,14 +100,16 @@ pub fn raise_watermark(
                 attempted: value,
             });
         }
+        let value = to_sql_i64(value, kind.range_field())?;
         conn.execute(
             "UPDATE watermarks SET value = ?1 WHERE pubkey = ?2 AND watermark_type = ?3",
-            (value as i64, pubkey, kind.as_sql_str()),
+            (value, pubkey, kind.as_sql_str()),
         )?;
     } else {
+        let value = to_sql_i64(value, kind.range_field())?;
         conn.execute(
             "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)",
-            (pubkey, kind.as_sql_str(), value as i64),
+            (pubkey, kind.as_sql_str(), value),
         )?;
     }
     Ok(())
@@ -125,7 +136,8 @@ pub(crate) fn raise_watermark_max(
     kind: WatermarkKind,
     value: u64,
 ) -> Result<(), SlashingError> {
-    conn.execute(RAISE_WATERMARK_MAX_SQL, (pubkey, kind.as_sql_str(), value as i64))?;
+    let value = to_sql_i64(value, kind.range_field())?;
+    conn.execute(RAISE_WATERMARK_MAX_SQL, (pubkey, kind.as_sql_str(), value))?;
     Ok(())
 }
 

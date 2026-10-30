@@ -107,6 +107,7 @@
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
 
+use crate::db::to_sql_i64;
 use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
 use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
@@ -275,7 +276,7 @@ impl<'db> StagedBlock<'db> {
                 (
                     AUDIT_ORIGIN,
                     &self.row.pubkey,
-                    self.row.slot as i64,
+                    to_sql_i64(self.row.slot, "slot")?,
                     &self.row.signing_root,
                     &self.row.gvr_hex,
                 ),
@@ -361,8 +362,8 @@ impl<'db> StagedAttestation<'db> {
                 (
                     AUDIT_ORIGIN,
                     &self.row.pubkey,
-                    self.row.source_epoch as i64,
-                    self.row.target_epoch as i64,
+                    to_sql_i64(self.row.source_epoch, "source_epoch")?,
+                    to_sql_i64(self.row.target_epoch, "target_epoch")?,
                     &self.row.signing_root,
                     &self.row.gvr_hex,
                 ),
@@ -437,6 +438,8 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<StagedBlock<'db>, SlashingError> {
+        // Before `pinned_gvr`: a cold cache takes `conn`.
+        to_sql_i64(slot, "slot")?;
         // M-6: GVR check before acquiring the main mutex to avoid nested-lock deadlock.
         // pinned_gvr() may itself briefly acquire the mutex on a cold cache, then release it.
         if let Some(pinned) = self.pinned_gvr()? {
@@ -519,6 +522,9 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<StagedAttestation<'db>, SlashingError> {
+        // Source before target. Before `pinned_gvr`: a cold cache takes `conn`.
+        to_sql_i64(source_epoch, "source_epoch")?;
+        to_sql_i64(target_epoch, "target_epoch")?;
         // M-6: GVR check before acquiring the main mutex.
         if let Some(pinned) = self.pinned_gvr()? {
             if pinned != *gvr {
@@ -709,8 +715,7 @@ fn reconcile_delete_txn(
     let before = if cfg!(debug_assertions) { Some(snapshot_watermarks(conn)?) } else { None };
 
     let pubkey = crate::db::normalize_pubkey(&reservation.pubkey_hex)?;
-    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)
-        .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))?;
+    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)?;
     if changes > 1 {
         return Err(SlashingError::ReconcileFailed(format!(
             "targeted delete affected {changes} rows (cap is 1)"
@@ -736,19 +741,28 @@ fn delete_reserved_row(
     conn: &Connection,
     pubkey: &str,
     reservation: &CommittedReservation,
-) -> rusqlite::Result<usize> {
+) -> Result<usize, SlashingError> {
     match reservation.kind {
-        ReservationKind::Block { slot } => conn.execute(
-            "DELETE FROM blocks
-             WHERE pubkey = ?1 AND slot = ?2 AND signing_root IS ?3",
-            (pubkey, slot as i64, &reservation.signing_root_hex),
-        ),
-        ReservationKind::Attestation { source, target } => conn.execute(
-            "DELETE FROM attestations
-             WHERE pubkey = ?1 AND source_epoch = ?2 AND target_epoch = ?3
-               AND signing_root IS ?4",
-            (pubkey, source as i64, target as i64, &reservation.signing_root_hex),
-        ),
+        ReservationKind::Block { slot } => {
+            let slot = to_sql_i64(slot, "slot")?;
+            conn.execute(
+                "DELETE FROM blocks
+                 WHERE pubkey = ?1 AND slot = ?2 AND signing_root IS ?3",
+                (pubkey, slot, &reservation.signing_root_hex),
+            )
+            .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))
+        }
+        ReservationKind::Attestation { source, target } => {
+            let source = to_sql_i64(source, "source_epoch")?;
+            let target = to_sql_i64(target, "target_epoch")?;
+            conn.execute(
+                "DELETE FROM attestations
+                 WHERE pubkey = ?1 AND source_epoch = ?2 AND target_epoch = ?3
+                   AND signing_root IS ?4",
+                (pubkey, source, target, &reservation.signing_root_hex),
+            )
+            .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))
+        }
     }
 }
 

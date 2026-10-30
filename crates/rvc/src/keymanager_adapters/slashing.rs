@@ -103,6 +103,9 @@ fn map_slashing_db_error(e: slashing::SlashingError) -> SlashingProtectionError 
                 hex::encode(got)
             ))
         }
+        SlashingError::OutOfRange { field, value } => SlashingProtectionError::InvalidInterchange(
+            format!("out of range: {field}={value} exceeds i64::MAX ({})", i64::MAX),
+        ),
         other => SlashingProtectionError::Backend(other.to_string()),
     }
 }
@@ -145,6 +148,7 @@ impl SlashingProtection for SlashingProtectionAdapter {
             })?;
         SlashingDb::validate_interchange_metadata(&interchange, &self.genesis_validators_root)
             .map_err(map_slashing_db_error)?;
+        SlashingDb::validate_interchange_ranges(&interchange).map_err(map_slashing_db_error)?;
         let rows = history_rows(&interchange);
         let admission = self.gate.admit(rows).await.map_err(map_deferral)?;
 
