@@ -1,14 +1,12 @@
 //! RR3-02: the interchange write path waits for a free slot window.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use keymanager_api::error::map_slashing_protection_error;
 use keymanager_api::traits::{SlashingProtection, SlashingProtectionError};
-use slashing::metrics::RVC_SLASHING_IMPORT_CONN_HOLD_MS;
 use timing::{due_ms, MockSlotClock, SlotClock, ATTESTATION_DUE_BPS};
 use tokio::time::Instant;
 use tracing::field::{Field, Visit};
@@ -289,77 +287,101 @@ async fn an_out_of_range_interchange_is_a_400_naming_the_field() {
     assert!(db.get_attestations("0xaaaa").expect("rows").is_empty());
 }
 
-struct Hold {
-    entered: AtomicUsize,
-    release: AtomicBool,
-    lock: Mutex<()>,
-    cv: Condvar,
-    second_hold_samples: Mutex<Option<u64>>,
+fn history_interchange(gvr: [u8; 32], pubkey: &str) -> String {
+    serde_json::json!({
+        "metadata": {
+            "interchange_format_version": "5",
+            "genesis_validators_root": format!("0x{}", hex::encode(gvr))
+        },
+        "data": [{
+            "pubkey": pubkey,
+            "signed_blocks": [],
+            "signed_attestations": [{
+                "source_epoch": "1",
+                "target_epoch": "2",
+                "signing_root": null
+            }]
+        }]
+    })
+    .to_string()
+}
+
+/// Sends on drop so a failed assertion cannot leave the blocking import parked.
+struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Dropping the caller while `import` is inside the blocking section must not
-/// drop the admission guard before the transaction records `conn_hold`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// drop the admission guard before the transaction commits.
+#[tokio::test(flavor = "current_thread")]
 async fn dropping_the_client_mid_import_does_not_release_the_guard_before_the_transaction_ends() {
     let (_clock, gate) = gate_at(8_000, Duration::from_secs(12));
     let gvr = [0x33u8; 32];
+    let pubkey = format!("0x{}", hex::encode([0x44u8; 48]));
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let adapter = Arc::new(SlashingProtectionAdapter::new(db, gvr, gate));
-    let hold = Arc::new(Hold {
-        entered: AtomicUsize::new(0),
-        release: AtomicBool::new(false),
-        lock: Mutex::new(()),
-        cv: Condvar::new(),
-        second_hold_samples: Mutex::new(None),
-    });
-    let hook_hold = Arc::clone(&hold);
+    let adapter = Arc::new(SlashingProtectionAdapter::new(Arc::clone(&db), gvr, Arc::clone(&gate)));
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(release_rx);
+    let hook_db = Arc::clone(&db);
+    let hook_pubkey = pubkey.clone();
     adapter.set_during_import(Some(Arc::new(move || {
-        let n = hook_hold.entered.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
-            let mut guard = hook_hold.lock.lock().expect("hold");
-            while !hook_hold.release.load(Ordering::SeqCst) {
-                guard = hook_hold.cv.wait(guard).expect("hold");
-            }
+        if let Some(tx) = entered_tx.lock().expect("entered").take() {
+            let _ = tx.send(());
+            let _ = release_rx.lock().expect("release").recv();
         } else {
-            let samples = RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_count();
-            *hook_hold.second_hold_samples.lock().expect("samples") = Some(samples);
+            let rows = hook_db.get_attestations(&hook_pubkey).expect("rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "the guard is released only after the first transaction commits"
+            );
+            assert_eq!(rows[0].source_epoch, 1);
+            assert_eq!(rows[0].target_epoch, 2);
         }
     })));
 
-    let before = RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_count();
-    let json = interchange_json(gvr);
     let first = {
         let adapter = Arc::clone(&adapter);
-        let json = json.clone();
+        let json = history_interchange(gvr, &pubkey);
         tokio::spawn(async move { adapter.import_interchange(&json).await })
     };
-    let started = std::time::Instant::now();
-    while hold.entered.load(Ordering::SeqCst) < 1 {
-        assert!(started.elapsed() < Duration::from_secs(5), "first import did not reach the guard");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("first import entered the hook")
+        .expect("entered oneshot");
     first.abort();
     let _ = first.await;
 
+    assert!(
+        gate.admission_in_progress(),
+        "dropping the client must not release the admission guard"
+    );
+
+    let _release = ReleaseOnDrop(Some(release_tx));
     let second = {
         let adapter = Arc::clone(&adapter);
+        let json = interchange_json(gvr);
         tokio::spawn(async move { adapter.import_interchange(&json).await })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        hold.entered.load(Ordering::SeqCst),
-        1,
-        "aborting the caller must not let the next import take the guard"
-    );
-
-    hold.release.store(true, Ordering::SeqCst);
-    hold.cv.notify_all();
-    second.await.expect("second import task").expect("second import");
-    assert_eq!(hold.entered.load(Ordering::SeqCst), 2);
-
-    let second_samples = hold.second_hold_samples.lock().expect("samples").expect("second hook");
-    assert!(
-        second_samples > before,
-        "the first transaction recorded conn_hold before the guard was released; before={before} at second entry={second_samples}"
-    );
+    // The second admission is waiting on the guard. Releasing the hook lets
+    // the first transaction commit and only then drop the guard.
+    drop(_release);
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second import finished")
+        .expect("second import task")
+        .expect("second import");
+    assert!(!gate.admission_in_progress(), "the guard is free after the transaction ends");
+    let rows = db.get_attestations(&pubkey).expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_epoch, 1);
 }

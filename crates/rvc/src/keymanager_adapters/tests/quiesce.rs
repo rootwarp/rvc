@@ -19,9 +19,9 @@ use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use keymanager_api::error::ApiError;
 use keymanager_api::handlers::{delete_keystores, import_keystores, AppState};
 use keymanager_api::traits::{
-    DeleteRemoteKeyError, DoppelgangerMonitor, ImportRemoteKeyError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
-    ValidatorManager,
+    DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange, ImportRemoteKeyError,
+    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, SlashingProtectionError,
+    ValidatorConfigManager, ValidatorManager,
 };
 use keymanager_api::types::{
     DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteStatus, ImportKeystoresRequest,
@@ -203,7 +203,10 @@ impl SlashingProtection for SecondExportStall {
         self.inner.import_interchange(json).await
     }
 
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 1 {
             if let Some(tx) = self.entered_tx.lock().expect("entered").take() {
@@ -211,9 +214,9 @@ impl SlashingProtection for SecondExportStall {
             }
             let _ = self.release_rx.lock().expect("release").recv_timeout(Duration::from_secs(15));
         }
-        let exported = self.inner.export_interchange(pubkeys)?;
+        let exported = self.inner.export_interchange(pubkeys).await?;
         if n == 1 {
-            *self.captured.lock().expect("captured") = Some(exported.clone());
+            *self.captured.lock().expect("captured") = Some(exported.json.clone());
         }
         Ok(exported)
     }

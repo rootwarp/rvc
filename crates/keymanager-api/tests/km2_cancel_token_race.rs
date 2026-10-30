@@ -23,9 +23,9 @@ use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{delete_keystores, import_keystores, AppState};
 use rvc_keymanager_api::lifecycle::{ConfigTouch, DoppelgangerLifecycle, ImportKind};
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
-    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
+    SlashingProtection, SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -190,8 +190,11 @@ impl SlashingProtection for NoopSlashingProtection {
     async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        Ok(String::new())
+    async fn export_interchange(
+        &self,
+        _: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        Ok(ExportedInterchange { json: String::new(), with_history: Vec::new() })
     }
 }
 

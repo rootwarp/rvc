@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use keymanager_api::traits::{Pubkey, SlashingProtection, SlashingProtectionError};
+use keymanager_api::traits::{
+    ExportedInterchange, Pubkey, SlashingProtection, SlashingProtectionError,
+};
 use slashing::SlashingDb;
 #[cfg(any(test, feature = "test-utils"))]
 use timing::SlotClock;
@@ -198,63 +200,51 @@ impl SlashingProtection for SlashingProtectionAdapter {
         joined
     }
 
-    /// Export an EIP-3076 interchange blob for the specified public keys.
+    /// Export an EIP-3076 interchange for the requested public keys.
     ///
     /// # Atomicity contract (ADR-008 / KM-1)
     ///
-    /// This function is all-or-nothing: either the interchange for every
-    /// requested key is returned, or `Err` is returned and no partial
-    /// interchange is emitted.  The underlying `SlashingDb::export` holds a
-    /// single `Mutex<Connection>` lock for the entire read — `read_all_pubkeys`,
-    /// `read_attestations`, and `read_blocks` all execute under that one held
-    /// guard — so no concurrent `seed_attestation`/`seed_block` write can
-    /// interleave and produce a stale snapshot.
+    /// All-or-nothing over the requested keys: either every requested key is
+    /// represented, or `Err` is returned and no partial interchange is emitted.
+    /// [`SlashingDb::export_pubkeys`](slashing::SlashingDb::export_pubkeys) holds
+    /// one `conn` lock for the whole read and runs the per-validator export
+    /// only for those keys. An unrepresentable floor on a key that was not
+    /// requested does not fail this call. A requested key that cannot be
+    /// represented does.
     ///
-    /// Export is synchronous and does not take the import gate.
+    /// The read runs on the calling task and does not take the import window
+    /// gate. W4-K1b moves it behind the gate and onto a blocking thread.
     ///
     /// # Completeness (KM-1(a))
     ///
-    /// Every requested pubkey is represented in the output. A key that
-    /// [`SlashingDb::export`](slashing::SlashingDb::export) already emitted —
-    /// including a watermark-only synthetic floor — is kept as exported.
-    /// A requested key with neither rows nor watermarks is absent from that
-    /// export and is filled in as an explicit empty record.
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        let interchange = self
+    /// Every requested pubkey is represented. A key with neither rows nor
+    /// watermarks is an explicit empty record. `with_history` lists the
+    /// requested keys that had any row or any watermark.
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        let requested: Vec<String> = pubkeys.iter().map(pubkey_hex).collect();
+        let (interchange, with_history_hex) = self
             .slashing_db
-            .export(&self.genesis_validators_root)
+            .export_pubkeys(&self.genesis_validators_root, &requested)
             .map_err(map_slashing_db_error)?;
-
-        // Build a canonical hex-string set for fast membership lookup.
-        let requested: std::collections::HashSet<String> = pubkeys.iter().map(pubkey_hex).collect();
-
-        // Collect DB records for requested keys.
-        let mut filtered_data: Vec<_> = interchange
-            .data
-            .into_iter()
-            .filter(|record| requested.contains(&record.pubkey))
-            .collect();
-
-        // KM-1(a): append an explicit empty record for every requested key
-        // absent from the DB export, so the interchange covers all deleted keys.
-        // Collect the keys to add first to avoid holding a shared borrow of
-        // filtered_data while also pushing into it.
-        let exported_pubkeys: std::collections::HashSet<String> =
-            filtered_data.iter().map(|r| r.pubkey.clone()).collect();
-        let missing: Vec<String> =
-            requested.into_iter().filter(|pk| !exported_pubkeys.contains(pk)).collect();
-        for pk_hex in missing {
-            filtered_data.push(slashing::ValidatorRecord {
-                pubkey: pk_hex,
-                signed_blocks: vec![],
-                signed_attestations: vec![],
-            });
+        let json = serde_json::to_string(&interchange)
+            .map_err(|e| SlashingProtectionError::Backend(format!("serialization failed: {e}")))?;
+        let mut with_history = Vec::with_capacity(with_history_hex.len());
+        for hex_key in with_history_hex {
+            with_history.push(pubkey_from_canonical_hex(&hex_key)?);
         }
-
-        let filtered =
-            slashing::InterchangeFormat { metadata: interchange.metadata, data: filtered_data };
-
-        serde_json::to_string(&filtered)
-            .map_err(|e| SlashingProtectionError::Backend(format!("serialization failed: {e}")))
+        Ok(ExportedInterchange { json, with_history })
     }
+}
+
+fn pubkey_from_canonical_hex(hex_key: &str) -> Result<Pubkey, SlashingProtectionError> {
+    eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_key)
+        .map(|parsed| *parsed.as_bytes())
+        .map_err(|_| {
+            SlashingProtectionError::Backend(
+                "slashing export returned a pubkey that is not 48 bytes".into(),
+            )
+        })
 }

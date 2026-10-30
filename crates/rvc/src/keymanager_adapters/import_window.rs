@@ -407,6 +407,15 @@ impl ImportWindowGate {
         self.cfg.post_admit
     }
 
+    /// `true` while an admission guard is held.
+    ///
+    /// A free mutex is taken and dropped before this returns, so the check
+    /// does not leave the gate locked.
+    #[cfg(test)]
+    pub(crate) fn admission_in_progress(&self) -> bool {
+        self.one_at_a_time.try_lock().is_err()
+    }
+
     /// Reserve the import mutex and wait until `rows` fits in one free window.
     ///
     /// The estimate is [`estimated_hold`]. The mutex is acquired before the

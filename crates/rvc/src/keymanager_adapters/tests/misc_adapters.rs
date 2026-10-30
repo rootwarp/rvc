@@ -29,9 +29,9 @@ fn test_slashing_adapter_import_valid() {
 fn test_slashing_adapter_export_empty() {
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let adapter = SlashingProtectionAdapter::new_in_free_window(db, [0u8; 32]);
-    let result = adapter.export_interchange(&[]);
+    let result = block_on(adapter.export_interchange(&[]));
     assert!(result.is_ok());
-    let export: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+    let export: serde_json::Value = serde_json::from_str(&result.unwrap().json).unwrap();
     assert!(export["data"].as_array().unwrap().is_empty());
 }
 

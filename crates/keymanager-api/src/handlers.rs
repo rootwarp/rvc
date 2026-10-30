@@ -301,23 +301,22 @@ async fn delete_keystores_inner(
 
     // Export slashing protection BEFORE any deletions.
     //
-    // KM-1 (ADR-008): the export must be atomic and fail-closed.
-    // If export_interchange returns Err, we abort the entire DELETE with
-    // HTTP 500 BEFORE touching the keystore.  Swallowing the error and
-    // returning an empty interchange (the previous behaviour) would allow
-    // re-import without any slashing history, creating a double-sign hazard.
-    //
-    // Atomicity contract: SlashingProtectionAdapter::export_interchange (in
-    // keymanager_adapters.rs) delegates to SlashingDb::export, which
-    // collects all rows inside a single read path and returns Err on any
-    // per-pubkey failure — no partial interchange is ever emitted.
+    // KM-1 (ADR-008): the export is per key and all-or-nothing over the
+    // requested keys (members only). If export_interchange returns Err, abort
+    // the entire DELETE with HTTP 500 BEFORE touching the keystore. An
+    // unrelated key that cannot be represented does not fail this export. A
+    // requested key that cannot be represented does. Swallowing the error and
+    // returning an empty interchange would allow re-import without slashing
+    // history.
     let slashing_protection = if existing_keys.is_empty() {
         empty_interchange()
     } else {
         state
             .slashing_protection
             .export_interchange(&existing_keys)
+            .await
             .map_err(map_slashing_export_error)?
+            .json
     };
 
     // Now process deletions
@@ -1091,8 +1090,8 @@ mod tests {
 
         use crate::lifecycle::arm_import_failure;
         use crate::traits::{
-            DeleteRemoteKeyError, DoppelgangerMonitor, ImportRemoteKeyError, RemoteKeyManager,
-            SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
+            DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange, ImportRemoteKeyError,
+            RemoteKeyManager, SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
         };
         use crate::types::RemoteKeyImport;
 
@@ -1125,8 +1124,11 @@ mod tests {
             async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
                 Ok(())
             }
-            fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-                Ok("{}".into())
+            async fn export_interchange(
+                &self,
+                _: &[Pubkey],
+            ) -> Result<ExportedInterchange, SlashingProtectionError> {
+                Ok(ExportedInterchange { json: "{}".into(), with_history: Vec::new() })
             }
         }
         struct OkRemote;

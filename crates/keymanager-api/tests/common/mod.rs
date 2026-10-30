@@ -21,9 +21,9 @@ use parking_lot::Mutex;
 use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::AppState;
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
-    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
+    SlashingProtection, ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 use rvc_keymanager_api::{KeymanagerDeps, KeymanagerServer, KeymanagerSettings};
 use tower::ServiceExt;
@@ -118,10 +118,10 @@ impl SlashingProtection for MockSlashingProtection {
         Ok(())
     }
 
-    fn export_interchange(
+    async fn export_interchange(
         &self,
         pubkeys: &[Pubkey],
-    ) -> Result<String, rvc_keymanager_api::traits::SlashingProtectionError> {
+    ) -> Result<ExportedInterchange, rvc_keymanager_api::traits::SlashingProtectionError> {
         let data: Vec<serde_json::Value> = pubkeys
             .iter()
             .map(|pk| {
@@ -132,14 +132,17 @@ impl SlashingProtection for MockSlashingProtection {
                 })
             })
             .collect();
-        Ok(serde_json::json!({
-            "metadata": {
-                "interchange_format_version": "5",
-                "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-            },
-            "data": data
+        Ok(ExportedInterchange {
+            json: serde_json::json!({
+                "metadata": {
+                    "interchange_format_version": "5",
+                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "data": data
+            })
+            .to_string(),
+            with_history: Vec::new(),
         })
-        .to_string())
     }
 }
 
@@ -395,10 +398,10 @@ impl SlashingProtection for FailingSlashingProtection {
         ))
     }
 
-    fn export_interchange(
+    async fn export_interchange(
         &self,
         _pubkeys: &[Pubkey],
-    ) -> Result<String, rvc_keymanager_api::traits::SlashingProtectionError> {
+    ) -> Result<ExportedInterchange, rvc_keymanager_api::traits::SlashingProtectionError> {
         Err(rvc_keymanager_api::traits::SlashingProtectionError::Backend("export failed".into()))
     }
 }
@@ -417,10 +420,10 @@ impl SlashingProtection for KeyAwareSlashingProtection {
         Ok(())
     }
 
-    fn export_interchange(
+    async fn export_interchange(
         &self,
         pubkeys: &[Pubkey],
-    ) -> Result<String, rvc_keymanager_api::traits::SlashingProtectionError> {
+    ) -> Result<ExportedInterchange, rvc_keymanager_api::traits::SlashingProtectionError> {
         let existing: Vec<&Pubkey> =
             pubkeys.iter().filter(|pk| self.keystore_manager.has_key(pk)).collect();
         let data: Vec<serde_json::Value> = existing
@@ -433,14 +436,17 @@ impl SlashingProtection for KeyAwareSlashingProtection {
                 })
             })
             .collect();
-        Ok(serde_json::json!({
-            "metadata": {
-                "interchange_format_version": "5",
-                "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-            },
-            "data": data
+        Ok(ExportedInterchange {
+            json: serde_json::json!({
+                "metadata": {
+                    "interchange_format_version": "5",
+                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "data": data
+            })
+            .to_string(),
+            with_history: Vec::new(),
         })
-        .to_string())
     }
 }
 

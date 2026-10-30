@@ -1036,6 +1036,289 @@ fn legacy_source_wrapped_row_clamps_the_export_floor_and_signing_stays_fail_open
     }
 }
 
+fn pubkey_of(byte: u8) -> String {
+    format!("0x{}", hex::encode([byte; 48]))
+}
+
+/// `i64::MIN` stored by the old `as i64` bind. Readers cast it back to `2^63`.
+const WRAPPED_EPOCH: u64 = 1 << 63;
+
+fn insert_legacy_attestation(conn: &rusqlite::Connection, pubkey: &str, source: i64, target: i64) {
+    conn.execute(
+        "INSERT INTO attestations \
+         (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+         VALUES ('local-vc', ?1, ?2, ?3, '0xleg', ?4)",
+        (pubkey, source, target, CHAIN_GVR_HEX),
+    )
+    .expect("legacy attestation");
+}
+
+fn insert_legacy_watermark(
+    conn: &rusqlite::Connection,
+    pubkey: &str,
+    kind: WatermarkKind,
+    value: i64,
+) {
+    conn.execute(
+        "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)",
+        (pubkey, kind.as_sql_str(), value),
+    )
+    .expect("legacy watermark");
+}
+
+#[test]
+fn export_pubkeys_returns_only_the_requested_key() {
+    let gvr = chain_gvr();
+    let db = SlashingDb::open_in_memory().expect("open");
+    let other = pubkey_of(0x22);
+    db.seed_attestation(PUBKEY, 1, 2, Some("0xa".into()), &gvr).expect("requested row");
+    db.seed_block(PUBKEY, 7, Some("0xb".into()), &gvr).expect("requested block");
+    db.seed_attestation(&other, 9, 9, Some("0xc".into()), &gvr).expect("other row");
+    db.set_attestation_watermark(&other, 4, 9).expect("other watermark");
+
+    let (file, history) =
+        db.export_pubkeys(&gvr, &[PUBKEY.to_string()]).expect("export the requested key");
+    assert_eq!(file.data.len(), 1);
+    assert_eq!(file.data[0].pubkey, PUBKEY);
+    assert_eq!(history, vec![PUBKEY.to_string()]);
+    assert!(file.data[0].signed_attestations.iter().any(|att| att.source_epoch == "1"));
+    assert!(file.data[0].signed_blocks.iter().any(|block| block.slot == "7"));
+    assert!(file.data.iter().all(|record| record.pubkey != other));
+
+    let (duplicated, duplicated_history) = db
+        .export_pubkeys(&gvr, &[PUBKEY.to_string(), PUBKEY.to_string()])
+        .expect("duplicate request");
+    assert_eq!(duplicated.data.len(), 1);
+    assert_eq!(duplicated.data[0].pubkey, PUBKEY);
+    assert_eq!(duplicated_history, vec![PUBKEY.to_string()]);
+
+    let upper = PUBKEY.to_uppercase();
+    let bare = PUBKEY.trim_start_matches("0x").to_string();
+    let (cased, cased_history) =
+        db.export_pubkeys(&gvr, &[upper, bare]).expect("case and bare hex are the same key");
+    assert_eq!(cased.data.len(), 1);
+    assert_eq!(cased.data[0].pubkey, PUBKEY);
+    assert_eq!(cased_history, vec![PUBKEY.to_string()]);
+    assert!(cased.data[0].signed_attestations.iter().any(|att| att.target_epoch == "2"));
+}
+
+#[test]
+fn export_pubkeys_skips_an_unrequested_unrepresentable_key() {
+    let gvr = chain_gvr();
+    let healthy = pubkey_of(0x11);
+    let (_dir, db) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 20)
+            .expect("one-sided source watermark");
+    });
+    db.seed_attestation(PUBKEY, 5, 10, Some("0xbad".into()), &gvr).expect("bad row");
+    db.seed_attestation(&healthy, 1, 2, Some("0xok".into()), &gvr).expect("healthy row");
+    db.set_attestation_watermark(&healthy, 1, 3).expect("healthy watermark");
+
+    let (file, history) = db
+        .export_pubkeys(&gvr, std::slice::from_ref(&healthy))
+        .expect("the unrequested key must not fail this");
+    assert_eq!(file.data.len(), 1);
+    assert_eq!(file.data[0].pubkey, healthy);
+    assert_eq!(history, vec![healthy.clone()]);
+    assert!(file.data.iter().all(|record| record.pubkey != PUBKEY));
+
+    match db.export_pubkeys(&gvr, &[PUBKEY.to_string()]).expect_err("requested one-sided key") {
+        SlashingError::UnrepresentableFloor { pubkey, source_bound, target_bound } => {
+            assert_eq!(pubkey, PUBKEY);
+            assert_eq!(source_bound, 20);
+            assert_eq!(target_bound, 0);
+        }
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+    match db
+        .export_pubkeys(&gvr, &[healthy.clone(), PUBKEY.to_string()])
+        .expect_err("a requested unrepresentable key fails the whole call")
+    {
+        SlashingError::UnrepresentableFloor { pubkey, .. } => assert_eq!(pubkey, PUBKEY),
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+    assert_eq!(db.get_attestations(PUBKEY).expect("bad rows").len(), 1);
+    assert_eq!(db.get_attestations(&healthy).expect("healthy rows").len(), 1);
+    assert_eq!(db.get_attestation_watermark(&healthy).expect("wm"), Some((1, 3)));
+}
+
+#[test]
+fn export_pubkeys_gives_an_empty_record_for_an_unknown_key_and_counts_a_watermark_only_key_as_history(
+) {
+    let gvr = chain_gvr();
+    let db = SlashingDb::open_in_memory().expect("open");
+    let pruned = pubkey_of(0x31);
+    let unknown = pubkey_of(0x32);
+    db.seed_attestation(&pruned, 5, 10, Some("0xrow".into()), &gvr).expect("row");
+    db.set_attestation_watermark(&pruned, 1, 11).expect("watermark");
+    db.prune_below_watermarks().expect("prune");
+    assert!(db.get_attestations(&pruned).expect("pruned rows").is_empty());
+    assert_eq!(db.get_attestation_watermark(&pruned).expect("wm"), Some((5, 11)));
+
+    let (file, history) =
+        db.export_pubkeys(&gvr, &[unknown.clone(), pruned.clone()]).expect("unknown and pruned");
+    assert_eq!(file.data.len(), 2);
+    assert_eq!(file.data[0].pubkey, unknown);
+    assert!(file.data[0].signed_attestations.is_empty());
+    assert!(file.data[0].signed_blocks.is_empty());
+    assert_eq!(file.data[1].pubkey, pruned);
+    assert_eq!(attestation_triples(&file.data[1]), vec![(5, 11, None)]);
+    assert_eq!(history, vec![pruned.clone()]);
+
+    let upper_unknown = unknown.to_uppercase();
+    let (once, once_history) =
+        db.export_pubkeys(&gvr, &[unknown.clone(), upper_unknown]).expect("duplicate unknown");
+    assert_eq!(once.data.len(), 1);
+    assert_eq!(once.data[0].pubkey, unknown);
+    assert!(once_history.is_empty());
+
+    let block_only = pubkey_of(0x33);
+    db.set_block_watermark(&block_only, 8).expect("block-only watermark");
+    let (block_file, block_history) = db
+        .export_pubkeys(&gvr, std::slice::from_ref(&block_only))
+        .expect("block-only watermark is history");
+    assert_eq!(block_file.data.len(), 1);
+    assert!(block_file.data[0].signed_attestations.is_empty());
+    assert_eq!(block_file.data[0].signed_blocks.len(), 1);
+    assert_eq!(block_file.data[0].signed_blocks[0].slot, "8");
+    assert_eq!(block_history, vec![block_only]);
+
+    let (empty, empty_history) = db.export_pubkeys(&gvr, &[]).expect("empty request");
+    assert!(empty.data.is_empty());
+    assert!(empty_history.is_empty());
+    assert_eq!(db.get_attestation_watermark(&pruned).expect("wm unchanged"), Some((5, 11)));
+}
+
+#[test]
+fn export_pubkeys_reads_wrapped_legacy_rows_in_the_u64_domain() {
+    let gvr = chain_gvr();
+    let source_row = pubkey_of(0x41);
+    let target_row = pubkey_of(0x42);
+    let both_row = pubkey_of(0x43);
+    let source_wm = pubkey_of(0x51);
+    let target_wm = pubkey_of(0x52);
+    let both_wm = pubkey_of(0x53);
+    let source_only = pubkey_of(0x61);
+    let target_only = pubkey_of(0x62);
+    let healthy = pubkey_of(0x71);
+
+    let (dir, db) = open_after_second_connection(|conn| {
+        insert_legacy_attestation(conn, &source_row, i64::MIN, 101);
+        insert_legacy_attestation(conn, &target_row, 10, i64::MIN);
+        insert_legacy_attestation(conn, &both_row, i64::MIN, i64::MIN);
+        insert_legacy_watermark(conn, &source_wm, WatermarkKind::AttestationSource, i64::MIN);
+        insert_legacy_watermark(conn, &source_wm, WatermarkKind::AttestationTarget, 5);
+        insert_legacy_watermark(conn, &target_wm, WatermarkKind::AttestationSource, 5);
+        insert_legacy_watermark(conn, &target_wm, WatermarkKind::AttestationTarget, i64::MIN);
+        insert_legacy_watermark(conn, &both_wm, WatermarkKind::AttestationSource, i64::MIN);
+        insert_legacy_watermark(conn, &both_wm, WatermarkKind::AttestationTarget, i64::MIN);
+        insert_legacy_watermark(conn, &source_only, WatermarkKind::AttestationSource, i64::MIN);
+        insert_legacy_watermark(conn, &target_only, WatermarkKind::AttestationTarget, i64::MIN);
+    });
+
+    db.set_attestation_watermark(&source_row, 1, 101).expect("source-row watermarks");
+    db.set_attestation_watermark(&target_row, 1, 20).expect("target-row watermarks");
+    db.set_attestation_watermark(&both_row, 1, 20).expect("both-row watermarks");
+    db.seed_attestation(&healthy, 1, 2, Some("0xok".into()), &gvr).expect("healthy");
+    db.set_attestation_watermark(&healthy, 1, 3).expect("healthy watermark");
+
+    let (healthy_file, healthy_history) = db
+        .export_pubkeys(&gvr, std::slice::from_ref(&healthy))
+        .expect("one-sided neighbours do not block");
+    assert_eq!(healthy_file.data.len(), 1);
+    assert_eq!(healthy_file.data[0].pubkey, healthy);
+    assert_eq!(healthy_history, vec![healthy]);
+
+    let (source_file, _) =
+        db.export_pubkeys(&gvr, std::slice::from_ref(&source_row)).expect("source-wrapped row");
+    assert_eq!(
+        attestation_triples(only_validator(&source_file, &source_row)),
+        vec![(WRAPPED_EPOCH, WRAPPED_EPOCH, None)]
+    );
+
+    let (target_file, _) =
+        db.export_pubkeys(&gvr, std::slice::from_ref(&target_row)).expect("target-wrapped row");
+    assert_eq!(
+        attestation_triples(only_validator(&target_file, &target_row)),
+        vec![(1, 20, None), (10, WRAPPED_EPOCH, Some("0xleg".into()))]
+    );
+
+    let (both_file, _) =
+        db.export_pubkeys(&gvr, std::slice::from_ref(&both_row)).expect("both columns wrapped");
+    assert_eq!(
+        attestation_triples(only_validator(&both_file, &both_row)),
+        vec![(1, 20, None), (WRAPPED_EPOCH, WRAPPED_EPOCH, Some("0xleg".into()))]
+    );
+
+    let (source_wm_file, _) = db
+        .export_pubkeys(&gvr, std::slice::from_ref(&source_wm))
+        .expect("wrapped source watermark");
+    assert_eq!(
+        attestation_triples(only_validator(&source_wm_file, &source_wm)),
+        vec![(WRAPPED_EPOCH, WRAPPED_EPOCH, None)]
+    );
+    let (target_wm_file, _) = db
+        .export_pubkeys(&gvr, std::slice::from_ref(&target_wm))
+        .expect("wrapped target watermark");
+    assert_eq!(
+        attestation_triples(only_validator(&target_wm_file, &target_wm)),
+        vec![(5, WRAPPED_EPOCH, None)]
+    );
+    let (both_wm_file, both_wm_history) =
+        db.export_pubkeys(&gvr, std::slice::from_ref(&both_wm)).expect("both watermarks wrapped");
+    assert_eq!(
+        attestation_triples(only_validator(&both_wm_file, &both_wm)),
+        vec![(WRAPPED_EPOCH, WRAPPED_EPOCH, None)]
+    );
+    assert_eq!(both_wm_history, vec![both_wm.clone()]);
+
+    match db
+        .export_pubkeys(&gvr, std::slice::from_ref(&source_only))
+        .expect_err("source-only wrapped watermark")
+    {
+        SlashingError::UnrepresentableFloor { source_bound, target_bound, .. } => {
+            assert_eq!(source_bound, WRAPPED_EPOCH);
+            assert_eq!(target_bound, 0);
+        }
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+    match db
+        .export_pubkeys(&gvr, std::slice::from_ref(&target_only))
+        .expect_err("target-only wrapped watermark")
+    {
+        SlashingError::UnrepresentableFloor { source_bound, target_bound, .. } => {
+            assert_eq!(source_bound, 0);
+            assert_eq!(target_bound, WRAPPED_EPOCH);
+        }
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+
+    let path = dir.path().join("slashing.db");
+    let conn = rusqlite::Connection::open(&path).expect("read back");
+    let stored_source: i64 = conn
+        .query_row(
+            "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+            [&source_only],
+            |row| row.get(0),
+        )
+        .expect("source-only watermark");
+    assert_eq!(stored_source, i64::MIN, "export must not rewrite a wrapped watermark");
+    let stored_target: i64 = conn
+        .query_row(
+            "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+            [&target_only],
+            |row| row.get(0),
+        )
+        .expect("target-only watermark");
+    assert_eq!(stored_target, i64::MIN, "export must not rewrite a wrapped watermark");
+    let stored_row_source: i64 = conn
+        .query_row("SELECT source_epoch FROM attestations WHERE pubkey = ?1", [&both_row], |row| {
+            row.get(0)
+        })
+        .expect("wrapped row");
+    assert_eq!(stored_row_source, i64::MIN, "export must not rewrite a wrapped row");
+}
+
 #[test]
 fn exports_get_smaller() {
     let _guard = export_metric_lock();

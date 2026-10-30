@@ -221,8 +221,8 @@ mod tests {
     use super::*;
     use crate::error::ApiError;
     use crate::traits::{
-        DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
-        Pubkey,
+        DeleteKeystoreError, DeleteRemoteKeyError, ExportedInterchange, ImportKeystoreError,
+        ImportRemoteKeyError, Pubkey,
     };
     use async_trait::async_trait;
     use axum::http::StatusCode;
@@ -309,11 +309,11 @@ mod tests {
         ) -> Result<(), crate::traits::SlashingProtectionError> {
             Ok(())
         }
-        fn export_interchange(
+        async fn export_interchange(
             &self,
             _pubkeys: &[Pubkey],
-        ) -> Result<String, crate::traits::SlashingProtectionError> {
-            Ok(String::new())
+        ) -> Result<ExportedInterchange, crate::traits::SlashingProtectionError> {
+            Ok(ExportedInterchange { json: String::new(), with_history: Vec::new() })
         }
     }
 
