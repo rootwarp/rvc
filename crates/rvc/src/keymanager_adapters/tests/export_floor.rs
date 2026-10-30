@@ -18,7 +18,7 @@ use keymanager_api::traits::{
 };
 use keymanager_api::types::DeleteKeystoresRequest;
 use keymanager_api::DoppelgangerLifecycle;
-use slashing::SlashingDb;
+use slashing::{raise_watermark, SlashingDb, WatermarkKind};
 use validator_store::ValidatorStore;
 
 use super::{pubkey_hex, test_pubkey, SlashingProtectionAdapter, ValidatorManagerAdapter};
@@ -207,9 +207,16 @@ async fn export_fails_closed_delete_aborts_and_key_stays_disabled() {
     let bad_hex = pubkey_hex(bad);
     let good_hex = pubkey_hex(good);
     let gvr = chain_gvr();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("km1.db");
+    drop(SlashingDb::open(&path).expect("schema"));
+    {
+        let conn = rusqlite::Connection::open(&path).expect("second connection");
+        raise_watermark(&conn, &bad_hex, WatermarkKind::AttestationSource, 20)
+            .expect("one-sided source watermark");
+    }
+    let db = Arc::new(SlashingDb::open(&path).expect("reopen"));
     db.seed_attestation(&bad_hex, 5, 10, Some("0xrow".into()), &gvr).expect("seed");
-    db.set_attestation_watermark(&bad_hex, 20, 11).expect("unrepresentable");
     db.seed_attestation(&good_hex, 1, 2, Some("0xok".into()), &gvr).expect("other");
     db.set_attestation_watermark(&good_hex, 1, 3).expect("other watermark");
 
@@ -242,4 +249,11 @@ async fn export_fails_closed_delete_aborts_and_key_stays_disabled() {
     assert!(keys.has_key(&bad), "key stays in the keystore");
     let config = store.get_config(&bad).expect("validator stays in the store");
     assert!(!config.enabled, "key stays disabled");
+    assert_eq!(db.get_attestations(&bad_hex).expect("bad rows").len(), 1, "DB rows remain");
+    assert_eq!(db.get_attestations(&good_hex).expect("good rows").len(), 1, "DB rows remain");
+    assert!(
+        db.get_attestation_watermark(&bad_hex).expect("bad wm").is_none(),
+        "the one-sided watermark is unchanged"
+    );
+    assert_eq!(db.get_attestation_watermark(&good_hex).expect("good wm"), Some((1, 3)));
 }

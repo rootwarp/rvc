@@ -119,13 +119,21 @@ pub fn raise_watermark(
 ///
 /// Interchange import prepares this once per transaction. [`raise_watermark_max`]
 /// uses the same text so the two paths cannot drift.
+///
+/// A legacy wrapped watermark is stored as a negative `i64` and reads back as
+/// `>= 2^63`. Signed `MAX` would replace that with a smaller positive candidate
+/// and lower the floor the signer uses, so a negative stored value is kept.
 pub(crate) const RAISE_WATERMARK_MAX_SQL: &str =
     "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)
      ON CONFLICT(pubkey, watermark_type) DO UPDATE
-     SET value = MAX(watermarks.value, excluded.value)";
+     SET value = CASE
+         WHEN watermarks.value < 0 THEN watermarks.value
+         ELSE MAX(watermarks.value, excluded.value)
+     END";
 
 /// Raise a watermark with `MAX(existing, new)` semantics (silent no-op when lower).
 ///
+/// A negative stored value is left unchanged (see [`RAISE_WATERMARK_MAX_SQL`]).
 /// Prune uses this so a lower candidate never fails and never lowers the floor.
 /// Interchange import prepares [`RAISE_WATERMARK_MAX_SQL`] once per transaction
 /// instead of calling this per row. Prefer [`raise_watermark`] for explicit set
@@ -179,6 +187,9 @@ impl SlashingDb {
     /// Set an attestation watermark for a validator.
     ///
     /// Both source and target epoch watermarks can only be raised, never lowered.
+    /// A lowered target still returns [`SlashingError::WatermarkLowered`] and
+    /// rolls the transaction back. When both raises succeed, the target is
+    /// raised to at least the source (`T* = max(T*, S*)`) in the same transaction.
     pub fn set_attestation_watermark(
         &self,
         pubkey: &str,
@@ -190,6 +201,8 @@ impl SlashingDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         raise_watermark(&tx, pubkey.as_ref(), WatermarkKind::AttestationSource, source_epoch)?;
         raise_watermark(&tx, pubkey.as_ref(), WatermarkKind::AttestationTarget, target_epoch)?;
+        // After the raise-only writes, so a lowered target still errors.
+        raise_watermark_max(&tx, pubkey.as_ref(), WatermarkKind::AttestationTarget, source_epoch)?;
         tx.commit()?;
         Ok(())
     }
@@ -220,8 +233,11 @@ impl SlashingDb {
     /// Prune is a second production writer of watermarks; interchange import is the
     /// other. Before deleting attestation rows it raises each pubkey's
     /// attestation-source watermark to the maximum source among the rows that
-    /// delete will remove. The write goes through `raise_watermark_max`, so prune
-    /// only ever raises a watermark and never lowers one.
+    /// delete will remove. After those deletes, and before commit, it raises each
+    /// pubkey's attestation-target watermark to `max(T*, S*)`. Both writes go
+    /// through `raise_watermark_max`, so prune only ever raises a non-negative
+    /// watermark and never lowers one. A legacy negative watermark is kept.
+    /// The deletes still see the pre-raise target.
     ///
     /// The redundancy lemma (a non-slashable history always still contains the
     /// floor row `(S_wm, T_wm)`, so a target-only delete cannot enable a surround)
@@ -289,7 +305,8 @@ impl SlashingDb {
             [WatermarkKind::Block.as_sql_str()],
         )?;
 
-        // Delete attestations below each validator's target epoch watermark
+        // Delete attestations below each validator's target epoch watermark.
+        // This still sees the pre-raise target. The T* raise is the next step.
         let attestations_deleted = tx.execute(
             "DELETE FROM attestations WHERE EXISTS (
                 SELECT 1 FROM watermarks w
@@ -299,6 +316,26 @@ impl SlashingDb {
             )",
             [WatermarkKind::AttestationTarget.as_sql_str()],
         )?;
+
+        // One pass over att_source. `raise_watermark_max` inserts T* when it
+        // is absent, keeps a negative stored target, and a legacy negative
+        // source fails `to_sql_i64` here so the deletes above roll back.
+        let source_watermarks: Vec<(String, i64)> = {
+            let mut stmt =
+                tx.prepare("SELECT pubkey, value FROM watermarks WHERE watermark_type = ?1")?;
+            let rows = stmt.query_map([WatermarkKind::AttestationSource.as_sql_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (pubkey, source_wm) in source_watermarks {
+            raise_watermark_max(
+                &tx,
+                pubkey.as_str(),
+                WatermarkKind::AttestationTarget,
+                source_wm as u64,
+            )?;
+        }
 
         tx.commit()?;
 
@@ -486,6 +523,211 @@ mod tests {
             "raw watermark type SQL literals must not remain in code; found:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// `set_attestation_watermark(20, 11)` stores `(20, 20)`, not `(20, 11)`.
+    #[test]
+    fn set_attestation_watermark_keeps_the_target_at_or_above_the_source() {
+        let db = open();
+        db.set_attestation_watermark("0x1234", 20, 11).expect("set");
+        let (source, target) = db.get_attestation_watermark("0x1234").unwrap().unwrap();
+        assert_eq!(source, 20);
+        assert_eq!(target, 20);
+    }
+
+    /// A lowered target still errors, and neither watermark moves.
+    ///
+    /// The source raise is in the same transaction as the failing target raise.
+    /// A setter that committed the source before returning `WatermarkLowered`
+    /// would leave source at 300.
+    #[test]
+    fn set_attestation_watermark_lowered_target_leaves_both_unchanged() {
+        let db = open();
+        db.set_attestation_watermark("0x1234", 200, 201).expect("set");
+        let err = db.set_attestation_watermark("0x1234", 300, 100).expect_err("lowered target");
+        assert!(
+            matches!(err, SlashingError::WatermarkLowered { .. }),
+            "expected WatermarkLowered, got {err:?}"
+        );
+        let (source, target) = db.get_attestation_watermark("0x1234").unwrap().unwrap();
+        assert_eq!(source, 200);
+        assert_eq!(target, 201);
+    }
+
+    /// Row `(20, 9)` with watermarks `(5, 12)` becomes `(20, 20)`.
+    ///
+    /// The row at target 15 sits between the pre-raise target (12) and the
+    /// post-raise target (20). It survives, and the deleted count matches
+    /// [`SlashingDb::count_below_watermarks`] taken before the raise. Raising
+    /// `T*` before the DELETE would remove that row.
+    #[test]
+    fn prune_keeps_the_source_watermark_at_or_below_the_target() {
+        let db = open();
+        let pk = "0x1234";
+        let gvr = [0u8; 32];
+        db.seed_attestation(pk, 20, 9, None, &gvr).expect("seed deleted row");
+        db.seed_attestation(pk, 18, 15, None, &gvr).expect("seed surviving row");
+        db.set_attestation_watermark(pk, 5, 12).expect("watermark");
+
+        let counted = db.count_below_watermarks().expect("pre-raise count");
+        assert_eq!(counted.attestations_deleted, 1);
+        assert_eq!(counted.blocks_deleted, 0);
+
+        let stats = db.prune_below_watermarks().expect("prune");
+        assert_eq!(stats.attestations_deleted, counted.attestations_deleted);
+        assert_eq!(stats.blocks_deleted, counted.blocks_deleted);
+
+        let (source, target) = db.get_attestation_watermark(pk).unwrap().unwrap();
+        assert_eq!(source, 20);
+        assert_eq!(target, 20);
+
+        let rows = db.get_attestations(pk).unwrap();
+        assert_eq!(rows.len(), 1, "the row above the pre-raise target stays");
+        assert_eq!(rows[0].source_epoch, 18);
+        assert_eq!(rows[0].target_epoch, 15);
+    }
+
+    /// A source watermark with no target is closed by the post-delete pass.
+    ///
+    /// The attestation DELETE still sees no target row, so the history row stays.
+    #[test]
+    fn prune_raises_a_missing_target_watermark_to_the_source() {
+        let db = open();
+        let pk = "0x1234";
+        let gvr = [0u8; 32];
+        db.seed_attestation(pk, 4, 9, None, &gvr).expect("seed");
+        {
+            let conn = db.conn.lock();
+            let stored = normalize_pubkey(pk).expect("pubkey");
+            raise_watermark(&conn, stored.as_ref(), WatermarkKind::AttestationSource, 20)
+                .expect("source only");
+        }
+        assert!(db.get_attestation_watermark(pk).unwrap().is_none());
+
+        let stats = db.prune_below_watermarks().expect("prune");
+        assert_eq!(stats.attestations_deleted, 0, "no target watermark at DELETE time");
+        assert_eq!(db.get_attestations(pk).unwrap().len(), 1);
+
+        let (source, target) = db.get_attestation_watermark(pk).unwrap().unwrap();
+        assert_eq!(source, 20);
+        assert_eq!(target, 20);
+    }
+
+    /// A legacy negative source watermark fails the target raise inside the
+    /// prune transaction, so the block DELETE rolls back.
+    #[test]
+    fn prune_rolls_back_deletes_when_the_target_raise_is_out_of_range() {
+        let db = open();
+        let pk = "0xabc";
+        let gvr = [0u8; 32];
+        db.seed_block(pk, 10, None, &gvr).expect("seed block");
+        {
+            let conn = db.conn.lock();
+            let stored = normalize_pubkey(pk).expect("pubkey");
+            let key = stored.as_ref();
+            raise_watermark(&conn, key, WatermarkKind::Block, 100).expect("block watermark");
+            conn.execute(
+                "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)",
+                (key, WatermarkKind::AttestationSource.as_sql_str(), i64::MIN),
+            )
+            .expect("legacy source watermark");
+            raise_watermark(&conn, key, WatermarkKind::AttestationTarget, 12).expect("target");
+        }
+
+        let err = db.prune_below_watermarks().expect_err("wrapped source cannot raise T*");
+        match err {
+            SlashingError::OutOfRange { field, value } => {
+                assert_eq!(field, "target_epoch");
+                assert_eq!(value, 1_u64 << 63);
+            }
+            other => panic!("expected OutOfRange from the target raise, got {other:?}"),
+        }
+        assert_eq!(db.get_blocks(pk).unwrap().len(), 1, "block delete rolled back");
+        assert_eq!(db.get_block_watermark(pk).unwrap(), Some(100));
+        let (source, target) = db.get_attestation_watermark(pk).unwrap().unwrap();
+        assert_eq!(source, 1_u64 << 63);
+        assert_eq!(target, 12);
+    }
+
+    /// A wrapped target (stored `i64::MIN`, read as `2^63`) stays put across
+    /// two prunes, the legacy row stays, and `(11, 20)` is still below that
+    /// target. Signed `MAX` would write `T* = 10`, the second prune would
+    /// delete the row, and the reserve would be accepted.
+    #[test]
+    fn prune_keeps_a_wrapped_target_and_still_refuses_a_surround() {
+        let wrapped = 1_u64 << 63;
+        let gvr = [0u8; 32];
+        let gvr_hex = SlashingDb::root_to_hex(&gvr);
+        let pk = "0x1234";
+
+        let db = open();
+        {
+            let conn = db.conn.lock();
+            let stored = normalize_pubkey(pk).expect("pubkey");
+            let key = stored.as_ref();
+            raise_watermark(&conn, key, WatermarkKind::AttestationSource, 10).expect("source");
+            conn.execute(
+                "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)",
+                (key, WatermarkKind::AttestationTarget.as_sql_str(), i64::MIN),
+            )
+            .expect("wrapped target");
+            conn.execute(
+                "INSERT INTO attestations \
+                 (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+                 VALUES ('local-vc', ?1, 10, ?2, '0xleg', ?3)",
+                (key, i64::MIN, gvr_hex.as_str()),
+            )
+            .expect("wrapped target row");
+        }
+
+        for pass in 1..=2 {
+            db.prune_below_watermarks().unwrap_or_else(|err| panic!("prune {pass}: {err}"));
+            let (source, target) = db.get_attestation_watermark(pk).unwrap().unwrap();
+            assert_eq!(source, 10, "prune {pass} changed the source");
+            assert_eq!(target, wrapped, "prune {pass} lowered the wrapped target");
+        }
+        let rows = db.get_attestations(pk).unwrap();
+        assert_eq!(rows.len(), 1, "the legacy row survives both prunes");
+        assert_eq!(rows[0].source_epoch, 10);
+        assert_eq!(rows[0].target_epoch, wrapped);
+
+        match db
+            .reserve_attestation(pk, 11, 20, Some("0xnext".into()), &gvr)
+            .expect_err("wrapped target must refuse (11, 20)")
+        {
+            SlashingError::BelowAttestationWatermark { target_epoch, watermark_target, .. } => {
+                assert_eq!(target_epoch, 20);
+                assert_eq!(watermark_target, wrapped);
+            }
+            other => panic!("expected BelowAttestationWatermark, got {other:?}"),
+        }
+
+        let bare = open();
+        {
+            let conn = bare.conn.lock();
+            let stored = normalize_pubkey(pk).expect("pubkey");
+            let key = stored.as_ref();
+            raise_watermark(&conn, key, WatermarkKind::AttestationSource, 10).expect("source");
+            conn.execute(
+                "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)",
+                (key, WatermarkKind::AttestationTarget.as_sql_str(), i64::MIN),
+            )
+            .expect("wrapped target");
+        }
+        bare.prune_below_watermarks().expect("prune with no row");
+        let (source, target) = bare.get_attestation_watermark(pk).unwrap().unwrap();
+        assert_eq!(source, 10);
+        assert_eq!(target, wrapped, "a wrapped target with no row is not lowered");
+        match bare
+            .reserve_attestation(pk, 11, 20, Some("0xnext".into()), &gvr)
+            .expect_err("wrapped target with no row must refuse (11, 20)")
+        {
+            SlashingError::BelowAttestationWatermark { target_epoch, watermark_target, .. } => {
+                assert_eq!(target_epoch, 20);
+                assert_eq!(watermark_target, wrapped);
+            }
+            other => panic!("expected BelowAttestationWatermark, got {other:?}"),
+        }
     }
 
     fn walkdir_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -850,7 +1092,11 @@ mod db_api_tests {
             for (pk_i, wm) in wms.iter().enumerate() {
                 if let Some((source_wm, target_wm)) = wm {
                     db.set_attestation_watermark(PROP_PKS[pk_i], *source_wm, *target_wm).unwrap();
-                    target_floors[pk_i] = Some(*target_wm);
+                    let (_, stored_target) = db
+                        .get_attestation_watermark(PROP_PKS[pk_i])
+                        .unwrap()
+                        .expect("both watermarks stored");
+                    target_floors[pk_i] = Some(stored_target);
                 }
             }
 

@@ -40,9 +40,9 @@ pub enum SlashingError {
 
     /// Attestation floor cannot be encoded as one interchange record.
     ///
-    /// The derived bounds have `source_bound > target_bound`, or only one of
-    /// the source and target watermarks is set (the missing side is `0`).
-    /// The whole export fails; no partial interchange is returned.
+    /// Only one of the two attestation watermarks is set (the missing side is
+    /// `0`). The whole export fails; no partial interchange is returned. A
+    /// two-sided floor with `S* > T*` is clamped on export instead.
     #[error(
         "attestation floor for {pubkey} cannot be represented \
          (source_bound={source_bound}, target_bound={target_bound})"
