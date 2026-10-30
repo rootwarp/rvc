@@ -117,6 +117,17 @@ pub enum SlashingProtectionError {
     ImportQueueFull { retry_after_secs: u64 },
 }
 
+/// Interchange blob returned by [`SlashingProtection::export_interchange`].
+///
+/// `json` is the EIP-3076 document for the requested keys. `with_history` is
+/// the subset that had any slashing row or watermark, in request order after
+/// canonical dedup. W4-K2 uses it for `not_active`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedInterchange {
+    pub json: String,
+    pub with_history: Vec<Pubkey>,
+}
+
 /// Manages EIP-3076 slashing protection interchange data.
 #[async_trait]
 pub trait SlashingProtection: Send + Sync {
@@ -124,7 +135,15 @@ pub trait SlashingProtection: Send + Sync {
         &self,
         interchange_json: &str,
     ) -> Result<(), SlashingProtectionError>;
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
+
+    /// Export slashing protection for `pubkeys`.
+    ///
+    /// All-or-nothing over the requested keys. An empty record stands for a
+    /// requested key with neither rows nor watermarks.
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError>;
 }
 
 /// Manages validator configurations (enable/disable).

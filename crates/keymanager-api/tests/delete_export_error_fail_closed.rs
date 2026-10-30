@@ -12,7 +12,7 @@
 //! # Schema-agnostic design
 //!
 //! All assertions are driven through the `SlashingProtection` trait interface
-//! (`pubkeys in → Result<String, SlashingProtectionError> out`).  The test does NOT inspect any
+//! (`pubkeys in → Result<ExportedInterchange, SlashingProtectionError> out`).  The test does NOT inspect any
 //! on-disk SQLite layout, column names, or file paths.  This means it passes
 //! against both the current slashing-DB schema and any future schema revision
 //! (e.g., the v2 schema added by Issue 2.4).
@@ -25,9 +25,9 @@ use axum::extract::{Json, State};
 use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{delete_keystores, AppState};
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DoppelgangerMonitor, ImportKeystoreError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
-    ValidatorManager,
+    DeleteKeystoreError, DoppelgangerMonitor, ExportedInterchange, ImportKeystoreError,
+    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, SlashingProtectionError,
+    ValidatorConfigManager, ValidatorManager,
 };
 use rvc_keymanager_api::types::{DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteStatus};
 
@@ -82,7 +82,10 @@ impl SlashingProtection for FailingExport {
         Ok(())
     }
 
-    fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+    async fn export_interchange(
+        &self,
+        _pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
         Err(SlashingProtectionError::Backend("boom: slashing DB unavailable".into()))
     }
 }
@@ -100,32 +103,41 @@ impl SlashingProtection for RecordingExport {
         Ok(())
     }
 
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        let data: Vec<serde_json::Value> = pubkeys
-            .iter()
-            .map(|pk| {
-                let has_history = pk[0] % 2 == 0;
-                let attestations = if has_history {
-                    serde_json::json!([{"source_epoch":"1","target_epoch":"2"}])
-                } else {
-                    serde_json::json!([])
-                };
-                serde_json::json!({
-                    "pubkey": format!("0x{}", hex::encode(pk)),
-                    "signed_blocks": [],
-                    "signed_attestations": attestations
-                })
-            })
-            .collect();
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        let mut with_history = Vec::new();
+        let mut data = Vec::with_capacity(pubkeys.len());
+        for pk in pubkeys {
+            // Even ids already carry an attestation record; odd ids are empty.
+            let has_history = pk[0] % 2 == 0;
+            if has_history {
+                with_history.push(*pk);
+            }
+            let attestations = if has_history {
+                serde_json::json!([{"source_epoch":"1","target_epoch":"2"}])
+            } else {
+                serde_json::json!([])
+            };
+            data.push(serde_json::json!({
+                "pubkey": format!("0x{}", hex::encode(pk)),
+                "signed_blocks": [],
+                "signed_attestations": attestations
+            }));
+        }
 
-        Ok(serde_json::json!({
-            "metadata": {
-                "interchange_format_version": "5",
-                "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-            },
-            "data": data
+        Ok(ExportedInterchange {
+            json: serde_json::json!({
+                "metadata": {
+                    "interchange_format_version": "5",
+                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "data": data
+            })
+            .to_string(),
+            with_history,
         })
-        .to_string())
     }
 }
 

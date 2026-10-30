@@ -18,9 +18,9 @@ use tower::ServiceExt;
 use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{set_attesting_enabled, AppState};
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
-    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
+    SlashingProtection, SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Minimal mock implementations ──────────────────────────────────────────
@@ -48,8 +48,11 @@ impl SlashingProtection for NoopSlashingProtection {
     async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        Ok(String::new())
+    async fn export_interchange(
+        &self,
+        _: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        Ok(ExportedInterchange { json: String::new(), with_history: Vec::new() })
     }
 }
 

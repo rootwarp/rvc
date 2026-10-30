@@ -2,6 +2,8 @@
 //!
 //! Pure code motion from the former monolithic `db` module (E2 part 2).
 
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, TransactionBehavior};
 
 use observability::logging::TruncatedPubkey;
@@ -174,6 +176,15 @@ fn export_validator(
     };
 
     Ok((ValidatorRecord { pubkey, signed_blocks, signed_attestations }, synthetics))
+}
+
+/// An empty record has no rows and no watermarks.
+///
+/// `export_validator` copies every row when the matching watermark is absent
+/// and emits a synthetic floor whenever a watermark is present. Both lists
+/// empty is therefore "nothing to protect", not a pruned key.
+fn record_has_history(record: &ValidatorRecord) -> bool {
+    !record.signed_attestations.is_empty() || !record.signed_blocks.is_empty()
 }
 
 /// One attestation row parsed before the connection is taken.
@@ -396,6 +407,72 @@ impl SlashingDb {
             synthetic_records += synthetics;
             data.push(record);
         }
+        let result = self.finish_export(genesis_validators_root, data, synthetic_records);
+        drop(conn);
+        Ok(result)
+    }
+
+    /// Export slashing protection for `pubkeys` only.
+    ///
+    /// The second value lists the requested keys that had any row or any
+    /// watermark, in first-seen order after [`normalize_pubkey`] dedup. A key
+    /// with neither is an explicit empty record and is absent from that list.
+    /// A watermark-only key is included: [`export_validator`] emits a synthetic
+    /// floor for every watermark, so an empty record is exactly "no rows and
+    /// no watermarks".
+    ///
+    /// Read-only. One `conn` lock covers every requested key, and
+    /// [`export_validator`] runs only for those keys. An unrepresentable floor
+    /// on a key that was not requested does not fail this call. A requested
+    /// key that cannot be represented fails the whole call; no partial
+    /// interchange is returned and the synthetic-record counter is unchanged.
+    ///
+    /// Watermarks and row epochs are compared in the `u64` domain. A legacy
+    /// value stored as `i64::MIN` reads back as `2^63`. This function does not
+    /// use a signed SQL `MAX` or `MIN` on those columns.
+    ///
+    /// [`SlashingDb::export`] remains the whole-database export.
+    #[tracing::instrument(name = "slashing.db.export_pubkeys", skip_all)]
+    pub fn export_pubkeys(
+        &self,
+        genesis_validators_root: &Root,
+        pubkeys: &[String],
+    ) -> Result<(InterchangeFormat, Vec<String>), SlashingError> {
+        let mut seen = HashSet::with_capacity(pubkeys.len());
+        let mut requested = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let canonical = normalize_pubkey(pubkey)?.to_string();
+            if seen.insert(canonical.clone()) {
+                requested.push(canonical);
+            }
+        }
+
+        // Single held lock: the same consistent snapshot as [`Self::export`],
+        // limited to the requested keys. Normalisation happens before the lock.
+        let conn = self.conn.lock();
+        let mut data = Vec::with_capacity(requested.len());
+        let mut with_history = Vec::new();
+        let mut synthetic_records = 0u64;
+        for pubkey in requested {
+            let (record, synthetics) = export_validator(&conn, pubkey)?;
+            synthetic_records += synthetics;
+            if record_has_history(&record) {
+                with_history.push(record.pubkey.clone());
+            }
+            data.push(record);
+        }
+        let interchange = self.finish_export(genesis_validators_root, data, synthetic_records);
+        drop(conn);
+        Ok((interchange, with_history))
+    }
+
+    /// Increment the synthetic counter only after every validator succeeded.
+    fn finish_export(
+        &self,
+        genesis_validators_root: &Root,
+        data: Vec<ValidatorRecord>,
+        synthetic_records: u64,
+    ) -> InterchangeFormat {
         if synthetic_records > 0 {
             metrics::RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL.inc_by(synthetic_records);
         }
@@ -416,7 +493,7 @@ impl SlashingDb {
             path = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             "slashing DB export completed"
         );
-        Ok(result)
+        result
     }
 
     /// Version and genesis-validators-root checks, with no connection lock.

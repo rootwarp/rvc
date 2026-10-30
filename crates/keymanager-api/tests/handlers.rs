@@ -13,9 +13,9 @@ use common::MockDoppelgangerMonitor;
 use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{delete_keystores, AppState};
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
-    KeystoreManager, Pubkey, QuiesceError, RemoteKeyManager, SigningQuiesce, SlashingProtection,
-    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, ExportedInterchange, ImportKeystoreError,
+    ImportRemoteKeyError, KeystoreManager, Pubkey, QuiesceError, RemoteKeyManager, SigningQuiesce,
+    SlashingProtection, SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 use rvc_keymanager_api::types::{DeleteKeystoresRequest, DeleteStatus};
 use rvc_keymanager_api::DoppelgangerLifecycle;
@@ -113,9 +113,12 @@ impl SlashingProtection for OkSlash {
     async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
         self.exported.lock().expect("export").push(pubkeys.to_vec());
-        Ok("{}".into())
+        Ok(ExportedInterchange { json: "{}".into(), with_history: Vec::new() })
     }
 }
 

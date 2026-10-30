@@ -232,8 +232,8 @@ fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
         "handler only exports interchange for keys where has_key is true"
     );
 
-    let export = slashing.export_interchange(&[pk]).expect("export");
-    let v: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let export = block_on(slashing.export_interchange(&[pk])).expect("export");
+    let v: serde_json::Value = serde_json::from_str(&export.json).unwrap();
     let data = v["data"].as_array().expect("data array");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0]["pubkey"], pk_hex);

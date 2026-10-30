@@ -17,9 +17,9 @@ use http_body_util::BodyExt;
 use keymanager_api::error::ApiError;
 use keymanager_api::handlers::{delete_keystores, AppState};
 use keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
-    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, SlashingProtectionError,
-    ValidatorConfigManager, ValidatorManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, ExportedInterchange, ImportKeystoreError,
+    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 use keymanager_api::types::DeleteKeystoresRequest;
 use keymanager_api::DoppelgangerLifecycle;
@@ -145,9 +145,12 @@ impl SlashingProtection for ExportSpy {
         self.inner.import_interchange(json).await
     }
 
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.export_interchange(pubkeys)
+        self.inner.export_interchange(pubkeys).await
     }
 }
 
