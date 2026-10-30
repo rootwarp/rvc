@@ -664,7 +664,7 @@ production half — leaving it at 77% tests defeats that work.
 
 **Relocation decision:** **crate-level `tests/`**. Verified: the inline suite references **none** of the
 file's private helpers (`escape_log_control_chars:801`, `sanitize_internal:815`, `sanitize_item_err:824`,
-`parse_pubkey:831`, `empty_interchange:842`, `hash_bearer_token:880`, `check_import_keystores_rate:895`)
+`parse_pubkey:831`, `zero-gvr helper:842`, `hash_bearer_token:880`, `check_import_keystores_rate:895`)
 — it drives the router. This is the cleanest crate-level move in the phase.
 
 **Implementation sketch:**

@@ -395,13 +395,19 @@ async fn a_delete_export_leaves_the_slashing_db_unchanged() {
     let after = serde_json::to_string(&db.export(&gvr).expect("after")).expect("after json");
     assert_eq!(before, after, "DELETE export must not write rows or watermarks");
 
-    let again = delete(state, vec![good_hex]).await.expect("already deleted");
+    let again = delete(state, vec![good_hex.clone()]).await.expect("already deleted");
     assert_eq!(again.data.len(), 1);
-    assert_eq!(again.data[0].status, DeleteStatus::NotFound);
+    assert_eq!(again.data[0].status, DeleteStatus::NotActive);
     assert!(!keys.has_key(&good), "an already-deleted key stays gone");
+    let first_json: serde_json::Value =
+        serde_json::from_str(&body.slashing_protection).expect("first json");
     let again_json: serde_json::Value =
         serde_json::from_str(&again.slashing_protection).expect("json");
-    assert!(again_json["data"].as_array().expect("data").is_empty());
+    assert_eq!(again_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(
+        again_json["data"], first_json["data"],
+        "the not_active retry carries the same floors as the first DELETE"
+    );
     let still = serde_json::to_string(&db.export(&gvr).expect("still")).expect("still json");
     assert_eq!(before, still);
 }
@@ -423,7 +429,11 @@ async fn delete_uppercase_request_exports_the_canonical_history() {
     let bare_upper = second_hex.trim_start_matches("0x").to_uppercase();
     let body = delete(state, vec![upper, first_hex.clone(), bare_upper]).await.expect("delete");
     assert_eq!(body.data[0].status, DeleteStatus::Deleted);
-    assert_eq!(body.data[1].status, DeleteStatus::NotFound, "the same key was already removed");
+    assert_eq!(
+        body.data[1].status,
+        DeleteStatus::NotActive,
+        "the same key was already removed and still has history"
+    );
     assert_eq!(body.data[2].status, DeleteStatus::Deleted);
     assert!(!keys.has_key(&first));
     assert!(!keys.has_key(&second));
@@ -440,7 +450,7 @@ async fn delete_uppercase_request_exports_the_canonical_history() {
 }
 
 #[tokio::test]
-async fn delete_edge_requests_export_only_member_history() {
+async fn delete_edge_requests_export_members_and_unloaded_keys() {
     let known = test_pubkey(11);
     let quiet = test_pubkey(12);
     let stranger = test_pubkey(13);
@@ -459,10 +469,7 @@ async fn delete_edge_requests_export_only_member_history() {
     let empty_json: serde_json::Value =
         serde_json::from_str(&empty.slashing_protection).expect("json");
     assert!(empty_json["data"].as_array().expect("data").is_empty());
-    assert_eq!(
-        empty_json["metadata"]["genesis_validators_root"],
-        "0x0000000000000000000000000000000000000000000000000000000000000000"
-    );
+    assert_eq!(empty_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
 
     let mixed = delete(
         Arc::clone(&state),
@@ -472,10 +479,13 @@ async fn delete_edge_requests_export_only_member_history() {
     .expect("mixed");
     assert_eq!(mixed.data[0].status, DeleteStatus::Deleted);
     assert_eq!(mixed.data[1].status, DeleteStatus::Deleted);
-    assert_eq!(mixed.data[2].status, DeleteStatus::NotFound);
+    assert_eq!(mixed.data[2].status, DeleteStatus::NotActive);
     let mixed_json: serde_json::Value =
         serde_json::from_str(&mixed.slashing_protection).expect("json");
-    assert_eq!(recorded_pubkeys(&mixed_json), vec![known_hex.as_str(), quiet_hex.as_str()]);
+    assert_eq!(
+        recorded_pubkeys(&mixed_json),
+        vec![known_hex.as_str(), quiet_hex.as_str(), stranger_hex.as_str()]
+    );
     let known_row = mixed_json["data"]
         .as_array()
         .expect("data")
@@ -491,14 +501,21 @@ async fn delete_edge_requests_export_only_member_history() {
         .expect("quiet");
     assert!(quiet_row["signed_attestations"].as_array().expect("atts").is_empty());
     assert!(quiet_row["signed_blocks"].as_array().expect("blocks").is_empty());
-    assert!(!mixed.slashing_protection.contains(&stranger_hex));
+    let stranger_row = mixed_json["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|row| row["pubkey"] == stranger_hex)
+        .expect("unloaded key with history is exported");
+    assert_eq!(stranger_row["signed_attestations"][0]["target_epoch"], "8");
     assert_eq!(db.get_attestations(&stranger_hex).expect("stranger rows").len(), 1);
 
     let unknown_only = delete(state, vec![stranger_hex.clone()]).await.expect("unknown");
-    assert_eq!(unknown_only.data[0].status, DeleteStatus::NotFound);
+    assert_eq!(unknown_only.data[0].status, DeleteStatus::NotActive);
     let unknown_json: serde_json::Value =
         serde_json::from_str(&unknown_only.slashing_protection).expect("json");
-    assert!(unknown_json["data"].as_array().expect("data").is_empty());
+    assert_eq!(unknown_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(recorded_pubkeys(&unknown_json), vec![stranger_hex.as_str()]);
     assert!(!unknown_only.slashing_protection.contains(&known_hex));
 }
 
@@ -545,4 +562,212 @@ async fn export_error_leaves_the_real_keystore_file_secret_and_sidecar() {
     assert!(composite.has_local_key(&bad), "the signing secret stays loaded");
     assert!(!store.is_signing_enabled(&bad), "the key stays disabled");
     assert_eq!(db.get_attestations(&bad_hex).expect("rows").len(), 1);
+}
+
+fn attestation_epochs(json: &serde_json::Value, hex_key: &str) -> Vec<(String, String)> {
+    let row = json["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|row| row["pubkey"] == hex_key)
+        .expect("record");
+    row["signed_attestations"]
+        .as_array()
+        .expect("atts")
+        .iter()
+        .map(|att| {
+            (
+                att["source_epoch"].as_str().expect("source").to_string(),
+                att["target_epoch"].as_str().expect("target").to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retried_delete_is_not_active_and_keeps_the_history() {
+    let key = test_pubkey(21);
+    let hex_key = pubkey_hex(key);
+    let gvr = chain_gvr();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.seed_attestation(&hex_key, 3, 4, Some("0xatt".into()), &gvr).expect("attestation");
+    db.seed_block(&hex_key, 9, Some("0xblk".into()), &gvr).expect("block");
+    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), gvr));
+
+    let (keys, _store, state) =
+        loaded_state(vec![key], Arc::clone(&adapter) as Arc<dyn SlashingProtection>);
+    let first = delete(Arc::clone(&state), vec![hex_key.clone()]).await.expect("first");
+    assert_eq!(first.data[0].status, DeleteStatus::Deleted);
+    let first_json: serde_json::Value =
+        serde_json::from_str(&first.slashing_protection).expect("json");
+    assert_eq!(first_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(attestation_epochs(&first_json, &hex_key), vec![("3".into(), "4".into())]);
+    assert_eq!(first_json["data"][0]["signed_blocks"][0]["slot"], "9");
+    assert!(!keys.has_key(&key));
+
+    let second = delete(state, vec![hex_key.clone()]).await.expect("retry");
+    assert_eq!(second.data[0].status, DeleteStatus::NotActive);
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second.slashing_protection).expect("json");
+    assert_eq!(second_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(second_json["data"], first_json["data"]);
+
+    let (dup_keys, _store, dup_state) =
+        loaded_state(vec![key], adapter as Arc<dyn SlashingProtection>);
+    let dup = delete(dup_state, vec![hex_key.clone(), hex_key.clone()]).await.expect("duplicate");
+    assert_eq!(dup.data[0].status, DeleteStatus::Deleted);
+    assert_eq!(dup.data[1].status, DeleteStatus::NotActive);
+    let dup_json: serde_json::Value = serde_json::from_str(&dup.slashing_protection).expect("json");
+    assert_eq!(recorded_pubkeys(&dup_json), vec![hex_key.as_str()]);
+    assert_eq!(dup_json["data"], first_json["data"]);
+    assert!(!dup_keys.has_key(&key));
+    assert_eq!(db.get_attestations(&hex_key).expect("rows").len(), 1);
+    assert_eq!(db.get_blocks(&hex_key).expect("blocks").len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_that_only_removes_a_leftover_secret_is_not_active_with_history_and_not_found_without(
+) {
+    let with_history = test_pubkey(31);
+    let without = test_pubkey(32);
+    let history_hex = pubkey_hex(with_history);
+    let clean_hex = pubkey_hex(without);
+    let gvr = chain_gvr();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.seed_attestation(&history_hex, 6, 7, Some("0xrow".into()), &gvr).expect("attestation");
+    db.seed_block(&history_hex, 12, Some("0xblk".into()), &gvr).expect("block");
+    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(db, gvr));
+    let (keys, _store, state) = loaded_state(Vec::new(), adapter);
+    assert_eq!(keys.deletes(), 0);
+
+    let request = vec![history_hex.clone(), clean_hex.clone()];
+    let first = delete(Arc::clone(&state), request.clone()).await.expect("retry");
+    assert_eq!(first.data[0].status, DeleteStatus::NotActive);
+    assert_eq!(first.data[1].status, DeleteStatus::NotFound);
+    assert_eq!(keys.deletes(), 2, "both keys are offered to delete_keystore");
+    let json: serde_json::Value = serde_json::from_str(&first.slashing_protection).expect("json");
+    assert_eq!(json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(recorded_pubkeys(&json), vec![history_hex.as_str(), clean_hex.as_str()]);
+    assert_eq!(attestation_epochs(&json, &history_hex), vec![("6".into(), "7".into())]);
+    let clean = json["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|row| row["pubkey"] == clean_hex)
+        .expect("empty record");
+    assert!(clean["signed_attestations"].as_array().expect("atts").is_empty());
+    assert!(clean["signed_blocks"].as_array().expect("blocks").is_empty());
+
+    let second = delete(state, request).await.expect("second retry");
+    assert_eq!(second.data[0].status, DeleteStatus::NotActive);
+    assert_eq!(second.data[1].status, DeleteStatus::NotFound);
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second.slashing_protection).expect("json");
+    assert_eq!(second_json, json);
+}
+
+#[tokio::test]
+async fn delete_aborts_when_a_requested_not_loaded_key_cannot_be_exported() {
+    let good = test_pubkey(41);
+    let bad = test_pubkey(42);
+    let good_hex = pubkey_hex(good);
+    let bad_hex = pubkey_hex(bad);
+    let gvr = chain_gvr();
+    let dir = tempfile::tempdir().expect("db");
+    let path = dir.path().join("km1.db");
+    drop(SlashingDb::open(&path).expect("schema"));
+    {
+        let conn = rusqlite::Connection::open(&path).expect("second connection");
+        raise_watermark(&conn, &bad_hex, WatermarkKind::AttestationSource, 20)
+            .expect("one-sided source watermark");
+    }
+    let db = Arc::new(SlashingDb::open(&path).expect("reopen"));
+    db.seed_attestation(&bad_hex, 5, 10, Some("0xbad".into()), &gvr).expect("bad");
+    db.seed_attestation(&good_hex, 1, 2, Some("0xok".into()), &gvr).expect("good");
+
+    let keystore_dir = tempfile::tempdir().expect("keystore");
+    write_keystore_bundle(keystore_dir.path(), &good_hex);
+    write_keystore_bundle(keystore_dir.path(), &bad_hex);
+    let good_file = keystore_dir.path().join(format!("{good_hex}.json"));
+    let bad_file = keystore_dir.path().join(format!("{bad_hex}.json"));
+    let good_secret = keystore_dir.path().join(Config::IMPORT_SECRETS_DIR).join(&good_hex);
+    let bad_secret = keystore_dir.path().join(Config::IMPORT_SECRETS_DIR).join(&bad_hex);
+
+    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), gvr));
+    let store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
+    let manager = ValidatorManagerAdapter::new(Arc::clone(&store));
+    manager.add_validator(good, true).expect("add");
+    let keys =
+        Arc::new(CountingKeys::with_keystore_dir(vec![good], keystore_dir.path().to_path_buf()));
+    let state = app_state(
+        Arc::clone(&keys) as Arc<dyn KeystoreManager>,
+        adapter,
+        Arc::new(manager) as Arc<dyn ValidatorManager>,
+    );
+
+    let err = delete(state, vec![good_hex.clone(), bad_hex.clone()])
+        .await
+        .expect_err("not-loaded key fails the export");
+    match err {
+        ApiError::Internal(message) => {
+            assert_eq!(message, "slashing protection export failed; no keystores deleted");
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    assert_eq!(keys.deletes(), 0, "nothing is removed or denylisted");
+    assert!(keys.has_key(&good), "the loaded key stays loaded");
+    assert!(!store.is_signing_enabled(&good), "the loaded key stays disabled");
+    assert!(good_file.exists() && bad_file.exists());
+    assert!(good_secret.exists() && bad_secret.exists());
+    assert_eq!(db.get_attestations(&good_hex).expect("good").len(), 1);
+    assert_eq!(db.get_attestations(&bad_hex).expect("bad").len(), 1);
+}
+
+#[tokio::test]
+async fn a_not_loaded_key_with_wrapped_legacy_rows_is_not_active_with_the_same_floors() {
+    let key = test_pubkey(51);
+    let hex_key = pubkey_hex(key);
+    let gvr = chain_gvr();
+    let wrapped = (1_u64 << 63).to_string();
+    let dir = tempfile::tempdir().expect("db");
+    let path = dir.path().join("wrapped.db");
+    drop(SlashingDb::open(&path).expect("schema"));
+    {
+        let conn = rusqlite::Connection::open(&path).expect("second connection");
+        conn.execute(
+            "INSERT INTO attestations \
+             (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+             VALUES ('local-vc', ?1, ?2, 101, '0xleg', ?3)",
+            (&hex_key, i64::MIN, CHAIN_GVR_HEX),
+        )
+        .expect("legacy row");
+    }
+    let db = Arc::new(SlashingDb::open(&path).expect("reopen"));
+    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), gvr));
+    let (_keys, _store, state) = loaded_state(Vec::new(), adapter);
+
+    let first = delete(Arc::clone(&state), vec![hex_key.clone()]).await.expect("first");
+    assert_eq!(first.data[0].status, DeleteStatus::NotActive);
+    let first_json: serde_json::Value =
+        serde_json::from_str(&first.slashing_protection).expect("json");
+    assert_eq!(first_json["metadata"]["genesis_validators_root"], CHAIN_GVR_HEX);
+    assert_eq!(
+        attestation_epochs(&first_json, &hex_key),
+        vec![(wrapped, "101".into())],
+        "a legacy i64::MIN source is exported as 2^63, not a signed epoch"
+    );
+
+    let second = delete(state, vec![hex_key.clone()]).await.expect("retry");
+    assert_eq!(second.data[0].status, DeleteStatus::NotActive);
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second.slashing_protection).expect("json");
+    assert_eq!(second_json, first_json);
+
+    let conn = rusqlite::Connection::open(&path).expect("read back");
+    let stored: i64 = conn
+        .query_row("SELECT source_epoch FROM attestations WHERE pubkey = ?1", [&hex_key], |row| {
+            row.get(0)
+        })
+        .expect("stored source");
+    assert_eq!(stored, i64::MIN, "export must not rewrite the wrapped row");
 }

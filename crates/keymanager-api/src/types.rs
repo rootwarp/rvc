@@ -227,12 +227,26 @@ pub struct DeleteKeystoresRequest {
     pub pubkeys: Vec<String>,
 }
 
+/// Per-key result of `DELETE /eth/v1/keystores`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteStatus {
+    /// This call removed a loaded key, an on-disk keystore, or the validators row.
     Deleted,
+    /// No local keystore remains and the key is not remote-registered, but
+    /// slashing history was exported under the node's genesis validators root.
     NotActive,
+    /// No keystore is loaded or on disk, and there is no slashing history.
+    ///
+    /// The interchange still carries an empty record under the node's genesis
+    /// validators root.
     NotFound,
+    /// The delete did not finish, or the pubkey is only a remote key.
+    ///
+    /// A remote-only pubkey is refused before `on_delete`: nothing is
+    /// denylisted, no enable token is cancelled, and the key is not exported.
+    /// Delete it through `DELETE /eth/v1/remotekeys`. A partial failure is
+    /// `error`, never `deleted`.
     Error,
 }
 

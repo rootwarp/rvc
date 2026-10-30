@@ -1667,6 +1667,10 @@ fn delete_reports_a_secret_removal_failure_and_keeps_the_key() {
     assert!(msg.contains("import password secret"), "{msg}");
     assert!(msg.contains("permission denied"), "{msg}");
     assert!(!msg.contains(password), "{msg}");
+    assert!(
+        !msg.contains(keystore_dir.path().to_str().expect("utf8 dir")),
+        "a secret-removal error must not carry the directory path: {msg}"
+    );
     assert!(adapter.has_key(&pk), "the key stays registered so DELETE can be retried");
     assert!(secret.exists(), "the plaintext remains when removal fails");
     assert!(!json_path.exists(), "the keystore was already removed");
@@ -2132,6 +2136,261 @@ fn import_forces_0700_on_an_existing_secrets_directory() {
     block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
     let mode = std::fs::symlink_metadata(&secrets).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "an existing secrets directory is tightened to 0700");
+}
+
+fn keystore_document(pubkey: &Pubkey, uppercase: bool) -> String {
+    let mut hex_key = hex::encode(pubkey);
+    if uppercase {
+        hex_key.make_ascii_uppercase();
+    }
+    format!(r#"{{"pubkey":"{hex_key}"}}"#)
+}
+
+fn neighbour_pubkey(pubkey: &Pubkey, index: usize) -> Pubkey {
+    let mut bytes = *pubkey;
+    bytes[index] ^= 0xff;
+    bytes
+}
+
+fn write_named_keystore(dir: &std::path::Path, name: &str, pubkey: &Pubkey, uppercase: bool) {
+    std::fs::write(dir.join(name), keystore_document(pubkey, uppercase)).unwrap();
+}
+
+fn write_secret_bytes(dir: &std::path::Path, pubkey: &Pubkey, bytes: &[u8]) {
+    let secrets = dir.join(".rvc.keymanager-secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join(pubkey_hex(pubkey)), bytes).unwrap();
+}
+
+fn write_sidecars(dir: &std::path::Path, pubkey: &Pubkey) {
+    let hex_key = pubkey_hex(pubkey);
+    std::fs::write(import_meta_path(dir, pubkey), b"{}").unwrap();
+    std::fs::write(dir.join(format!("{hex_key}.import_meta.json.partial")), b"{}").unwrap();
+    std::fs::write(dir.join(format!("{hex_key}.import_meta.json.removing.1")), b"{}").unwrap();
+}
+
+fn sidecar_paths(dir: &std::path::Path, pubkey: &Pubkey) -> [std::path::PathBuf; 3] {
+    let hex_key = pubkey_hex(pubkey);
+    [
+        import_meta_path(dir, pubkey),
+        dir.join(format!("{hex_key}.import_meta.json.partial")),
+        dir.join(format!("{hex_key}.import_meta.json.removing.1")),
+    ]
+}
+
+fn reloaded_denylist(dir: &std::path::Path) -> crate::deletion_denylist::DeletionDenylist {
+    crate::deletion_denylist::DeletionDenylist::load(dir).expect("denylist reloads")
+}
+
+struct ClearKeystoreUnlinkFail;
+impl Drop for ClearKeystoreUnlinkFail {
+    fn drop(&mut self) {
+        super::super::keystore::KEYSTORE_UNLINK_FAILS.with(|flag| flag.set(false));
+    }
+}
+
+fn arm_keystore_unlink_fail() -> ClearKeystoreUnlinkFail {
+    super::super::keystore::KEYSTORE_UNLINK_FAILS.with(|flag| flag.set(true));
+    ClearKeystoreUnlinkFail
+}
+
+#[test]
+fn delete_not_loaded_key_removes_its_keystore_and_reports_deleted() {
+    let cases = [("canonical", false), ("validator1.json", true), ("decoy-name", false)];
+    for (case, uppercase) in cases {
+        let keystore_dir = TempDir::new().unwrap();
+        let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let other = test_pubkey(0xAB);
+        assert!(!composite.has_local_key(&pk));
+        let target_name = match case {
+            "canonical" => format!("{}.json", pubkey_hex(pk)),
+            "validator1.json" | "decoy-name" => "validator1.json".to_string(),
+            other => panic!("unknown case {other}"),
+        };
+        if case == "decoy-name" {
+            // The canonical filename belongs to a different key. Matching is
+            // the pubkey inside the JSON, not the file name.
+            write_named_keystore(
+                keystore_dir.path(),
+                &format!("{}.json", pubkey_hex(pk)),
+                &other,
+                false,
+            );
+        }
+        write_named_keystore(keystore_dir.path(), &target_name, &pk, uppercase);
+        let neighbor_name = format!("neighbor-{}-extra.json", hex::encode(pk));
+        write_named_keystore(keystore_dir.path(), &neighbor_name, &other, false);
+        write_secret_bytes(keystore_dir.path(), &pk, b"secret-material");
+        write_secret_bytes(keystore_dir.path(), &other, b"other-secret");
+        write_sidecars(keystore_dir.path(), &pk);
+        write_sidecars(keystore_dir.path(), &other);
+
+        let removed = adapter.delete_keystore(&pk).expect(case);
+        assert!(removed, "{case}");
+        assert!(!keystore_dir.path().join(&target_name).exists(), "{case}");
+        assert!(!secret_file(keystore_dir.path(), &pk).exists(), "{case}");
+        for path in sidecar_paths(keystore_dir.path(), &pk) {
+            assert!(!path.exists(), "{case}: {}", path.display());
+        }
+        assert!(keystore_dir.path().join(&neighbor_name).exists(), "{case}");
+        assert!(secret_file(keystore_dir.path(), &other).exists(), "{case}");
+        for path in sidecar_paths(keystore_dir.path(), &other) {
+            assert!(path.exists(), "{case}: {}", path.display());
+        }
+        if case == "decoy-name" {
+            assert!(
+                keystore_dir.path().join(format!("{}.json", pubkey_hex(pk))).exists(),
+                "a canonical name whose JSON pubkey is a different key survives"
+            );
+        }
+        let denylist = reloaded_denylist(keystore_dir.path());
+        assert!(denylist.contains(&pk), "{case}");
+        assert!(!denylist.contains(&other), "{case}");
+        assert!(!adapter.has_key(&pk));
+    }
+}
+
+#[test]
+fn delete_not_loaded_key_leaves_last_byte_first_byte_and_description_neighbours() {
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    assert!(!composite.has_local_key(&pk));
+    let last = neighbour_pubkey(&pk, 47);
+    let first = neighbour_pubkey(&pk, 0);
+    let described = test_pubkey(0xCD);
+    assert_ne!(last[47], pk[47]);
+    assert_eq!(&last[..47], &pk[..47]);
+    assert_ne!(first[0], pk[0]);
+    assert_eq!(&first[1..], &pk[1..]);
+    assert_ne!(described, pk);
+    assert_ne!(last, first);
+
+    let target_name = format!("{}.json", pubkey_hex(pk));
+    write_named_keystore(keystore_dir.path(), &target_name, &pk, false);
+    write_named_keystore(keystore_dir.path(), "last-byte.json", &last, false);
+    write_named_keystore(keystore_dir.path(), "first-byte.json", &first, false);
+    let target_hex = hex::encode(pk);
+    let described_body =
+        format!(r#"{{"pubkey":"{}","description":"backup {target_hex}"}}"#, hex::encode(described));
+    assert!(described_body.contains(&target_hex));
+    std::fs::write(keystore_dir.path().join("described.json"), &described_body).unwrap();
+    for key in [&pk, &last, &first, &described] {
+        write_secret_bytes(keystore_dir.path(), key, b"secret-material");
+        write_sidecars(keystore_dir.path(), key);
+    }
+
+    let removed = adapter.delete_keystore(&pk).expect("delete");
+    assert!(removed);
+    assert!(!keystore_dir.path().join(&target_name).exists());
+    assert!(!secret_file(keystore_dir.path(), &pk).exists());
+    for path in sidecar_paths(keystore_dir.path(), &pk) {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for name in ["last-byte.json", "first-byte.json", "described.json"] {
+        assert!(keystore_dir.path().join(name).exists(), "{name} must survive");
+    }
+    for key in [&last, &first, &described] {
+        assert!(secret_file(keystore_dir.path(), key).exists());
+        for path in sidecar_paths(keystore_dir.path(), key) {
+            assert!(path.exists(), "{}", path.display());
+        }
+    }
+    let denylist = reloaded_denylist(keystore_dir.path());
+    assert!(denylist.contains(&pk));
+    assert!(!denylist.contains(&last));
+    assert!(!denylist.contains(&first));
+    assert!(!denylist.contains(&described));
+}
+
+#[test]
+fn delete_not_loaded_key_writes_denylist_when_secret_removal_fails() {
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    assert!(!composite.has_local_key(&pk));
+    let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+    write_named_keystore(
+        keystore_dir.path(),
+        json_path.file_name().unwrap().to_str().unwrap(),
+        &pk,
+        false,
+    );
+    write_secret_bytes(keystore_dir.path(), &pk, b"secret-material");
+    write_sidecars(keystore_dir.path(), &pk);
+    let secret = secret_file(keystore_dir.path(), &pk);
+
+    let _guard = arm_remove_fail();
+    let err = adapter.delete_keystore(&pk).expect_err("secret removal must be reported");
+    assert!(matches!(err, keymanager_api::traits::DeleteKeystoreError::Io(_)), "{err}");
+    assert!(!err.to_string().contains("secret-material"), "{err}");
+    assert!(!json_path.exists(), "the keystore is unlinked before the secret step");
+    assert!(secret.exists(), "the secret remains when removal fails");
+    for path in sidecar_paths(keystore_dir.path(), &pk) {
+        assert!(path.exists(), "sidecars wait for a successful secret removal: {}", path.display());
+    }
+    assert!(reloaded_denylist(keystore_dir.path()).contains(&pk));
+    drop(_guard);
+
+    let retry = adapter.delete_keystore(&pk).expect("retry");
+    assert!(!retry, "a retry that only removes a leftover secret is not a fresh delete");
+    assert!(!secret.exists());
+    for path in sidecar_paths(keystore_dir.path(), &pk) {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    assert!(reloaded_denylist(keystore_dir.path()).contains(&pk));
+}
+
+#[test]
+fn delete_not_loaded_key_unlink_failure_returns_before_the_denylist() {
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+    write_named_keystore(
+        keystore_dir.path(),
+        json_path.file_name().unwrap().to_str().unwrap(),
+        &pk,
+        false,
+    );
+    write_secret_bytes(keystore_dir.path(), &pk, b"secret-material");
+    write_sidecars(keystore_dir.path(), &pk);
+    let _guard = arm_keystore_unlink_fail();
+    let err = adapter.delete_keystore(&pk).expect_err("unlink failure");
+    assert!(matches!(err, keymanager_api::traits::DeleteKeystoreError::Io(_)), "{err}");
+    let message = err.to_string();
+    assert!(!message.contains(keystore_dir.path().to_str().unwrap()), "{message}");
+    assert!(!message.contains("secret-material"), "{message}");
+    assert!(json_path.exists(), "the keystore file remains");
+    assert!(secret_file(keystore_dir.path(), &pk).exists());
+    for path in sidecar_paths(keystore_dir.path(), &pk) {
+        assert!(path.exists(), "{}", path.display());
+    }
+    assert!(!reloaded_denylist(keystore_dir.path()).contains(&pk));
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_skips_a_keystore_symlink_that_resolves_outside_the_directory() {
+    let keystore_dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    let outside_file = outside.path().join("outside.json");
+    std::fs::write(&outside_file, keystore_document(&pk, false)).unwrap();
+    let link = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+    std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+    let removed = adapter.delete_keystore(&pk).expect("symlink is skipped");
+    assert!(!removed, "a symlink outside keystore_path is not a removed keystore");
+    assert!(link.exists(), "the symlink stays");
+    assert!(outside_file.exists(), "the outside file stays");
+    assert_eq!(std::fs::read(&outside_file).unwrap(), keystore_document(&pk, false).as_bytes());
 }
 
 struct RestoreDirPerms(std::path::PathBuf);

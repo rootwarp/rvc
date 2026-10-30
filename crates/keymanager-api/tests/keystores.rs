@@ -409,7 +409,7 @@ async fn test_delete_returns_slashing_export() {
 }
 
 #[tokio::test]
-async fn test_delete_empty_returns_empty_interchange() {
+async fn test_delete_unknown_pubkey_returns_one_empty_record() {
     let app = TestApp::new();
     let request_body = serde_json::json!({
         "pubkeys": [format!("0x{}", test_pubkey_hex(99))]
@@ -432,7 +432,11 @@ async fn test_delete_empty_returns_empty_interchange() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let resp: DeleteKeystoresResponse = serde_json::from_slice(&body).unwrap();
     let export: serde_json::Value = serde_json::from_str(&resp.slashing_protection).unwrap();
-    assert!(export["data"].as_array().unwrap().is_empty());
+    let data = export["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "an unknown key is an empty record, not a missing document");
+    assert_eq!(data[0]["pubkey"], format!("0x{}", test_pubkey_hex(99)));
+    assert!(data[0]["signed_attestations"].as_array().unwrap().is_empty());
+    assert!(data[0]["signed_blocks"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

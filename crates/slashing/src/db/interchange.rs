@@ -973,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_empty_interchange() {
+    fn test_import_interchange_with_no_records() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = CHAIN_GVR_HEX;
         let genesis_root_bytes = chain_gvr();

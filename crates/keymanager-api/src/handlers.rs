@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -254,9 +254,10 @@ async fn delete_keystores_inner(
 
     // Parse all pubkeys. Membership is decided under the import/delete lock
     // (`membership_for_delete`), which also records the in-flight count before
-    // releasing that lock. Only that set is disabled, drained, and exported.
-    // A key admitted afterwards must not be removed. `begin_delete_export`
-    // must not count again.
+    // releasing that lock. Only that set is disabled and drained. The export
+    // also includes parsed keys that are neither loaded nor remote-registered
+    // after the drain. A key admitted afterwards must not be removed.
+    // `begin_delete_export` must not count again.
     let parsed: Vec<Result<Pubkey, String>> =
         request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
     let candidates: Vec<Pubkey> = parsed.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
@@ -301,23 +302,35 @@ async fn delete_keystores_inner(
 
     // Export slashing protection BEFORE any deletions.
     //
-    // KM-1 (ADR-008): the export is per key and all-or-nothing over the
-    // requested keys (members only). If export_interchange returns Err, abort
-    // the entire DELETE with HTTP 500 BEFORE touching the keystore. An
-    // unrelated key that cannot be represented does not fail this export. A
-    // requested key that cannot be represented does. Swallowing the error and
-    // returning an empty interchange would allow re-import without slashing
-    // history.
-    let slashing_protection = if existing_keys.is_empty() {
-        empty_interchange()
-    } else {
-        state
-            .slashing_protection
-            .export_interchange(&existing_keys)
-            .await
-            .map_err(map_slashing_export_error)?
-            .json
-    };
+    // The set is the membership snapshot plus every parsed, deduped pubkey
+    // that is still neither loaded nor remote-registered. A key admitted
+    // during the drain is loaded, so it is left out. A remote-only key is
+    // left out. An empty set still calls the adapter so the response carries
+    // the node's genesis validators root.
+    //
+    // KM-1 (ADR-008): all-or-nothing over that set. If export_interchange
+    // returns Err, abort the entire DELETE with HTTP 500 BEFORE touching any
+    // keystore. An unrelated key that cannot be represented does not fail
+    // this export. A requested key that cannot be represented does.
+    let mut export_keys = existing_keys.clone();
+    let mut seen: HashSet<Pubkey> = existing_keys.iter().copied().collect();
+    for pubkey in &candidates {
+        if !seen.insert(*pubkey) {
+            continue;
+        }
+        if state.keystore_manager.has_key(pubkey) || state.remote_key_manager.has_remote_key(pubkey)
+        {
+            continue;
+        }
+        export_keys.push(*pubkey);
+    }
+    let exported = state
+        .slashing_protection
+        .export_interchange(&export_keys)
+        .await
+        .map_err(map_slashing_export_error)?;
+    let slashing_protection = exported.json;
+    let history: HashSet<Pubkey> = exported.with_history.into_iter().collect();
 
     // Now process deletions
     let mut results = Vec::with_capacity(request.pubkeys.len());
@@ -336,6 +349,46 @@ async fn delete_keystores_inner(
                     });
                     continue;
                 }
+                // Live remote check. A key that is remote and not loaded is
+                // refused before `on_delete`, including the second entry of
+                // `[K, K]` after the local half of a local-and-remote key was
+                // removed. The membership snapshot would still contain K and
+                // would miss that entry.
+                if !state.keystore_manager.has_key(pubkey)
+                    && state.remote_key_manager.has_remote_key(pubkey)
+                {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "error",
+                        "refusing a remote-only key on keystores DELETE"
+                    );
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Error,
+                        message: "registered as a remote key; delete it through /eth/v1/remotekeys"
+                            .into(),
+                    });
+                    continue;
+                }
+                // A non-member left out of the export (remote at export time,
+                // then deregistered during the await) is neither loaded nor
+                // remote now. Removing its files would report a delete with
+                // no interchange record.
+                if !existing_keys.contains(pubkey)
+                    && !export_keys.contains(pubkey)
+                    && !state.keystore_manager.has_key(pubkey)
+                    && !state.remote_key_manager.has_remote_key(pubkey)
+                {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "error",
+                        "refusing a key left out of the slashing-protection export"
+                    );
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Error,
+                        message: "not in the slashing-protection export; not deleted".into(),
+                    });
+                    continue;
+                }
                 // KM-2 (b)+(Finding 3): keystore removal + token cancel (+
                 // remove_validator / cancel_monitoring on success) are one
                 // critical section inside DoppelgangerLifecycle::on_delete.
@@ -351,53 +404,25 @@ async fn delete_keystores_inner(
                     });
 
                 match delete_result {
-                    Ok(present) => match config {
-                        ConfigRemoval::Failed(detail) => {
+                    Ok(present) => {
+                        let status = delete_status(present, &config, history.contains(pubkey));
+                        let message = if let ConfigRemoval::Failed(detail) = &config {
                             error!(
                                 pubkey = %TruncatedPubkey::new(pubkey_hex),
                                 error = %detail,
                                 "validator config removal failed after keystore delete"
                             );
-                            results.push(DeleteKeystoreResult {
-                                status: DeleteStatus::Error,
-                                message: "validator config update failed".into(),
-                            });
-                        }
-                        ConfigRemoval::Removed => {
+                            "validator config update failed".to_string()
+                        } else {
                             warn!(
                                 pubkey = %TruncatedPubkey::new(pubkey_hex),
-                                status = "deleted",
+                                status = delete_status_label(&status),
                                 "Keystore delete result"
                             );
-                            results.push(DeleteKeystoreResult {
-                                status: DeleteStatus::Deleted,
-                                message: String::new(),
-                            });
-                        }
-                        ConfigRemoval::Absent | ConfigRemoval::NotAttempted => {
-                            if present {
-                                warn!(
-                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
-                                    status = "deleted",
-                                    "Keystore delete result"
-                                );
-                                results.push(DeleteKeystoreResult {
-                                    status: DeleteStatus::Deleted,
-                                    message: String::new(),
-                                });
-                            } else {
-                                warn!(
-                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
-                                    status = "not_found",
-                                    "Keystore delete result"
-                                );
-                                results.push(DeleteKeystoreResult {
-                                    status: DeleteStatus::NotFound,
-                                    message: String::new(),
-                                });
-                            }
-                        }
-                    },
+                            String::new()
+                        };
+                        results.push(DeleteKeystoreResult { status, message });
+                    }
                     Err(e) => {
                         // M-8: central mapper sanitizes Backend-class payloads.
                         let message = map_delete_keystore_item_error(&e);
@@ -853,15 +878,35 @@ fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
         .map_err(|e| e.to_string())
 }
 
-fn empty_interchange() -> String {
-    serde_json::json!({
-        "metadata": {
-            "interchange_format_version": "5",
-            "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-        },
-        "data": []
-    })
-    .to_string()
+/// Map one keystore-delete outcome to the keymanager status.
+///
+/// `present` is `delete_keystore`'s `Ok` flag: a loaded key was removed, or a
+/// keystore file was unlinked. [`ConfigRemoval::Removed`] is a validators-file
+/// row removed by this call. `has_history` is membership in the export's
+/// `with_history` list. A partial failure is [`DeleteStatus::Error`].
+fn delete_status(present: bool, config: &ConfigRemoval, has_history: bool) -> DeleteStatus {
+    match config {
+        ConfigRemoval::Failed(_) => DeleteStatus::Error,
+        ConfigRemoval::Removed => DeleteStatus::Deleted,
+        ConfigRemoval::Absent | ConfigRemoval::NotAttempted => {
+            if present {
+                DeleteStatus::Deleted
+            } else if has_history {
+                DeleteStatus::NotActive
+            } else {
+                DeleteStatus::NotFound
+            }
+        }
+    }
+}
+
+fn delete_status_label(status: &DeleteStatus) -> &'static str {
+    match status {
+        DeleteStatus::Deleted => "deleted",
+        DeleteStatus::NotActive => "not_active",
+        DeleteStatus::NotFound => "not_found",
+        DeleteStatus::Error => "error",
+    }
 }
 
 pub(crate) fn parse_eth_address(s: &str) -> Result<[u8; 20], ApiError> {
@@ -1233,5 +1278,40 @@ mod tests {
             ImportRemoteKeyStatus::Error,
             "a failed remote import must not be reported as imported"
         );
+    }
+
+    #[test]
+    fn delete_status_maps_each_outcome() {
+        let removed = ConfigRemoval::Removed;
+        let absent = ConfigRemoval::Absent;
+        let not_attempted = ConfigRemoval::NotAttempted;
+        let failed = ConfigRemoval::Failed("disk".into());
+        // present, config, history, expected. Expectations are literals so a
+        // change to `delete_status` cannot update the oracle with it.
+        let cases = [
+            (true, &removed, true, DeleteStatus::Deleted),
+            (true, &removed, false, DeleteStatus::Deleted),
+            (false, &removed, true, DeleteStatus::Deleted),
+            (false, &removed, false, DeleteStatus::Deleted),
+            (true, &absent, true, DeleteStatus::Deleted),
+            (true, &absent, false, DeleteStatus::Deleted),
+            (true, &not_attempted, true, DeleteStatus::Deleted),
+            (true, &not_attempted, false, DeleteStatus::Deleted),
+            (false, &absent, true, DeleteStatus::NotActive),
+            (false, &not_attempted, true, DeleteStatus::NotActive),
+            (false, &absent, false, DeleteStatus::NotFound),
+            (false, &not_attempted, false, DeleteStatus::NotFound),
+            (true, &failed, true, DeleteStatus::Error),
+            (true, &failed, false, DeleteStatus::Error),
+            (false, &failed, true, DeleteStatus::Error),
+            (false, &failed, false, DeleteStatus::Error),
+        ];
+        for (present, config, has_history, expected) in cases {
+            assert_eq!(
+                delete_status(present, config, has_history),
+                expected,
+                "present={present} history={has_history} config={config:?}"
+            );
+        }
     }
 }
