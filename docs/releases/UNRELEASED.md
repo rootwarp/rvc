@@ -587,10 +587,13 @@ fields, restores that field's local value when the live value is still the
 remote one. A failed fetch does not.
 
 `reload_config` keeps URL ownership for a validator that is not in the
-file, so a later save still writes that validator's local baseline. A
-validator the file replaces takes the file values, and that URL ownership
-is dropped. Remote defaults are cleared because the file replaces them.
-Nothing in the shipped binary calls `reload_config`.
+file, so a later save still writes that validator's local baseline. For a
+validator the file contains, each field the file still holds at its
+baseline stays URL-owned: the live value stays the URL value, and a later
+save still writes that baseline. A field the file changed takes the file
+value and becomes file-owned. A remote default field is kept when
+`[defaults]` still holds its baseline and cleared when the file changed
+that field. Nothing in the shipped binary calls `reload_config`.
 
 A 401, a body that is not JSON, a 200 whose JSON has neither
 `proposer_config` nor `default_config`, or one invalid entry leaves every
