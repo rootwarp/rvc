@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
-use rvc::config::{BnRole, Config, ConfigError, ConfigSource, ParseKind, StartArgs};
+use rvc::config::{
+    BnRole, Config, ConfigError, ConfigSource, ParseKind, ServiceBuilder, StartArgs,
+};
+use validator_store::{ValidatorStore, ValidatorStoreError};
 
 const SECRET: &str = "https://alice:SECRET@host";
 
@@ -558,4 +561,279 @@ fn mixed_duplicate_table_header_escapes_controls() {
     if let Some(trailer) = trailer {
         assert!(trailer.chars().all(|c| c == '\n' || !c.is_control()), "{trailer:?}");
     }
+}
+
+fn boot_validators(contents: &str) -> (NamedTempFile, ConfigError) {
+    let file = write_toml(contents);
+    let err = match ServiceBuilder::new(Config::default()).build_validator_store(Some(file.path()))
+    {
+        Err(err) => err,
+        Ok(_) => panic!("validators file must fail"),
+    };
+    (file, err)
+}
+
+fn reload_validators(contents: &str) -> ValidatorStoreError {
+    let file =
+        write_toml("[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n");
+    let store = ValidatorStore::load_from_config(file.path()).expect("baseline validators file");
+    fs::write(file.path(), contents).expect("rewrite validators file");
+    store.reload_config().expect_err("reload must fail")
+}
+
+fn assert_store_clean(label: &str, err: ValidatorStoreError) -> String {
+    let display = err.to_string();
+    let debug = format!("{err:?}");
+    let chained = format!("{:?}", anyhow::Error::from(err));
+    assert_no_secret(label, &display, &debug, &chained);
+    display
+}
+
+fn toml_basic_string(raw: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in raw.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn shown_key(display: &str) -> &str {
+    let start = display.find('`').expect("opening backtick");
+    let end = display.rfind('`').expect("closing backtick");
+    &display[start + 1..end]
+}
+
+/// Type, value, and syntax errors in the validators file stay value-free at boot and on reload.
+#[test]
+fn validators_file_parse_errors_do_not_echo_values() {
+    let fee = "0x0000000000000000000000000000000000000001";
+    let pk = "0x".to_string() + &"11".repeat(48);
+
+    let type_body = format!("[defaults]\nfee_recipient = \"{fee}\"\ngas_limit = \"{SECRET}\"\n");
+    let (file, err) = boot_validators(&type_body);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse { kind: ParseKind::InvalidType { .. }, file: Some(p), .. }
+                if p == file.path()
+        ),
+        "{err:?}"
+    );
+    let (display, debug, chained) = renderings(err);
+    assert_no_secret("boot invalid type", &display, &debug, &chained);
+    assert_names_file(&display, file.path());
+    let reloaded = assert_store_clean("reload invalid type", reload_validators(&type_body));
+    assert!(reloaded.contains("invalid type"), "{reloaded}");
+
+    let value_body = format!(
+        "[defaults]\nfee_recipient = \"{fee}\"\n\n[[validators]]\npubkey = \"{pk}\"\nblock_selection_mode = \"{SECRET}\"\n"
+    );
+    let (file, err) = boot_validators(&value_body);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse {
+                kind: ParseKind::UnknownVariant { ref expected },
+                file: Some(p),
+                ..
+            } if p == file.path() && !expected.contains("SECRET")
+        ),
+        "{err:?}"
+    );
+    let (display, debug, chained) = renderings(err);
+    assert_no_secret("boot unknown variant", &display, &debug, &chained);
+    let reloaded = assert_store_clean("reload unknown variant", reload_validators(&value_body));
+    assert!(reloaded.contains("unknown variant"), "{reloaded}");
+    assert!(!reloaded.contains("SECRET"), "{reloaded}");
+
+    let syntax = "# comment\nfee_recipient = \"https://alice:SECRET@host\n";
+    let (file, err) = boot_validators(syntax);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse {
+                kind: ParseKind::Syntax(message),
+                file: Some(p),
+                line: Some(line),
+                column: Some(_),
+                ..
+            } if p == file.path() && *line == 2 && message == "invalid basic string"
+        ),
+        "{err:?}"
+    );
+    let (display, debug, chained) = renderings(err);
+    assert_no_secret("boot syntax", &display, &debug, &chained);
+    assert_names_file(&display, file.path());
+    assert!(!display.contains("fee_recipient"), "{display}");
+    let reloaded = assert_store_clean("reload syntax", reload_validators(syntax));
+    assert!(reloaded.contains("invalid basic string"), "{reloaded}");
+    assert!(reloaded.contains("at line 2"), "{reloaded}");
+
+    let missing =
+        format!("[defaults]\nfee_recipient = \"{fee}\"\n\n[[validators]]\nenabled = true\n");
+    let (file, err) = boot_validators(&missing);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse { kind: ParseKind::MissingField(name), file: Some(p), .. }
+                if name == "pubkey" && p == file.path()
+        ),
+        "{err:?}"
+    );
+    let reloaded = reload_validators(&missing);
+    match &reloaded {
+        ValidatorStoreError::TomlParse(parsed) => {
+            assert!(matches!(&parsed.kind, ParseKind::MissingField(name) if name == "pubkey"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A validators-file key with controls and a long name is one escaped, bounded line.
+#[test]
+fn validators_unknown_key_display_escapes_controls_and_caps_length() {
+    let fee = "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n";
+    let cases = [
+        ("mid", "A".repeat(32)),
+        ("boundary", "A".repeat(64)),
+        ("boundary+1", "A".repeat(65)),
+        ("controls", format!("\n\u{1b}\r\t{}", "A".repeat(80))),
+    ];
+    for (label, raw) in cases {
+        let contents = format!("{fee}{} = 1\n", toml_basic_string(&raw));
+        let (file, err) = boot_validators(&contents);
+        assert!(
+            matches!(
+                &err,
+                ConfigError::UnknownKey { key, file: Some(p) } if key == &raw && p == file.path()
+            ),
+            "{label}: {err:?}"
+        );
+        let (display, debug, chained) = renderings(err);
+        assert_eq!(display.lines().count(), 1, "{label}: {display:?}");
+        assert!(!display.contains('\n') && !display.contains('\r') && !display.contains('\u{1b}'));
+        let shown = shown_key(&display);
+        assert!(shown.chars().count() <= 64, "{label}: {shown}");
+        if raw.chars().count() <= 64 && !raw.chars().any(char::is_control) {
+            assert_eq!(shown, raw, "{label}");
+        } else {
+            assert!(shown.chars().count() < raw.chars().count(), "{label}: {shown}");
+        }
+        if label == "controls" {
+            assert!(display.contains("\\n") && display.contains("\\r") && display.contains("\\t"));
+            assert!(display.contains("\\u{1b}"), "{display}");
+            assert_rendered_key_is_escaped(&display, &debug, &chained);
+        }
+        let reloaded = assert_store_clean(label, reload_validators(&contents));
+        assert_eq!(reloaded.lines().count(), 1, "{label}: {reloaded:?}");
+        assert!(!reloaded.contains('\u{1b}'), "{reloaded:?}");
+        let shown = shown_key(&reloaded);
+        assert!(shown.chars().count() <= 64, "{label} reload: {shown}");
+    }
+}
+
+/// Duplicate, dotted, and mixed table-header failures on the validators path stay escaped.
+#[test]
+fn validators_file_duplicate_and_dotted_keys_escape_controls() {
+    let quoted = "\"\\n\\u001B\\r\\t\"";
+    let duplicate = format!("{quoted} = 1\n{quoted} = 2\n");
+    let (file, err) = boot_validators(&duplicate);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse { kind: ParseKind::DuplicateKey(name), file: Some(p), .. }
+                if p == file.path() && name.contains('\n') && name.contains('\u{1b}')
+        ),
+        "{err:?}"
+    );
+    let (display, debug, chained) = renderings(err);
+    assert_rendered_key_is_escaped(&display, &debug, &chained);
+    let reloaded = reload_validators(&duplicate);
+    match &reloaded {
+        ValidatorStoreError::TomlParse(parsed) => {
+            assert!(matches!(&parsed.kind, ParseKind::DuplicateKey(name) if name.contains('\n')));
+        }
+        other => panic!("{other:?}"),
+    }
+    let reloaded = assert_store_clean("reload duplicate", reloaded);
+    assert_rendered_key_is_escaped(&reloaded, &reloaded, &reloaded);
+
+    let dotted = format!("{quoted} = 1\n{quoted}.child = 2\n");
+    let (file, err) = boot_validators(&dotted);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse { kind: ParseKind::Syntax(message), file: Some(p), .. }
+                if p == file.path()
+                    && message.starts_with("dotted key `")
+                    && !message.chars().any(char::is_control)
+        ),
+        "{err:?}"
+    );
+    let reloaded = assert_store_clean("reload dotted", reload_validators(&dotted));
+    assert!(reloaded.contains("dotted key `"), "{reloaded}");
+    assert!(!reloaded.chars().any(char::is_control), "{reloaded:?}");
+
+    let header = format!("[t]\n{quoted}.y = 1\n[t.{quoted}]\n");
+    let (file, err) = boot_validators(&header);
+    assert!(
+        matches!(
+            &err,
+            ConfigError::Parse { kind: ParseKind::Syntax(message), file: Some(p), .. }
+                if p == file.path()
+                    && message.starts_with("invalid table header")
+                    && !message.chars().any(char::is_control)
+        ),
+        "{err:?}"
+    );
+    let reloaded = assert_store_clean("reload header", reload_validators(&header));
+    assert!(reloaded.contains("invalid table header"), "{reloaded}");
+    assert!(reloaded.contains("\\n"), "{reloaded}");
+    assert!(!reloaded.chars().any(char::is_control), "{reloaded:?}");
+}
+
+/// A structural validators error that is not a parse failure still names the file.
+#[test]
+fn validators_config_error_names_the_file() {
+    let (file, err) = boot_validators(
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"zz\"\n",
+    );
+    match err {
+        ConfigError::ValidatorStoreError(message) => {
+            assert!(message.contains(&file.path().display().to_string()), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn every_shipped_validators_toml_parses_strict() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let paths = [
+        root.join("validators.example.toml"),
+        root.join("scripts/tests/fixtures/expected_validators.toml"),
+        root.join("scripts/tests/fixtures/validators__three_entries.toml"),
+        root.join("scripts/tests/fixtures/validators__unprefixed.toml"),
+    ];
+    for path in paths {
+        ValidatorStore::load_from_config(&path).unwrap_or_else(|err| {
+            panic!("{} must load under strict keys: {err}", path.display());
+        });
+    }
+    let template = fs::read_to_string(root.join("scripts/devnet/config/templates/validators.toml"))
+        .expect("devnet validators template")
+        .replace("@@FEE_RECIPIENT@@", "0x0000000000000000000000000000000000000001");
+    let file = write_toml(&template);
+    ValidatorStore::load_from_config(file.path()).unwrap_or_else(|err| {
+        panic!("devnet template must load under strict keys: {err}");
+    });
 }
