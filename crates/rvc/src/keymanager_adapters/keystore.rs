@@ -263,6 +263,26 @@ impl KeystoreManagerAdapter {
     pub(crate) fn set_after_secret_before_keystore_hook(&self, hook: TestHook) {
         *self.after_secret_before_keystore.lock() = Some(hook);
     }
+
+    /// Keystore unlink, then the import secret, then M-12 sidecars, then the
+    /// denylist.
+    ///
+    /// An unlink error returns before the denylist. A secret-removal error
+    /// still writes the denylist and is returned afterwards. Sidecars run only
+    /// when the secret step succeeds. The caller removes the signing-registry
+    /// entry only after this returns `Ok`. `Ok(true)` means a keystore file
+    /// was unlinked.
+    fn remove_key_files(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
+        let keystore_removed = remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
+        let secret_removed = remove_import_secret(&self.keystore_dir, pubkey);
+        if secret_removed.is_ok() {
+            let _ = std::fs::remove_file(import_meta_path(&self.keystore_dir, pubkey));
+            let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
+            remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
+        }
+        insert_denylist_after_secret(self.denylist.as_ref(), pubkey, secret_removed)?;
+        Ok(keystore_removed)
+    }
 }
 
 /// Per-pubkey DELETE snapshots that have not yet finished.
@@ -365,6 +385,10 @@ thread_local! {
     /// The next import-secret unlink fails with `PermissionDenied`.
     pub(super) static IMPORT_SECRET_REMOVE_FAILS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// The next keystore-file unlink in [`remove_matching_keystore_files`] fails
+    /// with `PermissionDenied`.
+    pub(super) static KEYSTORE_UNLINK_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn sync_keystore_dir(dir: &Path) -> Result<(), ImportKeystoreError> {
@@ -394,6 +418,14 @@ fn sync_keystore_dir(dir: &Path) -> Result<(), ImportKeystoreError> {
 fn unlink_import_path(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"));
+    }
+    std::fs::remove_file(path)
+}
+
+fn unlink_keystore_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if KEYSTORE_UNLINK_FAILS.with(|flag| flag.replace(false)) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"));
     }
     std::fs::remove_file(path)
@@ -669,7 +701,11 @@ fn remove_import_secret(keystore_dir: &Path, pubkey: &Pubkey) -> Result<(), Impo
                 error = %e,
                 "failed to remove an import password secret"
             );
-            first_err = Some(io_import("remove import password secret", &path, e));
+            // The directory path stays in the log above. The error returned
+            // to the caller names the action only, so a DELETE body cannot
+            // carry the secrets directory.
+            first_err =
+                Some(ImportKeystoreError::Io(format!("remove import password secret: {e}")));
         }
     }
     // Partials are attempted even when the final secret could not be removed.
@@ -871,61 +907,48 @@ fn rollback_failed_keystore(
     admissions.finish_keystore_rollback(pubkey, inserted_row, files_gone)
 }
 
-/// Unlink every keystore JSON under `keystore_dir` whose EIP-2335 `pubkey`
-/// field matches `pubkey` (plus the canonical API-import name
-/// `0x{hex}.json`).
+/// Unlink every keystore JSON under `keystore_dir` whose `pubkey` field
+/// decodes to `pubkey`.
 ///
-/// Boot load accepts any `*.json` name (`KeyManager::load_from_directory`);
-/// DELETE must therefore not rely solely on the API-import filename
-/// convention. Secret-provider keys with no on-disk file are fine — this
-/// returns `Ok` when nothing matches.
+/// The match is the 48 decoded bytes. A filename that contains the hex,
+/// including the canonical `0x{hex}.json` name, is not enough: the JSON
+/// pubkey has to be that key. `.import_meta.json` is not a keystore.
 ///
-/// Path-traversal: each candidate is canonicalized and required to stay
-/// under `keystore_dir` before unlink (same rule as key load).
+/// Returns whether any file was unlinked. No matching file is `Ok(false)`.
+///
+/// Path containment: each candidate is canonicalized and must stay under
+/// `keystore_dir` before it is read or unlinked. A symlink that resolves
+/// outside the directory is skipped.
 fn remove_matching_keystore_files(
     keystore_dir: &Path,
     pubkey: &Pubkey,
-) -> Result<(), DeleteKeystoreError> {
-    let target_hex = hex::encode(pubkey);
-    let canonical_name = format!("0x{target_hex}.json");
-    let canonical_path = keystore_dir.join(&canonical_name);
-
-    match std::fs::remove_file(&canonical_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
-    }
-
+) -> Result<bool, DeleteKeystoreError> {
     let entries = match std::fs::read_dir(keystore_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
     };
 
     let canonical_dir = match keystore_dir.canonicalize() {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
     };
 
+    let canonical_name = format!("{}.json", pubkey_hex(*pubkey));
+    let mut removed = false;
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
         };
-
         // Only keystore JSON; never the import-meta sidecar (handled separately).
         if !name.ends_with(".json") || name.ends_with(".import_meta.json") {
             continue;
         }
-        // Already attempted above; skip re-stat of the canonical name.
-        if name == canonical_name {
-            continue;
-        }
 
         let canonical_file = match path.canonicalize() {
-            Ok(p) => p,
+            Ok(path) => path,
             Err(_) => continue,
         };
         if !canonical_file.starts_with(&canonical_dir) {
@@ -937,35 +960,45 @@ fn remove_matching_keystore_files(
         }
 
         let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+            Ok(content) => content,
             Err(_) => continue,
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(pk_str) = value.get("pubkey").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let pk_norm =
-            pk_str.strip_prefix("0x").or_else(|| pk_str.strip_prefix("0X")).unwrap_or(pk_str);
-        if !pk_norm.eq_ignore_ascii_case(&target_hex) {
+        if parsed_keystore_pubkey(&content) != Some(*pubkey) {
             continue;
         }
 
-        match std::fs::remove_file(&path) {
+        match unlink_keystore_file(&path) {
             Ok(()) => {
-                info!(
-                    path = %path.display(),
-                    pubkey = %TruncatedPubkey::new(&target_hex),
-                    "Removed non-canonical keystore file on delete"
-                );
+                removed = true;
+                if name != canonical_name {
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                        "Removed non-canonical keystore file on delete"
+                    );
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
         }
     }
 
-    Ok(())
+    Ok(removed)
+}
+
+/// Decode the EIP-2335 `pubkey` field to 48 bytes.
+///
+/// Accepts a bare hex string or a `0x` / `0X` prefix. Any other length or
+/// non-hex text is not a match.
+fn parsed_keystore_pubkey(content: &str) -> Option<Pubkey> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let pk_str = value.get("pubkey")?.as_str()?;
+    let bare = pk_str.strip_prefix("0x").or_else(|| pk_str.strip_prefix("0X")).unwrap_or(pk_str);
+    if bare.len() != std::mem::size_of::<Pubkey>() * 2 {
+        return None;
+    }
+    let mut bytes = [0u8; 48];
+    hex::decode_to_slice(bare, &mut bytes).ok()?;
+    Some(bytes)
 }
 
 fn discard_renamed_removed_secret(keystore_dir: &Path, pubkey: &Pubkey, unlink_failed: &mut bool) {
@@ -1458,43 +1491,28 @@ impl KeystoreManager for KeystoreManagerAdapter {
             }
         }
         if !self.composite_signer.has_local_key(pubkey) {
-            // Already absent from the signer. Still remove a leftover secret
-            // and write the denylist. A failed secret removal does not skip
-            // the denylist and does not register the key.
-            insert_denylist_after_secret(
-                self.denylist.as_ref(),
-                pubkey,
-                remove_import_secret(&self.keystore_dir, pubkey),
-            )?;
-            return Ok(false);
+            // Already absent from the signer. Same on-disk order as a loaded
+            // key. `Ok(true)` means a keystore file was unlinked. A leftover
+            // secret alone is `Ok(false)`. A failed secret removal does not
+            // skip the denylist and does not register the key.
+            return self.remove_key_files(pubkey);
         }
 
-        // Order:
+        // Order, shared with the not-loaded branch via `remove_key_files`:
         //   1. Unlink keystore files. Failure leaves memory and the denylist
         //      unchanged. The keystore directory is not fsynced.
         //   2. Remove the import secret, including the secrets-dir fsync.
-        //   3. Durable denylist.insert, including when step 2 fails.
-        //   4. Remove from the signing registry only when 2 and 3 both succeed.
+        //   3. M-12 sidecars when step 2 succeeds.
+        //   4. Durable denylist.insert, including when step 2 fails.
+        //   5. Remove from the signing registry only when this returns Ok.
         //
         // A failed secret removal still denylists the key so a restart does
         // not load it. The registry stays so DELETE can be retried.
-
-        // Matches any `*.json` whose EIP-2335 pubkey field equals this key
+        //
+        // Matches any `*.json` whose pubkey field decodes to this key
         // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).
         // No matching file is OK (secret-provider / already removed).
-        remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
-        let secret_removed = remove_import_secret(&self.keystore_dir, pubkey);
-        if secret_removed.is_ok() {
-            // M-12: remove the import-time sidecar so a re-import starts clean.
-            // A leftover staged partial or `.removing.*` set-aside is the same
-            // unfinished marker (older cleanups used rename-aside; boot still
-            // fails closed). Skipped when the secret is still on disk.
-            let meta_path = import_meta_path(&self.keystore_dir, pubkey);
-            let _ = std::fs::remove_file(&meta_path);
-            let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
-            remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
-        }
-        insert_denylist_after_secret(self.denylist.as_ref(), pubkey, secret_removed)?;
+        self.remove_key_files(pubkey)?;
 
         // Drop bookkeeping after denylist succeeds (lock still held for
         // remove_local_key + map update so concurrent deletes/imports serialize).

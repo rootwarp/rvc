@@ -659,6 +659,34 @@ async fn delete_export_behind_a_held_gate_is_503_and_deletes_nothing() {
     drop(holder);
 }
 
+/// A 503 from the import-window gate covers a request that also names a key
+/// that is not loaded. Neither key's files are removed.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn delete_export_503_with_a_not_loaded_key_removes_nothing() {
+    let rig = DeleteRig::open(8_000, true);
+    let unloaded = test_pubkey(9);
+    let unloaded_hex = pubkey_hex(unloaded);
+    let dir = rig.keystore_file.parent().expect("keystore dir");
+    export_floor::write_keystore_bundle(dir, &unloaded_hex);
+    let unloaded_file = dir.join(format!("{unloaded_hex}.json"));
+    let unloaded_sidecar = dir.join(format!("{unloaded_hex}.import_meta.json"));
+    let unloaded_secret = dir.join(crate::config::Config::IMPORT_SECRETS_DIR).join(&unloaded_hex);
+
+    let holder = rig.gate.admit(0).await.expect("the test holds the gate");
+    let started = Instant::now();
+    let err = rig.delete(vec![rig.hex_key.clone(), unloaded_hex]).await.expect_err("queue bound");
+    assert_eq!(started.elapsed(), Duration::from_secs(24));
+    let response = unavailable_response(err, Some(24));
+    assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after = response.headers().get("Retry-After").expect("Retry-After");
+    assert_eq!(retry_after.to_str().expect("header"), "24");
+    rig.assert_nothing_removed();
+    assert!(unloaded_file.exists(), "the not-loaded keystore remains");
+    assert!(unloaded_sidecar.exists(), "the not-loaded sidecar remains");
+    assert!(unloaded_secret.exists(), "the not-loaded secret remains");
+    drop(holder);
+}
+
 /// The export read runs off the runtime thread and keeps the admission guard
 /// after the DELETE task is aborted, until the read returns.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1033,27 +1061,38 @@ async fn ensure_still_fits_failing_after_admission_aborts_and_removes_nothing() 
     assert!(!rig.gate.admission_in_progress());
 }
 
-/// An empty DELETE has no members, so it does not wait on a held gate.
+/// An empty DELETE still asks the adapter for the node's genesis validators
+/// root, so a held import gate makes it wait and then return 503. No member
+/// is disabled and nothing is removed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn an_empty_delete_does_not_take_the_import_gate() {
+async fn an_empty_delete_admits_the_export_and_503s_when_the_gate_is_held() {
     let rig = DeleteRig::open(8_000, true);
     let holder = rig.gate.admit(0).await.expect("hold");
     assert!(rig.store.is_signing_enabled(&rig.key));
     let started = Instant::now();
-    let body = rig.delete(Vec::new()).await.expect("empty request");
-    assert_eq!(Instant::now(), started, "an empty DELETE must not wait for the gate");
-    assert!(body.data.is_empty());
+    let err = rig.delete(Vec::new()).await.expect_err("empty request still admits");
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(24),
+        "QUEUE_WAIT_SLOTS is 2 and the slot is 12s"
+    );
+    let response = unavailable_response(err, Some(24));
+    assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after = response.headers().get("Retry-After").expect("Retry-After");
+    assert_eq!(retry_after.to_str().expect("header"), "24");
     assert!(rig.gate.admission_in_progress(), "the test's guard is still the holder");
     assert_eq!(rig.keys.deletes(), 0);
     assert!(rig.keys.has_key(&rig.key));
+    assert!(rig.keystore_file.exists());
     assert!(rig.store.is_signing_enabled(&rig.key), "no member was disabled");
     drop(holder);
     assert!(!rig.gate.admission_in_progress());
 }
 
-/// A request that mixes a member and an unknown key exports only the member.
+/// A member and an unloaded key with history are both exported. The unloaded
+/// key is `not_active`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_delete_of_a_member_and_an_unknown_key_exports_only_the_member() {
+async fn a_delete_of_a_member_and_an_unloaded_key_exports_both() {
     let rig = DeleteRig::open(8_000, true);
     let stranger = test_pubkey(99);
     let stranger_hex = pubkey_hex(stranger);
@@ -1064,17 +1103,24 @@ async fn a_delete_of_a_member_and_an_unknown_key_exports_only_the_member() {
         rig.delete(vec![rig.hex_key.clone(), stranger_hex.clone()]).await.expect("mixed request");
     assert_eq!(body.data.len(), 2);
     assert_eq!(body.data[0].status, DeleteStatus::Deleted);
-    assert_eq!(body.data[1].status, DeleteStatus::NotFound);
-    // The handler calls `delete_keystore` for the unknown key too. The stub
-    // counts that NotFound call; the key was never a member.
+    assert_eq!(body.data[1].status, DeleteStatus::NotActive);
     assert_eq!(rig.keys.deletes(), 2);
     assert!(!rig.keystore_file.exists(), "the member keystore was removed");
     assert!(!rig.keys.has_key(&rig.key));
     assert!(!rig.keys.has_key(&stranger));
 
     let json: serde_json::Value = serde_json::from_str(&body.slashing_protection).expect("json");
-    assert_eq!(export_floor::recorded_pubkeys(&json), vec![rig.hex_key.as_str()]);
-    assert!(!body.slashing_protection.contains(&stranger_hex));
+    assert_eq!(
+        export_floor::recorded_pubkeys(&json),
+        vec![rig.hex_key.as_str(), stranger_hex.as_str()]
+    );
+    let stranger_row = json["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|row| row["pubkey"] == stranger_hex)
+        .expect("unloaded key");
+    assert_eq!(stranger_row["signed_attestations"][0]["target_epoch"], "10");
     assert_eq!(rig.db.get_attestations(&stranger_hex).expect("stranger rows").len(), 1);
     assert_eq!(rig.db.get_attestations(&rig.hex_key).expect("member rows").len(), 1);
 }

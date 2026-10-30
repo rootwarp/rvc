@@ -157,9 +157,11 @@ fn boot_load_keystore_dir_key() -> (TempDir, Arc<CompositeSigner>, Pubkey) {
     km.insert(sk);
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(km)));
     let dir = TempDir::new().unwrap();
-    // Optional on-disk keystore file (as `--keystore-path` would leave behind)
+    // On-disk keystore. DELETE matches the pubkey inside the JSON, so the
+    // placeholder has to carry this key. A filename alone is not a match.
     let filename = format!("{}.json", pubkey_hex(pk_bytes));
-    std::fs::write(dir.path().join(&filename), "{}").unwrap();
+    let body = format!(r#"{{"pubkey":"{}"}}"#, hex::encode(pk_bytes));
+    std::fs::write(dir.path().join(&filename), body).unwrap();
     (dir, composite, pk_bytes)
 }
 
@@ -213,9 +215,8 @@ async fn test_delete_boot_loaded_key_returns_ok_true_and_stops_signing() {
 
 #[test]
 fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
-    // Mirrors the DELETE handler: has_key gates export of existing keys, so a
-    // boot-loaded key with real slashing rows must yield a non-empty history
-    // in the interchange (not the empty interchange used for never-known keys).
+    // A loaded key with real slashing rows yields that history in the
+    // interchange. The handler exports it because the key is a member.
     let (dir, composite, pk) = boot_load_keystore_dir_key();
     let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
@@ -227,10 +228,7 @@ fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
 
     let slashing = SlashingProtectionAdapter::new_in_free_window(db, gvr_root);
 
-    assert!(
-        adapter.has_key(&pk),
-        "handler only exports interchange for keys where has_key is true"
-    );
+    assert!(adapter.has_key(&pk), "a boot-loaded key is present in the signing registry");
 
     let export = block_on(slashing.export_interchange(&[pk])).expect("export");
     let v: serde_json::Value = serde_json::from_str(&export.json).unwrap();

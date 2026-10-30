@@ -273,9 +273,8 @@ impl ValidatorConfigManager for NoopConfigManager {
 ///   2. Not invoke `delete_keystore` on any keystore (fail before the
 ///      deletion loop).
 ///
-/// On the un-patched code this test fails because the handler uses
-/// `unwrap_or_else(|e| empty_interchange())`, proceeds to delete all
-/// keystores, and returns `Ok` with an empty interchange.
+/// On the un-patched code this test fails because the handler swallowed the
+/// export error, proceeded to delete every keystore, and returned `Ok`.
 #[tokio::test]
 async fn test_delete_keystores_export_error_fails_closed_no_deletion() {
     let known_key = test_pubkey(42);
