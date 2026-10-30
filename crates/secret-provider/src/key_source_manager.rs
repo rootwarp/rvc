@@ -46,7 +46,15 @@ pub struct ProviderFetchResult {
     pub skipped: usize,
     pub errors: Vec<String>,
     /// Successfully converted keys that passed the post-fetch denylist check.
-    pub keys: Vec<SecretKey>,
+    ///
+    /// The `String` is the provider secret id. Callers that do not cache ids
+    /// ignore it. The vec does not include denylisted or failed ids.
+    pub keys: Vec<(String, SecretKey)>,
+    /// Ids the post-fetch denylist check skipped, with the pubkey only.
+    ///
+    /// No [`SecretKey`], keystore JSON, or password is retained. List-time hex
+    /// skips are not recorded here: those ids are never fetched.
+    pub denied: Vec<(String, [u8; 48])>,
 }
 
 enum FetchOutcome {
@@ -92,6 +100,7 @@ pub async fn fetch_provider_keys(
     let mut skipped = 0usize;
     let mut errors = Vec::new();
     let mut keys = Vec::new();
+    let mut denied = Vec::new();
 
     let concurrency = concurrency.max(1);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -172,10 +181,12 @@ pub async fn fetch_provider_keys(
                             "Skipping denylisted secret-provider key"
                         );
                         skipped += 1;
+                        // Pubkey only. `secret_key` drops here and zeroizes.
+                        denied.push((entry_id, pubkey_bytes));
                         continue;
                     }
                     loaded += 1;
-                    keys.push(secret_key);
+                    keys.push((entry_id, secret_key));
                 }
                 Err(e) => {
                     warn!(
@@ -234,7 +245,7 @@ pub async fn fetch_provider_keys(
         .with_label_values(&[provider_name.as_str()])
         .observe(load_started.elapsed().as_secs_f64());
 
-    ProviderFetchResult { name: provider_name, loaded, skipped, errors, keys }
+    ProviderFetchResult { name: provider_name, loaded, skipped, errors, keys, denied }
 }
 
 pub struct KeySourceManager {
@@ -370,7 +381,7 @@ impl KeySourceManager {
             )
             .await;
 
-            for secret_key in fetch.keys {
+            for (_id, secret_key) in fetch.keys {
                 let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
                 info!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use crate::key_source_manager::{
     DEFAULT_KEY_FETCH_TIMEOUT,
 };
 use crate::metrics::RVC_SECRET_PROVIDER_KEYS_LOADED;
+use crate::SecretKeyEntry;
 use crate::SecretProvider;
 use crypto::SecretKey;
 
@@ -20,6 +21,20 @@ pub type DenylistCheck = Arc<dyn Fn(&[u8; 48]) -> bool + Send + Sync>;
 pub struct RefreshService {
     providers: Vec<Arc<dyn SecretProvider>>,
     known_pubkeys: HashSet<[u8; 48]>,
+    /// `(provider slot, secret id) → pubkey` for ids this process has already resolved.
+    ///
+    /// The slot is the provider's index in [`Self::providers`]. That vec is fixed by
+    /// [`Self::new`] / [`Self::with_denylist`]; nothing adds, removes, or reorders it,
+    /// so the slot stays stable for the life of the service. [`SecretProvider::name`]
+    /// is a log label, not an identity: two providers may share a name, and the same
+    /// opaque id under two slots is two keys.
+    ///
+    /// An entry is inserted only after a fetch returns that pubkey (admitted, already
+    /// known, or skipped by the post-fetch denylist). A fetch error, timeout, or
+    /// decrypt failure is not inserted. [`Self::run`] drops every entry whose pubkey
+    /// `on_new_key` rejects. The map holds pubkey bytes only: no [`SecretKey`],
+    /// keystore JSON, or password.
+    known_ids: HashMap<(usize, String), [u8; 48]>,
     /// Live denylist check (SEC-1b). Consulted every refresh so a key deleted
     /// mid-process is not re-added from the secret provider.
     is_denied: Option<DenylistCheck>,
@@ -50,6 +65,7 @@ impl RefreshService {
         Self {
             providers,
             known_pubkeys,
+            known_ids: HashMap::new(),
             is_denied,
             interval,
             fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
@@ -74,7 +90,7 @@ impl RefreshService {
         let start = Instant::now();
         let mut new_keys = Vec::new();
 
-        for provider in &self.providers {
+        for (slot, provider) in self.providers.iter().enumerate() {
             info!(
                 source = %provider.name(),
                 interval_secs = self.interval.as_secs(),
@@ -96,24 +112,14 @@ impl RefreshService {
                 }
             };
 
-            // known_pubkeys bookkeeping stays outside the shared pipeline: early-skip
-            // already-known entries (when list metadata has pubkey_hex) so we do not
-            // re-fetch them. Denylist is applied by fetch_provider_keys (hex precheck
-            // + post-fetch public_key check).
-            let to_fetch: Vec<_> = entries
-                .into_iter()
-                .filter(|entry| {
-                    if let Some(ref hex_str) = entry.pubkey_hex {
-                        if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str)
-                        {
-                            if self.known_pubkeys.contains(pk.as_bytes()) {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
-                .collect();
+            // known_pubkeys / known_ids bookkeeping stays outside the shared pipeline.
+            // Skip a fetch when list metadata already names a known pubkey, or when this
+            // slot has resolved the id to a pubkey that is known or denylisted *now*.
+            // `is_denied` is read every cycle, so a pubkey that leaves the denylist is
+            // fetched again. The denylist check itself stays inside fetch_provider_keys
+            // (hex precheck + post-fetch public_key check) for anything we do fetch.
+            let to_fetch: Vec<_> =
+                entries.into_iter().filter(|entry| self.should_fetch(slot, entry)).collect();
 
             // Idle cycle: nothing to fetch — do not wipe KEYS_LOADED or observe a
             // no-op load duration sample (RF4-14 Findings 1 + 3).
@@ -134,11 +140,12 @@ impl RefreshService {
             .await;
 
             let mut admitted_this_provider = 0usize;
-            for sk in fetch.keys {
+            for (id, sk) in fetch.keys {
                 let pubkey = sk.public_key().to_bytes();
-                // known_pubkeys bookkeeping: drop already-loaded keys (e.g. list had no
-                // pubkey_hex so early skip could not run). Denylist was applied inside
-                // fetch_provider_keys.
+                // Cache before the known-pubkey drop so an opaque id whose key is
+                // already loaded is not fetched again. `sk` still drops (and zeroizes)
+                // on the continue below. Denylist was applied inside fetch_provider_keys.
+                self.known_ids.insert((slot, id), pubkey);
                 if self.known_pubkeys.contains(&pubkey) {
                     continue;
                 }
@@ -153,6 +160,9 @@ impl RefreshService {
                 self.known_pubkeys.insert(pubkey);
                 new_keys.push(sk);
                 admitted_this_provider += 1;
+            }
+            for (id, pubkey) in fetch.denied {
+                self.known_ids.insert((slot, id), pubkey);
             }
 
             // Increment (never overwrite) the boot-set source total by newly admitted keys.
@@ -176,9 +186,46 @@ impl RefreshService {
         new_keys
     }
 
+    /// Skip this id without calling `fetch_key`.
+    ///
+    /// A cached id is skipped only when its pubkey is already loaded or is
+    /// denylisted on this call. A cache hit whose pubkey is neither is fetched
+    /// again, which is how a cleared denylist entry is loaded. A rejected key
+    /// is removed from the map, so the next cycle is a cache miss.
+    fn should_fetch(&self, slot: usize, entry: &SecretKeyEntry) -> bool {
+        if let Some(pubkey) = self.cached_pubkey(slot, &entry.id) {
+            if self.known_pubkeys.contains(&pubkey)
+                || self.is_denied.as_ref().is_some_and(|deny| deny(&pubkey))
+            {
+                return false;
+            }
+        }
+        if let Some(ref hex_str) = entry.pubkey_hex {
+            if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str) {
+                if self.known_pubkeys.contains(pk.as_bytes()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn cached_pubkey(&self, slot: usize, id: &str) -> Option<[u8; 48]> {
+        self.known_ids.get(&(slot, id.to_owned())).copied()
+    }
+
+    /// Drop a rejected key from both sets so the next cycle offers it again.
+    fn forget_rejected_pubkey(&mut self, pubkey: &[u8; 48]) {
+        self.known_pubkeys.remove(pubkey);
+        self.known_ids.retain(|_, cached| cached != pubkey);
+    }
+
     /// `on_new_key` returns `true` when the key was kept. `false` drops it from
-    /// `known_pubkeys` so the next refresh offers it again.
-    pub async fn run<F>(mut self, mut on_new_key: F)
+    /// `known_pubkeys` and from every `known_ids` entry that maps to it, so the
+    /// next refresh offers it again.
+    ///
+    /// Returns the service after `cancel_token` fires.
+    pub async fn run<F>(mut self, mut on_new_key: F) -> Self
     where
         F: FnMut(SecretKey) -> bool,
     {
@@ -189,27 +236,32 @@ impl RefreshService {
                     for sk in new_keys {
                         let pubkey = sk.public_key().to_bytes();
                         if !on_new_key(sk) {
-                            self.known_pubkeys.remove(&pubkey);
+                            self.forget_rejected_pubkey(&pubkey);
                         }
                     }
                 }
                 _ = self.cancel_token.cancelled() => break,
             }
         }
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use parking_lot::Mutex;
 
     use async_trait::async_trait;
+    use tracing::field::Visit;
+    use tracing_subscriber::layer::SubscriberExt;
     use zeroize::Zeroizing;
 
     use super::*;
     use crate::key_source_manager::mock::MockSecretProvider;
-    use crate::{KeyMaterial, SecretKeyEntry, SecretProviderError};
+    use crate::{KeyMaterial, SecretKeyEntry, SecretProvider, SecretProviderError};
 
     fn make_raw_key_entry(
         id: &str,
@@ -777,5 +829,709 @@ mod tests {
             "in-flight fetches must respect concurrency cap, peak={observed_peak}"
         );
         assert!(observed_peak >= 1, "at least one fetch must have run");
+    }
+
+    // ── W4-K3b: (provider slot, id) → pubkey cache ────────────────────────
+
+    struct CountingProvider<P> {
+        inner: P,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl<P: SecretProvider> SecretProvider for CountingProvider<P> {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            self.inner.list_keys().await
+        }
+
+        async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch_key(id).await
+        }
+    }
+
+    fn counting_raw(
+        name: &str,
+        id: &str,
+        sk: &SecretKey,
+        fetches: Arc<AtomicUsize>,
+    ) -> CountingProvider<MockSecretProvider> {
+        let (entry, material) = make_raw_key_entry(id, sk);
+        assert!(entry.pubkey_hex.is_none(), "{id} must be an opaque id");
+        CountingProvider {
+            inner: MockSecretProvider {
+                name: name.to_string(),
+                keys: vec![(entry, material)],
+                list_error: None,
+            },
+            fetches,
+        }
+    }
+
+    fn pubkey_of(sk: &SecretKey) -> [u8; 48] {
+        sk.public_key().to_bytes()
+    }
+
+    fn fresh_service(
+        providers: Vec<Arc<dyn SecretProvider>>,
+        known: HashSet<[u8; 48]>,
+        deny: Option<DenylistCheck>,
+    ) -> RefreshService {
+        RefreshService::with_denylist(
+            providers,
+            known,
+            deny,
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        )
+    }
+
+    /// One paused-time step of `RefreshService::run`. Returns the offered pubkey.
+    async fn offered_pubkey(
+        rx: &mut tokio::sync::mpsc::Receiver<[u8; 48]>,
+        interval: Duration,
+    ) -> [u8; 48] {
+        if let Ok(pk) = rx.try_recv() {
+            return pk;
+        }
+        tokio::time::timeout(interval.saturating_mul(3), rx.recv())
+            .await
+            .expect("paused clock reached an offer")
+            .expect("offer channel stays open")
+    }
+
+    /// AC: a known opaque id is fetched once across two cycles and never returned.
+    #[tokio::test]
+    async fn an_opaque_known_id_is_fetched_once_across_two_cycles() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = counting_raw("opaque-known", "validator-7", &sk, Arc::clone(&fetches));
+        let mut known = HashSet::new();
+        known.insert(pk);
+        let mut service = fresh_service(vec![Arc::new(provider)], known, None);
+
+        let first = service.refresh().await;
+        let second = service.refresh().await;
+
+        assert!(first.is_empty(), "a known pubkey is not returned as new");
+        assert!(second.is_empty(), "the second cycle still returns nothing");
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "cache hit must not fetch or decrypt");
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+    }
+
+    /// A new opaque id is fetched and returned once, then served from the cache.
+    #[tokio::test]
+    async fn a_new_opaque_id_is_fetched_once_then_cached() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = counting_raw("opaque-new", "validator-7", &sk, Arc::clone(&fetches));
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(pubkey_of(&first[0]), pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        let second = service.refresh().await;
+        assert!(second.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "the second cycle is a cache hit");
+        assert!(service.known_pubkeys.contains(&pk));
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+    }
+
+    /// AC / NM-6: the same opaque id under two providers is cached per slot, not by name.
+    #[tokio::test]
+    async fn the_same_opaque_id_in_two_providers_is_cached_per_provider() {
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let pk_a = pubkey_of(&sk_a);
+        let pk_b = pubkey_of(&sk_b);
+        let fetches_a = Arc::new(AtomicUsize::new(0));
+        let fetches_b = Arc::new(AtomicUsize::new(0));
+        // Same log name on purpose: `name()` must not be the cache key.
+        let provider_a = counting_raw("mock", "validator-7", &sk_a, Arc::clone(&fetches_a));
+        let provider_b = counting_raw("mock", "validator-7", &sk_b, Arc::clone(&fetches_b));
+        let mut known = HashSet::new();
+        known.insert(pk_a);
+        let mut service =
+            fresh_service(vec![Arc::new(provider_a), Arc::new(provider_b)], known, None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1, "only provider B's key is new");
+        assert_eq!(pubkey_of(&first[0]), pk_b);
+        assert_eq!(fetches_a.load(Ordering::SeqCst), 1);
+        assert_eq!(fetches_b.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk_a));
+        assert_eq!(service.cached_pubkey(1, "validator-7"), Some(pk_b));
+
+        let second = service.refresh().await;
+        assert!(second.is_empty());
+        assert_eq!(fetches_a.load(Ordering::SeqCst), 1, "slot 0 cache hit");
+        assert_eq!(fetches_b.load(Ordering::SeqCst), 1, "slot 1 cache hit");
+    }
+
+    /// AC: a denylisted opaque id is fetched once, hidden, and fetched again after the denylist clears.
+    #[tokio::test]
+    async fn a_denylisted_opaque_id_is_not_fetched_again() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = counting_raw("opaque-deny", "validator-9", &sk, Arc::clone(&fetches));
+        let denied_now = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&denied_now);
+        let is_denied: DenylistCheck =
+            Arc::new(move |got| flag.load(Ordering::SeqCst) && *got == pk);
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), Some(is_denied));
+
+        let first = service.refresh().await;
+        assert!(first.is_empty(), "a denylisted key is not returned");
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "validator-9"), Some(pk));
+        assert!(!service.known_pubkeys.contains(&pk));
+
+        let second = service.refresh().await;
+        assert!(second.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "still denylisted: cache hit, no fetch");
+
+        denied_now.store(false, Ordering::SeqCst);
+        let third = service.refresh().await;
+        assert_eq!(third.len(), 1, "clearing the denylist fetches and returns the key");
+        assert_eq!(pubkey_of(&third[0]), pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(service.known_pubkeys.contains(&pk));
+    }
+
+    /// AC: `on_new_key` returning false evicts the id, so the next cycle fetches it again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_rejected_key_evicts_its_id_and_is_fetched_again() {
+        let interval = Duration::from_secs(30);
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = counting_raw("opaque-reject", "validator-7", &sk, Arc::clone(&fetches));
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let service =
+            RefreshService::new(vec![Arc::new(provider)], HashSet::new(), interval, cancel);
+
+        let handle = tokio::spawn(async move {
+            service
+                .run(move |got| {
+                    tx.try_send(pubkey_of(&got)).expect("offer channel accepts the key");
+                    false
+                })
+                .await
+        });
+
+        tokio::time::advance(interval).await;
+        let first = offered_pubkey(&mut rx, interval).await;
+        assert_eq!(first, pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(interval).await;
+        let second = offered_pubkey(&mut rx, interval).await;
+        assert_eq!(second, pk, "a rejected key is offered on the next cycle");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+
+        cancel_task.cancel();
+        let service = handle.await.expect("run returns after cancel");
+        assert!(!service.known_pubkeys.contains(&pk));
+        assert!(
+            service.known_ids.values().all(|cached| cached != &pk),
+            "rejection removes every known_ids entry for that pubkey"
+        );
+    }
+
+    struct LogEvent {
+        level: tracing::Level,
+        fields: Vec<(String, String)>,
+    }
+
+    struct LogCapture {
+        events: Arc<Mutex<Vec<LogEvent>>>,
+    }
+
+    struct LogVisitor {
+        fields: Vec<(String, String)>,
+    }
+
+    impl Visit for LogVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push((field.name().to_string(), format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = LogVisitor { fields: Vec::new() };
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .push(LogEvent { level: *event.metadata().level(), fields: visitor.fields });
+        }
+    }
+
+    fn field_value<'a>(event: &'a LogEvent, name: &str) -> Option<&'a str> {
+        event.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.trim_matches('"'))
+    }
+
+    /// AC: a decrypt failure is a warn, is not cached, and is fetched again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decrypt_failure_is_skipped_and_retried_next_cycle() {
+        let password = Zeroizing::new("not-logged-keystore-password".to_string());
+        let broken =
+            KeyMaterial::Keystore { keystore_json: "{".to_string(), password: password.clone() };
+        let err = crate::key_source_manager::convert_key_material("validator-7", broken)
+            .expect_err("malformed keystore JSON");
+        assert!(
+            matches!(err, SecretProviderError::DecryptionFailed { ref id, .. } if id == "validator-7"),
+            "decrypt failure is DecryptionFailed, got {err:?}"
+        );
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            inner: MockSecretProvider {
+                name: "opaque-decrypt".to_string(),
+                keys: vec![(
+                    SecretKeyEntry { id: "validator-7".to_string(), pubkey_hex: None },
+                    Ok(KeyMaterial::Keystore {
+                        keystore_json: "{".to_string(),
+                        password: password.clone(),
+                    }),
+                )],
+                list_error: None,
+            },
+            fetches: Arc::clone(&fetches),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogCapture { events: Arc::clone(&events) };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+        let first = service.refresh().await;
+        let second = service.refresh().await;
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "a decrypt failure is not cached");
+        assert!(service.known_ids.is_empty());
+        let captured = events.lock();
+        let warn_count = captured
+            .iter()
+            .filter(|event| {
+                event.level == tracing::Level::WARN
+                    && field_value(event, "message") == Some("Key fetch failure")
+            })
+            .count();
+        assert_eq!(warn_count, 2, "each failed decrypt warns once");
+        let secret = password.as_str();
+        assert!(
+            captured
+                .iter()
+                .all(|event| { event.fields.iter().all(|(_, value)| !value.contains(secret)) }),
+            "decrypt warn must not contain the keystore password"
+        );
+    }
+
+    struct FailThenServe {
+        bytes: Zeroizing<[u8; 32]>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for FailThenServe {
+        fn name(&self) -> &str {
+            "opaque-fetch-error"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(vec![SecretKeyEntry { id: "validator-7".to_string(), pubkey_hex: None }])
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            let n = self.fetches.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(SecretProviderError::Provider("provider down".into()));
+            }
+            Ok(KeyMaterial::RawKey(self.bytes.clone()))
+        }
+    }
+
+    /// A fetch error is not cached, so the next cycle loads the key.
+    #[tokio::test]
+    async fn a_fetch_error_is_not_cached_and_is_retried_next_cycle() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider =
+            FailThenServe { bytes: Zeroizing::new(sk.to_bytes()), fetches: Arc::clone(&fetches) };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert!(first.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert!(service.known_ids.is_empty(), "fetch error must not become a cache entry");
+
+        let second = service.refresh().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(pubkey_of(&second[0]), pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+    }
+
+    struct TimeoutThenServe {
+        bytes: Zeroizing<[u8; 32]>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for TimeoutThenServe {
+        fn name(&self) -> &str {
+            "opaque-timeout"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(vec![SecretKeyEntry { id: "validator-7".to_string(), pubkey_hex: None }])
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            let n = self.fetches.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok(KeyMaterial::RawKey(self.bytes.clone()))
+        }
+    }
+
+    /// A fetch timeout is not cached. The next cycle fetches again. Paused clock only.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_timeout_is_not_cached_and_is_retried_next_cycle() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = TimeoutThenServe {
+            bytes: Zeroizing::new(sk.to_bytes()),
+            fetches: Arc::clone(&fetches),
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None)
+            .with_fetch_timeout(Duration::from_secs(5));
+
+        let first = service.refresh().await;
+        assert!(first.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert!(service.known_ids.is_empty(), "timeout must not become a cache entry");
+
+        let second = service.refresh().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(pubkey_of(&second[0]), pk);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    struct RotatingId {
+        bytes: Arc<Mutex<Zeroizing<[u8; 32]>>>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for RotatingId {
+        fn name(&self) -> &str {
+            "opaque-rotate"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(vec![SecretKeyEntry { id: "validator-7".to_string(), pubkey_hex: None }])
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let bytes = self.bytes.lock().clone();
+            Ok(KeyMaterial::RawKey(bytes))
+        }
+    }
+
+    /// A new key under an already cached id is not fetched. Rotation waits for restart.
+    #[tokio::test]
+    async fn a_changed_secret_version_under_the_same_id_is_not_refetched() {
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let pk1 = pubkey_of(&sk1);
+        let pk2 = pubkey_of(&sk2);
+        let bytes = Arc::new(Mutex::new(Zeroizing::new(sk1.to_bytes())));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = RotatingId { bytes: Arc::clone(&bytes), fetches: Arc::clone(&fetches) };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(pubkey_of(&first[0]), pk1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        *bytes.lock() = Zeroizing::new(sk2.to_bytes());
+        let second = service.refresh().await;
+        assert!(second.is_empty(), "refresh does not detect a same-id rotation");
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk1));
+        assert!(!service.known_pubkeys.contains(&pk2));
+    }
+
+    struct ListToggle {
+        bytes: Zeroizing<[u8; 32]>,
+        fail_list: Arc<AtomicBool>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for ListToggle {
+        fn name(&self) -> &str {
+            "opaque-list-fail"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            if self.fail_list.load(Ordering::SeqCst) {
+                return Err(SecretProviderError::Provider("list failed".into()));
+            }
+            Ok(vec![SecretKeyEntry { id: "validator-7".to_string(), pubkey_hex: None }])
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(KeyMaterial::RawKey(self.bytes.clone()))
+        }
+    }
+
+    /// `list_keys` failing does not insert and does not evict. The id stays cached.
+    #[tokio::test]
+    async fn a_list_keys_failure_does_not_drop_a_cached_id() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let fail_list = Arc::new(AtomicBool::new(false));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = ListToggle {
+            bytes: Zeroizing::new(sk.to_bytes()),
+            fail_list: Arc::clone(&fail_list),
+            fetches: Arc::clone(&fetches),
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        fail_list.store(true, Ordering::SeqCst);
+        let during_outage = service.refresh().await;
+        assert!(during_outage.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+
+        fail_list.store(false, Ordering::SeqCst);
+        let after = service.refresh().await;
+        assert!(after.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "list failure must not evict the id");
+    }
+
+    struct OverlappingFetches {
+        keys: Vec<ListedRaw>,
+        fetches: Arc<AtomicUsize>,
+        started: Arc<AtomicUsize>,
+        gate: Arc<tokio::sync::watch::Sender<bool>>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for OverlappingFetches {
+        fn name(&self) -> &str {
+            "opaque-concurrent"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .keys
+                .iter()
+                .map(|entry| SecretKeyEntry { id: entry.id.clone(), pubkey_hex: None })
+                .collect())
+        }
+
+        async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let mut rx = self.gate.subscribe();
+            let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.keys.len() {
+                self.gate.send(true).expect("watch channel is open");
+            }
+            while !*rx.borrow() {
+                rx.changed().await.expect("watch channel stays open");
+            }
+            let bytes = self
+                .keys
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.bytes.clone())
+                .expect("listed id is fetchable");
+            Ok(KeyMaterial::RawKey(bytes))
+        }
+    }
+
+    /// One cycle's fetch fan-out is concurrent. Every success is cached for the next cycle.
+    ///
+    /// `RefreshService::refresh` takes `&mut self`, so two cycles cannot overlap.
+    /// The concurrent path is the bounded `fetch_key` fan-out inside one cycle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_fetches_in_one_cycle_are_all_cached() {
+        let mut expected = HashSet::new();
+        let mut keys = Vec::new();
+        for i in 0..4 {
+            let sk = SecretKey::generate();
+            expected.insert(pubkey_of(&sk));
+            keys.push(ListedRaw { id: format!("id-{i}"), bytes: Zeroizing::new(sk.to_bytes()) });
+        }
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (gate, _rx) = tokio::sync::watch::channel(false);
+        let provider = OverlappingFetches {
+            keys,
+            fetches: Arc::clone(&fetches),
+            started: Arc::new(AtomicUsize::new(0)),
+            gate: Arc::new(gate),
+        };
+        let mut service =
+            fresh_service(vec![Arc::new(provider)], HashSet::new(), None).with_fetch_concurrency(4);
+
+        let first = service.refresh().await;
+        let got: HashSet<_> = first.iter().map(pubkey_of).collect();
+        assert_eq!(got, expected);
+        assert_eq!(fetches.load(Ordering::SeqCst), 4);
+        assert_eq!(service.known_ids.len(), 4);
+
+        let second = service.refresh().await;
+        assert!(second.is_empty());
+        assert_eq!(fetches.load(Ordering::SeqCst), 4, "every concurrent id is cached");
+    }
+
+    struct ListedRaw {
+        id: String,
+        bytes: Zeroizing<[u8; 32]>,
+    }
+
+    struct MutableOpaqueList {
+        entries: Arc<Mutex<Vec<ListedRaw>>>,
+        fetches: Arc<AtomicUsize>,
+        fetched_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SecretProvider for MutableOpaqueList {
+        fn name(&self) -> &str {
+            "opaque-mutable"
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .entries
+                .lock()
+                .iter()
+                .map(|entry| SecretKeyEntry { id: entry.id.clone(), pubkey_hex: None })
+                .collect())
+        }
+
+        async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.fetched_ids.lock().push(id.to_string());
+            let bytes = self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.bytes.clone())
+                .expect("listed id is fetchable");
+            Ok(KeyMaterial::RawKey(bytes))
+        }
+    }
+
+    /// A newly listed opaque id is fetched even when a sibling id is already cached.
+    #[tokio::test]
+    async fn a_new_sibling_id_is_fetched_while_the_cached_id_is_not() {
+        let sk_old = SecretKey::generate();
+        let sk_new = SecretKey::generate();
+        let pk_new = pubkey_of(&sk_new);
+        let entries = Arc::new(Mutex::new(vec![ListedRaw {
+            id: "validator-7".to_string(),
+            bytes: Zeroizing::new(sk_old.to_bytes()),
+        }]));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetched_ids = Arc::new(Mutex::new(Vec::new()));
+        let provider = MutableOpaqueList {
+            entries: Arc::clone(&entries),
+            fetches: Arc::clone(&fetches),
+            fetched_ids: Arc::clone(&fetched_ids),
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(pubkey_of(&first[0]), pubkey_of(&sk_old));
+
+        entries.lock().push(ListedRaw {
+            id: "validator-8".to_string(),
+            bytes: Zeroizing::new(sk_new.to_bytes()),
+        });
+        fetched_ids.lock().clear();
+        let second = service.refresh().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(pubkey_of(&second[0]), pk_new);
+        assert_eq!(fetched_ids.lock().as_slice(), ["validator-8"]);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// Dropping an id from the listing does not evict it. Putting that id back is a cache hit.
+    ///
+    /// Eviction is the rejected-callback path. A same-id rotation, including delete-and-recreate,
+    /// is picked up at the next restart.
+    #[tokio::test]
+    async fn an_id_omitted_from_a_later_listing_is_not_evicted() {
+        let sk = SecretKey::generate();
+        let pk = pubkey_of(&sk);
+        let entries = Arc::new(Mutex::new(vec![ListedRaw {
+            id: "validator-7".to_string(),
+            bytes: Zeroizing::new(sk.to_bytes()),
+        }]));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let provider = MutableOpaqueList {
+            entries: Arc::clone(&entries),
+            fetches: Arc::clone(&fetches),
+            fetched_ids: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut service = fresh_service(vec![Arc::new(provider)], HashSet::new(), None);
+
+        let first = service.refresh().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        entries.lock().clear();
+        let while_absent = service.refresh().await;
+        assert!(while_absent.is_empty());
+        assert_eq!(service.cached_pubkey(0, "validator-7"), Some(pk));
+
+        entries.lock().push(ListedRaw {
+            id: "validator-7".to_string(),
+            bytes: Zeroizing::new(sk.to_bytes()),
+        });
+        let relisted = service.refresh().await;
+        assert!(relisted.is_empty(), "re-listing a cached id does not fetch");
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
 }
