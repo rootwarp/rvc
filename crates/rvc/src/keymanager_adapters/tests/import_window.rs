@@ -231,6 +231,64 @@ async fn unfittable_import_is_no_free_window_in_the_http_response() {
     assert!(message.contains("split the payload"), "{message}");
 }
 
+/// An out-of-range epoch is `InvalidInterchange` on the first poll, before `admit`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_out_of_range_interchange_is_a_400_naming_the_field() {
+    let (_clock, gate) = gate_at(1_000, Duration::from_secs(12));
+    let gvr = [0x11u8; 32];
+    let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let adapter = SlashingProtectionAdapter::new(Arc::clone(&db), gvr, gate);
+    let above = (1_u64 << 63).to_string();
+    let json = serde_json::json!({
+        "metadata": {
+            "interchange_format_version": "5",
+            "genesis_validators_root": format!("0x{}", hex::encode(gvr))
+        },
+        "data": [{
+            "pubkey": "0xaaaa",
+            "signed_blocks": [],
+            "signed_attestations": [{
+                "source_epoch": "1",
+                "target_epoch": above,
+                "signing_root": null
+            }]
+        }]
+    })
+    .to_string();
+
+    let started = Instant::now();
+    let import = adapter.import_interchange(&json);
+    tokio::pin!(import);
+    let polled = tokio::select! {
+        biased;
+        result = import.as_mut() => result,
+        _ = tokio::task::yield_now() => {
+            panic!("first poll must be Ready(Err(InvalidInterchange)), not a window wait")
+        }
+    };
+    assert_eq!(Instant::now(), started, "an out-of-range interchange must not wait for the window");
+    let err = polled.expect_err("out of range");
+    let SlashingProtectionError::InvalidInterchange(msg) = &err else {
+        panic!("expected InvalidInterchange, got {err:?}");
+    };
+    assert!(msg.contains("target_epoch"), "{msg}");
+    assert!(msg.contains(&(1_u64 << 63).to_string()), "{msg}");
+
+    let response =
+        map_slashing_protection_error(err, "slashing protection import failed").into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = json["message"].as_str().unwrap_or("");
+    assert!(message.starts_with("invalid interchange:"), "{message}");
+    assert!(message.contains("target_epoch"), "{message}");
+    assert!(
+        json.get("code").is_none(),
+        "same message-only shape as other InvalidInterchange errors, got {json}"
+    );
+    assert!(db.get_attestations("0xaaaa").expect("rows").is_empty());
+}
+
 struct Hold {
     entered: AtomicUsize,
     release: AtomicBool,

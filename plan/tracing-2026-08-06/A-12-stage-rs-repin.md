@@ -8,18 +8,19 @@ architecture phase-5 entry criterion **E3**).
 
 | Field | Value |
 |---|---|
-| **A-12 / T19 pin SHA** | `22aa3de5bf5ed0c03ed571694dc3a5652e460613` |
-| **Short** | `22aa3de5` |
-| **Role** | Initiative-start / post-ADR-005 `stage.rs` byte baseline |
+| **A-12 / T19 pin blob** | `463ff36184a946a0eea0d4d4839a8bc04f74479c` |
+| **Previous commit pin** | `22aa3de5bf5ed0c03ed571694dc3a5652e460613` (`22aa3de5`) |
+| **Role** | Byte baseline of `crates/slashing/src/stage.rs` after W4-S1a (#820) |
+| **Why a blob** | The range-check redesign is one commit. A commit cannot contain its own SHA, so T19 compares `git rev-parse HEAD:crates/slashing/src/stage.rs` to this blob. |
 | **Why not `0ae9a09`** | CD-1: `stage.rs` changed under ARCH-5e (and follow-ons). Pinning `0ae9a09` would fail on tip. |
 | **CI** | `.github/workflows/ci.yml` job `check`, step **T19 — stage.rs byte-identical to A-12 pin** |
 
 ```text
-git diff 22aa3de5bf5ed0c03ed571694dc3a5652e460613 -- crates/slashing/src/stage.rs
+git rev-parse HEAD:crates/slashing/src/stage.rs
 ```
 
-must be empty at every merge that retains the T19 guard. Failure text in CI
-names **A-12** and points at this file.
+must equal `463ff36184a946a0eea0d4d4839a8bc04f74479c` at every merge that retains
+the T19 guard. Failure text in CI names **A-12** and points at this file.
 
 ## What A-12 was
 
@@ -54,18 +55,26 @@ This file **is** that resolution. The pin is not discovered by a red CI step.
 
 When an authorized `stage.rs` redesign (ARCH-5e class) merges to `develop`:
 
-1. Take `git rev-parse` of the merge commit that contains the new
-   `stage.rs` bytes.
-2. Replace the T19 baseline SHA in this file **and** in
-   `.github/workflows/ci.yml` (the `PIN=` constant).
-3. `git diff <new-pin> -- crates/slashing/src/stage.rs` must be empty on tip.
+1. Take `git rev-parse HEAD:crates/slashing/src/stage.rs` of the commit that
+   contains the new bytes.
+2. Replace the T19 `PIN_BLOB` in this file **and** in
+   `.github/workflows/ci.yml`.
+3. That `git rev-parse` must equal `PIN_BLOB` on tip.
 4. Tracing work must still not instrument `stage.rs`; the pin's *purpose* is
    unchanged.
 
-**Current pin** `22aa3de5bf5ed0c03ed571694dc3a5652e460613` is the tracing
+A commit SHA cannot name itself, so the guard compares blobs. W4-S1a is the
+redesign that moved the pin off `22aa3de5`.
+
+**Previous pin** `22aa3de5bf5ed0c03ed571694dc3a5652e460613` is the tracing
 initiative-start tip (`fix(devnet): cheap k8 metrics empty-body check (#401)`).
-At that commit, `stage.rs` already reflects the post-redesign surface; T19 CI
-now enforces byte-identity against it.
+At that commit, `stage.rs` reflected the post-ARCH-5e surface.
+
+**Current pin** `463ff36184a946a0eea0d4d4839a8bc04f74479c` is the blob of
+`stage.rs` after W4-S1a (#820): out-of-range slots and epochs are refused
+before `pinned_gvr`, and every bind goes through `to_sql_i64`. That is not
+tracing instrumentation. T19 still rejects any other byte change, including
+`#[instrument]`.
 
 ## What this does *not* authorize
 

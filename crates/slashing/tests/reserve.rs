@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use rvc_slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
-    BlockSlashingViolation, CommittedReservation, InterchangeAttestation, InterchangeBlock,
-    InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
-    SlashingDb, SlashingError, ValidatorRecord,
+    BlockSlashingViolation, CommittedReservation, GroupCommitConfig, InterchangeAttestation,
+    InterchangeBlock, InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome,
+    ReservationKind, SlashingDb, SlashingError, ValidatorRecord,
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -661,4 +661,188 @@ fn test_scoped_reserve_pins_client_cn_and_gvr() {
         .query_row("SELECT COUNT(*) FROM blocks WHERE pubkey = ?1", [PUBKEY2], |row| row.get(0))
         .expect("count");
     assert_eq!(leftover, 0, "GVR-rejected reserve must write no row");
+}
+
+fn assert_out_of_range(err: SlashingError, field: &str, value: u64) {
+    match &err {
+        SlashingError::OutOfRange { field: got, value: got_value } => {
+            assert_eq!(*got, field, "{err}");
+            assert_eq!(*got_value, value, "{err}");
+        }
+        other => panic!("expected OutOfRange {{ field: {field}, value: {value} }}, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(msg.contains(field), "{msg}");
+    assert!(msg.contains(&value.to_string()), "{msg}");
+    assert!(msg.contains("i64::MAX"), "{msg}");
+    assert!(msg.contains(&i64::MAX.to_string()), "{msg}");
+    assert!(!err.is_reserve_commit_failure(), "{err:?}");
+}
+
+/// With (100, 101) stored, a target of 2^63 used to bind as `i64::MIN` and miss the surround.
+#[test]
+fn reserve_attestation_rejects_a_target_at_2_pow_63_and_writes_no_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.reserve_attestation(PUBKEY, 100, 101, Some("0xstored".into()), GVR)
+        .expect("store (100, 101)");
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1);
+
+    let err = db
+        .reserve_attestation(PUBKEY, 99, 1 << 63, Some("0xwrap".into()), GVR)
+        .expect_err("target 2^63");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1, "no wrapped row");
+
+    let err = db
+        .reserve_attestation(PUBKEY, 1 << 63, (1 << 63) + 1, Some("0xsrc".into()), GVR)
+        .expect_err("source 2^63");
+    assert_out_of_range(err, "source_epoch", 1 << 63);
+    assert_eq!(
+        db.get_attestations(PUBKEY).expect("rows").len(),
+        1,
+        "source refusal writes nothing"
+    );
+}
+
+#[test]
+fn reserve_block_rejects_a_slot_at_2_pow_63() {
+    for slot in [1_u64 << 63, u64::MAX] {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let err = db
+            .reserve_block(PUBKEY, slot, Some("0xslot".into()), GVR)
+            .expect_err("slot above i64::MAX");
+        assert_out_of_range(err, "slot", slot);
+        assert!(db.get_blocks(PUBKEY).expect("rows").is_empty(), "slot {slot} must write no row");
+    }
+}
+
+/// `i64::MAX` is a real signed SQLite value and must be stored as itself.
+#[test]
+fn reserve_accepts_i64_max_exactly() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let limit = i64::MAX as u64;
+
+    let block = db.reserve_block(PUBKEY, limit, Some("0xblock".into()), GVR).expect("slot");
+    assert!(block.inserted);
+    let blocks = db.get_blocks(PUBKEY).expect("blocks");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].slot, limit);
+
+    let by_target =
+        db.reserve_attestation(PUBKEY, 1, limit, Some("0xtarget".into()), GVR).expect("target");
+    assert!(by_target.inserted);
+    let by_source = db
+        .reserve_attestation(PUBKEY2, limit, limit, Some("0xsource".into()), GVR)
+        .expect("source");
+    assert!(by_source.inserted);
+
+    let target_row = db
+        .get_attestations(PUBKEY)
+        .expect("target rows")
+        .into_iter()
+        .find(|row| row.target_epoch == limit)
+        .expect("target row");
+    assert_eq!(target_row.target_epoch, limit);
+    let source_row = db
+        .get_attestations(PUBKEY2)
+        .expect("source rows")
+        .into_iter()
+        .find(|row| row.source_epoch == limit)
+        .expect("source row");
+    assert_eq!(source_row.source_epoch, limit);
+    assert_eq!(source_row.target_epoch, limit);
+}
+
+#[test]
+fn set_block_and_attestation_watermarks_reject_2_pow_63() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let above = 1_u64 << 63;
+
+    let err = db.set_block_watermark(PUBKEY, above).expect_err("block watermark");
+    assert_out_of_range(err, "slot", above);
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("block wm"), None);
+
+    db.set_block_watermark(PUBKEY, 10).expect("in-range block watermark");
+    let err = db.set_block_watermark(PUBKEY, u64::MAX).expect_err("block watermark max");
+    assert_out_of_range(err, "slot", u64::MAX);
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("block wm"), Some(10));
+
+    let err = db.set_attestation_watermark(PUBKEY, above, 5).expect_err("source watermark");
+    assert_out_of_range(err, "source_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), None);
+
+    let err = db.set_attestation_watermark(PUBKEY, 5, above).expect_err("target watermark");
+    assert_out_of_range(err, "target_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), None);
+
+    db.set_attestation_watermark(PUBKEY, 3, 4).expect("in-range attestation watermark");
+    let err =
+        db.set_attestation_watermark(PUBKEY, above, above + 1).expect_err("both out of range");
+    assert_out_of_range(err, "source_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), Some((3, 4)));
+}
+
+/// The out-of-range member is refused before enqueue. A sibling already queued
+/// with `wait_to_fill == 0` and `batch_size == 2` still commits. If the range
+/// check ran only inside `insert_spec`, that sibling would share the batch and
+/// come back as `ReserveCommitFailed`.
+#[test]
+fn out_of_range_member_does_not_roll_back_its_group_commit_sibling() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the in-range sibling without a leader");
+    sibling.arm();
+
+    let err = db
+        .reserve_attestation(PUBKEY2, 99, 1 << 63, Some("0xbad".into()), GVR)
+        .expect_err("out of range member");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+
+    let leader =
+        db.reserve_block(PUBKEY, 8, Some("0xleader".into()), GVR).expect("in-range leader");
+    assert!(leader.inserted, "valid sibling's batch must commit");
+    let queued = sibling.recv().expect("pre-queued sibling commits");
+    assert!(queued.inserted);
+
+    let blocks = db.get_blocks(PUBKEY).expect("blocks");
+    assert_eq!(blocks.len(), 2, "no batch rollback, got {blocks:?}");
+    assert!(blocks.iter().any(|block| block.slot == 7));
+    assert!(blocks.iter().any(|block| block.slot == 8));
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+}
+
+#[test]
+fn enqueue_helpers_reject_a_slot_above_i64_max_before_queueing() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let err = db
+        .enqueue_and_abandon_block(PUBKEY, 1 << 63, Some("0xabandon".into()), GVR)
+        .expect_err("abandon");
+    assert_out_of_range(err, "slot", 1 << 63);
+
+    let cancellable = db.enqueue_block_cancellable(PUBKEY, u64::MAX, Some("0xcancel".into()), GVR);
+    let err = match cancellable {
+        Err(err) => err,
+        Ok(_) => panic!("cancellable enqueue of u64::MAX must be OutOfRange"),
+    };
+    assert_out_of_range(err, "slot", u64::MAX);
+    assert!(db.get_blocks(PUBKEY).expect("rows").is_empty());
+}
+
+#[test]
+fn scoped_reserve_delegates_the_range_check() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), *GVR);
+    let err = scoped
+        .reserve_attestation(PUBKEY, 99, 1 << 63, Some("0xscoped".into()))
+        .expect_err("scoped attestation");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    let err =
+        scoped.reserve_block(PUBKEY, 1 << 63, Some("0xscoped".into())).expect_err("scoped block");
+    assert_out_of_range(err, "slot", 1 << 63);
+    assert!(db.get_attestations(PUBKEY).expect("atts").is_empty());
+    assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty());
 }

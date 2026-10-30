@@ -65,6 +65,14 @@ pub(crate) fn normalize_pubkey(
     }
 }
 
+/// Convert a slot or epoch to the signed integer SQLite stores.
+///
+/// `i64::try_from` refuses any value above [`i64::MAX`]. Callers propagate
+/// with `?` and do not saturate, clamp, or wrap.
+pub(crate) fn to_sql_i64(value: u64, field: &'static str) -> Result<i64, SlashingError> {
+    i64::try_from(value).map_err(|_| SlashingError::OutOfRange { field, value })
+}
+
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
     pub(crate) conn: Mutex<Connection>,

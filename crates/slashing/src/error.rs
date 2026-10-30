@@ -131,6 +131,12 @@ pub enum SlashingError {
     /// failure off a signing path.
     #[error("slashing-protection compensating delete failed (row retained): {0}")]
     ReconcileFailed(String),
+
+    /// Slot or epoch above [`i64::MAX`]. SQLite binds these columns as signed
+    /// integers; a wider value would wrap negative and weaken a surround or
+    /// double-proposal check. Refused, never saturated.
+    #[error("out of range: {field}={value} exceeds i64::MAX (9223372036854775807)")]
+    OutOfRange { field: &'static str, value: u64 },
 }
 
 impl SlashingError {
