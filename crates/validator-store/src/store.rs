@@ -9,9 +9,10 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::block_selection::BlockSelectionMode;
 use crate::config::{DefaultUpdate, ValidatorConfig, ValidatorConfigUpdate};
-use crate::error::ValidatorStoreError;
+use crate::error::{classify_document_error, ValidatorStoreError};
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TomlConfig {
     #[serde(default)]
     defaults: Option<TomlDefaults>,
@@ -20,6 +21,7 @@ struct TomlConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TomlDefaults {
     fee_recipient: Option<String>,
     gas_limit: Option<u64>,
@@ -27,6 +29,7 @@ struct TomlDefaults {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TomlValidator {
     pubkey: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +140,9 @@ fn validate_builder_urls(urls: &[String]) -> Result<(), ValidatorStoreError> {
 fn parse_config(
     content: &str,
 ) -> Result<(ValidatorDefaults, Vec<ValidatorConfig>), ValidatorStoreError> {
-    let toml_config: TomlConfig = toml::from_str(content)?;
+    let toml_config: TomlConfig = toml::from_str(content).map_err(|err| {
+        ValidatorStoreError::TomlParse(classify_document_error(&err, Some(content)))
+    })?;
 
     let mut fee_recipient = DEFAULT_FEE_RECIPIENT;
     let mut gas_limit = DEFAULT_GAS_LIMIT;
@@ -215,8 +220,9 @@ struct StoreState {
     /// * [`ValidatorStore::reload_config`] keeps entries whose pubkey is
     ///   absent from the parsed file and drops entries the file replaces.
     ///   `remote_defaults` is cleared there because live defaults are replaced
-    ///   from the file. A parse error returns before either change. Reload
-    ///   does not restore a URL-owned value onto a row the file replaces.
+    ///   from the file. A parse error or a zero default fee recipient returns
+    ///   before either change. Reload does not restore a URL-owned value onto
+    ///   a row the file replaces.
     /// * `set_enabled` does not take `save_lock` and does not change this
     ///   overlay. Non-durable [`ValidatorStore::update_config`] and
     ///   [`ValidatorStore::apply_default_update`] do not take `save_lock` and
@@ -1212,12 +1218,12 @@ impl ValidatorStore {
 
     /// Re-read the validators file and merge it into the live store.
     ///
-    /// Parse errors return before any write, which is the path RV-5.1 uses
-    /// for an unknown key. On success, pubkeys absent from the file keep
-    /// their URL ownership and their live URL values. Pubkeys the file
-    /// contains are replaced from the file and lose URL ownership. Remote
-    /// defaults are cleared because live defaults are replaced from the file.
-    /// Nothing in the shipped binary calls this.
+    /// A parse error, or a missing or zero `[defaults] fee_recipient`, returns
+    /// before any write and before the post-parse test hook. On success,
+    /// pubkeys absent from the file keep their URL ownership and their live
+    /// URL values. Pubkeys the file contains are replaced from the file and
+    /// lose URL ownership. Remote defaults are cleared because live defaults
+    /// are replaced from the file. Nothing in the shipped binary calls this.
     #[tracing::instrument(name = "validator_store.reload_config", skip_all)]
     pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
@@ -1233,14 +1239,22 @@ impl ValidatorStore {
             warn!(path = %path.display(), error = %e, "config parse error");
             e
         })?;
-        // Parse-first: compute all new values before any mutation.
+        // Parse-first: compute all new values before any mutation. The zero
+        // fee check is here, still before the test hook and the state write,
+        // so a refusal cannot publish `[0u8; 20]` or run the hook.
         let (new_defaults, parsed_validators) = parse_config(&content).map_err(|e| {
             warn!(path = %path.display(), error = %e, "config parse error");
             e
         })?;
+        if new_defaults.fee_recipient == [0u8; 20] {
+            let err = ValidatorStoreError::ZeroDefaultFeeRecipient;
+            warn!(path = %path.display(), error = %err, "config reload refused");
+            return Err(err);
+        }
 
         // Still holding `save_lock`. A test asserts `try_lock` fails here so
-        // removing the guard makes that test fail.
+        // removing the guard makes that test fail. Refusals return above, so
+        // the hook does not run when the file is rejected.
         #[cfg(test)]
         invoke_reload_after_parse_hook();
 
@@ -1266,6 +1280,14 @@ impl ValidatorStore {
 
         Ok(())
     }
+}
+
+/// Deserialize `content` as a validators file and return only the toml error.
+///
+/// Callers classify it with [`classify_document_error`] or `parse_error` and
+/// drop it. Storing it in `Display`, `Debug`, or `source` quotes the source line.
+pub fn validators_file_de_error(content: &str) -> Result<(), toml::de::Error> {
+    toml::from_str::<TomlConfig>(content).map(|_| ())
 }
 
 fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreError> {
@@ -2004,6 +2026,14 @@ mod tests {
         let mut fr = [0u8; 20];
         fr[0] = id;
         fr
+    }
+
+    /// `Result::unwrap_err` requires `Debug` on the success type. `ValidatorStore` does not implement it.
+    fn must_err<T, E>(result: Result<T, E>) -> E {
+        match result {
+            Err(err) => err,
+            Ok(_) => panic!("expected an error"),
+        }
     }
 
     #[test]
@@ -2920,14 +2950,17 @@ builder_proposals = false
         let pk = [1u8; 48];
         assert!(!store.is_builder_enabled(&pk));
 
+        let fee_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
         let toml_v2 = format!(
             r#"
+[defaults]
+fee_recipient = "{fee_hex}"
+
 [[validators]]
-pubkey = "{}"
+pubkey = "{pubkey_hex}"
 builder_proposals = true
 builder_boost_factor = 250
 "#,
-            pubkey_hex,
         );
         std::fs::write(&config_path, &toml_v2).unwrap();
 
@@ -3002,16 +3035,19 @@ pubkey = "{}"
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
         assert_eq!(store.list_enabled_pubkeys().len(), 1);
 
+        let fee_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
         let toml_v2 = format!(
             r#"
-[[validators]]
-pubkey = "{}"
+[defaults]
+fee_recipient = "{fee_hex}"
 
 [[validators]]
-pubkey = "{}"
+pubkey = "{pk1_hex}"
+
+[[validators]]
+pubkey = "{pk2_hex}"
 builder_proposals = true
 "#,
-            pk1_hex, pk2_hex,
         );
         std::fs::write(&config_path, &toml_v2).unwrap();
 
@@ -3026,12 +3062,15 @@ builder_proposals = true
     fn test_reload_config_preserves_programmatic_validators() {
         let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
 
+        let fee_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
         let toml_v1 = format!(
             r#"
+[defaults]
+fee_recipient = "{fee_hex}"
+
 [[validators]]
-pubkey = "{}"
+pubkey = "{pk1_hex}"
 "#,
-            pk1_hex,
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -3178,12 +3217,14 @@ pubkey = "{}"
         );
         std::fs::write(&config_path, &toml_v2).unwrap();
 
-        store.reload_config().unwrap();
+        let err = store.reload_config().unwrap_err();
+        assert!(matches!(err, ValidatorStoreError::ZeroDefaultFeeRecipient), "{err:?}");
+        assert!(err.to_string().contains("[defaults] fee_recipient"), "{err}");
 
-        // Defaults should reset to hardcoded fallbacks
-        assert_eq!(store.state.read().defaults.fee_recipient, [0u8; 20]);
-        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
-        assert!(store.state.read().defaults.graffiti.is_none());
+        // The missing section is a refusal: the previous defaults stay.
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 50_000_000);
+        assert!(store.state.read().defaults.graffiti.is_some());
     }
 
     #[test]
@@ -3210,23 +3251,23 @@ pubkey = "{}"
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
 
-        // Keep [defaults] but remove some fields
+        // Keep fee_recipient so the reload is not the zero-fee refusal.
+        // Gas is set; graffiti is omitted and falls back.
         let toml_v2 = format!(
             r#"
 [defaults]
+fee_recipient = "{fr_hex}"
 gas_limit = 40000000
 
 [[validators]]
-pubkey = "{}"
+pubkey = "{pk1_hex}"
 "#,
-            pk1_hex,
         );
         std::fs::write(&config_path, &toml_v2).unwrap();
 
         store.reload_config().unwrap();
 
-        // fee_recipient and graffiti should reset to hardcoded fallbacks
-        assert_eq!(store.state.read().defaults.fee_recipient, [0u8; 20]);
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
         assert_eq!(store.state.read().defaults.gas_limit, 40_000_000);
         assert!(store.state.read().defaults.graffiti.is_none());
     }
@@ -6199,5 +6240,273 @@ builder_boost_factor = 175
         assert_eq!(live.gas_limit, Some(36_000_000));
         assert!(live.builder_proposals);
         assert!(store.state.read().url_owned.is_empty());
+    }
+
+    fn fee_defaults(fee: [u8; 20]) -> String {
+        format!("[defaults]\nfee_recipient = \"0x{}\"\n", hex::encode(fee))
+    }
+
+    fn reload_hook_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        super::RELOAD_AFTER_PARSE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        fired
+    }
+
+    /// `enable = false` is not the `enabled` field. The row must not load enabled.
+    #[test]
+    fn load_from_config_rejects_enable_typo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let body = format!(
+            "{}\n[[validators]]\npubkey = \"0x{}\"\nenable = false\n",
+            fee_defaults(test_fee_recipient(1)),
+            hex::encode(pk),
+        );
+        std::fs::write(&path, body).unwrap();
+        let err = must_err(ValidatorStore::load_from_config(&path));
+        match &err {
+            ValidatorStoreError::TomlParse(parsed) => {
+                assert_eq!(parsed.unknown_key.as_deref(), Some("enable"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("enable"), "{err}");
+        let real = format!(
+            "{}\n[[validators]]\npubkey = \"0x{}\"\nenabled = false\n",
+            fee_defaults(test_fee_recipient(1)),
+            hex::encode(pk),
+        );
+        std::fs::write(&path, real).unwrap();
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        assert!(!store.is_signing_enabled(&pk));
+    }
+
+    /// A typo inside `[defaults]` and a misspelled table are refused by name.
+    #[test]
+    fn unknown_defaults_and_top_level_keys_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let fee = hex::encode(test_fee_recipient(1));
+        std::fs::write(
+            &path,
+            format!("[defaults]\nfee_recipient = \"0x{fee}\"\nfee_recipent = \"0x{fee}\"\n"),
+        )
+        .unwrap();
+        let err = must_err(ValidatorStore::load_from_config(&path));
+        match &err {
+            ValidatorStoreError::TomlParse(parsed) => {
+                assert_eq!(parsed.unknown_key.as_deref(), Some("fee_recipent"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("fee_recipent"), "{err}");
+
+        std::fs::write(&path, format!("[default]\nfee_recipient = \"0x{fee}\"\n")).unwrap();
+        let err = must_err(ValidatorStore::load_from_config(&path));
+        match &err {
+            ValidatorStoreError::TomlParse(parsed) => {
+                assert_eq!(parsed.unknown_key.as_deref(), Some("default"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("default"), "{err}");
+
+        let pk = test_pubkey(1);
+        std::fs::write(
+            &path,
+            format!(
+                "[defaults]\nfee_recipient = \"0x{fee}\"\n\n[[validators]]\npubkey = \"0x{}\"\ndoppelganger_hold_untill = 1\n",
+                hex::encode(pk),
+            ),
+        )
+        .unwrap();
+        let err = must_err(ValidatorStore::load_from_config(&path));
+        match &err {
+            ValidatorStoreError::TomlParse(parsed) => {
+                assert_eq!(parsed.unknown_key.as_deref(), Some("doppelganger_hold_untill"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An unknown key on reload adds nothing and leaves ownership untouched.
+    /// The post-parse hook does not run.
+    #[test]
+    fn reload_config_rejects_unknown_key_and_keeps_state() {
+        let _clear = ClearHooks;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let extra = test_pubkey(2);
+        let body = format!(
+            "{}\ngas_limit = 31000000\n\n[[validators]]\npubkey = \"0x{}\"\nfee_recipient = \"0x{}\"\n",
+            fee_defaults(test_fee_recipient(1)),
+            hex::encode(pk),
+            hex::encode(test_fee_recipient(4)),
+        );
+        std::fs::write(&path, body).unwrap();
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(5))),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(test_fee_recipient(6)),
+                gas_limit: Some(40_000_000),
+                ..DefaultUpdate::default()
+            })
+            .unwrap();
+        let gen = store.validator_generation(&pk);
+        let next_gen = store.state.read().next_validator_gen;
+        let fired = reload_hook_flag();
+
+        let bad = format!(
+            "{}\n\n[[validators]]\npubkey = \"0x{}\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false\n",
+            fee_defaults(test_fee_recipient(9)),
+            hex::encode(pk),
+            hex::encode(extra),
+        );
+        std::fs::write(&path, bad).unwrap();
+        let err = store.reload_config().unwrap_err();
+        match &err {
+            ValidatorStoreError::TomlParse(parsed) => {
+                assert_eq!(parsed.unknown_key.as_deref(), Some("enable"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "hook ran on a refused reload");
+        assert!(store.get_config(&extra).is_none());
+        assert_eq!(store.validator_generation(&pk), gen);
+        assert_eq!(store.state.read().next_validator_gen, next_gen);
+        assert_eq!(store.get_config(&pk).unwrap().fee_recipient, Some(test_fee_recipient(5)));
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(6));
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        {
+            let state = store.state.read();
+            assert!(state.url_owned.contains_key(&pk));
+            assert!(state.remote_defaults.fee_recipient.is_some());
+            assert!(state.remote_defaults.gas_limit.is_some());
+            assert_eq!(state.url_owned[&pk].generation, gen.unwrap());
+        }
+    }
+
+    /// Missing and explicit-zero default fees are refused before the hook.
+    /// One past the zero address still reloads.
+    #[test]
+    fn a_reload_without_a_default_fee_recipient_is_refused() {
+        let _clear = ClearHooks;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let original = test_fee_recipient(1);
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n\n[[validators]]\npubkey = \"0x{}\"\n",
+                fee_defaults(original),
+                hex::encode(pk),
+            ),
+        )
+        .unwrap();
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        let gen = store.validator_generation(&pk);
+
+        let fired = reload_hook_flag();
+        std::fs::write(&path, format!("[[validators]]\npubkey = \"0x{}\"\n", hex::encode(pk)))
+            .unwrap();
+        let err = store.reload_config().unwrap_err();
+        assert!(matches!(err, ValidatorStoreError::ZeroDefaultFeeRecipient), "{err:?}");
+        assert!(err.to_string().contains("[defaults] fee_recipient"), "{err}");
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.default_fee_recipient(), original);
+        assert_eq!(store.validator_generation(&pk), gen);
+
+        let zero = "0x0000000000000000000000000000000000000000";
+        std::fs::write(
+            &path,
+            format!(
+                "[defaults]\nfee_recipient = \"{zero}\"\n\n[[validators]]\npubkey = \"0x{}\"\n",
+                hex::encode(pk)
+            ),
+        )
+        .unwrap();
+        let err = store.reload_config().unwrap_err();
+        assert!(matches!(err, ValidatorStoreError::ZeroDefaultFeeRecipient), "{err:?}");
+        assert_eq!(store.default_fee_recipient(), original);
+        assert_eq!(store.validator_generation(&pk), gen);
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+
+        // One past the zero address: the last byte is 1.
+        let mut nonzero = [0u8; 20];
+        nonzero[19] = 1;
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n\n[[validators]]\npubkey = \"0x{}\"\n",
+                fee_defaults(nonzero),
+                hex::encode(pk),
+            ),
+        )
+        .unwrap();
+        store.reload_config().unwrap();
+        assert_eq!(store.default_fee_recipient(), nonzero);
+        assert_ne!(store.default_fee_recipient(), [0u8; 20]);
+    }
+
+    /// Every optional field, and a URL overlay, survives `disk_toml` and `snapshot_toml`.
+    #[test]
+    fn snapshot_toml_round_trips_under_strict_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(7);
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.state.write().defaults.graffiti = Some(parse_graffiti("base"));
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(test_fee_recipient(2));
+        cfg.gas_limit = Some(21_000_000);
+        cfg.builder_proposals = false;
+        cfg.builder_boost_factor = Some(90);
+        cfg.graffiti = Some(parse_graffiti("row"));
+        cfg.enabled = false;
+        cfg.doppelganger_hold_until = Some(1_700_000_000);
+        cfg.block_selection_mode = Some(BlockSelectionMode::ExecutionOnly);
+        cfg.builders = Some(vec!["https://relay.example".to_string()]);
+        cfg.min_bid = Some(10);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(path);
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(3))),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let disk = toml::to_string(&store.disk_toml(&store.state.read())).unwrap();
+        parse_config(&disk).expect("disk_toml reloads under the strict parser");
+        let live = toml::to_string(&snapshot_toml(&store.state.read())).unwrap();
+        parse_config(&live).expect("snapshot_toml reloads under the strict parser");
+        let url_fee = hex::encode(test_fee_recipient(3));
+        let base_fee = hex::encode(test_fee_recipient(2));
+        assert!(live.contains(&url_fee), "{live}");
+        assert!(disk.contains(&base_fee), "{disk}");
+        assert!(!disk.contains(&url_fee), "{disk}");
     }
 }

@@ -4,7 +4,7 @@
 
 ## Overview
 
-Unknown keys in `config.toml` fail startup. Strict parsing of the validators file follows in W4-C3.
+Unknown keys in `config.toml` and in the validators file fail startup.
 
 `validators_config` is a separate TOML file (not the main `config.toml`) that holds:
 
@@ -95,6 +95,8 @@ There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block
 
 **Malformed entries fail the whole file:** an invalid hex string/length in any `fee_recipient` or `pubkey` (defaults or per-validator) makes `load_from_config` return an error and the process refuses to start — there's no partial/best-effort loading of a broken file.
 
+**Unknown keys fail closed.** A key that is not in the tables above, including `enable = false` (the field is `enabled`), fails startup. The error names the key and the validators file. The same rejection applies inside `[defaults]` and to a misspelled table such as `[default]`. A file the store itself writes uses only these keys and reloads.
+
 ### `block_selection_mode` values
 
 | Value | Effect |
@@ -143,7 +145,7 @@ This means changes made through the HTTP API **persist across restarts** without
 
 Safe **only while the process is stopped**. There is currently no reload trigger while `rvc` is running:
 
-- `ValidatorStore::reload_config()` exists (parses the file fresh, applies parse-first/apply-second so a broken file never partially mutates the store, and preserves any validator that was registered programmatically but isn't in the file) — but **nothing in the shipped `rvc` binary calls it**. No file watcher, no HTTP endpoint, no signal handler triggers it (SIGHUP only reloads the log filter).
+- `ValidatorStore::reload_config()` exists (parses the file fresh, applies parse-first/apply-second so a broken file never partially mutates the store, and preserves any validator that was registered programmatically but isn't in the file). It refuses an unknown key, and it refuses a missing or zero `[defaults] fee_recipient`, without changing defaults, rows, or URL ownership. **Nothing in the shipped `rvc` binary calls it.** No file watcher, no HTTP endpoint, no signal handler triggers it (SIGHUP only reloads the log filter).
 - Because HTTP writes call `update_config_durable`, which re-serializes from in-memory state rather than re-reading the file, a hand-edit made while the process is running can be **silently overwritten** the next time any fee-recipient/gas-limit/graffiti HTTP write fires.
 
 **Recommendation:** treat "edit the file directly" and "use the HTTP API" as mutually exclusive while the process is live. Stop `rvc`, edit, restart — or manage everything through the Keymanager API.
@@ -172,7 +174,7 @@ These are separate, MEV-boost/Prysm-style config options (`Config.proposer_confi
 | `list_enabled_pubkeys()` / `has_validator(pubkey)` / `get_config(pubkey)` | read | none |
 | `add_validator(config)` / `remove_validator(pubkey)` / `set_enabled(pubkey, bool)` / `update_config(pubkey, update)` | write | **in-memory only** — does not persist |
 | `save_config()` | write | atomically serializes the snapshot to `config_path` (temp file + `fsync` + rename). A field a proposer-config URL still owns is written as the local baseline from when the URL started owning it. A remote `default_config` is not written as `[defaults]`. Errors if `config_path` is `None` |
-| `reload_config()` | write | re-reads `config_path` from disk, parse-first/apply-second; not called anywhere in the shipped binary today. URL ownership is kept for validators absent from the file and dropped for validators the file replaces. Remote defaults are cleared |
+| `reload_config()` | write | re-reads `config_path` from disk, parse-first/apply-second; not called anywhere in the shipped binary today. An unknown key or a missing or zero `[defaults] fee_recipient` returns before any change. URL ownership is kept for validators absent from the file and dropped for validators the file replaces. Remote defaults are cleared |
 
 `ValidatorConfigUpdate` (the argument to `update_config`) is a sparse patch: each optional field is `Option<Option<T>>` — outer `None` means "don't touch", `Some(None)` means "clear back to default", `Some(Some(v))` means "set to `v`".
 

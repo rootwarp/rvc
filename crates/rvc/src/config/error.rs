@@ -1,70 +1,17 @@
 //! Configuration error types.
+//!
+//! Parse classification lives in `validator-store` so the validators file and
+//! `config.toml` share one function. [`ParseKind`] is that type, re-exported.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use validator_store::{classify_data_error, classify_document_error, ClassifiedToml};
 
-/// Display cap for an unknown-key name. Control characters are escaped first,
-/// then the escaped form is cut so a crafted key cannot inject a new log line
-/// or a terminal escape, and cannot grow the line without bound.
-const KEY_DISPLAY_MAX_CHARS: usize = 64;
+pub use validator_store::ParseKind;
 
-/// Fixed text for a serde message [`ParseKind::from_serde_message`] does not
-/// recognise. The raw message is dropped, so a credential in it cannot render.
-const UNRECOGNIZED_PARSE: &str = "unrecognized config parse error";
-
-/// Category of a config parse failure. The unexpected value is never stored.
-///
-/// W4-C3 reuses this type for the validators file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseKind {
-    /// Toml's `message()` only. The source snippet is not included.
-    Syntax(String),
-    /// Serde `invalid type`, keeping the static `expected` tail.
-    InvalidType { expected: String },
-    /// Serde `invalid value`, keeping the static `expected` tail.
-    InvalidValue { expected: String },
-    /// Serde `unknown variant`, keeping the static `expected` tail.
-    UnknownVariant { expected: String },
-    /// Serde `missing field`.
-    MissingField(String),
-    /// Toml/serde duplicate key. Empty when the message names no key.
-    DuplicateKey(String),
-    /// Serde `invalid length`. The length and the value are not stored.
-    InvalidLength,
-    /// A message shape this parser does not recognise. Fixed text only.
-    Other,
-}
-
-impl ParseKind {
-    /// Classify a serde error message, keeping only the static `expected` tail.
-    ///
-    /// The "unexpected" half holds the operator's value and is dropped. A shape
-    /// this function does not recognise becomes [`ParseKind::Other`].
-    pub fn from_serde_message(message: &str) -> Self {
-        let message = message.trim();
-        if let Some(kind) = classify_serde_message(message) {
-            return kind;
-        }
-        Self::Other
-    }
-}
-
-impl fmt::Display for ParseKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Syntax(message) => f.write_str(message),
-            Self::InvalidType { expected } => write!(f, "invalid type: expected {expected}"),
-            Self::InvalidValue { expected } => write!(f, "invalid value: expected {expected}"),
-            Self::UnknownVariant { expected } => write!(f, "unknown variant: expected {expected}"),
-            Self::MissingField(name) => write!(f, "missing field `{name}`"),
-            Self::DuplicateKey(name) if name.is_empty() => f.write_str("duplicate key"),
-            Self::DuplicateKey(name) => write!(f, "duplicate key `{}`", escape_key(name)),
-            Self::InvalidLength => f.write_str("invalid length"),
-            Self::Other => f.write_str(UNRECOGNIZED_PARSE),
-        }
-    }
+fn escape_key(key: &str) -> String {
+    validator_store::escape_key(key)
 }
 
 #[derive(Debug, Error)]
@@ -259,224 +206,41 @@ impl From<rvc_config::ConfigError> for ConfigError {
     }
 }
 
-/// Where a toml error was raised.
-enum DeOrigin {
-    /// `toml::from_str` of the file. Unrecognised messages stay [`ParseKind::Syntax`].
-    Document,
-    /// A value that already parsed. Unrecognised messages become [`ParseKind::Other`].
-    Data,
-}
-
 /// Map a toml deserialize error onto [`ConfigError`] without keeping the error.
 ///
-/// Line and column come from `err.span()` over `content`. An `unknown field`
-/// message becomes [`ConfigError::UnknownKey`]. Unrecognised messages from the
-/// document parse stay [`ParseKind::Syntax`]; [`parse_data_error`] maps those
-/// to [`ParseKind::Other`]. W4-C3 reuses this for the validators file. The toml
-/// error is borrowed and dropped here: no variant stores it or a `String` built
-/// from its Display.
+/// Classification is [`classify_document_error`]: the same function the
+/// validators file uses. Line and column come from `err.span()` over `content`.
+/// An `unknown field` message becomes [`ConfigError::UnknownKey`]. The toml
+/// error is borrowed and dropped here: no variant stores it or a `String`
+/// built from its Display.
 pub(crate) fn parse_error(
     err: &toml::de::Error,
     content: Option<&str>,
     file: Option<&Path>,
 ) -> ConfigError {
-    map_de_error(err, content, file.map(Path::to_path_buf), None, DeOrigin::Document)
+    classified_to_config(classify_document_error(err, content), file.map(Path::to_path_buf), None)
 }
 
 /// Map a semantic deserialize error. `path` is the key path, never the value.
 pub(crate) fn parse_data_error(err: &toml::de::Error, path: Option<String>) -> ConfigError {
-    map_de_error(err, None, None, path, DeOrigin::Data)
+    classified_to_config(classify_data_error(err), None, path)
 }
 
-fn map_de_error(
-    err: &toml::de::Error,
-    content: Option<&str>,
+fn classified_to_config(
+    classified: ClassifiedToml,
     file: Option<PathBuf>,
     path: Option<String>,
-    origin: DeOrigin,
 ) -> ConfigError {
-    let message = err.message();
-    let (line, column) = line_column(content, err.span());
-
-    if let Some(key) = unknown_field_key(message) {
+    if let Some(key) = classified.unknown_key {
         return ConfigError::UnknownKey { key, file };
     }
-    if message.trim_start().starts_with("unknown field") {
-        return ConfigError::Parse { file, line, column, path, kind: ParseKind::Other };
+    ConfigError::Parse {
+        file,
+        line: classified.line,
+        column: classified.column,
+        path,
+        kind: classified.kind,
     }
-    if serde_data_prefix(message) {
-        return ConfigError::Parse {
-            file,
-            line,
-            column,
-            path,
-            kind: ParseKind::from_serde_message(message),
-        };
-    }
-    if let Some(key) = dotted_key_name(message) {
-        return ConfigError::Parse {
-            file,
-            line,
-            column,
-            path,
-            kind: ParseKind::Syntax(format!("dotted key `{}`", escape_key(key))),
-        };
-    }
-
-    let kind = match origin {
-        DeOrigin::Data => ParseKind::Other,
-        DeOrigin::Document => ParseKind::Syntax(escape_controls(message)),
-    };
-    ConfigError::Parse { file, line, column, path, kind }
-}
-
-fn dotted_key_name(message: &str) -> Option<&str> {
-    let rest = message.trim_start().strip_prefix("dotted key `")?;
-    let end = rest.find('`')?;
-    let key = &rest[..end];
-    if key.is_empty() {
-        None
-    } else {
-        Some(key)
-    }
-}
-
-fn classify_serde_message(message: &str) -> Option<ParseKind> {
-    if message.starts_with("invalid type:") {
-        return Some(match expected_tail(message, "invalid type:") {
-            Some(expected) => ParseKind::InvalidType { expected },
-            None => ParseKind::Other,
-        });
-    }
-    if message.starts_with("invalid value:") {
-        return Some(match expected_tail(message, "invalid value:") {
-            Some(expected) => ParseKind::InvalidValue { expected },
-            None => ParseKind::Other,
-        });
-    }
-    if message.starts_with("unknown variant") {
-        return Some(match expected_tail(message, "unknown variant") {
-            Some(expected) => ParseKind::UnknownVariant { expected },
-            None => ParseKind::Other,
-        });
-    }
-    if message.starts_with("missing field") {
-        return Some(match backtick_payload(message) {
-            Some(name) => ParseKind::MissingField(name),
-            None => ParseKind::Other,
-        });
-    }
-    if message.starts_with("duplicate key") {
-        return Some(ParseKind::DuplicateKey(backtick_payload(message).unwrap_or_default()));
-    }
-    if message.starts_with("invalid length") {
-        return Some(ParseKind::InvalidLength);
-    }
-    None
-}
-
-fn serde_data_prefix(message: &str) -> bool {
-    let message = message.trim_start();
-    message.starts_with("invalid type:")
-        || message.starts_with("invalid value:")
-        || message.starts_with("unknown variant")
-        || message.starts_with("missing field")
-        || message.starts_with("duplicate key")
-        || message.starts_with("invalid length")
-}
-
-/// Text after the last `, expected ` marker. `None` when that tail is missing,
-/// so the unexpected half (which holds the value) is never returned.
-fn expected_tail(message: &str, prefix: &str) -> Option<String> {
-    let rest = message.strip_prefix(prefix)?;
-    let marker = ", expected ";
-    let idx = rest.rfind(marker)?;
-    let tail = rest[idx + marker.len()..].trim();
-    if tail.is_empty() {
-        None
-    } else {
-        Some(tail.to_string())
-    }
-}
-
-fn backtick_payload(message: &str) -> Option<String> {
-    let start = message.find('`')?;
-    let rest = &message[start + '`'.len_utf8()..];
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
-}
-
-fn unknown_field_key(message: &str) -> Option<String> {
-    let rest = message.trim_start().strip_prefix("unknown field ")?;
-    let rest = rest.strip_prefix('`')?;
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
-}
-
-fn line_column(
-    content: Option<&str>,
-    span: Option<std::ops::Range<usize>>,
-) -> (Option<usize>, Option<usize>) {
-    let (Some(content), Some(span)) = (content, span) else {
-        return (None, None);
-    };
-    let (line, column) = offset_to_line_column(content, span.start);
-    (Some(line), Some(column))
-}
-
-fn offset_to_line_column(content: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for (idx, ch) in content.char_indices() {
-        if idx >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    (line, column)
-}
-
-/// Escape C0 controls so a document `Syntax` message cannot split a log line.
-///
-/// Unlike [`escape_key`], this does not cap the length: the sentence after the
-/// controls is the diagnostic.
-fn escape_controls(text: &str) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn escape_key(key: &str) -> String {
-    let mut out = String::new();
-    for ch in key.chars() {
-        let piece = match ch {
-            '\n' => "\\n".to_string(),
-            '\r' => "\\r".to_string(),
-            '\t' => "\\t".to_string(),
-            c if c.is_control() => format!("\\u{{{:x}}}", u32::from(c)),
-            c => c.to_string(),
-        };
-        if out.chars().count() + piece.chars().count() > KEY_DISPLAY_MAX_CHARS {
-            break;
-        }
-        out.push_str(&piece);
-    }
-    out
 }
 
 fn file_location(file: Option<&PathBuf>) -> String {
@@ -511,6 +275,7 @@ fn format_parse(
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use validator_store::UNRECOGNIZED_PARSE;
 
     fn boom<'de, D: serde::Deserializer<'de>>(_: D) -> Result<u8, D::Error> {
         Err(serde::de::Error::custom(

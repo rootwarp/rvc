@@ -27,12 +27,31 @@ use rvc_config::TimingConfig;
 use signer::{SignerService, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
 use timing::{DeadlineBps, DeadlineSchedule, SystemSlotClock};
-use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
 
-use super::error::ConfigError;
+use super::error::{parse_error, ConfigError};
 use super::types::{redact_url, redact_urls, Config};
+use validator_store::{validators_file_de_error, ValidatorStore, ValidatorStoreError};
+
+/// Map a validators-file failure onto [`ConfigError`].
+///
+/// [`ValidatorStoreError::TomlParse`] is re-parsed from `raw` and passed
+/// through [`parse_error`], so boot names the file and drops the source line.
+/// Every other store error stays [`ConfigError::ValidatorStoreError`] and is
+/// prefixed with the path.
+fn validator_store_config_error(err: ValidatorStoreError, raw: &str, path: &Path) -> ConfigError {
+    match err {
+        ValidatorStoreError::TomlParse(_) => match validators_file_de_error(raw) {
+            Err(de) => parse_error(&de, Some(raw), Some(path)),
+            Ok(()) => ConfigError::ValidatorStoreError(format!(
+                "{}: validators file changed while loading",
+                path.display()
+            )),
+        },
+        other => ConfigError::ValidatorStoreError(format!("{}: {other}", path.display())),
+    }
+}
 
 fn log_fork_schedule(schedule: &ForkSchedule) {
     info!(
@@ -465,6 +484,9 @@ fn open_doppelganger_holds(
     pubkey_map: &PubkeyMap,
     now_unix: u64,
 ) -> Result<HashSet<[u8; 48]>, String> {
+    // `load_from_config` returns a sanitized [`ValidatorStoreError`]. `%err`
+    // below is that Display: it names an unknown key and does not quote the
+    // source line. A parse failure still fails closed (`force_all`).
     let store = ValidatorStore::load_from_config(path).map_err(|e| e.to_string())?;
     let mut open = HashSet::new();
     for pubkey in pubkey_map.read().keys() {
@@ -1144,7 +1166,7 @@ impl ServiceBuilder {
                     return Err(ConfigError::EmptyValidatorsConfig);
                 }
                 ValidatorStore::load_from_config(path)
-                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?
+                    .map_err(|e| validator_store_config_error(e, &raw, path))?
             }
             None => ValidatorStore::new([0u8; 20], 30_000_000),
         };
@@ -2735,6 +2757,38 @@ mod tests {
         );
     }
 
+    /// `enable = false` is an unknown key. Boot names that key and the validators path.
+    #[test]
+    fn build_validator_store_names_the_validators_file_on_an_unknown_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let pk = "0x".to_string() + &"11".repeat(48);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"{pk}\"\nenable = false\n"
+            ),
+        )
+        .unwrap();
+        let err = match ServiceBuilder::new(create_minimal_config())
+            .build_validator_store(Some(&config_path))
+        {
+            Err(err) => err,
+            Ok(_) => panic!("unknown key"),
+        };
+        assert!(
+            matches!(
+                &err,
+                ConfigError::UnknownKey { key, file: Some(path) }
+                    if key == "enable" && path == &config_path
+            ),
+            "{err:?}"
+        );
+        let display = err.to_string();
+        assert!(display.contains("enable"), "{display}");
+        assert!(display.contains(&config_path.display().to_string()), "{display}");
+    }
+
     /// The empty-file error points at the rejected-file recovery steps.
     #[test]
     fn test_empty_validators_config_points_at_rejected_recovery() {
@@ -3311,6 +3365,52 @@ mod tests {
         let name = format!("0x{}{suffix}", hex::encode(pk.to_bytes()));
         std::fs::write(dir.join(name), format!("{{\"imported_unix_seconds\":{imported_unix}}}"))
             .unwrap();
+    }
+
+    /// A validators file that does not parse fails the hold pre-read closed.
+    ///
+    /// Both keys have recent attestation history, which would mark them Safe
+    /// on a normal `register`. `enable = false` is an unknown key, so every
+    /// loaded key stays Pending. The log is the sanitized store error and
+    /// does not include the builder URL.
+    #[test]
+    #[tracing_test::traced_test]
+    fn enable_typo_in_the_validators_file_keeps_every_loaded_key_pending() {
+        const SECRET: &str = "https://alice:SECRET@host";
+        let gvr = [0x62u8; 32];
+        let (_sk_a, pk_a) = restart_keypair();
+        let (_sk_b, pk_b) = restart_keypair();
+        let paths = restart_paths();
+        std::fs::write(
+            &paths.validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false\nbuilders = [\"{SECRET}\"]\n",
+                hex::encode(pk_a.to_bytes()),
+            ),
+        )
+        .unwrap();
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        for pk in [&pk_a, &pk_b] {
+            seed_recent_attestation(&db, pk, &gvr);
+        }
+        let pubkey_map = map_of(&[pk_a.clone(), pk_b.clone()]);
+        let builder = builder_for(&paths, true);
+        let (_enablement, machine) =
+            builder.build_signing_enablement(db, gvr, RESTART_EPOCH, &pubkey_map, false);
+        let machine = machine.expect("doppelganger on");
+        assert_eq!(
+            machine.status(&pk_a),
+            doppelganger::ForwardWindowStatus::Pending,
+            "a key in the unreadable file stays Pending"
+        );
+        assert_eq!(
+            machine.status(&pk_b),
+            doppelganger::ForwardWindowStatus::Pending,
+            "a key absent from the unreadable file stays Pending"
+        );
+        assert!(logs_contain("cannot read validators file"));
+        assert!(!logs_contain("SECRET"), "hold pre-read log quotes the validators file");
+        assert!(!logs_contain(SECRET));
     }
 
     /// Restart of an interrupted import: open hold, recent slashing history.
