@@ -24,6 +24,9 @@ pub struct VoluntaryExitManagerAdapter {
     slot_duration_ms: u64,
     /// Startup-validated genesis time. Not re-read from a pool BN.
     genesis_time: u64,
+    /// Production passes [`system_now_unix_secs`]. Read only when the caller
+    /// omits an explicit epoch. Test builds replace it through `with_clock`.
+    now_unix_secs: fn() -> Result<u64, ApiError>,
 }
 
 impl VoluntaryExitManagerAdapter {
@@ -46,8 +49,27 @@ impl VoluntaryExitManagerAdapter {
             genesis_validators_root,
             slot_duration_ms,
             genesis_time,
+            now_unix_secs: system_now_unix_secs,
         }
     }
+
+    /// Fix the clock. Compiled only for tests. [`Self::new`] keeps the system clock.
+    #[cfg(test)]
+    pub fn with_clock(mut self, now_unix_secs: fn() -> Result<u64, ApiError>) -> Self {
+        self.now_unix_secs = now_unix_secs;
+        self
+    }
+}
+
+/// Unix seconds from the system clock.
+///
+/// The same read the no-epoch branch used before the clock seam, including the
+/// "system time before UNIX epoch" error.
+fn system_now_unix_secs() -> Result<u64, ApiError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ApiError::Internal("system time before UNIX epoch".to_string()))
 }
 
 #[async_trait]
@@ -57,6 +79,18 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
         pubkey: &Pubkey,
         epoch: Option<u64>,
     ) -> Result<SignedVoluntaryExit, ApiError> {
+        // EIP-7044 exits are valid from Capella onward. An unscheduled Capella
+        // (`u64::MAX`) refuses every explicit epoch, including `u64::MAX`.
+        // A clock-derived epoch is not checked: a pre-Capella devnet can still exit.
+        if let Some(explicit) = epoch {
+            let capella_fork_epoch = self.fork_schedule.capella_fork_epoch;
+            if capella_fork_epoch == u64::MAX || explicit < capella_fork_epoch {
+                return Err(ApiError::BadRequest(format!(
+                    "exit epoch {explicit} is before the Capella fork epoch {capella_fork_epoch}"
+                )));
+            }
+        }
+
         let pubkey_hex = pubkey_hex(pubkey);
 
         // Resolve validator index from the beacon-node pool.
@@ -83,11 +117,7 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
         let epoch = match epoch {
             Some(e) => e,
             None => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| ApiError::Internal("system time before UNIX epoch".to_string()))?
-                    .as_secs();
-
+                let now = (self.now_unix_secs)()?;
                 current_epoch_at(now, self.genesis_time, self.slot_duration_ms)?
             }
         };
@@ -150,6 +180,14 @@ mod tests {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Fixed genesis. The clock sits in the middle of epoch 10 at 6 s slots.
+    const GENESIS: u64 = 1_700_000_000;
+    const EPOCH_TEN_AT_SIX_SECONDS: u64 = GENESIS + 10 * 192 + 96;
+
+    fn clock_at_epoch_ten() -> Result<u64, ApiError> {
+        Ok(EPOCH_TEN_AT_SIX_SECONDS)
+    }
+
     #[test]
     fn test_current_epoch_at_genesis_is_zero() {
         let genesis = 1_606_824_023_u64;
@@ -177,6 +215,11 @@ mod tests {
             current_epoch_at(genesis + ten_epochs_at_six_seconds, genesis, 12_000).unwrap(),
             5
         );
+    }
+
+    #[test]
+    fn test_current_epoch_at_future_genesis_is_zero() {
+        assert_eq!(current_epoch_at(1_000, 2_000, 12_000).unwrap(), 0);
     }
 
     #[test]
@@ -326,8 +369,8 @@ mod tests {
         mount_validators(&up, body, 200).await;
 
         let adapter = adapter_for(pool(vec![down.uri(), up.uri()]), sk);
-        let signed = adapter.sign_voluntary_exit(&pubkey, Some(9)).await.expect("failover");
-        assert_eq!(signed.message.epoch, 9);
+        let signed = adapter.sign_voluntary_exit(&pubkey, Some(30)).await.expect("failover");
+        assert_eq!(signed.message.epoch, 30);
         assert_eq!(signed.message.validator_index, 42);
 
         assert!(
@@ -391,9 +434,9 @@ mod tests {
 
         let adapter = adapter_for(pool(vec![empty.uri(), full.uri()]), sk);
         let signed =
-            adapter.sign_voluntary_exit(&pubkey, Some(11)).await.expect("empty 200 fails over");
+            adapter.sign_voluntary_exit(&pubkey, Some(31)).await.expect("empty 200 fails over");
         assert_eq!(signed.message.validator_index, 42);
-        assert_eq!(signed.message.epoch, 11);
+        assert_eq!(signed.message.epoch, 31);
 
         let full_paths = request_paths(&full).await;
         assert!(
@@ -415,7 +458,7 @@ mod tests {
 
         let adapter = adapter_for(pool(vec![wrong.uri(), right.uri()]), sk);
         let signed =
-            adapter.sign_voluntary_exit(&pubkey, Some(12)).await.expect("wrong pubkey fails over");
+            adapter.sign_voluntary_exit(&pubkey, Some(32)).await.expect("wrong pubkey fails over");
         assert_eq!(signed.message.validator_index, 42);
         assert_ne!(signed.message.validator_index, 7, "must not sign the other index");
 
@@ -432,15 +475,13 @@ mod tests {
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
         let hex = super::pubkey_hex(pubkey);
-        let now =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let genesis = now - 10 * 192 - 96;
         mount_validators(&server, validator_body(&hex), 200).await;
         // A pool BN that advertises a different clock must not move the epoch.
         mount_genesis(&server, "1", &format!("0x{}", hex::encode([0xbb_u8; 32]))).await;
         mount_spec(&server, "12000").await;
 
-        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
         let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("cached genesis");
         assert_eq!(signed.message.epoch, 10);
 
@@ -469,14 +510,10 @@ mod tests {
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
         let hex = super::pubkey_hex(pubkey);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after the unix epoch")
-            .as_secs();
-        let genesis = now - 10 * 192 - 96;
         mount_validators(&server, validator_body(&hex), 200).await;
 
-        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
         let signed =
             adapter.sign_voluntary_exit(&pubkey, None).await.expect("6000 ms slot duration");
         assert_eq!(signed.message.epoch, 10);
@@ -490,16 +527,14 @@ mod tests {
         let pubkey = sk.public_key().to_bytes();
         let hex = super::pubkey_hex(pubkey);
         let configured = format!("0x{}", hex::encode([0xaa_u8; 32]));
-        let now =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         // Middle of epoch 10 at 6 s slots (192 s per epoch). A 12 s clock would
         // report epoch 5 for the same genesis.
-        let genesis = now - 10 * 192 - 96;
         mount_validators(&server, validator_body(&hex), 200).await;
         mount_genesis(&server, "1", &configured).await;
         mount_spec(&server, "12000").await;
 
-        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
         let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("default epoch");
         assert_eq!(signed.message.epoch, 10);
         let paths = request_paths(&server).await;

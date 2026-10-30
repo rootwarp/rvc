@@ -49,6 +49,24 @@ mod tests {
             Network::Mainnet.genesis_fork_version()
         );
         assert_eq!(Network::Custom.genesis_fork_version(), None);
+        assert_eq!(
+            Network::Mainnet.capella_fork_version(),
+            Some(eth_types::NetworkPreset::MAINNET.capella_fork_version)
+        );
+        assert_eq!(
+            Network::Hoodi.capella_fork_version(),
+            Some(eth_types::NetworkPreset::HOODI.capella_fork_version)
+        );
+        assert_eq!(
+            Network::Holesky.capella_fork_version(),
+            Some(eth_types::NetworkPreset::HOLESKY.capella_fork_version)
+        );
+        assert_eq!(
+            Network::Sepolia.capella_fork_version(),
+            Some(eth_types::NetworkPreset::SEPOLIA.capella_fork_version)
+        );
+        assert_ne!(Network::Hoodi.capella_fork_version(), Network::Mainnet.capella_fork_version());
+        assert_eq!(Network::Custom.capella_fork_version(), None);
     }
 
     #[test]

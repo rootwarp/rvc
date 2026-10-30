@@ -69,6 +69,8 @@ pub fn run_with_mnemonic(args: BlsToExecutionArgs, mnemonic_phrase: &str) -> Res
     let signed =
         SignedBLSToExecutionChange { message: change, signature: signature.to_bytes().to_vec() };
 
+    // Beacon pool submissions are a JSON array of changes. One change is still an array.
+    let signed = vec![signed];
     let json = serde_json::to_string_pretty(&signed)
         .context("Failed to serialize signed BLS-to-execution change")?;
 
@@ -223,33 +225,36 @@ mod tests {
         assert_ne!(withdrawal_key.public_key().to_bytes(), signing_key.public_key().to_bytes());
     }
 
+    fn write_bls_change(output_dir: &std::path::Path, validator_index: u64) -> std::path::PathBuf {
+        let execution_address = format!("0x{}", "ab".repeat(20));
+        run_with_mnemonic(
+            BlsToExecutionArgs {
+                network: "mainnet".into(),
+                output_dir: output_dir.to_path_buf(),
+                validator_index,
+                execution_address,
+                bls_withdrawal_index: 0,
+                mnemonic_passphrase: String::new(),
+            },
+            TEST_MNEMONIC,
+        )
+        .expect("run_with_mnemonic writes the change");
+        let mut paths: Vec<_> = fs::read_dir(output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        paths.pop().unwrap()
+    }
+
     #[test]
     fn test_bls_to_execution_output_json_structure() {
-        let (withdrawal_key, withdrawal_pubkey) = test_withdrawal_key(0);
-        let exec_addr = [0xAB; 20];
-
-        let change = BLSToExecutionChange {
-            validator_index: 42,
-            from_bls_pubkey: withdrawal_pubkey.to_bytes(),
-            to_execution_address: exec_addr,
-        };
-
-        let network = network::from_name("mainnet").unwrap();
-        let domain = compute_domain(
-            DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.genesis_fork_version,
-            network.genesis_validators_root,
-        );
-        let signing_root = compute_signing_root(&change, domain);
-        let signature = withdrawal_key.sign(&signing_root);
-
-        let signed = SignedBLSToExecutionChange {
-            message: change,
-            signature: signature.to_bytes().to_vec(),
-        };
-
-        let json = serde_json::to_string_pretty(&signed).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = write_bls_change(dir.path(), 42);
+        let content = fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let parsed = parsed.as_array().expect("top level is a JSON array").first().unwrap();
 
         assert!(parsed.get("message").is_some());
         assert!(parsed.get("signature").is_some());
@@ -271,46 +276,34 @@ mod tests {
         assert_eq!(sig_str.len(), 194);
     }
 
+    #[test]
+    fn output_is_a_json_array_of_one_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = write_bls_change(dir.path(), 42);
+        let content = fs::read_to_string(&output_path).unwrap();
+        let parsed: Vec<SignedBLSToExecutionChange> =
+            serde_json::from_str(&content).expect("array of one SignedBLSToExecutionChange");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message.validator_index, 42);
+        assert_eq!(parsed[0].signature.len(), 96);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_bls_to_execution_output_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (withdrawal_key, withdrawal_pubkey) = test_withdrawal_key(0);
-
-        let change = BLSToExecutionChange {
-            validator_index: 1,
-            from_bls_pubkey: withdrawal_pubkey.to_bytes(),
-            to_execution_address: [0x01; 20],
-        };
-
-        let network = network::from_name("mainnet").unwrap();
-        let domain = compute_domain(
-            DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.genesis_fork_version,
-            network.genesis_validators_root,
-        );
-        let signing_root = compute_signing_root(&change, domain);
-        let signature = withdrawal_key.sign(&signing_root);
-
-        let signed = SignedBLSToExecutionChange {
-            message: change,
-            signature: signature.to_bytes().to_vec(),
-        };
-
-        let json = serde_json::to_string_pretty(&signed).unwrap();
-
         let dir = tempfile::tempdir().unwrap();
-        let output_path = dir.path().join("test_bls.json");
-        crate::fs_util::write_new_0600(&output_path, json.as_bytes()).unwrap();
+        let output_path = write_bls_change(dir.path(), 1);
 
         let metadata = fs::metadata(&output_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
         let content = fs::read_to_string(&output_path).unwrap();
-        let parsed: SignedBLSToExecutionChange = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.message.validator_index, 1);
+        let parsed: Vec<SignedBLSToExecutionChange> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message.validator_index, 1);
     }
 
     /// Command body must refuse to overwrite an existing output path (create_new via helper).
