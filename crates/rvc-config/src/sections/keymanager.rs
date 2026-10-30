@@ -182,7 +182,7 @@ impl KeymanagerArgs {
 
 /// Keymanager API and remote-signer settings (resolved / `Config` field).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KeymanagerConfig {
     #[serde(default)]
     pub enabled: bool,

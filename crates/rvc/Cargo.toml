@@ -41,6 +41,7 @@ secret-provider.workspace = true
 signer.workspace = true
 slashing.workspace = true
 serde.workspace = true
+serde_path_to_error.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 timing.workspace = true
@@ -58,6 +59,7 @@ validator-store.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 axum.workspace = true
 # test-utils: produce-return hook for the proposer fence tests. The production
 # dependency line above does not enable this feature.

@@ -101,7 +101,7 @@ impl SafetyArgs {
 
 /// `[safety]` table (section-relative names only; no flat aliases).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SafetyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_unsupported_fork: Option<bool>,

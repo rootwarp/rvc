@@ -126,37 +126,23 @@ roles = ["proposal"]
 /// ConfigWire is what lifts `beacon_url` into the section.
 #[test]
 fn naive_section_struct_does_not_bind_flat_keys() {
-    let section: BeaconConfig = toml::from_str(r#"beacon_url = "http://flat-must-not-bind:5052""#)
-        .expect("unknown keys on BeaconConfig are ignored (no deny_unknown_fields)");
-    assert!(
-        section.url.is_none(),
-        "flat beacon_url must not bind on BeaconConfig; that is why ConfigWire exists"
-    );
+    let err = toml::from_str::<BeaconConfig>(r#"beacon_url = "http://flat-must-not-bind:5052""#)
+        .expect_err("flat beacon_url on BeaconConfig must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("beacon_url"), "{msg}");
 }
 
 #[test]
 fn nested_table_prefixed_names_do_not_bind_in_new_sections() {
-    let nested: Config = toml::from_str(
-        r#"
-[beacon]
-beacon_url = "http://nested-must-not-bind:5052"
-beacon_nodes = ["http://nested-must-not-bind:5052"]
-beacon_max_body_bytes = 1
-
-[server]
-# section-relative names are metrics_address (no server_ prefix)
-
-[keys]
-# keystore_path is already section-relative
-"#,
-    )
-    .expect("unknown prefixed keys inside nested tables are ignored");
-    assert_eq!(
-        nested.beacon_url, "http://localhost:5052",
-        "prefixed names inside [beacon] must not bind"
-    );
-    assert!(nested.beacon_nodes.is_empty());
-    assert_eq!(nested.beacon_max_body_bytes, 32 * 1024 * 1024);
+    for (doc, key) in [
+        ("[beacon]\nbeacon_url = \"http://nested-must-not-bind:5052\"\n", "beacon_url"),
+        ("[beacon]\nbeacon_nodes = [\"http://nested-must-not-bind:5052\"]\n", "beacon_nodes"),
+        ("[beacon]\nbeacon_max_body_bytes = 1\n", "beacon_max_body_bytes"),
+    ] {
+        let err = toml::from_str::<Config>(doc).expect_err(key);
+        let msg = err.to_string();
+        assert!(msg.contains(key), "{key} must be rejected, got {msg}");
+    }
 
     let section: Config = toml::from_str(
         r#"

@@ -17,7 +17,7 @@ use url::Url;
 
 use beacon::ResponseCaps;
 
-use super::error::ConfigError;
+use super::error::{parse_data_error, parse_error, ConfigError};
 use super::network::Network;
 use super::start::StartArgs;
 use crate::orchestrator::dispatch::DispatchLimits;
@@ -274,6 +274,7 @@ fn default_beacon_max_body_bytes() -> usize {
 
 /// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeaconNodeEntry {
     pub url: String,
     #[serde(default = "default_bn_roles")]
@@ -348,30 +349,82 @@ impl Default for Config {
 
 /// `[beacon]` table plus the TOML-only `beacon_nodes_config` array (names
 /// [`BnRole`], so it cannot live on `rvc-config::BeaconConfig`).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+///
+/// Serde cannot `deny_unknown_fields` across `flatten`. This removes only
+/// `beacon_nodes_config` and deserializes the rest as the strict `BeaconConfig`.
+#[derive(Debug, Default)]
 struct BeaconSection {
-    #[serde(flatten)]
     inner: BeaconConfig,
-    #[serde(default)]
     beacon_nodes_config: Vec<BeaconNodeEntry>,
+}
+
+impl<'de> Deserialize<'de> for BeaconSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        let toml::Value::Table(mut table) = value else {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: {}, expected a table",
+                value.type_str()
+            )));
+        };
+        let beacon_nodes_config = match table.remove("beacon_nodes_config") {
+            Some(entry) => Vec::<BeaconNodeEntry>::deserialize(entry)
+                .map_err(|err| serde::de::Error::custom(err.message()))?,
+            None => Vec::new(),
+        };
+        let inner = BeaconConfig::deserialize(toml::Value::Table(table))
+            .map_err(|err| serde::de::Error::custom(err.message()))?;
+        Ok(Self { inner, beacon_nodes_config })
+    }
 }
 
 /// `[server]` table plus leftover-key sentinels.
 ///
-/// Without these fields a leftover `[server] grpc_port` would parse silently
-/// (`#[serde(default)]`, no `deny_unknown_fields`).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+/// Serde cannot `deny_unknown_fields` across `flatten`. This removes only
+/// `grpc_port` and `grpc_address`, then deserializes the strict `ServerConfig`.
+#[derive(Debug, Default)]
 struct ServerSection {
-    #[serde(flatten)]
     inner: ServerConfig,
     grpc_port: Option<toml::Value>,
     grpc_address: Option<toml::Value>,
 }
 
+impl<'de> Deserialize<'de> for ServerSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        let toml::Value::Table(mut table) = value else {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: {}, expected a table",
+                value.type_str()
+            )));
+        };
+        let grpc_port = table.remove("grpc_port");
+        let grpc_address = table.remove("grpc_address");
+        let inner = ServerConfig::deserialize(toml::Value::Table(table))
+            .map_err(|err| serde::de::Error::custom(err.message()))?;
+        Ok(Self { inner, grpc_port, grpc_address })
+    }
+}
+
 /// Replacement probes named in `ConfigError::RemovedKey`.
-const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics HTTP server";
+///
+/// The gRPC reason lives here so the generic removed-key text still names
+/// `/health` and `/readyz`.
+const GRPC_KEY_REPLACEMENT: &str =
+    "GET /health and GET /readyz on the metrics HTTP server (gRPC healthz listener is gone)";
+
+/// Legacy `[secret_provider]` names and the spelling that replaces each one.
+const REMOVED_SECRET_PROVIDER_KEYS: &[(&str, &str)] = &[
+    ("provider", "providers = [\"gcp\"]"),
+    ("gcp_project_id", "[secret_provider.gcp] project_id"),
+    ("gcp_secret_prefix", "[secret_provider.gcp] secret_prefix"),
+];
 
 /// Intermediate wire format that accepts **both** nested tables and legacy flat
 /// keys. Flat keys fill fields that the corresponding nested table left at
@@ -382,7 +435,7 @@ const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics H
 /// plus the 31 4f/4g legacy keys (VD-4.1). Not deleted — serde `alias` cannot
 /// lift a top-level key into a nested table.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ConfigWire {
     beacon_url: String,
     beacon_nodes: Vec<String>,
@@ -511,7 +564,11 @@ fn removed_grpc_key(w: &ConfigWire) -> Option<&'static str> {
 impl Config {
     fn from_wire(w: ConfigWire) -> Result<Self, ConfigError> {
         if let Some(key) = removed_grpc_key(&w) {
-            return Err(ConfigError::RemovedKey { key, replacement: GRPC_KEY_REPLACEMENT });
+            return Err(ConfigError::RemovedKey {
+                key,
+                replacement: GRPC_KEY_REPLACEMENT,
+                file: None,
+            });
         }
         let mut logfile = w.logfile;
         if let Some(v) = w.logfile_max_size {
@@ -740,7 +797,7 @@ impl Config {
             other => {
                 return Err(ConfigError::Invalid {
                     field: "config",
-                    message: format!("config must be a TOML table, got {other:?}"),
+                    message: format!("config must be a TOML table, got {}", other.type_str()),
                     source_layer: ConfigSource::Default,
                 });
             }
@@ -755,7 +812,10 @@ impl Config {
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     field: "logfile",
-                    message: format!("logfile must be a string path or a table, got {other:?}"),
+                    message: format!(
+                        "logfile must be a string path or a table, got {}",
+                        other.type_str()
+                    ),
                     source_layer: ConfigSource::Default,
                 });
             }
@@ -763,9 +823,17 @@ impl Config {
         };
 
         let flat_network = match map.remove("network") {
-            Some(toml::Value::String(s)) => Some(
-                Network::deserialize(toml::Value::String(s)).map_err(ConfigError::ParseError)?,
-            ),
+            Some(toml::Value::String(s)) => {
+                match serde_path_to_error::deserialize(toml::Value::String(s)) {
+                    Ok(network) => Some(network),
+                    Err(err) => {
+                        return Err(parse_data_error(
+                            &err.into_inner(),
+                            Some("network".to_string()),
+                        ))
+                    }
+                }
+            }
             Some(toml::Value::Table(t)) => {
                 map.insert("network".into(), toml::Value::Table(t));
                 None
@@ -773,15 +841,28 @@ impl Config {
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     field: "network",
-                    message: format!("network must be a string preset or a table, got {other:?}"),
+                    message: format!(
+                        "network must be a string preset or a table, got {}",
+                        other.type_str()
+                    ),
                     source_layer: ConfigSource::Default,
                 });
             }
             None => None,
         };
 
-        let wire: ConfigWire =
-            ConfigWire::deserialize(toml::Value::Table(map)).map_err(ConfigError::ParseError)?;
+        if let Some((key, replacement)) = removed_secret_provider_key(&map) {
+            return Err(ConfigError::RemovedKey { key, replacement, file: None });
+        }
+
+        let wire: ConfigWire = match serde_path_to_error::deserialize(toml::Value::Table(map)) {
+            Ok(wire) => wire,
+            Err(err) => {
+                let rendered = err.path().to_string();
+                let path = if rendered.is_empty() { None } else { Some(rendered) };
+                return Err(parse_data_error(&err.into_inner(), path));
+            }
+        };
         let mut cfg = Self::from_wire(wire)?;
         if let Some(path) = flat_logfile_path {
             cfg.logfile.path = Some(path);
@@ -790,6 +871,33 @@ impl Config {
             cfg.network = net;
         }
         Ok(cfg)
+    }
+}
+
+fn removed_secret_provider_key(map: &toml::Table) -> Option<(&'static str, &'static str)> {
+    let section = match map.get("secret_provider") {
+        Some(toml::Value::Table(section)) => section,
+        _ => return None,
+    };
+    for (key, replacement) in REMOVED_SECRET_PROVIDER_KEYS {
+        if section.contains_key(*key) {
+            return Some((*key, *replacement));
+        }
+    }
+    None
+}
+
+fn attach_config_file(err: ConfigError, path: &Path) -> ConfigError {
+    let file = Some(path.to_path_buf());
+    match err {
+        ConfigError::UnknownKey { key, .. } => ConfigError::UnknownKey { key, file },
+        ConfigError::RemovedKey { key, replacement, .. } => {
+            ConfigError::RemovedKey { key, replacement, file }
+        }
+        ConfigError::Parse { line, column, kind, path, .. } => {
+            ConfigError::Parse { file, line, column, path, kind }
+        }
+        other => other,
     }
 }
 
@@ -815,8 +923,14 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)?;
-        let value: toml::Value = toml::from_str(&content)?;
-        let mut cfg = Self::from_toml_value(value)?;
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(value) => value,
+            Err(err) => return Err(parse_error(&err, Some(&content), Some(path))),
+        };
+        let mut cfg = match Self::from_toml_value(value) {
+            Ok(cfg) => cfg,
+            Err(err) => return Err(attach_config_file(err, path)),
+        };
         if cfg.proposer_config.refresh_interval != ProposerConfigSource::default().refresh_interval
         {
             cfg.proposer_config.refresh_interval_source = ConfigSource::File(path.to_path_buf());
@@ -1382,7 +1496,9 @@ impl Config {
     pub fn load(file: Option<&Path>, cli: StartArgs) -> Result<Self, ConfigError> {
         let mut config = match file {
             Some(path) => Self::from_file(path).map_err(|err| match err {
-                removed @ ConfigError::RemovedKey { .. } => removed,
+                passed @ (ConfigError::RemovedKey { .. }
+                | ConfigError::UnknownKey { .. }
+                | ConfigError::Parse { .. }) => passed,
                 err => ConfigError::Invalid {
                     field: "config",
                     message: err.to_string(),
@@ -2305,6 +2421,8 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    use crate::config::ParseKind;
+
     fn overlay(f: impl FnOnce(&mut StartArgs)) -> Config {
         let mut cli = StartArgs::default();
         f(&mut cli);
@@ -2757,16 +2875,29 @@ aggregate_due_bps = 10001
     }
 
     #[test]
-    fn test_timing_bps_non_integer_fails_naming_key() {
-        let err = toml::from_str::<Config>(
-            r#"
-[timing]
-attestation_due_bps = "not-an-integer"
-"#,
-        )
-        .expect_err("non-integer bps must fail");
+    fn test_timing_bps_non_integer_fails_without_echoing_the_value() {
+        let mut file = NamedTempFile::new().expect("temp config");
+        write!(file, "[timing]\nattestation_due_bps = \"not-an-integer\"\n",).expect("write");
+        let err = Config::load(Some(file.path()), StartArgs::default())
+            .expect_err("non-integer bps must fail");
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Parse {
+                    kind: ParseKind::InvalidType { expected },
+                    path: Some(path),
+                    file: Some(p),
+                    ..
+                } if path == "timing.attestation_due_bps"
+                    && !expected.contains("not-an-integer")
+                    && p == file.path()
+            ),
+            "{err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("attestation_due_bps"), "{msg}");
+        assert!(msg.contains("invalid type"), "{msg}");
+        assert!(!msg.contains("not-an-integer"), "{msg}");
     }
 
     #[test]
@@ -5225,12 +5356,26 @@ builders = ["not a url"]
         assert!(reject.validate().is_ok());
     }
 
-    /// An unknown policy name is rejected, and the error names that name.
+    /// An unknown policy name is rejected. The variant text is kept; the value is not.
     #[test]
-    fn unknown_fee_recipient_policy_is_rejected_naming_the_value() {
+    fn unknown_fee_recipient_policy_is_rejected_without_echoing_the_value() {
         let err = toml::from_str::<Config>("fee_recipient_policy = \"sometimes\"").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("sometimes"), "{msg}");
+        assert!(msg.contains("unknown variant"), "{msg}");
+        assert!(!msg.contains("sometimes"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_top_level_key_on_the_serde_path_has_no_file() {
+        let value: toml::Value = toml::from_str("x = 1").expect("x = 1 is valid TOML");
+        let err = Config::from_toml_value(value).expect_err("unknown key");
+        assert!(
+            matches!(err, ConfigError::UnknownKey { ref key, file: None } if key == "x"),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains('x'), "{msg}");
+        assert!(!msg.contains(" in "), "{msg}");
     }
 
     // -- RF5-13: nested call sites; flat shims deleted --

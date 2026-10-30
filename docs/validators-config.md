@@ -4,6 +4,8 @@
 
 ## Overview
 
+Unknown keys in `config.toml` fail startup. Strict parsing of the validators file follows in W4-C3.
+
 `validators_config` is a separate TOML file (not the main `config.toml`) that holds:
 
 - **Global defaults** — fee recipient, gas limit, graffiti applied to every validator that doesn't override them.

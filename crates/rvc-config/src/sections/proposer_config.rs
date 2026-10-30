@@ -91,7 +91,7 @@ impl ProposerConfigArgs {
 /// No flat-legacy `#[serde(alias)]` here: those bind inside `[proposer_config]`
 /// (4f SEC).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProposerConfigSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

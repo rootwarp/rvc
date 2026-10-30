@@ -13,7 +13,7 @@ pub(crate) use builder::{
     clear_completed_import_sidecars, doppelganger_import_window, import_sidecar_pubkey,
     ImportSidecarKind,
 };
-pub use error::ConfigError;
+pub use error::{ConfigError, ParseKind};
 pub use knobs::OPERATOR_KNOB_NAMES;
 pub use network::Network;
 pub use rvc_config::ConfigSource;

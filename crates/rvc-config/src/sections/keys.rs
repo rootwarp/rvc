@@ -84,7 +84,7 @@ impl KeysArgs {
 ///
 /// Does not include `secret_provider` — that stays `[secret_provider]` (A-4.5).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KeysConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keystore_path: Option<PathBuf>,

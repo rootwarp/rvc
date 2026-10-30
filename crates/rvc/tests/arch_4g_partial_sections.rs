@@ -69,37 +69,37 @@ validator_registration_batch_delay = 100
 
 #[test]
 fn nested_table_flat_legacy_names_do_not_bind_in_partial_sections() {
-    let nested: Config = toml::from_str(
-        r#"
-[logfile]
-logfile = "/nested-must-not-bind.log"
-logfile_max_size = 1
-logfile_max_number = 1
-logfile_compress = true
-logfile_level = "error"
-
-[proposer_config]
-proposer_config_url = "https://nested-must-not-bind"
-proposer_config_refresh_interval = 1
-
-[builder_limits]
-builder_circuit_breaker_consecutive_limit = 99
-builder_circuit_breaker_epoch_limit = 99
-
-[secret_provider.gcp]
-gcp_project_id = "nested-must-not-bind"
-gcp_secret_prefix = "nested-"
-"#,
-    )
-    .expect("unknown prefixed keys inside nested tables are ignored (no deny on *Config)");
-    assert!(nested.logfile.path.is_none(), "prefixed names inside [logfile] must not bind");
-    assert_eq!(nested.logfile.max_size, 200);
-    assert!(nested.proposer_config.url.is_none());
-    assert_eq!(nested.proposer_config.refresh_interval, 384);
-    assert_eq!(nested.builder_limits.circuit_breaker_consecutive_limit, 3);
-    assert_eq!(nested.builder_limits.circuit_breaker_epoch_limit, 5);
-    assert!(nested.secret_provider.gcp.project_id.is_none());
-    assert_eq!(nested.secret_provider.gcp.secret_prefix, "validator-key-");
+    // One document per table, and one key per document, so a later alias cannot
+    // hide behind the first unknown-field error.
+    for (doc, key) in [
+        ("[logfile]\nlogfile = \"/nested-must-not-bind.log\"\n", "logfile"),
+        ("[logfile]\nlogfile_max_size = 1\n", "logfile_max_size"),
+        ("[logfile]\nlogfile_max_number = 1\n", "logfile_max_number"),
+        ("[logfile]\nlogfile_compress = true\n", "logfile_compress"),
+        ("[logfile]\nlogfile_level = \"error\"\n", "logfile_level"),
+        (
+            "[proposer_config]\nproposer_config_url = \"https://nested-must-not-bind\"\n",
+            "proposer_config_url",
+        ),
+        (
+            "[proposer_config]\nproposer_config_refresh_interval = 1\n",
+            "proposer_config_refresh_interval",
+        ),
+        (
+            "[builder_limits]\nbuilder_circuit_breaker_consecutive_limit = 99\n",
+            "builder_circuit_breaker_consecutive_limit",
+        ),
+        (
+            "[builder_limits]\nbuilder_circuit_breaker_epoch_limit = 99\n",
+            "builder_circuit_breaker_epoch_limit",
+        ),
+        ("[secret_provider.gcp]\ngcp_project_id = \"nested-must-not-bind\"\n", "gcp_project_id"),
+        ("[secret_provider.gcp]\ngcp_secret_prefix = \"nested-\"\n", "gcp_secret_prefix"),
+    ] {
+        let err = toml::from_str::<Config>(doc).expect_err(key);
+        let msg = err.to_string();
+        assert!(msg.contains(key), "{key} must be rejected, got {msg}");
+    }
 
     let section: Config = toml::from_str(
         r#"
