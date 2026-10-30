@@ -72,36 +72,49 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Fixed point `(S*, T*)`. `Err` is that pair when `S* > T*`.
+/// Fixed point of the attestation rows, plus the clamped export floor.
+///
+/// `pre_clamp_target` is the fixed point before `T* = max(T*, S*)`. The
+/// synthetic record uses `(source_bound, target_bound)` with
+/// `target_bound = max(pre_clamp_target, source_bound)`. Rows with
+/// `target > pre_clamp_target` are still emitted: the clamp never drops a
+/// row the unclamped fixed point would have kept.
+struct SyntheticBounds {
+    source_bound: Epoch,
+    pre_clamp_target: Epoch,
+    target_bound: Epoch,
+}
+
+/// Infallible fixed point. A two-sided `S* > T*` becomes `(S*, S*)`.
 fn attestation_synthetic_bounds(
     rows: &[(Epoch, Epoch)],
     source_wm: Epoch,
     target_wm: Epoch,
-) -> Result<(Epoch, Epoch), (Epoch, Epoch)> {
-    let mut target_bound = target_wm;
+) -> SyntheticBounds {
+    let mut pre_clamp_target = target_wm;
     let mut source_bound;
     loop {
         source_bound = source_wm;
         for &(source, target) in rows {
-            if target <= target_bound {
+            if target <= pre_clamp_target {
                 source_bound = source_bound.max(source);
             }
         }
         let mut raised: Option<Epoch> = None;
         for &(source, target) in rows {
-            if target > target_bound && source < source_bound {
+            if target > pre_clamp_target && source < source_bound {
                 raised = Some(raised.map_or(target, |current| current.max(target)));
             }
         }
         match raised {
-            Some(next) => target_bound = next,
+            Some(next) => pre_clamp_target = next,
             None => break,
         }
     }
-    if source_bound > target_bound {
-        Err((source_bound, target_bound))
-    } else {
-        Ok((source_bound, target_bound))
+    SyntheticBounds {
+        source_bound,
+        pre_clamp_target,
+        target_bound: pre_clamp_target.max(source_bound),
     }
 }
 
@@ -121,26 +134,17 @@ fn export_validator(
         (Some(source_wm), Some(target_wm)) => {
             let rows: Vec<(Epoch, Epoch)> =
                 attestations.iter().map(|att| (att.source_epoch, att.target_epoch)).collect();
-            let (source_bound, target_bound) =
-                match attestation_synthetic_bounds(&rows, source_wm, target_wm) {
-                    Ok(bounds) => bounds,
-                    Err((source_bound, target_bound)) => {
-                        return Err(SlashingError::UnrepresentableFloor {
-                            pubkey,
-                            source_bound,
-                            target_bound,
-                        });
-                    }
-                };
+            let bounds = attestation_synthetic_bounds(&rows, source_wm, target_wm);
             synthetics += 1;
             let mut out = Vec::with_capacity(1 + attestations.len());
             out.push(InterchangeAttestation {
-                source_epoch: source_bound.to_string(),
-                target_epoch: target_bound.to_string(),
+                source_epoch: bounds.source_bound.to_string(),
+                target_epoch: bounds.target_bound.to_string(),
                 signing_root: None,
             });
+            // Pre-clamp target: a row between `T*` and `max(T*, S*)` is still emitted.
             for attestation in attestations {
-                if attestation.target_epoch > target_bound {
+                if attestation.target_epoch > bounds.pre_clamp_target {
                     out.push(wire_attestation(attestation));
                 }
             }
@@ -350,10 +354,12 @@ impl SlashingDb {
     /// minimum below the watermark — the floor never travels — and the two
     /// records are a double vote or a surround inside the file.
     ///
-    /// `S* > T*`, or only one of the two attestation watermarks, fails the
-    /// whole export with [`SlashingError::UnrepresentableFloor`]. No partial
-    /// interchange is returned. A validator with neither attestation
-    /// watermark exports its attestation rows unchanged.
+    /// Only one of the two attestation watermarks fails the whole export with
+    /// [`SlashingError::UnrepresentableFloor`]. No partial interchange is
+    /// returned. A two-sided fixed point with `S* > T*` is exported as
+    /// `(S*, max(T*, S*))`; rows above the pre-clamp target are still emitted.
+    /// A validator with neither attestation watermark exports its attestation
+    /// rows unchanged.
     ///
     /// The protection invariant is non-weakening: if this database would
     /// refuse a candidate, an EIP-3076 importer of the file refuses it too.
@@ -473,13 +479,21 @@ impl SlashingDb {
     ///
     /// For each validator in the interchange, after inserting rows:
     /// - block watermark ← `MAX(signed_blocks.slot)`
-    /// - attestation watermarks ← `(MAX(source_epoch), MAX(target_epoch))`
+    /// - attestation watermarks ← `(MAX(source_epoch), max(MAX(target_epoch), MAX(source_epoch), stored S*))`
+    ///
+    /// The target raise uses the source watermark stored after that source
+    /// update, so an incoming file whose maxima are both below a stored source
+    /// still leaves `T* >= S*`. A stored watermark that does not fit in `i64`
+    /// (a legacy wrapped source) fails the import closed and rolls the
+    /// transaction back. A negative stored value is not replaced.
     ///
     /// Watermark updates are **raise-only** and share the same transaction as the
     /// row inserts: a partial import cannot leave watermarks ahead of rows, and
     /// re-importing an older (lower-maxima) interchange **does not lower**
-    /// watermarks and **does not fail** the import (EIP-3076 import is additive;
-    /// `WatermarkLowered` is reserved for the explicit `set_*_watermark` APIs).
+    /// a non-negative watermark and **does not fail** that import (EIP-3076
+    /// import is additive; `WatermarkLowered` is reserved for the explicit
+    /// `set_*_watermark` APIs). A legacy wrapped source is the exception
+    /// above: representing it as the new target fails the import closed.
     ///
     /// A `WHERE NOT EXISTS` conflict drops the row and still raises the watermark
     /// from the parsed maxima. An audit table for those drops was rejected: no
@@ -578,11 +592,32 @@ impl SlashingDb {
                         WatermarkKind::AttestationSource.as_sql_str(),
                         to_sql_i64(source, "source_epoch")?,
                     ))?;
+                    // Same prepared statement. Target is at least the source, so
+                    // an interchange with S > T cannot leave the watermarks inverted.
                     raise_watermark.execute((
                         pubkey,
                         WatermarkKind::AttestationTarget.as_sql_str(),
-                        to_sql_i64(target, "target_epoch")?,
+                        to_sql_i64(target.max(source), "target_epoch")?,
                     ))?;
+                    // Stored S* can sit above both incoming maxima. Raise T*
+                    // to that source in this transaction. `read_watermark`
+                    // returns the unsigned view, so a wrapped source does not
+                    // fit in `i64` and this fails closed instead of leaving
+                    // `T* < S*`. The upsert keeps a negative stored target.
+                    let stored_source = super::watermarks::read_watermark(
+                        &tx,
+                        pubkey,
+                        WatermarkKind::AttestationSource,
+                    )?
+                    .ok_or(SlashingError::InternalInvariant(
+                        "attestation source watermark missing after raise",
+                    ))?;
+                    super::watermarks::raise_watermark_max(
+                        &tx,
+                        pubkey,
+                        WatermarkKind::AttestationTarget,
+                        stored_source,
+                    )?;
                 }
             }
         }

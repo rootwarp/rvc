@@ -12,8 +12,9 @@ use rvc_slashing::metrics::{
     RVC_SLASHING_IMPORT_CONN_HOLD_MS, RVC_SLASHING_IMPORT_DURATION_MS,
 };
 use rvc_slashing::{
-    AttestationSlashingViolation, BlockSlashingViolation, InterchangeAttestation, InterchangeBlock,
-    InterchangeFormat, InterchangeMetadata, SlashingDb, SlashingError, ValidatorRecord,
+    raise_watermark, AttestationSlashingViolation, BlockSlashingViolation, InterchangeAttestation,
+    InterchangeBlock, InterchangeFormat, InterchangeMetadata, SlashingDb, SlashingError,
+    ValidatorRecord, WatermarkKind,
 };
 use support::{refuses, same_slot_is_double_proposal, slashable_attestation_pair, Candidate};
 
@@ -330,12 +331,10 @@ fn attestation_triples(record: &ValidatorRecord) -> Vec<(u64, u64, Option<String
         .collect()
 }
 
-/// Independent fixed point. Not the production function.
-fn reference_floor(
-    rows: &[(u64, u64)],
-    source_wm: u64,
-    target_wm: u64,
-) -> Result<(u64, u64), (u64, u64)> {
+/// Independent fixed point before the clamp. Not the production function.
+///
+/// Returns `(S*, pre_clamp_target)`.
+fn reference_fixed_point(rows: &[(u64, u64)], source_wm: u64, target_wm: u64) -> (u64, u64) {
     let mut target_bound = target_wm;
     let mut source_bound;
     loop {
@@ -356,11 +355,13 @@ fn reference_floor(
             None => break,
         }
     }
-    if source_bound > target_bound {
-        Err((source_bound, target_bound))
-    } else {
-        Ok((source_bound, target_bound))
-    }
+    (source_bound, target_bound)
+}
+
+/// Independent clamped floor `(S*, max(T*, S*))`. Not the production function.
+fn reference_floor(rows: &[(u64, u64)], source_wm: u64, target_wm: u64) -> (u64, u64) {
+    let (source_bound, pre_clamp_target) = reference_fixed_point(rows, source_wm, target_wm);
+    (source_bound, pre_clamp_target.max(source_bound))
 }
 
 /// Watermark floors plus double-vote/surround. Min-target and min-slot are
@@ -427,6 +428,12 @@ fn assert_no_synthetic_slashable_pair(file: &InterchangeFormat) {
                 );
             }
         }
+    }
+    assert_no_synthetic_block_double_proposal(file);
+}
+
+fn assert_no_synthetic_block_double_proposal(file: &InterchangeFormat) {
+    for record in &file.data {
         for (i, left) in record.signed_blocks.iter().enumerate() {
             if left.signing_root.is_some() {
                 continue;
@@ -444,14 +451,79 @@ fn assert_no_synthetic_slashable_pair(file: &InterchangeFormat) {
     }
 }
 
-fn assert_non_weakening(
+/// Synthetic floor equals [`reference_floor`] of the stored watermarks.
+///
+/// Every row with `target` above the pre-clamp fixed point is still in the
+/// file. A row above the clamped target must not form a slashable pair with
+/// the synthetic. A row between the pre-clamp target and `S*` is emitted on
+/// purpose and may surround, or share a target with, the clamped synthetic
+/// `(S*, S*)`.
+fn assert_export_floor_matches_reference(
+    file: &InterchangeFormat,
+    pubkey: &str,
+    rows: &[(u64, u64)],
+    source_wm: u64,
+    target_wm: u64,
+) {
+    let (pre_source, pre_target) = reference_fixed_point(rows, source_wm, target_wm);
+    let (s_star, t_star) = reference_floor(rows, source_wm, target_wm);
+    assert_eq!((s_star, t_star), (pre_source, pre_target.max(pre_source)));
+    assert!(t_star >= s_star, "clamped floor inverted: ({s_star}, {t_star})");
+
+    let record = only_validator(file, pubkey);
+    let synthetic = record
+        .signed_attestations
+        .iter()
+        .find(|att| att.signing_root.is_none())
+        .expect("two-sided watermark exports a synthetic floor");
+    let got_source: u64 = synthetic.source_epoch.parse().expect("source");
+    let got_target: u64 = synthetic.target_epoch.parse().expect("target");
+    assert_eq!(got_source, s_star, "synthetic source is below the reference floor");
+    assert_eq!(got_target, t_star, "synthetic target is below the reference floor");
+
+    let emitted: Vec<(u64, u64)> = record
+        .signed_attestations
+        .iter()
+        .filter(|att| att.signing_root.is_some())
+        .map(|att| {
+            (att.source_epoch.parse().expect("source"), att.target_epoch.parse().expect("target"))
+        })
+        .collect();
+    for &(source, target) in rows {
+        if target > pre_target {
+            assert!(
+                emitted.contains(&(source, target)),
+                "row ({source}, {target}) above pre-clamp target {pre_target} was dropped"
+            );
+        }
+    }
+    let floor = InterchangeAttestation {
+        source_epoch: s_star.to_string(),
+        target_epoch: t_star.to_string(),
+        signing_root: None,
+    };
+    for &(source, target) in &emitted {
+        if target > t_star {
+            let row = InterchangeAttestation {
+                source_epoch: source.to_string(),
+                target_epoch: target.to_string(),
+                signing_root: Some("0xkept".into()),
+            };
+            assert!(
+                !slashable_attestation_pair(&floor, &row),
+                "row ({source}, {target}) above the clamped floor is slashable with {floor:?}"
+            );
+        }
+    }
+}
+
+fn assert_refuses_what_the_db_refuses(
     db: &SlashingDb,
     file: &InterchangeFormat,
     pubkeys: &[&str],
     gvr: &[u8; 32],
     domain: u64,
 ) {
-    assert_no_synthetic_slashable_pair(file);
     for pubkey in pubkeys {
         for source in 0..domain {
             for target in source..domain {
@@ -481,6 +553,17 @@ fn assert_non_weakening(
             );
         }
     }
+}
+
+fn assert_non_weakening(
+    db: &SlashingDb,
+    file: &InterchangeFormat,
+    pubkeys: &[&str],
+    gvr: &[u8; 32],
+    domain: u64,
+) {
+    assert_no_synthetic_slashable_pair(file);
+    assert_refuses_what_the_db_refuses(db, file, pubkeys, gvr, domain);
 }
 
 fn model_refuses_grid(
@@ -612,35 +695,26 @@ proptest! {
             load_spec(&db, pubkey, spec, &gvr);
         }
 
-        match db.export(&gvr) {
-            Err(SlashingError::UnrepresentableFloor { pubkey, source_bound, target_bound }) => {
-                let spec = specs
-                    .iter()
-                    .zip(pubkeys)
-                    .find(|(_, pk)| *pk == pubkey)
-                    .map(|(spec, _)| spec)
-                    .expect("error names a loaded pubkey");
-                let (source_wm, target_wm) = spec.att_wm.expect("floor error requires attestation watermarks");
-                let Err((s_star, t_star)) = reference_floor(&spec.atts, source_wm, target_wm) else {
-                    panic!("export failed closed but the reference floor is representable");
-                };
-                prop_assert!(s_star > t_star, "S* = {s_star}, T* = {t_star}");
-                prop_assert_eq!(source_bound, s_star);
-                prop_assert_eq!(target_bound, t_star);
-            }
-            Err(other) => panic!("unexpected export error: {other:?}"),
-            Ok(file) => {
-                for (pubkey, spec) in pubkeys.iter().zip(specs.iter()) {
-                    if let Some((source_wm, target_wm)) = spec.att_wm {
-                        prop_assert!(
-                            reference_floor(&spec.atts, source_wm, target_wm).is_ok(),
-                            "export succeeded but S* > T* for {pubkey}"
-                        );
-                    }
-                }
-                assert_non_weakening(&db, &file, &pubkeys, &gvr, EXPORT_DOMAIN);
+        let file = db.export(&gvr).unwrap_or_else(|err| {
+            panic!("every two-sided export must succeed, got {err:?}")
+        });
+        for (pubkey, spec) in pubkeys.iter().zip(specs.iter()) {
+            if spec.att_wm.is_some() {
+                let (source_wm, target_wm) = db
+                    .get_attestation_watermark(pubkey)
+                    .expect("watermark read")
+                    .expect("setter stored both sides");
+                assert_export_floor_matches_reference(
+                    &file,
+                    pubkey,
+                    &spec.atts,
+                    source_wm,
+                    target_wm,
+                );
             }
         }
+        assert_no_synthetic_block_double_proposal(&file);
+        assert_refuses_what_the_db_refuses(&db, &file, &pubkeys, &gvr, EXPORT_DOMAIN);
     }
 }
 
@@ -750,14 +824,32 @@ fn a_destination_refuses_2_12_after_importing_the_synthetic() {
     }
 }
 
+/// Schema, then `write` on a second connection that is dropped before the
+/// returned handle's first transaction.
+fn open_after_second_connection(
+    write: impl FnOnce(&rusqlite::Connection),
+) -> (tempfile::TempDir, SlashingDb) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slashing.db");
+    drop(SlashingDb::open(&path).expect("schema"));
+    {
+        let conn = rusqlite::Connection::open(&path).expect("second connection");
+        write(&conn);
+    }
+    let db = SlashingDb::open(&path).expect("reopen");
+    (dir, db)
+}
+
 #[test]
 fn export_fails_closed_when_the_floor_cannot_be_represented() {
     let _guard = export_metric_lock();
     let before = synthetic_count();
     let gvr = chain_gvr();
-    let db = SlashingDb::open_in_memory().expect("open");
+    let (_dir, db) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 20)
+            .expect("one-sided source watermark");
+    });
     db.seed_attestation(PUBKEY, 5, 10, Some("0xrow".into()), &gvr).expect("seed");
-    db.set_attestation_watermark(PUBKEY, 20, 11).expect("unrepresentable watermark");
     db.seed_attestation(OTHER_PUBKEY, 1, 2, Some("0xok".into()), &gvr).expect("other seed");
     db.set_attestation_watermark(OTHER_PUBKEY, 1, 3).expect("other watermark");
 
@@ -767,15 +859,181 @@ fn export_fails_closed_when_the_floor_cannot_be_represented() {
         SlashingError::UnrepresentableFloor { pubkey, source_bound, target_bound } => {
             assert_eq!(pubkey, PUBKEY);
             assert_eq!(source_bound, 20);
-            assert_eq!(target_bound, 11);
-            assert!(source_bound > target_bound);
+            assert_eq!(target_bound, 0);
         }
         other => panic!("expected UnrepresentableFloor, got {other:?}"),
     }
     assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1);
     assert_eq!(db.get_attestations(OTHER_PUBKEY).expect("rows").len(), 1);
-    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("wm"), Some((20, 11)));
+    assert!(db.get_attestation_watermark(PUBKEY).expect("wm").is_none(), "only att_source is set");
     assert_eq!(db.get_attestation_watermark(OTHER_PUBKEY).expect("wm"), Some((1, 3)));
+}
+
+#[test]
+fn a_source_greater_than_target_import_still_exports() {
+    let _guard = export_metric_lock();
+    let path = format!(
+        "{}/tests/conformance/single_validator_source_greater_than_target.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("conformance file"))
+            .expect("json");
+    let interchange: InterchangeFormat =
+        serde_json::from_value(raw["steps"][0]["interchange"].clone()).expect("interchange");
+    let pubkey = interchange.data[0].pubkey.clone();
+    let gvr = [0u8; 32];
+
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.import(&interchange, &gvr).expect("import");
+
+    let (source, target) = db.get_attestation_watermark(&pubkey).expect("wm").expect("pair");
+    assert_eq!(source, 8);
+    assert_eq!(target, 8);
+
+    let file = db.export(&gvr).expect("export");
+    let record = only_validator(&file, &pubkey);
+    assert_eq!(attestation_triples(record), vec![(8, 8, None)]);
+    let synthetic = &record.signed_attestations[0];
+    assert_eq!(synthetic.source_epoch, "8");
+    assert_eq!(synthetic.target_epoch, "8");
+}
+
+#[test]
+fn import_raises_the_stored_source_above_both_incoming_maxima() {
+    let gvr = chain_gvr();
+    let (_dir, db) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 8).expect("source");
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationTarget, 7).expect("target");
+    });
+    let (source, target) = db.get_attestation_watermark(PUBKEY).unwrap().unwrap();
+    assert_eq!(source, 8);
+    assert_eq!(target, 7);
+
+    db.import(&interchange(vec![att("1", "2", None)], vec![]), &gvr).expect("import");
+    let (source, target) = db.get_attestation_watermark(PUBKEY).unwrap().unwrap();
+    assert_eq!(source, 8, "stored source stays");
+    assert_eq!(target, 8, "target is raised to the stored source");
+}
+
+#[test]
+fn import_raises_the_target_when_the_incoming_target_is_below_the_stored_source() {
+    let gvr = chain_gvr();
+    let (_dir, db) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 20).expect("source");
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationTarget, 12).expect("target");
+    });
+
+    db.import(&interchange(vec![att("9", "15", None)], vec![]), &gvr).expect("import");
+    let (source, target) = db.get_attestation_watermark(PUBKEY).unwrap().unwrap();
+    assert_eq!(source, 20);
+    assert_eq!(target, 20, "incoming target 15 is still below the stored source");
+}
+
+#[test]
+fn inverted_watermarks_export_with_the_target_clamped() {
+    let _guard = export_metric_lock();
+    let gvr = chain_gvr();
+    let (_dir, db) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 8).expect("source");
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationTarget, 7).expect("target");
+    });
+    // Target 8 is above the pre-clamp target 7 and equal to the clamped target,
+    // so filtering on the clamped target would drop the row. Source 9 does not
+    // raise the fixed point (`9 < 8` is false).
+    db.seed_attestation(PUBKEY, 9, 8, Some("0xrow".into()), &gvr).expect("row above target");
+
+    let file = db.export(&gvr).expect("export");
+    let triples = attestation_triples(only_validator(&file, PUBKEY));
+    let floor = triples.iter().find(|row| row.2.is_none()).expect("synthetic floor");
+    assert_eq!(floor.0, 8);
+    assert_eq!(floor.1, 8);
+    assert!(
+        triples.iter().any(|row| row.0 == 9 && row.1 == 8 && row.2.as_deref() == Some("0xrow")),
+        "row above the pre-clamp target must still be emitted, got {triples:?}"
+    );
+}
+
+#[test]
+fn one_sided_watermark_at_i64_max_still_refuses() {
+    let _guard = export_metric_lock();
+    let gvr = chain_gvr();
+    let limit = i64::MAX as u64;
+    let before = synthetic_count();
+
+    let (_dir, source_only) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, limit)
+            .expect("source at i64::MAX");
+    });
+    match source_only.export(&gvr).expect_err("source-only") {
+        SlashingError::UnrepresentableFloor { source_bound, target_bound, .. } => {
+            assert_eq!(source_bound, limit);
+            assert_eq!(target_bound, 0);
+        }
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+
+    let (_dir, target_only) = open_after_second_connection(|conn| {
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationTarget, limit)
+            .expect("target at i64::MAX");
+    });
+    match target_only.export(&gvr).expect_err("target-only") {
+        SlashingError::UnrepresentableFloor { source_bound, target_bound, .. } => {
+            assert_eq!(source_bound, 0);
+            assert_eq!(target_bound, limit);
+        }
+        other => panic!("expected UnrepresentableFloor, got {other:?}"),
+    }
+    assert_eq!(synthetic_count(), before, "a refused export counts no synthetic");
+}
+
+/// RSA NIT 5 on #900. A row stored as `(i64::MIN, 101)` reads back as source
+/// `2^63`. Ordered watermarks include it in the fixed point, so export clamps
+/// to `(2^63, 2^63)` and does not lower that source. Re-import is `OutOfRange`.
+/// Signing `(99, 102)` still succeeds: the surround query compares the signed
+/// source, and a source-greater-than-target refusal is W4-S2.
+#[test]
+fn legacy_source_wrapped_row_clamps_the_export_floor_and_signing_stays_fail_open() {
+    let _guard = export_metric_lock();
+    let gvr = chain_gvr();
+    let wrapped = 1_u64 << 63;
+    let (_dir, db) = open_after_second_connection(|conn| {
+        conn.execute(
+            "INSERT INTO attestations \
+             (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+             VALUES ('local-vc', ?1, ?2, ?3, '0xleg', ?4)",
+            (PUBKEY, i64::MIN, 101_i64, CHAIN_GVR_HEX),
+        )
+        .expect("legacy source-wrapped row");
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationSource, 1).expect("source");
+        raise_watermark(conn, PUBKEY, WatermarkKind::AttestationTarget, 101).expect("target");
+    });
+
+    let rows = db.get_attestations(PUBKEY).expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_epoch, wrapped);
+    assert_eq!(rows[0].target_epoch, 101);
+
+    let file = db.export(&gvr).expect("export clamps instead of UnrepresentableFloor");
+    assert_eq!(attestation_triples(only_validator(&file, PUBKEY)), vec![(wrapped, wrapped, None)]);
+    let (source, target) = db.get_attestation_watermark(PUBKEY).expect("wm").expect("pair");
+    assert_eq!(source, 1);
+    assert_eq!(target, 101);
+
+    let reserved = db
+        .reserve_attestation(PUBKEY, 99, 102, Some("0xnext".into()), &gvr)
+        .expect("source-only wrap must not block (99, 102)");
+    assert!(reserved.inserted);
+
+    let destination = SlashingDb::open_in_memory().expect("destination");
+    let err = destination.import(&file, &gvr).expect_err("2^63 floor is not a signed epoch");
+    match err {
+        SlashingError::OutOfRange { field, value } => {
+            assert_eq!(field, "source_epoch");
+            assert_eq!(value, wrapped);
+        }
+        other => panic!("expected OutOfRange, got {other:?}"),
+    }
 }
 
 #[test]
