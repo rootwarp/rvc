@@ -187,6 +187,57 @@ fn record_has_history(record: &ValidatorRecord) -> bool {
     !record.signed_attestations.is_empty() || !record.signed_blocks.is_empty()
 }
 
+/// Which history table [`SlashingDb::history_row_count`] counts.
+///
+/// The table name is this enum, never a caller string.
+#[derive(Clone, Copy)]
+enum HistoryTable {
+    Attestations,
+    Blocks,
+}
+
+impl HistoryTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Attestations => "attestations",
+            Self::Blocks => "blocks",
+        }
+    }
+}
+
+/// `COUNT(*)` for `pubkeys` in one history table.
+///
+/// `pubkeys` is non-empty. Placeholders are bound, not interpolated.
+fn count_rows_for_pubkeys(
+    conn: &rusqlite::Connection,
+    table: HistoryTable,
+    pubkeys: &[String],
+) -> Result<usize, SlashingError> {
+    let mut placeholders = String::new();
+    for index in 0..pubkeys.len() {
+        if index > 0 {
+            placeholders.push(',');
+        }
+        placeholders.push('?');
+    }
+    let sql = format!("SELECT COUNT(*) FROM {} WHERE pubkey IN ({placeholders})", table.name());
+    let count: i64 =
+        conn.query_row(&sql, rusqlite::params_from_iter(pubkeys.iter()), |row| row.get(0))?;
+    usize_from_sql_count(count)
+}
+
+/// A `COUNT(*)` is never negative. A negative value is a broken driver, not
+/// an empty history.
+fn usize_from_sql_count(count: i64) -> Result<usize, SlashingError> {
+    let non_negative = u64::try_from(count)
+        .map_err(|_| SlashingError::InternalInvariant("history row count was negative"))?;
+    Ok(usize::try_from(non_negative).unwrap_or(usize::MAX))
+}
+
+fn saturating_history_rows(attestations: usize, blocks: usize) -> usize {
+    attestations.saturating_add(blocks)
+}
+
 /// One attestation row parsed before the connection is taken.
 struct ParsedAttestation<'a> {
     source_epoch: Epoch,
@@ -464,6 +515,37 @@ impl SlashingDb {
         let interchange = self.finish_export(genesis_validators_root, data, synthetic_records);
         drop(conn);
         Ok((interchange, with_history))
+    }
+
+    /// Count attestation and block rows for the normalised, deduped `pubkeys`.
+    ///
+    /// The admission estimate for a DELETE export. Watermark-only keys add
+    /// nothing: a watermark is not a history row. An empty request is `0`
+    /// and does not take `conn`.
+    ///
+    /// One `conn` hold covers both counts. The totals are added with
+    /// saturating arithmetic. This function does not read slot or epoch
+    /// values, so a legacy `i64::MIN` row (meaning `2^63`) is still a row.
+    /// A query error is `Err`, never `Ok(0)`.
+    #[tracing::instrument(name = "slashing.db.history_row_count", skip_all)]
+    pub fn history_row_count(&self, pubkeys: &[String]) -> Result<usize, SlashingError> {
+        let mut seen = HashSet::with_capacity(pubkeys.len());
+        let mut requested = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let canonical = normalize_pubkey(pubkey)?.to_string();
+            if seen.insert(canonical.clone()) {
+                requested.push(canonical);
+            }
+        }
+        if requested.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.conn.lock();
+        let attestations = count_rows_for_pubkeys(&conn, HistoryTable::Attestations, &requested)?;
+        let blocks = count_rows_for_pubkeys(&conn, HistoryTable::Blocks, &requested)?;
+        drop(conn);
+        Ok(saturating_history_rows(attestations, blocks))
     }
 
     /// Increment the synthetic counter only after every validator succeeded.
@@ -1946,5 +2028,19 @@ mod tests {
         let blocks_500 = db.get_blocks("0x0001f4").expect("query failed");
         assert_eq!(blocks_500.len(), 1);
         assert_eq!(blocks_500[0].slot, 5000);
+    }
+
+    #[test]
+    fn history_row_total_uses_saturating_math() {
+        assert_eq!(super::saturating_history_rows(usize::MAX, 1), usize::MAX);
+        assert_eq!(super::saturating_history_rows(2, 3), 5);
+        assert_eq!(super::usize_from_sql_count(0).expect("zero"), 0);
+        assert_eq!(super::usize_from_sql_count(3).expect("three"), 3);
+        assert!(
+            super::usize_from_sql_count(-1).is_err(),
+            "a negative COUNT is not an empty history"
+        );
+        let max_i64 = super::usize_from_sql_count(i64::MAX).expect("max signed count");
+        assert_eq!(u64::try_from(max_i64).expect("fits"), u64::try_from(i64::MAX).expect("i64"));
     }
 }

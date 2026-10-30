@@ -1040,6 +1040,76 @@ fn pubkey_of(byte: u8) -> String {
     format!("0x{}", hex::encode([byte; 48]))
 }
 
+fn insert_legacy_block(conn: &rusqlite::Connection, pubkey: &str, slot: i64) {
+    conn.execute(
+        "INSERT INTO blocks \
+         (client_cn, pubkey, slot, signing_root, genesis_validators_root) \
+         VALUES ('local-vc', ?1, ?2, '0xleg', ?3)",
+        (pubkey, slot, CHAIN_GVR_HEX),
+    )
+    .expect("legacy block");
+}
+
+/// Admission input for a DELETE export: attestation and block rows of the
+/// requested keys only. A watermark is not a row. A legacy `i64::MIN` cell
+/// (the stored form of `2^63`) is still a row.
+#[test]
+fn history_row_count_counts_only_the_requested_keys() {
+    let gvr = chain_gvr();
+    let with_rows = pubkey_of(0x11);
+    let also_rows = pubkey_of(0x22);
+    let watermark_only = pubkey_of(0x33);
+    let unrequested = pubkey_of(0x44);
+    let wrapped = pubkey_of(0x55);
+    let (_dir, db) = open_after_second_connection(|conn| {
+        insert_legacy_attestation(conn, &wrapped, i64::MIN, 4);
+        insert_legacy_block(conn, &wrapped, i64::MIN);
+    });
+    db.seed_attestation(&with_rows, 1, 2, None, &gvr).expect("first attestation");
+    db.seed_attestation(&with_rows, 1, 3, None, &gvr).expect("second attestation");
+    db.seed_block(&with_rows, 9, None, &gvr).expect("block");
+    db.seed_attestation(&also_rows, 4, 5, None, &gvr).expect("other attestation");
+    db.set_attestation_watermark(&watermark_only, 1, 2).expect("watermark only");
+    db.seed_attestation(&unrequested, 8, 8, None, &gvr).expect("unrequested attestation");
+    db.seed_block(&unrequested, 8, None, &gvr).expect("unrequested block");
+
+    let requested = [with_rows.clone(), also_rows.clone(), watermark_only.clone(), wrapped.clone()];
+    assert_eq!(
+        db.history_row_count(&requested).expect("count"),
+        6,
+        "two attestations, one block, one other attestation, and the wrapped attestation plus wrapped block"
+    );
+    assert_eq!(db.history_row_count(std::slice::from_ref(&with_rows)).expect("one key"), 3);
+    assert_eq!(db.history_row_count(std::slice::from_ref(&watermark_only)).expect("wm"), 0);
+    assert_eq!(db.history_row_count(&[]).expect("empty"), 0);
+    assert_eq!(
+        db.history_row_count(&[with_rows.clone(), with_rows.to_uppercase()]).expect("dedup"),
+        3,
+        "case variants are one key and are not counted twice"
+    );
+    assert_eq!(db.history_row_count(std::slice::from_ref(&also_rows)).expect("subset"), 1);
+    assert_eq!(db.history_row_count(std::slice::from_ref(&wrapped)).expect("wrapped"), 2);
+}
+
+/// A query failure is not an empty history. Treating it as `0` would admit a
+/// DELETE as if the key had no rows.
+#[test]
+fn history_row_count_query_error_is_not_zero() {
+    // Drop after `open`: reopening would run the schema migration and recreate
+    // the table, and an empty table is a real zero, not a query failure.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slashing.db");
+    let db = SlashingDb::open(&path).expect("open");
+    {
+        let conn = rusqlite::Connection::open(&path).expect("second connection");
+        conn.execute_batch("DROP TABLE attestations;").expect("drop attestations");
+    }
+    let err = db
+        .history_row_count(std::slice::from_ref(&PUBKEY.to_string()))
+        .expect_err("a missing table must fail the count");
+    assert!(matches!(err, SlashingError::DatabaseError(_)), "{err:?}");
+}
+
 /// `i64::MIN` stored by the old `as i64` bind. Readers cast it back to `2^63`.
 const WRAPPED_EPOCH: u64 = 1 << 63;
 

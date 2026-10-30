@@ -27,16 +27,17 @@ use validator_store::ValidatorStore;
 use super::{pubkey_hex, test_pubkey, SlashingProtectionAdapter, ValidatorManagerAdapter};
 use crate::config::Config;
 
-const CHAIN_GVR_HEX: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+pub(super) const CHAIN_GVR_HEX: &str =
+    "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
-fn chain_gvr() -> [u8; 32] {
+pub(super) fn chain_gvr() -> [u8; 32] {
     let bytes = hex::decode(CHAIN_GVR_HEX.strip_prefix("0x").expect("prefix")).expect("hex");
     let mut root = [0u8; 32];
     root.copy_from_slice(&bytes);
     root
 }
 
-struct CountingKeys {
+pub(super) struct CountingKeys {
     keys: Mutex<Vec<Pubkey>>,
     deletes: AtomicU32,
     /// When set, `delete_keystore` unlinks the keystore file, sidecar, and secret.
@@ -44,15 +45,15 @@ struct CountingKeys {
 }
 
 impl CountingKeys {
-    fn with_keys(keys: Vec<Pubkey>) -> Self {
+    pub(super) fn with_keys(keys: Vec<Pubkey>) -> Self {
         Self { keys: Mutex::new(keys), deletes: AtomicU32::new(0), keystore_dir: None }
     }
 
-    fn with_keystore_dir(keys: Vec<Pubkey>, dir: PathBuf) -> Self {
+    pub(super) fn with_keystore_dir(keys: Vec<Pubkey>, dir: PathBuf) -> Self {
         Self { keys: Mutex::new(keys), deletes: AtomicU32::new(0), keystore_dir: Some(dir) }
     }
 
-    fn deletes(&self) -> u32 {
+    pub(super) fn deletes(&self) -> u32 {
         self.deletes.load(Ordering::SeqCst)
     }
 }
@@ -158,7 +159,7 @@ impl ValidatorConfigManager for NoopConfig {
     }
 }
 
-fn app_state(
+pub(super) fn app_state(
     keys: Arc<dyn KeystoreManager>,
     slashing: Arc<dyn SlashingProtection>,
     validator_manager: Arc<dyn ValidatorManager>,
@@ -294,11 +295,11 @@ async fn export_fails_closed_delete_aborts_and_key_stays_disabled() {
     assert!(secret.exists(), "import secret remains");
 }
 
-fn recorded_pubkeys(json: &serde_json::Value) -> Vec<&str> {
+pub(super) fn recorded_pubkeys(json: &serde_json::Value) -> Vec<&str> {
     json["data"].as_array().expect("data").iter().filter_map(|row| row["pubkey"].as_str()).collect()
 }
 
-fn write_keystore_bundle(dir: &std::path::Path, hex_key: &str) {
+pub(super) fn write_keystore_bundle(dir: &std::path::Path, hex_key: &str) {
     std::fs::write(dir.join(format!("{hex_key}.json")), b"{}").expect("keystore");
     std::fs::write(dir.join(format!("{hex_key}.import_meta.json")), b"{}").expect("sidecar");
     let secrets = dir.join(Config::IMPORT_SECRETS_DIR);
@@ -306,7 +307,7 @@ fn write_keystore_bundle(dir: &std::path::Path, hex_key: &str) {
     std::fs::write(secrets.join(hex_key), b"secret-material").expect("secret");
 }
 
-fn loaded_state(
+pub(super) fn loaded_state(
     keys: Vec<Pubkey>,
     slashing: Arc<dyn SlashingProtection>,
 ) -> (Arc<CountingKeys>, Arc<ValidatorStore>, Arc<AppState>) {
@@ -322,7 +323,7 @@ fn loaded_state(
     (counting, store, state)
 }
 
-async fn delete(
+pub(super) async fn delete(
     state: Arc<AppState>,
     pubkeys: Vec<String>,
 ) -> Result<DeleteKeystoresResponse, ApiError> {
@@ -499,71 +500,6 @@ async fn delete_edge_requests_export_only_member_history() {
         serde_json::from_str(&unknown_only.slashing_protection).expect("json");
     assert!(unknown_json["data"].as_array().expect("data").is_empty());
     assert!(!unknown_only.slashing_protection.contains(&known_hex));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn concurrent_delete_and_import_exports_the_precommit_snapshot() {
-    let key = test_pubkey(14);
-    let key_hex = pubkey_hex(key);
-    let gvr = chain_gvr();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
-    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), gvr));
-
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let entered_tx = Mutex::new(Some(entered_tx));
-    let release_rx = Mutex::new(release_rx);
-    adapter.set_during_import(Some(Arc::new(move || {
-        if let Some(tx) = entered_tx.lock().expect("entered").take() {
-            let _ = tx.send(());
-            let _ = release_rx.lock().expect("release").recv();
-        }
-    })));
-
-    let import_json = serde_json::json!({
-        "metadata": {
-            "interchange_format_version": "5",
-            "genesis_validators_root": CHAIN_GVR_HEX
-        },
-        "data": [{
-            "pubkey": key_hex,
-            "signed_blocks": [],
-            "signed_attestations": [{
-                "source_epoch": "3",
-                "target_epoch": "4",
-                "signing_root": null
-            }]
-        }]
-    })
-    .to_string();
-    let import_adapter = Arc::clone(&adapter);
-    let import_task =
-        tokio::spawn(async move { import_adapter.import_interchange(&import_json).await });
-    tokio::time::timeout(Duration::from_secs(5), entered_rx)
-        .await
-        .expect("import entered")
-        .expect("entered");
-
-    let (_keys, _store, state) =
-        loaded_state(vec![key], Arc::clone(&adapter) as Arc<dyn SlashingProtection>);
-    let body = delete(state, vec![key_hex.clone()]).await.expect("delete during import");
-    assert_eq!(body.data[0].status, DeleteStatus::Deleted);
-    let json: serde_json::Value = serde_json::from_str(&body.slashing_protection).expect("json");
-    assert_eq!(recorded_pubkeys(&json), vec![key_hex.as_str()]);
-    assert!(json["data"][0]["signed_attestations"].as_array().expect("atts").is_empty());
-    assert!(db.get_attestations(&key_hex).expect("rows").is_empty(), "import has not committed");
-
-    release_tx.send(()).expect("release");
-    tokio::time::timeout(Duration::from_secs(5), import_task)
-        .await
-        .expect("import finished")
-        .expect("import task")
-        .expect("import");
-    let rows = db.get_attestations(&key_hex).expect("rows");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].source_epoch, 3);
-    assert_eq!(rows[0].target_epoch, 4);
-    assert!(json["data"][0]["signed_attestations"].as_array().expect("atts").is_empty());
 }
 
 #[tokio::test]

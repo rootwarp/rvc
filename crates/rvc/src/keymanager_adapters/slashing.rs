@@ -23,6 +23,34 @@ pub struct SlashingProtectionAdapter {
     /// `SlashingDb::import`, while the admission guard is still held.
     #[cfg(test)]
     during_import: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs on the blocking thread at the start of the history-row count,
+    /// before `conn` is taken and before the gate.
+    #[cfg(test)]
+    during_row_count: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs on the async task after the row count returns and before
+    /// `admit_capped`. Non-blocking.
+    #[cfg(test)]
+    before_export_admit: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs on the async task after `admit_capped` returns and before the
+    /// export `spawn_blocking`. Non-blocking. The admission guard is held.
+    #[cfg(test)]
+    after_export_admitted: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs on the blocking export thread after `Handle::enter` and before
+    /// `ensure_still_fits`. The admission guard is held.
+    #[cfg(test)]
+    before_export_fit: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs inside the blocking export, after the fit re-check and before
+    /// `export_pubkeys`, while the admission guard is still held.
+    #[cfg(test)]
+    during_export: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs inside the blocking export after `export_pubkeys` returns and
+    /// before the admission guard is dropped.
+    #[cfg(test)]
+    after_export_read: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// When set, the next row-count stage returns an error instead of the
+    /// database count. One shot. The real count is not substituted with 0.
+    #[cfg(test)]
+    fail_row_count: std::sync::atomic::AtomicBool,
 }
 
 impl SlashingProtectionAdapter {
@@ -37,6 +65,20 @@ impl SlashingProtectionAdapter {
             gate,
             #[cfg(test)]
             during_import: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            during_row_count: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_export_admit: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_export_admitted: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_export_fit: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            during_export: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_export_read: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_row_count: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -80,6 +122,42 @@ impl SlashingProtectionAdapter {
     #[cfg(test)]
     pub(crate) fn set_during_import(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.during_import.lock().expect("during_import") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_during_row_count(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.during_row_count.lock().expect("during_row_count") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_export_admit(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.before_export_admit.lock().expect("before_export_admit") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_export_admitted(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.after_export_admitted.lock().expect("after_export_admitted") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_export_fit(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.before_export_fit.lock().expect("before_export_fit") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_during_export(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.during_export.lock().expect("during_export") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_export_read(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.after_export_read.lock().expect("after_export_read") = hook;
+    }
+
+    /// The next `history_row_count` stage fails. The count is not read as 0.
+    #[cfg(test)]
+    pub(crate) fn fail_next_history_row_count(&self) {
+        self.fail_row_count.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -134,6 +212,17 @@ fn history_rows(interchange: &slashing::InterchangeFormat) -> usize {
 
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn export_task_error(err: tokio::task::JoinError) -> SlashingProtectionError {
+    SlashingProtectionError::Backend(format!("interchange export task failed: {err}"))
+}
+
+#[cfg(test)]
+fn run_test_hook(hook: &Option<Arc<dyn Fn() + Send + Sync>>) {
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[async_trait]
@@ -212,8 +301,13 @@ impl SlashingProtection for SlashingProtectionAdapter {
     /// requested does not fail this call. A requested key that cannot be
     /// represented does.
     ///
-    /// The read runs on the calling task and does not take the import window
-    /// gate. W4-K1b moves it behind the gate and onto a blocking thread.
+    /// The history count and the export each run on a `spawn_blocking` thread.
+    /// The count takes `conn` and drops it before this function awaits the
+    /// import-window gate. [`ImportWindowGate::admit_capped`](super::import_window::ImportWindowGate::admit_capped)
+    /// then admits the export. The admission guard moves into the export
+    /// closure and is dropped only after `export_pubkeys` returns, including
+    /// when the caller has gone. A count error, a [`tokio::task::JoinError`],
+    /// or a late fit check fails the export and removes nothing.
     ///
     /// # Completeness (KM-1(a))
     ///
@@ -225,12 +319,91 @@ impl SlashingProtection for SlashingProtectionAdapter {
         pubkeys: &[Pubkey],
     ) -> Result<ExportedInterchange, SlashingProtectionError> {
         let requested: Vec<String> = pubkeys.iter().map(pubkey_hex).collect();
-        let (interchange, with_history_hex) = self
-            .slashing_db
-            .export_pubkeys(&self.genesis_validators_root, &requested)
-            .map_err(map_slashing_db_error)?;
-        let json = serde_json::to_string(&interchange)
-            .map_err(|e| SlashingProtectionError::Backend(format!("serialization failed: {e}")))?;
+        let count_keys = requested.clone();
+        let db = Arc::clone(&self.slashing_db);
+        let handle = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let during_row_count = self.during_row_count.lock().expect("during_row_count").clone();
+        #[cfg(test)]
+        let fail_row_count = self.fail_row_count.swap(false, std::sync::atomic::Ordering::SeqCst);
+        // The count's `conn` guard lives inside `history_row_count` and is
+        // dropped before this await completes. The gate is awaited next,
+        // with no `conn` held.
+        let rows = tokio::task::spawn_blocking(move || {
+            let _ctx = handle.enter();
+            #[cfg(test)]
+            run_test_hook(&during_row_count);
+            #[cfg(test)]
+            if fail_row_count {
+                return Err(slashing::SlashingError::InternalInvariant(
+                    "injected history_row_count failure",
+                ));
+            }
+            db.history_row_count(&count_keys)
+        })
+        .await
+        .map_err(export_task_error)?
+        .map_err(map_slashing_db_error)?;
+
+        #[cfg(test)]
+        {
+            let hook = self.before_export_admit.lock().expect("before_export_admit").clone();
+            run_test_hook(&hook);
+        }
+        let admission = self.gate.admit_capped(rows).await.map_err(map_deferral)?;
+        #[cfg(test)]
+        {
+            let hook = self.after_export_admitted.lock().expect("after_export_admitted").clone();
+            run_test_hook(&hook);
+        }
+
+        let wait_ms = millis(admission.wait);
+        if wait_ms > 0 {
+            let window_ms = millis(admission.window);
+            let estimated_hold_ms = millis(admission.estimated_hold);
+            tracing::info!(
+                wait_ms,
+                window_ms,
+                estimated_hold_ms,
+                "keymanager delete export deferred"
+            );
+        }
+
+        let db = Arc::clone(&self.slashing_db);
+        let gvr = self.genesis_validators_root;
+        let handle = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let before_export_fit = self.before_export_fit.lock().expect("before_export_fit").clone();
+        #[cfg(test)]
+        let during_export = self.during_export.lock().expect("during_export").clone();
+        #[cfg(test)]
+        let after_export_read = self.after_export_read.lock().expect("after_export_read").clone();
+        // `admission` moves into the closure here. `admission.guard` is
+        // dropped only after `export_pubkeys` returns, on this blocking
+        // thread, including when the caller has been dropped.
+        let (json, with_history_hex) = tokio::task::spawn_blocking(move || {
+            let _ctx = handle.enter();
+            let result = (|| {
+                #[cfg(test)]
+                run_test_hook(&before_export_fit);
+                admission.ensure_still_fits().map_err(map_deferral)?;
+                #[cfg(test)]
+                run_test_hook(&during_export);
+                let (interchange, with_history) =
+                    db.export_pubkeys(&gvr, &requested).map_err(map_slashing_db_error)?;
+                #[cfg(test)]
+                run_test_hook(&after_export_read);
+                let json = serde_json::to_string(&interchange).map_err(|e| {
+                    SlashingProtectionError::Backend(format!("serialization failed: {e}"))
+                })?;
+                Ok((json, with_history))
+            })();
+            drop(admission.guard);
+            result
+        })
+        .await
+        .map_err(export_task_error)??;
+
         let mut with_history = Vec::with_capacity(with_history_hex.len());
         for hex_key in with_history_hex {
             with_history.push(pubkey_from_canonical_hex(&hex_key)?);

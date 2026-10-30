@@ -22,6 +22,17 @@
 //! the same one-slot cap as every other admission. Every other clock error
 //! still refuses admission.
 //!
+//! # DELETE export
+//!
+//! [`ImportWindowGate::admit_capped`] admits a DELETE export. Its estimate is
+//! `min(estimated_hold(rows), one free window)`, so a history longer than the
+//! window is not [`ImportDeferralError::NoFreeWindow`]. Before genesis that
+//! cap is applied before the saturated-estimate refusal and uses slot 0's
+//! window. [`ImportWindowGate::admit`] does not cap. A capped hold that fills
+//! the window may start until that window closes, so a `spawn_blocking` delay
+//! does not turn the export into a permanent refusal. The read can overrun
+//! the close once.
+//!
 //! # Time after admission
 //!
 //! [`estimated_hold`] is the measured per-row connection hold, plus the
@@ -418,16 +429,45 @@ impl ImportWindowGate {
 
     /// Reserve the import mutex and wait until `rows` fits in one free window.
     ///
-    /// The estimate is [`estimated_hold`]. The mutex is acquired before the
-    /// clock is read, and that wait is capped at [`QUEUE_WAIT_SLOTS`]. The
-    /// returned guard is owned so the caller can move it into `spawn_blocking`;
-    /// it stays held until that owner drops it.
+    /// The estimate is [`estimated_hold`], uncapped. An import that does not
+    /// fit is [`ImportDeferralError::NoFreeWindow`]. DELETE export uses
+    /// [`Self::admit_capped`].
+    ///
+    /// The mutex is acquired before the clock is read, and that wait is capped
+    /// at [`QUEUE_WAIT_SLOTS`]. The returned guard is owned so the caller can
+    /// move it into `spawn_blocking`; it stays held until that owner drops it.
     ///
     /// The sleep after the mutex is acquired is at most one slot. Before
     /// genesis the guard is returned without sleeping only when the estimate
     /// finishes at or before genesis. Dropping this future before it returns
     /// drops the guard (or cancels the wait to acquire it).
     pub(crate) async fn admit(&self, rows: usize) -> Result<ImportAdmission, ImportDeferralError> {
+        self.admit_with_cap(rows, EstimateCap::Uncapped).await
+    }
+
+    /// [`Self::admit`] for a DELETE export, with the hold capped to one window.
+    ///
+    /// The cap is `min(estimated_hold(rows), one free window)`. It is applied
+    /// before the saturated-estimate refusal on the before-genesis path, and
+    /// that window is slot 0's. When the cap shortens the estimate, any start
+    /// in `[open, close)` fits, in slot and before genesis. Import admission
+    /// does not call this.
+    pub(crate) async fn admit_capped(
+        &self,
+        rows: usize,
+    ) -> Result<ImportAdmission, ImportDeferralError> {
+        self.admit_with_cap(rows, EstimateCap::Capped).await
+    }
+
+    /// Shared body of [`Self::admit`] and [`Self::admit_capped`].
+    ///
+    /// `cap` is the only difference. [`EstimateCap::Uncapped`] keeps the
+    /// estimate [`estimated_hold`] returns.
+    async fn admit_with_cap(
+        &self,
+        rows: usize,
+        cap: EstimateCap,
+    ) -> Result<ImportAdmission, ImportDeferralError> {
         let queued_at = tokio::time::Instant::now();
         let queue_bound = self
             .clock
@@ -446,12 +486,14 @@ impl ImportWindowGate {
             }
         };
         let acquired_at = tokio::time::Instant::now();
-        let estimate = estimated_hold(rows, &self.cfg);
+        let raw_estimate = estimated_hold(rows, &self.cfg);
 
         let slot = match self.clock.current_slot() {
             Ok(slot) => slot,
             Err(TimingError::BeforeGenesis { .. }) => {
-                return self.admit_before_genesis(guard, queued_at, acquired_at, estimate).await;
+                return self
+                    .admit_before_genesis(guard, queued_at, acquired_at, raw_estimate, cap)
+                    .await;
             }
             Err(err) => return Err(err.into()),
         };
@@ -460,6 +502,7 @@ impl ImportWindowGate {
         let anchor = SlotAnchor::capture(self.clock.as_ref(), slot);
         let bps = attestation_bps(self.clock.as_ref());
         let window = free_window_len(&anchor, bps, &self.cfg);
+        let (estimate, reduced) = apply_cap(raw_estimate, window, cap);
 
         if estimate > window {
             return Err(no_free_window(estimate, window));
@@ -467,7 +510,7 @@ impl ImportWindowGate {
 
         loop {
             let now = tokio::time::Instant::now();
-            match earliest_start(&anchor, bps, &self.cfg, estimate, now) {
+            match earliest_start(&anchor, bps, &self.cfg, estimate, now, reduced) {
                 Some(start_at) if start_at > bound => {
                     return Err(no_free_window(estimate, window));
                 }
@@ -476,7 +519,9 @@ impl ImportWindowGate {
                 }
                 Some(_) => {
                     let latest_start =
-                        latest_start_in_fit(&anchor, bps, &self.cfg, estimate, now).unwrap_or(now);
+                        latest_start_in_fit(&anchor, bps, &self.cfg, estimate, now, reduced)
+                            .unwrap_or(now);
+                    let latest_start = widen_capped_start(latest_start, estimate, reduced);
                     return Ok(ImportAdmission {
                         guard,
                         wait: tokio::time::Instant::now().saturating_duration_since(queued_at),
@@ -490,19 +535,49 @@ impl ImportWindowGate {
         }
     }
 
+    /// Length of slot 0's free window, the cap used before genesis.
+    ///
+    /// Same edges as the fall-through inside [`Self::admit_before_genesis`]:
+    /// attestation deadline plus the attestation reserve, through slot end
+    /// minus the block reserve. A slot with no such interval is `0`.
+    fn slot0_free_window_len(&self) -> Result<Duration, ImportDeferralError> {
+        let bps = attestation_bps(self.clock.as_ref());
+        let slot_duration = self.clock.slot_duration();
+        let slot_ms = u64::try_from(slot_duration.as_millis()).unwrap_or(u64::MAX / 2);
+        let open_offset = Duration::from_millis(due_ms(bps, slot_ms))
+            .checked_add(self.cfg.att_reserve_margin)
+            .ok_or(ImportDeferralError::Clock(TimingError::InvalidSlotDuration))?;
+        let Some(close_offset) = slot_duration.checked_sub(self.cfg.block_reserve_margin) else {
+            return Ok(Duration::ZERO);
+        };
+        if open_offset >= close_offset {
+            return Ok(Duration::ZERO);
+        }
+        Ok(close_offset.saturating_sub(open_offset))
+    }
+
     /// Admit before genesis, or fall through to slot 0 when the hold would cross it.
     ///
-    /// A saturated estimate is refused. When `time_to_genesis >= estimate` the
-    /// latest start is the instant at which the hold still ends at genesis.
-    /// Otherwise slot 0's free window is used, and the sleep after the mutex
-    /// is acquired stays inside one slot.
+    /// A saturated estimate is refused. [`EstimateCap::Capped`] applies
+    /// `min(estimate, slot 0's window)` before that refusal. When
+    /// `time_to_genesis >= estimate` the latest start is the instant at which
+    /// the hold still ends at genesis. Otherwise slot 0's free window is used,
+    /// and the sleep after the mutex is acquired stays inside one slot.
     async fn admit_before_genesis(
         &self,
         guard: OwnedMutexGuard<()>,
         queued_at: tokio::time::Instant,
         acquired_at: tokio::time::Instant,
-        estimate: Duration,
+        raw_estimate: Duration,
+        cap: EstimateCap,
     ) -> Result<ImportAdmission, ImportDeferralError> {
+        let (estimate, reduced) = match cap {
+            EstimateCap::Uncapped => (raw_estimate, false),
+            EstimateCap::Capped => {
+                let window = self.slot0_free_window_len()?;
+                apply_cap(raw_estimate, window, cap)
+            }
+        };
         if estimate == Duration::MAX {
             return Err(no_free_window(estimate, Duration::ZERO));
         }
@@ -546,6 +621,7 @@ impl ImportWindowGate {
                 slot_duration,
                 estimate,
                 now,
+                reduced,
             ) {
                 Some(start_at) if start_at > bound => {
                     return Err(no_free_window(estimate, window));
@@ -561,8 +637,10 @@ impl ImportWindowGate {
                         slot_duration,
                         estimate,
                         now,
+                        reduced,
                     )
                     .unwrap_or(now);
+                    let latest_start = widen_capped_start(latest_start, estimate, reduced);
                     return Ok(ImportAdmission {
                         guard,
                         wait: tokio::time::Instant::now().saturating_duration_since(queued_at),
@@ -575,6 +653,46 @@ impl ImportWindowGate {
             }
         }
     }
+}
+
+/// Whether [`ImportWindowGate::admit_with_cap`] shortens the row estimate.
+#[derive(Clone, Copy)]
+enum EstimateCap {
+    /// Import. [`estimated_hold`] is used as computed.
+    Uncapped,
+    /// DELETE export. The estimate is at most one free window.
+    Capped,
+}
+
+/// `min(raw, window)` when `cap` is [`EstimateCap::Capped`].
+///
+/// The bool is true only when the cap actually shortened the estimate.
+fn apply_cap(raw: Duration, window: Duration, cap: EstimateCap) -> (Duration, bool) {
+    match cap {
+        EstimateCap::Uncapped => (raw, false),
+        EstimateCap::Capped => {
+            let estimate = raw.min(window);
+            (estimate, estimate < raw)
+        }
+    }
+}
+
+/// Let a capped hold start until the window it fills has closed.
+///
+/// When the cap shortens the estimate, the fit is any start in `[open, close)`
+/// and the ordinary latest start is `close - estimate`. Adding the estimate
+/// puts `latest_start` at the close, so a blocking thread that starts later
+/// in that window still passes [`ImportAdmission::ensure_still_fits`]. The
+/// read may then run past the close. Uncapped admissions are unchanged.
+fn widen_capped_start(
+    latest_start: tokio::time::Instant,
+    estimate: Duration,
+    reduced: bool,
+) -> tokio::time::Instant {
+    if !reduced {
+        return latest_start;
+    }
+    latest_start.checked_add(estimate).unwrap_or(latest_start)
 }
 
 /// Later of the pre-Gloas and Gloas attestation deadlines.
@@ -682,6 +800,7 @@ fn latest_start_in_fit(
     cfg: &ImportWindowConfig,
     estimate: Duration,
     now: tokio::time::Instant,
+    reduced: bool,
 ) -> Option<tokio::time::Instant> {
     for slots_ahead in 0..2u64 {
         let (open, close) = window_bounds(anchor, bps, cfg, slots_ahead)?;
@@ -689,8 +808,7 @@ fn latest_start_in_fit(
         if start_at >= close {
             continue;
         }
-        let end = start_at.checked_add(estimate)?;
-        if end <= close {
+        if hold_fits(start_at, close, estimate, reduced) {
             return close.checked_sub(estimate);
         }
     }
@@ -698,12 +816,17 @@ fn latest_start_in_fit(
 }
 
 /// Earliest tokio instant at or after `now` whose hold fits in this slot or the next.
+///
+/// `reduced` is set only after the estimate was capped down to the window.
+/// That hold fits at any instant in `[open, close)`. An uncapped hold fits
+/// only when it ends at or before `close`.
 fn earliest_start(
     anchor: &SlotAnchor,
     bps: u64,
     cfg: &ImportWindowConfig,
     estimate: Duration,
     now: tokio::time::Instant,
+    reduced: bool,
 ) -> Option<tokio::time::Instant> {
     for slots_ahead in 0..2u64 {
         let (open, close) = window_bounds(anchor, bps, cfg, slots_ahead)?;
@@ -711,12 +834,27 @@ fn earliest_start(
         if start_at >= close {
             continue;
         }
-        let end = start_at.checked_add(estimate)?;
-        if end <= close {
+        if hold_fits(start_at, close, estimate, reduced) {
             return Some(start_at);
         }
     }
     None
+}
+
+/// Whether `start_at` may begin a hold that was estimated at `estimate`.
+///
+/// A reduced estimate fills the window, so the start only has to fall inside
+/// it. The caller has already rejected `start_at >= close`.
+fn hold_fits(
+    start_at: tokio::time::Instant,
+    close: tokio::time::Instant,
+    estimate: Duration,
+    reduced: bool,
+) -> bool {
+    if reduced {
+        return start_at < close;
+    }
+    start_at.checked_add(estimate).is_some_and(|end| end <= close)
 }
 
 /// Earliest instant at or after `now` whose hold fits slot 0 or slot 1.
@@ -727,8 +865,9 @@ fn pre_genesis_start(
     slot_duration: Duration,
     estimate: Duration,
     now: tokio::time::Instant,
+    reduced: bool,
 ) -> Option<tokio::time::Instant> {
-    pre_genesis_fit(genesis_at, open_offset, close_offset, slot_duration, estimate, now)
+    pre_genesis_fit(genesis_at, open_offset, close_offset, slot_duration, estimate, now, reduced)
         .map(|(start_at, _)| start_at)
 }
 
@@ -740,8 +879,9 @@ fn pre_genesis_latest(
     slot_duration: Duration,
     estimate: Duration,
     now: tokio::time::Instant,
+    reduced: bool,
 ) -> Option<tokio::time::Instant> {
-    pre_genesis_fit(genesis_at, open_offset, close_offset, slot_duration, estimate, now)
+    pre_genesis_fit(genesis_at, open_offset, close_offset, slot_duration, estimate, now, reduced)
         .map(|(_, latest)| latest)
 }
 
@@ -752,6 +892,7 @@ fn pre_genesis_fit(
     slot_duration: Duration,
     estimate: Duration,
     now: tokio::time::Instant,
+    reduced: bool,
 ) -> Option<(tokio::time::Instant, tokio::time::Instant)> {
     for ahead in 0..2u32 {
         let shift = slot_duration.checked_mul(ahead)?;
@@ -761,8 +902,7 @@ fn pre_genesis_fit(
         if start_at >= close {
             continue;
         }
-        let end = start_at.checked_add(estimate)?;
-        if end <= close {
+        if hold_fits(start_at, close, estimate, reduced) {
             return Some((start_at, close.checked_sub(estimate)?));
         }
     }
