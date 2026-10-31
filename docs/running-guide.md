@@ -152,7 +152,7 @@ All three TLS flags are required when `--grpc-signer-url` is set.
 |------|---------|-------------|
 | `--secret-provider <NAME>` | none | Secret provider to use for loading validator keys (e.g., `gcp`) |
 | `--gcp-project-id <ID>` | none | GCP project ID (required when `--secret-provider` includes `gcp`) |
-| `--gcp-secret-prefix <PREFIX>` | `validator-key-` | Prefix for GCP secret names |
+| `--gcp-secret-prefix <PREFIX>` | `validator-key-` | Case-sensitive prefix the GCP secret id must start with; ids whose suffix is not a pubkey load with one warning |
 | `--secret-refresh-interval <SECS>` | `0` | Interval in seconds to refresh keys from secret providers (0 = disabled) |
 
 #### Tracing Options (OpenTelemetry)
@@ -190,7 +190,7 @@ rvc voluntary-exit [OPTIONS]
 | `--confirm` | no | false | Skip confirmation prompt |
 | `--beacon-url <URL>` | no | `http://localhost:5052` | Beacon node URL |
 | `--slashing-db-path <PATH>` | no | none | Slashing DB path |
-| `--network <NETWORK>` | no | none | Network preset |
+| `--network <NETWORK>` | no | `mainnet` | Network preset |
 | `--genesis-validators-root <HEX>` | no | none | Override genesis root |
 | `--log-level <LEVEL>` | no | `info` | Log level |
 
@@ -208,6 +208,11 @@ are offline and are not doppelganger-gated. A voluntary exit is not a slashable
 duty, and the command logs a warning when it signs. `prepare-exit` writes the
 signed message to a file and does not broadcast it. `voluntary-exit` submits
 the signed exit to the beacon node after `--confirm`.
+
+- `--network` defaults to `mainnet`.
+- The command refuses when the beacon node's genesis validators root does not match the local root.
+- On a named network it refuses when the beacon node's Capella fork version does not match the preset. Custom networks are not checked against a preset.
+- It refuses an explicit `--epoch` before the Capella fork epoch, and every explicit epoch when Capella is unscheduled (`u64::MAX`).
 
 ## Configuration File
 
@@ -250,21 +255,26 @@ log_level = "info"
 # keymanager_token_file = "./keymanager-api-token.txt"
 # remote_signer_url = "https://web3signer:9000"
 
-# Secret provider
-# [secret_provider]
-# provider = "gcp"
-# gcp_project_id = "my-project"
-# gcp_secret_prefix = "validator-key-"
-# refresh_interval = 3600
-
 # gRPC remote signer (rvc-signer)
 # grpc_signer_url = "https://signer.example.com:50052"
 # grpc_signer_tls_cert = "./certs/client.pem"
 # grpc_signer_tls_key = "./certs/client-key.pem"
 # grpc_signer_tls_ca_cert = "./certs/ca.pem"
+
+# Secret provider (tables last: a key below a table header belongs to it)
+# [secret_provider]
+# providers = ["gcp"]
+# refresh_interval = 3600
+#
+# [secret_provider.gcp]
+# project_id = "my-project"
+# secret_prefix = "validator-key-"
 ```
 
 CLI flags override config file values.
+
+Unknown config keys fail startup. A key that is not a field of its table is an
+error and names the key and the file.
 
 ### `[timing]` — duty deadlines (TOML only)
 
@@ -305,6 +315,26 @@ contribution_due_bps_gloas = 5000
 payload_due_bps = 5000
 payload_attestation_due_bps = 7500
 ```
+
+### Validators file
+
+`validators.toml` (`--validators-config`) uses the same unknown-key failure as
+`config.toml`: startup names the key and the file, and
+`enable` must be written `enabled`. A reload of that file refuses a
+missing or zero `[defaults] fee_recipient`. There is still no reload trigger.
+The keys are in [validators-config.md](validators-config.md).
+
+When a proposer-config URL owns a field, a reload that repeats that field at
+its baseline keeps the URL value in memory. The baseline is the live value
+when the URL started owning the field. It can differ from the last saved file
+when an `update_config` that was not saved came before that claim. A hand edit
+that changes the field wins over the URL. The reload compares the file value
+with the baseline, so it cannot tell an untouched field from an edit back to
+the baseline: deleting `builder_proposals = false`, or deleting a
+`[defaults] gas_limit` whose 30000000 fallback equals the baseline, keeps the
+URL value. After a remote default graffiti, `set_default_graffiti` followed by
+a reload whose file omits graffiti brings the remote graffiti back when no
+graffiti was set at the claim (setter ownership is deferred to W4-C4).
 
 ## Password File Format
 
@@ -678,6 +708,9 @@ rvc start -c config.toml \
   --gcp-secret-prefix validator-key- \
   --secret-refresh-interval 3600
 ```
+
+The GCP secret id must start with the configured prefix (case-sensitive); a
+secret whose id only contains the prefix is not loaded.
 
 ### With OpenTelemetry Tracing
 
