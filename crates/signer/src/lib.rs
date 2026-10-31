@@ -355,6 +355,40 @@ pub enum BackendKind {
     Unknown,
 }
 
+/// How `composite` routes `pk`. **Fail-closed:** only a local-only key is
+/// [`BackendKind::InProcess`].
+///
+/// The one classifier behind [`SignerService::backend_kind`] and the SEC-1
+/// policy closure. A free function, so the `'static` closure can call it
+/// without capturing the service.
+fn classify_backend(composite: &CompositeSigner, pk: &[u8; 48]) -> BackendKind {
+    let local = composite.has_local_key(pk);
+    let remote = composite.has_grpc_remote(pk) || composite.has_remote_key(pk);
+    match (local, remote) {
+        (true, false) => BackendKind::InProcess,
+        (false, true) => BackendKind::Remote,
+        // Dual-registered or unregistered: cannot prove in-process drop is safe.
+        _ => BackendKind::Unknown,
+    }
+}
+
+/// Per-method inputs of [`SignerService::sign_slashable_vc`].
+///
+/// Owned values only, so the `async_trait` futures stay `Send`.
+struct VcSlashable {
+    /// Taken after admission; the completion debug measures from here.
+    started: Instant,
+    pubkey_hex: String,
+    op_name: &'static str,
+    /// `signing_type` of the completion debug line.
+    signing_type: &'static str,
+    hooks: StandardSlashableHooks,
+    kind: SlashableKind,
+    fork_name: ForkName,
+    signing_root: Root,
+    typed: Option<TypedSignFactory>,
+}
+
 /// Service that combines signing through CompositeSigner with slashing protection.
 ///
 /// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
@@ -864,15 +898,7 @@ impl SignerService {
     /// Dual registration (local + remote) or missing registration is
     /// [`BackendKind::Unknown`].
     pub fn backend_kind(&self, pubkey: &PublicKey) -> BackendKind {
-        let pk = pubkey.to_bytes();
-        let local = self.signer.has_local_key(&pk);
-        let remote = self.signer.has_grpc_remote(&pk) || self.signer.has_remote_key(&pk);
-        match (local, remote) {
-            (true, false) => BackendKind::InProcess,
-            (false, true) => BackendKind::Remote,
-            // Dual-registered or unregistered: cannot prove in-process drop is safe.
-            _ => BackendKind::Unknown,
-        }
+        classify_backend(&self.signer, &pubkey.to_bytes())
     }
 
     /// Map [`BackendKind`] → [`TimeoutPolicy`]. **Default is fail-closed retain.**
@@ -901,15 +927,7 @@ impl SignerService {
         let composite = Arc::clone(&self.signer);
         let pk_bytes = pubkey.to_bytes();
         TimeoutPolicySource::ResolveUnderLock(Arc::new(move || {
-            let local = composite.has_local_key(&pk_bytes);
-            let remote =
-                composite.has_grpc_remote(&pk_bytes) || composite.has_remote_key(&pk_bytes);
-            let kind = match (local, remote) {
-                (true, false) => BackendKind::InProcess,
-                (false, true) => BackendKind::Remote,
-                _ => BackendKind::Unknown,
-            };
-            Self::timeout_policy_for_kind(kind)
+            Self::timeout_policy_for_kind(classify_backend(&composite, &pk_bytes))
         }))
     }
 
@@ -1018,6 +1036,71 @@ impl SignerService {
         Signature::from_bytes(&bytes).map_err(|e| {
             SignerError::SigningFailed(format!("invalid signature bytes from sign core: {e}"))
         })
+    }
+
+    /// The VC's one slashable sign through [`sign_slashable`]: policy source,
+    /// BLS backend, request, `slashing_result` record and error mapping.
+    ///
+    /// The caller has already admitted the duty and computed its root. This
+    /// helper opens no span, so `slashing_result` lands on the caller's
+    /// `sign.*` span.
+    async fn sign_slashable_vc(
+        &self,
+        pubkey: &PublicKey,
+        gvr: Root,
+        req: VcSlashable,
+    ) -> Result<Signature, SignerError> {
+        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
+        let policy = self.timeout_policy_source(pubkey);
+        let signer = self.bls_backend_for_duty(pubkey, req.signing_root, req.typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
+
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: Arc::clone(&self.enablement),
+            signer,
+            signing_root: req.signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(req.hooks),
+            op_name: req.op_name,
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: req.kind,
+            fork_name: Some(req.fork_name),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
+        })
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = req.started.elapsed().as_millis() as u64,
+                    signing_type = req.signing_type,
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &req.pubkey_hex))
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1241,63 +1324,24 @@ impl ValidatorSigner for SignerService {
         drop(_slashing_span);
 
         let gvr = *genesis_validators_root;
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-
         let data_owned = data.clone();
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.target.epoch);
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_attestation(&data_owned, &sign_ctx).await
         });
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: Arc::clone(&self.enablement),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::attestation()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_attestation",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "attestation",
+            hooks: StandardSlashableHooks::attestation(),
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
-            fork_name: Some(ForkName::from_epoch(data.target.epoch, fork_schedule)),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "attestation",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name: ForkName::from_epoch(data.target.epoch, fork_schedule),
+            signing_root,
+            typed,
+        };
+        self.sign_slashable_vc(pubkey, gvr, req).await
     }
 
     /// Signs a block after checking slashing protection.
@@ -1328,58 +1372,18 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
 
-        let gvr = *genesis_validators_root;
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, None);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
-
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: Arc::clone(&self.enablement),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::block()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_block",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "block",
+            hooks: StandardSlashableHooks::block(),
             kind: SlashableKind::Block { slot },
-            fork_name: Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "block",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name: ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule),
+            signing_root,
+            typed: None,
+        };
+        self.sign_slashable_vc(pubkey, *genesis_validators_root, req).await
     }
 
     /// Signs a block from five header leaves after slashing protection.
@@ -1413,8 +1417,6 @@ impl ValidatorSigner for SignerService {
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &ctx);
 
         let gvr = *genesis_validators_root;
-        let policy = self.timeout_policy_source(pubkey);
-
         let header_owned = header.clone();
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
@@ -1445,55 +1447,19 @@ impl ValidatorSigner for SignerService {
                 grpc.sign_block(&block, &sign_ctx).await
             }
         });
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: Arc::clone(&self.enablement),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::block()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_block_header",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "block",
+            hooks: StandardSlashableHooks::block(),
             kind: SlashableKind::Block { slot },
-            fork_name: Some(fork_name),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "block",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name,
+            signing_root,
+            typed,
+        };
+        self.sign_slashable_vc(pubkey, gvr, req).await
     }
 
     /// Signs a RANDAO reveal for the given epoch.
