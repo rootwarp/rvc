@@ -91,7 +91,10 @@ There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block
 | `builder_boost_factor` | integer | no | `100` | Weight applied to a blinded block when beacon nodes are ranked against each other. A local block keeps its raw value. `0` ranks every local block above every blinded block. `u64::MAX` ranks every blinded block above every local block. |
 | `graffiti` | string | no | inherits `[defaults].graffiti` | Same truncation behavior as above. |
 | `enabled` | bool | no | `true` | Master per-validator signing gate — `false` blocks all attesting/proposing for this key. Unknown pubkeys (not listed here and not loaded from a keystore) are treated as `enabled = false` (fail-closed). |
+| `doppelganger_hold_until` | integer | no | none | Unix-second deadline. The store writes it only for a doppelganger import hold, beside `enabled = false`. An operator or slashing disable leaves it unset, so boot does not re-enable that row. |
 | `block_selection_mode` | string | no | the global default set by `--block-selection-mode` or the top-level TOML key `block_selection_mode` (`max-profit` when both are unset) | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). A per-validator value wins over that global default. See below. |
+| `builders` | array of strings | no | none | Per-validator Gloas builder URLs. Omitted falls through to the store global, then an empty list. Each URL must be `http` or `https` with a host, at most 2048 bytes. The store writes this key. |
+| `min_bid` | integer | no | none | Per-validator minimum bid in Gwei. Omitted falls through to the store global, then `0`. A value above `i64::MAX` is rejected. The store writes this key. |
 
 **Malformed entries fail the whole file:** an invalid hex string/length in any `fee_recipient` or `pubkey` (defaults or per-validator) makes `load_from_config` return an error and the process refuses to start — there's no partial/best-effort loading of a broken file.
 

@@ -728,6 +728,9 @@ fn validators_unknown_key_display_escapes_controls_and_caps_length() {
         } else {
             assert!(shown.chars().count() < raw.chars().count(), "{label}: {shown}");
         }
+        if label == "boundary+1" {
+            assert_eq!(shown, "A".repeat(64), "{label}: {shown}");
+        }
         if label == "controls" {
             assert!(display.contains("\\n") && display.contains("\\r") && display.contains("\\t"));
             assert!(display.contains("\\u{1b}"), "{display}");
@@ -738,6 +741,9 @@ fn validators_unknown_key_display_escapes_controls_and_caps_length() {
         assert!(!reloaded.contains('\u{1b}'), "{reloaded:?}");
         let shown = shown_key(&reloaded);
         assert!(shown.chars().count() <= 64, "{label} reload: {shown}");
+        if label == "boundary+1" {
+            assert_eq!(shown, "A".repeat(64), "{label} reload: {shown}");
+        }
     }
 }
 
