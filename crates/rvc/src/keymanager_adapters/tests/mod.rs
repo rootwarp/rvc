@@ -29,6 +29,7 @@ use validator_store::ValidatorStore;
 
 use crate::bootstrap::executor::TaskExecutor;
 use crate::orchestrator::PubkeyMap;
+use crate::quiesce::TrackedKeys;
 
 fn test_pubkey(id: u8) -> Pubkey {
     let mut pk = [0u8; 48];
@@ -64,6 +65,32 @@ fn test_remote_adapter(
     let pubkey_map = create_pubkey_map();
     let adapter = RemoteKeyManagerAdapter::new(signer, allowed_hosts, pubkey_map.clone(), tx);
     (adapter, pubkey_map, rx)
+}
+
+/// Remote adapter on a caller's `PubkeyMap` and `TrackedKeys`, as
+/// `build_keymanager_api` wires it next to the keystore adapter.
+fn shared_remote_adapter(
+    signer: Arc<CompositeSigner>,
+    pubkey_map: PubkeyMap,
+    tracked_keys: Arc<TrackedKeys>,
+) -> (RemoteKeyManagerAdapter, watch::Receiver<u64>) {
+    let (tx, rx) = watch::channel(0u64);
+    let adapter =
+        RemoteKeyManagerAdapter::new(signer, None, pubkey_map, tx).with_tracked_keys(tracked_keys);
+    (adapter, rx)
+}
+
+/// Registers a new key K only as a gRPC remote signer, as boot does for the
+/// keys of a configured gRPC signer, and returns K's secret. An empty
+/// `LocalSigner` stands in for the gRPC client: the duplicate checks never
+/// sign, only the map K lands in matters.
+fn add_grpc_remote_key(composite: &CompositeSigner) -> SecretKey {
+    let secret = SecretKey::generate();
+    composite.add_grpc_remote_signer(
+        vec![secret.public_key().to_bytes()],
+        Arc::new(LocalSigner::new(KeyManager::new())),
+    );
+    secret
 }
 
 /// Drive a future that needs a Tokio runtime (`KdfBudget::admit`, `spawn_blocking`).

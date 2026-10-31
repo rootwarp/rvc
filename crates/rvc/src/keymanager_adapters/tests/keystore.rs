@@ -2641,3 +2641,319 @@ fn reimport_after_a_crash_between_secret_and_keystore_succeeds() {
     assert!(canonical.is_file());
     assert!(boot().expect("boot after the re-import").contains(&pk));
 }
+
+/// Regular files under `dir`, relative and sorted.
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path.strip_prefix(dir).unwrap().display().to_string());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// What a keystore import of a remote pubkey leaves behind.
+#[derive(Debug, PartialEq)]
+struct AfterLocalImport {
+    is_duplicate: bool,
+    local: bool,
+    remote: bool,
+    secret_written: bool,
+    files: Vec<String>,
+}
+
+/// 749-1, reverse direction. With its own `PubkeyMap` the keystore adapter's
+/// later map check cannot see K, so only the backend check refuses it. Wired
+/// as `build_keymanager_api` does (one map, one `TrackedKeys`), the refusal
+/// comes before the import secret is written.
+#[test]
+fn local_import_of_a_remote_pubkey_is_a_duplicate() {
+    for shared in [false, true] {
+        let composite = create_empty_composite_signer();
+        let keystore_dir = TempDir::new().unwrap();
+        let (adapter, pubkey_map, _rx) =
+            test_keystore_adapter(keystore_dir.path().to_path_buf(), Arc::clone(&composite));
+        let (remote, _remote_rx) = if shared {
+            shared_remote_adapter(
+                Arc::clone(&composite),
+                pubkey_map,
+                Arc::clone(&adapter.tracked_keys),
+            )
+        } else {
+            let (remote, _, rx) = test_remote_adapter(Arc::clone(&composite), None);
+            (remote, rx)
+        };
+        let secret_written = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&secret_written);
+        adapter.set_after_secret_before_keystore_hook(Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        remote
+            .import_remote_key(pk, "https://signer.example.com".to_string())
+            .expect("remote import");
+
+        let result = block_on(adapter.import_keystore(&encrypt_json(&sk, "testpass"), "testpass"));
+
+        assert_eq!(
+            AfterLocalImport {
+                is_duplicate: matches!(result, Err(ImportKeystoreError::Duplicate)),
+                local: composite.has_local_key(&pk),
+                remote: composite.has_remote_key(&pk),
+                secret_written: secret_written.load(std::sync::atomic::Ordering::SeqCst),
+                files: files_under(keystore_dir.path()),
+            },
+            AfterLocalImport {
+                is_duplicate: true,
+                local: false,
+                remote: true,
+                secret_written: false,
+                files: Vec::new(),
+            },
+            "shared map and lock: {shared}; import {result:?}"
+        );
+    }
+}
+
+/// What a keystore import of a gRPC remote pubkey leaves behind.
+#[derive(Debug, PartialEq)]
+struct AfterGrpcKeyImport {
+    is_duplicate: bool,
+    local: bool,
+    remote: bool,
+    grpc: bool,
+    secret_written: bool,
+    files: Vec<String>,
+    pubkey_map: Vec<Pubkey>,
+    key_gen: u64,
+}
+
+/// K is only in `grpc_remote`. The keystore import call site refuses K before
+/// the import secret is written, both with K in the `PubkeyMap` as boot leaves
+/// it and without, where the later map check cannot see K.
+#[test]
+fn local_import_of_a_grpc_pubkey_is_a_duplicate() {
+    for in_pubkey_map in [false, true] {
+        let composite = create_empty_composite_signer();
+        let keystore_dir = TempDir::new().unwrap();
+        let (adapter, pubkey_map, key_gen) =
+            test_keystore_adapter(keystore_dir.path().to_path_buf(), Arc::clone(&composite));
+        let sk = add_grpc_remote_key(&composite);
+        let public = sk.public_key();
+        let pk = public.to_bytes();
+        if in_pubkey_map {
+            pubkey_map.write().insert(pk, public);
+        }
+        let map_before: Vec<Pubkey> = pubkey_map.read().keys().copied().collect();
+        let secret_written = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&secret_written);
+        adapter.set_after_secret_before_keystore_hook(Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let result = block_on(adapter.import_keystore(&encrypt_json(&sk, "testpass"), "testpass"));
+
+        assert_eq!(
+            AfterGrpcKeyImport {
+                is_duplicate: matches!(result, Err(ImportKeystoreError::Duplicate)),
+                local: composite.has_local_key(&pk),
+                remote: composite.has_remote_key(&pk),
+                grpc: composite.has_grpc_remote(&pk),
+                secret_written: secret_written.load(std::sync::atomic::Ordering::SeqCst),
+                files: files_under(keystore_dir.path()),
+                pubkey_map: pubkey_map.read().keys().copied().collect(),
+                key_gen: *key_gen.borrow(),
+            },
+            AfterGrpcKeyImport {
+                is_duplicate: true,
+                local: false,
+                remote: false,
+                grpc: true,
+                secret_written: false,
+                files: Vec::new(),
+                pubkey_map: map_before,
+                key_gen: 0,
+            },
+            "K in the PubkeyMap: {in_pubkey_map}; import {result:?}"
+        );
+    }
+}
+
+/// Spins until `done()`. The deadline is a hang guard only.
+fn spin_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "hang guard: {what}");
+        std::thread::yield_now();
+    }
+}
+
+/// The points inside a remote import or delete where its section hook runs.
+const SECTION_POINTS: [&str; 2] = ["before_change", "after_change"];
+
+/// A keystore import started from inside a remote adapter section.
+struct ImportInSection {
+    /// The import blocked on `TrackedKeys` before it could end.
+    waited: bool,
+    thread: std::thread::JoinHandle<Result<Pubkey, ImportKeystoreError>>,
+}
+
+type ImportInSectionSlot = Arc<parking_lot::Mutex<Option<ImportInSection>>>;
+
+/// Arms `remote` so that its next import or delete, at `point` with both
+/// locks held, starts a keystore import of `sk` on another thread. The section
+/// goes on only once that import has either blocked on `TrackedKeys` or ended.
+fn import_inside_the_next_remote_section(
+    remote: &RemoteKeyManagerAdapter,
+    point: &'static str,
+    keystore: &Arc<KeystoreManagerAdapter>,
+    sk: &SecretKey,
+) -> ImportInSectionSlot {
+    let slot = ImportInSectionSlot::default();
+    let filled = Arc::clone(&slot);
+    let pending =
+        parking_lot::Mutex::new(Some((Arc::clone(keystore), encrypt_json(sk, "testpass"))));
+    remote.set_section_hook(Arc::new(move |at| {
+        if at != point {
+            return;
+        }
+        let Some((keystore, json)) = pending.lock().take() else {
+            return;
+        };
+        let tracked_keys = Arc::clone(&keystore.tracked_keys);
+        let before = tracked_keys.contended();
+        let thread =
+            std::thread::spawn(move || block_on(keystore.import_keystore(&json, "testpass")));
+        spin_until("the keystore import neither blocked nor ended", || {
+            tracked_keys.contended() > before || thread.is_finished()
+        });
+        let waited = tracked_keys.contended() > before;
+        *filled.lock() = Some(ImportInSection { waited, thread });
+    }));
+    slot
+}
+
+/// Joins the import once the remote section has returned.
+fn finish_import_in_section(slot: &ImportInSectionSlot) -> (bool, String) {
+    let ImportInSection { waited, thread } =
+        slot.lock().take().expect("the remote section ran the hook");
+    spin_until("the keystore import did not end after the section", || thread.is_finished());
+    let result = thread.join().expect("keystore import thread");
+    (waited, format!("{:?}", result.map(|_| ())))
+}
+
+/// What a keystore import of K, started inside a remote section on K, leaves.
+#[derive(Debug, PartialEq)]
+struct AfterImportInSection {
+    remote_op: String,
+    local_import_waited: bool,
+    local_import: String,
+    local: bool,
+    remote: bool,
+    in_pubkey_map: bool,
+    keystore_dir_empty: bool,
+}
+
+/// A remote import holds `TrackedKeys` from its duplicate check to its end. A
+/// keystore import of K started just before or just after the remote insert
+/// waits for that section, then finds the remote K and returns `duplicate`.
+#[test]
+fn keystore_import_inside_a_remote_import_waits_then_is_a_duplicate() {
+    for point in SECTION_POINTS {
+        let composite = create_empty_composite_signer();
+        let keystore_dir = TempDir::new().unwrap();
+        let (keystore, pubkey_map, _rx) =
+            test_keystore_adapter(keystore_dir.path().to_path_buf(), Arc::clone(&composite));
+        let keystore = Arc::new(keystore);
+        let (remote, _remote_rx) = shared_remote_adapter(
+            Arc::clone(&composite),
+            pubkey_map.clone(),
+            Arc::clone(&keystore.tracked_keys),
+        );
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let local = import_inside_the_next_remote_section(&remote, point, &keystore, &sk);
+
+        let imported = remote.import_remote_key(pk, "https://signer.example.com".to_string());
+        let (local_import_waited, local_import) = finish_import_in_section(&local);
+
+        assert_eq!(
+            AfterImportInSection {
+                remote_op: format!("{imported:?}"),
+                local_import_waited,
+                local_import,
+                local: composite.has_local_key(&pk),
+                remote: composite.has_remote_key(&pk),
+                in_pubkey_map: pubkey_map.read().contains_key(&pk),
+                keystore_dir_empty: files_under(keystore_dir.path()).is_empty(),
+            },
+            AfterImportInSection {
+                remote_op: "Ok(())".to_string(),
+                local_import_waited: true,
+                local_import: "Err(Duplicate)".to_string(),
+                local: false,
+                remote: true,
+                in_pubkey_map: true,
+                keystore_dir_empty: true,
+            },
+            "keystore import started at {point}"
+        );
+    }
+}
+
+/// A remote DELETE holds `TrackedKeys` from its lookup to its end. A keystore
+/// import of K started just before or just after the removal waits for that
+/// section, then imports K.
+#[test]
+fn keystore_import_inside_a_remote_delete_waits_then_imports() {
+    for point in SECTION_POINTS {
+        let composite = create_empty_composite_signer();
+        let keystore_dir = TempDir::new().unwrap();
+        let (keystore, pubkey_map, _rx) =
+            test_keystore_adapter(keystore_dir.path().to_path_buf(), Arc::clone(&composite));
+        let keystore = Arc::new(keystore);
+        let (remote, _remote_rx) = shared_remote_adapter(
+            Arc::clone(&composite),
+            pubkey_map.clone(),
+            Arc::clone(&keystore.tracked_keys),
+        );
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        remote.import_remote_key(pk, "https://signer.example.com".to_string()).expect("remote");
+        let local = import_inside_the_next_remote_section(&remote, point, &keystore, &sk);
+
+        let deleted = remote.delete_remote_key(&pk);
+        let (local_import_waited, local_import) = finish_import_in_section(&local);
+
+        assert_eq!(
+            AfterImportInSection {
+                remote_op: format!("{deleted:?}"),
+                local_import_waited,
+                local_import,
+                local: composite.has_local_key(&pk),
+                remote: composite.has_remote_key(&pk),
+                in_pubkey_map: pubkey_map.read().contains_key(&pk),
+                keystore_dir_empty: files_under(keystore_dir.path()).is_empty(),
+            },
+            AfterImportInSection {
+                remote_op: "Ok(true)".to_string(),
+                local_import_waited: true,
+                local_import: "Ok(())".to_string(),
+                local: true,
+                remote: false,
+                in_pubkey_map: true,
+                keystore_dir_empty: false,
+            },
+            "keystore import started at {point}"
+        );
+    }
+}

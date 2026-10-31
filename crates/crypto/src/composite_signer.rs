@@ -141,6 +141,15 @@ impl CompositeSigner {
         }
         self.local.contains_key(pubkey)
     }
+
+    /// Returns `true` if `pubkey` is loaded in any backend: local (boot or
+    /// dynamic), HTTP remote, or gRPC remote.
+    ///
+    /// Each map is read under its own lock, so the answer is a snapshot.
+    /// Callers that must not race a writer hold that writer's lock.
+    pub fn has_any_backend(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.has_local_key(pubkey) || self.has_remote_key(pubkey) || self.has_grpc_remote(pubkey)
+    }
 }
 
 #[async_trait]
@@ -904,5 +913,37 @@ mod tests {
         composite.add_local_key(sk2);
         assert!(composite.public_keys().contains(&pk2));
         assert!(composite.remove_local_key(&pk2));
+    }
+
+    #[test]
+    fn test_composite_signer_has_any_backend_covers_every_map() {
+        let boot = SecretKey::generate();
+        let boot_pk = boot.public_key().to_bytes();
+        let composite = CompositeSigner::new(create_local_signer_with_key(boot));
+
+        let dynamic = SecretKey::generate();
+        let dynamic_pk = dynamic.public_key().to_bytes();
+        composite.add_local_key(dynamic);
+
+        let remote_pk = SecretKey::generate().public_key().to_bytes();
+        composite.add_remote_key(remote_pk, Arc::new(FakeUnsupportedRemote { pubkey: remote_pk }));
+
+        let grpc = SecretKey::generate();
+        let grpc_pk = grpc.public_key().to_bytes();
+        composite.add_grpc_remote_signer(
+            vec![grpc_pk],
+            Arc::new(MockGrpcSigner::new(&grpc, vec![grpc_pk])),
+        );
+
+        for (map, pk) in [
+            ("local", boot_pk),
+            ("dynamic_local", dynamic_pk),
+            ("remote", remote_pk),
+            ("grpc_remote", grpc_pk),
+        ] {
+            assert!(composite.has_any_backend(&pk), "a key in `{map}` must count");
+        }
+        let absent = SecretKey::generate().public_key().to_bytes();
+        assert!(!composite.has_any_backend(&absent), "an absent key must not count");
     }
 }

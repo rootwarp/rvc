@@ -238,12 +238,15 @@ pub fn build_keymanager_api(
         deps.epoch_clock,
     );
 
-    let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(
-        km_composite,
-        config.keymanager.remote_signer_allowed_hosts.clone(),
-        deps.pubkey_map,
-        deps.key_gen_tx,
-    ));
+    let remote_key_mgr = Arc::new(
+        RemoteKeyManagerAdapter::new(
+            km_composite,
+            config.keymanager.remote_signer_allowed_hosts.clone(),
+            deps.pubkey_map,
+            deps.key_gen_tx,
+        )
+        .with_tracked_keys(Arc::clone(&deps.tracked_keys)),
+    );
 
     let config_mgr =
         Arc::new(ValidatorConfigManagerAdapter::new(Arc::clone(&deps.validator_store)));

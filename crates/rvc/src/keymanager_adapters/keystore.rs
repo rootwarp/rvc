@@ -1101,9 +1101,10 @@ fn import_keystore_blocking(job: ImportJob) -> Result<Pubkey, ImportKeystoreErro
     reject_unbootable_pubkey(keystore.pubkey.as_deref(), &pubkey_bytes)?;
 
     // Hold lock for the entire check-and-insert to prevent TOCTOU race.
-    // Duplicate check uses the real local registry (not only API-tracked keys).
+    // A pubkey in any backend (local, HTTP remote or gRPC remote) is a
+    // duplicate. The remote import makes the same check under this lock.
     let mut keys = tracked_keys.lock();
-    if composite_signer.has_local_key(&pubkey_bytes) {
+    if composite_signer.has_any_backend(&pubkey_bytes) {
         return Err(ImportKeystoreError::Duplicate);
     }
     // Absent, but a DELETE that snapshotted this key has not finished.
