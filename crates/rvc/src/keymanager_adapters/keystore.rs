@@ -43,9 +43,10 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 /// # Deletion denylist (SEC-1b)
 ///
 /// `delete_keystore` records the pubkey in [`DeletionDenylist`] even when
-/// import-secret removal fails, so the next boot skips the key. The signing
-/// registry is updated only after secret removal and the denylist write both
-/// succeed. Intentional re-import via `import_keystore` clears the entry.
+/// import-secret removal or the keystore-directory fsync fails, so the next
+/// boot skips the key. The signing registry is updated only after secret
+/// removal, that fsync, and the denylist write all succeed. Intentional
+/// re-import via `import_keystore` clears the entry.
 pub struct KeystoreManagerAdapter {
     keystore_dir: PathBuf,
     composite_signer: Arc<CompositeSigner>,
@@ -265,22 +266,26 @@ impl KeystoreManagerAdapter {
     }
 
     /// Keystore unlink, then the import secret, then M-12 sidecars, then the
-    /// denylist.
+    /// keystore-directory fsync, then the denylist.
     ///
-    /// An unlink error returns before the denylist. A secret-removal error
-    /// still writes the denylist and is returned afterwards. Sidecars run only
-    /// when the secret step succeeds. The caller removes the signing-registry
-    /// entry only after this returns `Ok`. `Ok(true)` means a keystore file
-    /// was unlinked.
+    /// An unlink error returns before the denylist. A secret-removal or
+    /// directory-fsync error still writes the denylist and is returned
+    /// afterwards. Sidecars run only when the secret step succeeds. The fsync
+    /// runs on every call, so a retry makes an earlier unlink durable. The
+    /// caller removes the signing-registry entry only after this returns `Ok`.
+    /// `Ok(true)` means a keystore file was unlinked.
     fn remove_key_files(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
         let keystore_removed = remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
-        let secret_removed = remove_import_secret(&self.keystore_dir, pubkey);
-        if secret_removed.is_ok() {
+        let mut removal = remove_import_secret(&self.keystore_dir, pubkey);
+        if removal.is_ok() {
             let _ = std::fs::remove_file(import_meta_path(&self.keystore_dir, pubkey));
             let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
             remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
         }
-        insert_denylist_after_secret(self.denylist.as_ref(), pubkey, secret_removed)?;
+        if let Err(sync_err) = sync_keystore_dir_after_delete(&self.keystore_dir) {
+            removal = Err(attach_import_sync(removal.err(), sync_err));
+        }
+        insert_denylist_after_secret(self.denylist.as_ref(), pubkey, removal)?;
         Ok(keystore_removed)
     }
 }
@@ -413,6 +418,15 @@ fn sync_keystore_dir(dir: &Path) -> Result<(), ImportKeystoreError> {
     }
     let file = std::fs::File::open(dir).map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
     file.sync_all().map_err(|e| ImportKeystoreError::Io(e.to_string()))
+}
+
+/// A missing keystore directory has nothing to fsync.
+fn sync_keystore_dir_after_delete(keystore_dir: &Path) -> Result<(), ImportKeystoreError> {
+    match std::fs::metadata(keystore_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => sync_keystore_dir(keystore_dir)
+            .map_err(|e| ImportKeystoreError::Io(format!("sync keystore directory: {e}"))),
+    }
 }
 
 fn unlink_import_path(path: &Path) -> std::io::Result<()> {
@@ -729,10 +743,11 @@ fn remove_import_secret(keystore_dir: &Path, pubkey: &Pubkey) -> Result<(), Impo
     }
 }
 
-/// Write the denylist after the secret-removal attempt.
+/// Write the denylist after the secret-removal attempt and the keystore-dir
+/// fsync.
 ///
-/// A failed secret removal still denylists the key. Registry updates stay
-/// with the caller and run only when this returns `Ok`.
+/// A failure of either still denylists the key. Registry updates stay with
+/// the caller and run only when this returns `Ok`.
 fn insert_denylist_after_secret(
     denylist: Option<&Arc<DeletionDenylist>>,
     pubkey: &Pubkey,
@@ -1500,14 +1515,18 @@ impl KeystoreManager for KeystoreManagerAdapter {
 
         // Order, shared with the not-loaded branch via `remove_key_files`:
         //   1. Unlink keystore files. Failure leaves memory and the denylist
-        //      unchanged. The keystore directory is not fsynced.
+        //      unchanged.
         //   2. Remove the import secret, including the secrets-dir fsync.
         //   3. M-12 sidecars when step 2 succeeds.
-        //   4. Durable denylist.insert, including when step 2 fails.
-        //   5. Remove from the signing registry only when this returns Ok.
+        //   4. Fsync the keystore directory, on every DELETE, so the unlink
+        //      in step 1 (or in an earlier attempt) is durable.
+        //   5. Durable denylist.insert, including when step 2 or 4 fails. The
+        //      first insert also fsyncs the denylist's directory.
+        //   6. Remove from the signing registry only when this returns Ok.
         //
-        // A failed secret removal still denylists the key so a restart does
-        // not load it. The registry stays so DELETE can be retried.
+        // A failed secret removal or keystore-dir fsync still denylists the
+        // key so a restart does not load it. The registry stays so DELETE can
+        // be retried.
         //
         // Matches any `*.json` whose pubkey field decodes to this key
         // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).

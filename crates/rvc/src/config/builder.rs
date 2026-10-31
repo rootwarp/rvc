@@ -34,6 +34,26 @@ use super::error::{parse_error, ConfigError};
 use super::types::{redact_url, redact_urls, Config};
 use validator_store::{validators_file_de_error, ValidatorStore, ValidatorStoreError};
 
+#[cfg(test)]
+type AfterLoadHook = Box<dyn FnOnce(&mut Result<KeyManager, crypto::KeyManagerError>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread, right after the boot keystore loader returns.
+    static AFTER_LOAD_HOOK: std::cell::RefCell<Option<AfterLoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_load_hook(
+    mut loaded: Result<KeyManager, crypto::KeyManagerError>,
+) -> Result<KeyManager, crypto::KeyManagerError> {
+    if let Some(hook) = AFTER_LOAD_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(&mut loaded);
+    }
+    loaded
+}
+
 /// Map a validators-file failure onto [`ConfigError`].
 ///
 /// [`ValidatorStoreError::TomlParse`] is re-parsed from `raw` and passed
@@ -655,6 +675,12 @@ impl ServiceBuilder {
     /// Returns an owned [`KeyManager`] so callers (notably bootstrap
     /// `load_signing_keys`) can build a [`CompositeSigner`] without
     /// `Arc::try_unwrap`.
+    ///
+    /// Import secrets are checked after every load, including one that
+    /// returns an error, and an [`ConfigError::ImportSecret`] wins over the
+    /// loader error. When a secrets directory is present, the keystore
+    /// directory is indexed before and after the load, and a change for a
+    /// secret's pubkey fails startup.
     pub fn build_key_manager_owned_filtered(
         &self,
         denylist: Option<&std::collections::HashSet<[u8; 48]>>,
@@ -665,23 +691,36 @@ impl ServiceBuilder {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
+        let before = self.config.index_keystores_before_load()?;
         let mut report = crypto::KeystoreLoadReport::default();
-        let key_manager = match KeyManager::load_from_directory_with_threads_filtered_reporting(
+        let loaded = KeyManager::load_from_directory_with_threads_filtered_reporting(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
             denylist,
             &mut report,
-        ) {
+        );
+        #[cfg(test)]
+        let loaded = run_after_load_hook(loaded);
+        let key_manager = match loaded {
             Ok(manager) => manager,
-            Err(err @ crypto::KeyManagerError::NoKeystoreFiles) => {
+            Err(err) => {
                 let empty = KeyManager::new();
-                self.config.reject_undecrypted_import_secrets(&empty, denylist, &report)?;
+                self.config.reject_undecrypted_import_secrets(
+                    &empty,
+                    denylist,
+                    &report,
+                    before.as_ref(),
+                )?;
                 return Err(err.into());
             }
-            Err(err) => return Err(err.into()),
         };
-        self.config.reject_undecrypted_import_secrets(&key_manager, denylist, &report)?;
+        self.config.reject_undecrypted_import_secrets(
+            &key_manager,
+            denylist,
+            &report,
+            before.as_ref(),
+        )?;
         info!(
             key_count = key_manager.len(),
             path = ?self.config.keystore_path,
@@ -2059,6 +2098,161 @@ mod tests {
             .build_key_manager_owned_filtered(Some(&denylist))
             .expect("denylisted keystore is skipped");
         assert!(!loaded.contains(&pk));
+    }
+
+    struct ClearAfterLoad;
+    impl Drop for ClearAfterLoad {
+        fn drop(&mut self) {
+            super::AFTER_LOAD_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    fn arm_after_load(
+        hook: impl FnOnce(&mut Result<KeyManager, crypto::KeyManagerError>) + 'static,
+    ) -> ClearAfterLoad {
+        super::AFTER_LOAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        ClearAfterLoad
+    }
+
+    /// A corrupt import keystore beats any loader failure of another keystore.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_reports_a_corrupt_import_keystore_when_another_keystore_fails() {
+        let secret = "corrupt-import-secret";
+        // "reported": the loader records the unrelated decrypt failure and
+        // returns Ok. The other cases make the loader return that error.
+        for kind in [
+            "reported",
+            "decryption",
+            "load-failed",
+            "traversal",
+            "io",
+            "directory",
+            "thread-pool",
+            "no-files",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            std::fs::write(dir.path().join(format!("0x{bare}.json")), br#"{"pubkey":"#).unwrap();
+            write_import_secret(dir.path(), &pk, secret);
+            let other = write_encrypted_keystore(dir.path(), "unrelated-keystore-password");
+            let other_path = dir.path().join(format!("keystore-{}.json", hex::encode(other)));
+            let passwords = password_file(dir.path(), "*=not-the-unrelated-password\n");
+            let injected = match kind {
+                "reported" => None,
+                "decryption" => Some(crypto::KeyManagerError::DecryptionFailed {
+                    path: other_path,
+                    source: crypto::KeystoreError::ChecksumMismatch,
+                }),
+                "load-failed" => Some(crypto::KeyManagerError::KeystoreLoadFailed {
+                    path: other_path,
+                    source: crypto::KeystoreError::ChecksumMismatch,
+                }),
+                "traversal" => Some(crypto::KeyManagerError::PathTraversal {
+                    path: other_path,
+                    base: dir.path().to_path_buf(),
+                }),
+                "io" => Some(crypto::KeyManagerError::Io(std::io::Error::other("injected"))),
+                "directory" => {
+                    Some(crypto::KeyManagerError::DirectoryNotFound(dir.path().to_path_buf()))
+                }
+                "thread-pool" => Some(crypto::KeyManagerError::ThreadPoolError("injected".into())),
+                "no-files" => Some(crypto::KeyManagerError::NoKeystoreFiles),
+                other => panic!("unknown case {other}"),
+            };
+            let _guard = injected.map(|err| arm_after_load(move |loaded| *loaded = Err(err)));
+            let config = Config {
+                keystore_path: dir.path().to_path_buf(),
+                password_file: Some(passwords),
+                ..create_minimal_config()
+            };
+            let err = match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+                Err(err) => err,
+                Ok(_) => panic!("{kind}: a corrupt import keystore must fail boot"),
+            };
+            let msg = err.to_string();
+            match err {
+                ConfigError::ImportSecret { path, reason } => {
+                    assert_eq!(reason, "keystore is corrupt", "{kind}");
+                    assert!(path.ends_with(format!("0x{bare}")), "{kind}: {}", path.display());
+                }
+                other => panic!("{kind}: the loader error was returned: {other}"),
+            }
+            assert!(!msg.contains(secret), "{kind}: {msg}");
+        }
+
+        // A loader error with nothing to reject is still the loader error.
+        let dir = TempDir::new().unwrap();
+        write_import_secret(dir.path(), &[0x11u8; 48], secret);
+        let _guard = arm_after_load(|loaded| {
+            *loaded = Err(crypto::KeyManagerError::Io(std::io::Error::other("injected")))
+        });
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+            Err(ConfigError::KeyManagerError(crypto::KeyManagerError::Io(_))) => {}
+            Err(other) => panic!("an orphan secret is not a startup error: {other}"),
+            Ok(_) => panic!("the loader error is returned"),
+        }
+    }
+
+    /// A keystore change between the load and the classification fails closed.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn boot_fails_closed_when_a_keystore_changes_between_load_and_classification() {
+        let changed = |case: &str, dir: &std::path::Path, bare: &str| {
+            let config = Config { keystore_path: dir.to_path_buf(), ..create_minimal_config() };
+            match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+                Err(ConfigError::ImportSecret { path, reason }) => {
+                    assert_eq!(reason, "keystore directory changed during boot", "{case}");
+                    assert!(path.ends_with(format!("0x{bare}")), "{case}: {}", path.display());
+                }
+                Err(other) => panic!("{case}: wrong error: {other}"),
+                Ok(_) => panic!("{case}: boot continued after the directory changed"),
+            }
+        };
+
+        // The secret-bearing canonical keystore is moved away after the load.
+        let dir = TempDir::new().unwrap();
+        let pk = [0xabu8; 48];
+        let bare = hex::encode(pk);
+        let canonical = dir.path().join(format!("0x{bare}.json"));
+        std::fs::write(&canonical, br#"{"pubkey":"#).unwrap();
+        write_import_secret(dir.path(), &pk, "changed-during-boot-secret");
+        let moved = canonical.with_extension("moved");
+        let guard = arm_after_load(move |_| std::fs::rename(&canonical, &moved).unwrap());
+        changed("moved", dir.path(), &bare);
+        drop(guard);
+
+        // The secrets directory appears after the load.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.json"), b"{}").unwrap();
+        let keystore = dir.path().to_path_buf();
+        let guard = arm_after_load(move |_| write_import_secret(&keystore, &pk, "late-secret"));
+        changed("secrets-dir-appeared", dir.path(), &bare);
+        drop(guard);
+
+        // A keystore with no import secret moves. The orphan secret only warns.
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "unrelated-keystore-password";
+        let kept = write_encrypted_keystore(dir.path(), kept_pw);
+        let kept_path = dir.path().join(format!("keystore-{}.json", hex::encode(kept)));
+        write_import_secret(dir.path(), &pk, "orphan-secret");
+        let passwords = password_file(dir.path(), &format!("*={kept_pw}\n"));
+        let _guard = arm_after_load(move |_| {
+            std::fs::rename(&kept_path, kept_path.with_extension("moved")).unwrap()
+        });
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("a change to a keystore with no secret does not fail boot");
+        assert!(loaded.contains(&kept));
+        assert!(logs_contain("import password secret has no keystore"));
     }
 
     #[test]

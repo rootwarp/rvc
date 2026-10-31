@@ -2405,3 +2405,239 @@ impl Drop for RestoreDirPerms {
         }
     }
 }
+
+fn reset_dir_sync_calls() {
+    super::super::keystore::IMPORT_SECRET_DIR_SYNC_CALLS.with(|slot| slot.set(0));
+}
+
+fn dir_sync_calls() -> u32 {
+    super::super::keystore::IMPORT_SECRET_DIR_SYNC_CALLS.with(|slot| slot.get())
+}
+
+struct ClearSyncFailOnCall;
+impl Drop for ClearSyncFailOnCall {
+    fn drop(&mut self) {
+        super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.set(0));
+    }
+}
+
+#[test]
+fn delete_fsyncs_the_keystore_directory() {
+    let password = "import-only-testpass";
+    // Secrets-dir sync when a secret is removed, then the keystore-dir sync on
+    // every DELETE, including one that has nothing left to unlink.
+    for (case, expected) in
+        [("imported", 2), ("keystore-only", 1), ("not-loaded", 2), ("nothing-left", 1)]
+    {
+        let keystore_dir = TempDir::new().unwrap();
+        let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+        let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+        let secret = secret_file(keystore_dir.path(), &pk);
+        match case {
+            "keystore-only" => std::fs::remove_file(&secret).unwrap(),
+            "not-loaded" => assert!(composite.remove_local_key(&pk)),
+            "nothing-left" => {
+                std::fs::remove_file(&secret).unwrap();
+                std::fs::remove_file(&json_path).unwrap();
+            }
+            _ => {}
+        }
+        reset_dir_sync_calls();
+        assert!(adapter.delete_keystore(&pk).expect(case), "{case}");
+        assert_eq!(dir_sync_calls(), expected, "{case}");
+        assert!(!json_path.exists(), "{case}");
+        assert!(!secret.exists(), "{case}");
+        assert!(reloaded_denylist(keystore_dir.path()).contains(&pk), "{case}");
+        assert!(!adapter.has_key(&pk), "{case}");
+    }
+}
+
+#[test]
+fn delete_reports_a_keystore_dir_sync_failure_and_keeps_the_key() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+    let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+    let _guard = ClearSyncFailOnCall;
+    reset_dir_sync_calls();
+    // Call 1 is the secrets directory, call 2 the keystore directory.
+    super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.set(2));
+    let err = adapter.delete_keystore(&pk).expect_err("the keystore directory sync is reported");
+    let msg = err.to_string();
+    assert!(msg.contains("sync keystore directory"), "{msg}");
+    let synced = format!("sync import secret directory {} failed", keystore_dir.path().display());
+    assert!(msg.contains(&synced), "{msg}");
+    assert!(!msg.contains(password), "{msg}");
+    assert!(
+        reloaded_denylist(keystore_dir.path()).contains(&pk),
+        "a failed keystore-dir sync still writes the denylist"
+    );
+    assert!(adapter.has_key(&pk), "the key stays registered so DELETE can be retried");
+    assert!(!json_path.exists());
+    assert!(!secret_file(keystore_dir.path(), &pk).exists());
+
+    assert!(adapter.delete_keystore(&pk).expect("retry"));
+    assert_eq!(dir_sync_calls(), 3, "the retry fsyncs the keystore directory again");
+    assert!(!adapter.has_key(&pk));
+}
+
+#[test]
+fn delete_reports_both_a_secret_removal_and_a_keystore_dir_sync_failure() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+    let _remove = arm_remove_fail();
+    let _sync = ClearSyncFailOnCall;
+    reset_dir_sync_calls();
+    // The secret is not removed, so the only directory sync is the keystore's.
+    super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.set(1));
+    let err = adapter.delete_keystore(&pk).expect_err("both failures are reported");
+    let msg = err.to_string();
+    assert!(msg.contains("remove import password secret"), "{msg}");
+    assert!(msg.contains("sync keystore directory"), "{msg}");
+    assert!(!msg.contains(password), "{msg}");
+    assert_eq!(dir_sync_calls(), 1);
+    assert!(reloaded_denylist(keystore_dir.path()).contains(&pk));
+    assert!(adapter.has_key(&pk));
+    assert!(secret_file(keystore_dir.path(), &pk).exists());
+}
+
+#[test]
+fn delete_skips_the_keystore_dir_sync_when_the_directory_is_missing() {
+    let root = TempDir::new().unwrap();
+    let missing = root.path().join("missing");
+    let (adapter, _composite, _validators) = validators_backed_adapter(&missing);
+    let pk = test_pubkey(0x5A);
+    reset_dir_sync_calls();
+    let removed = adapter.delete_keystore(&pk).expect("a missing keystore directory is skipped");
+    assert!(!removed);
+    assert_eq!(dir_sync_calls(), 0);
+    assert!(reloaded_denylist(&missing).contains(&pk));
+}
+
+/// With keystore locking off, boot continues when `keystore_path` is absent
+/// and keys come from a secret provider. DELETE then creates `keystore_path`
+/// through the denylist insert, and every directory that gains an entry is
+/// fsynced before `deleted`.
+#[test]
+fn delete_with_an_absent_keystore_path_fsyncs_every_directory_the_denylist_creates() {
+    use crate::deletion_denylist::{take_syncs, Synced};
+
+    let root = TempDir::new().unwrap();
+    let absent = root.path().join("absent");
+    let keystore_path = absent.join("keystore");
+    let slashing_db_path = root.path().join("slashing.db");
+    SlashingDb::open(&slashing_db_path).unwrap();
+    let config = crate::config::Config {
+        keystore_path: keystore_path.clone(),
+        slashing_db_path,
+        disable_keystore_locking: true,
+        ..Default::default()
+    };
+    let handles = crate::bootstrap::open_slashing_db(&config, false, false)
+        .expect("boot continues without a keystore directory");
+    assert!(!absent.exists());
+
+    let composite = create_empty_composite_signer();
+    let (adapter, _, _) = test_keystore_adapter(keystore_path.clone(), Arc::clone(&composite));
+    let adapter = adapter.with_denylist(Arc::clone(&handles.denylist));
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    composite.add_local_key(sk);
+
+    reset_dir_sync_calls();
+    take_syncs();
+    assert!(adapter.delete_keystore(&pk).expect("deleted"));
+    assert_eq!(dir_sync_calls(), 0, "no keystore directory existed to fsync");
+    assert_eq!(
+        take_syncs(),
+        [
+            Synced::File(keystore_path.join(".rvc.deleted_keys")),
+            Synced::Dir(root.path().to_path_buf()),
+            Synced::Dir(absent),
+            Synced::Dir(keystore_path.clone()),
+        ]
+    );
+    assert!(!adapter.has_key(&pk));
+    assert!(reloaded_denylist(&keystore_path).contains(&pk));
+}
+
+#[test]
+fn delete_with_an_unremovable_secret_still_denylists() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+    // `remove_file` on a non-empty directory fails in the kernel for every
+    // euid (EISDIR on Linux, EPERM on macOS). No hook, no chmod.
+    let secret = secret_file(keystore_dir.path(), &pk);
+    std::fs::remove_file(&secret).unwrap();
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::write(secret.join("pinned"), b"pinned").unwrap();
+    let err = adapter.delete_keystore(&pk).expect_err("a real unlink failure is reported");
+    let msg = err.to_string();
+    assert!(msg.contains("remove import password secret"), "{msg}");
+    assert!(!msg.contains(password), "{msg}");
+    assert!(reloaded_denylist(keystore_dir.path()).contains(&pk));
+    assert!(adapter.has_key(&pk), "the key stays registered so DELETE can be retried");
+    assert!(secret.join("pinned").exists());
+    assert!(!keystore_dir.path().join(format!("{}.json", pubkey_hex(pk))).exists());
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+        std::fs::set_permissions(&target, entry.metadata().unwrap().permissions()).unwrap();
+    }
+}
+
+#[test]
+fn reimport_after_a_crash_between_secret_and_keystore_succeeds() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let crash = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    let json = encrypt_json(&sk, password);
+    let (source, image) = (keystore_dir.path().to_path_buf(), crash.path().to_path_buf());
+    adapter.set_after_secret_before_keystore_hook(Arc::new(move || copy_dir(&source, &image)));
+    block_on(adapter.import_keystore(&json, password)).expect("import");
+    assert!(secret_file(crash.path(), &pk).is_file(), "the crash image has the secret");
+    let canonical = crash.path().join(format!("{}.json", pubkey_hex(pk)));
+    assert!(!canonical.exists(), "the crash image has no keystore");
+
+    std::fs::write(crash.path().join("notes.json"), b"{}").unwrap();
+    let boot = || {
+        let config = crate::config::Config {
+            keystore_path: crash.path().to_path_buf(),
+            ..Default::default()
+        };
+        crate::config::ServiceBuilder::new(config).build_key_manager()
+    };
+    let booted = boot().expect("a secret with no keystore warns");
+    assert!(!booted.contains(&pk));
+
+    let (reimport, _composite, _validators) = validators_backed_adapter(crash.path());
+    block_on(reimport.import_keystore(&json, password)).expect("re-import over the crash image");
+    assert!(canonical.is_file());
+    assert!(boot().expect("boot after the re-import").contains(&pk));
+}

@@ -1338,6 +1338,19 @@ impl Config {
         Ok(())
     }
 
+    /// Keystore declarations indexed before the boot loader runs.
+    ///
+    /// `None` when the import secrets directory is absent, so a boot without
+    /// import secrets does not scan the keystore directory again.
+    pub(crate) fn index_keystores_before_load(
+        &self,
+    ) -> Result<Option<DeclaredKeystores>, ConfigError> {
+        if import_secrets_absent(&self.import_secrets_dir())? {
+            return Ok(None);
+        }
+        index_declared_keystores(&self.keystore_path).map(Some)
+    }
+
     /// Fail startup when a non-denylisted secret did not load its keystore.
     ///
     /// A checksum failure says the password did not decrypt the keystore. A
@@ -1346,11 +1359,18 @@ impl Config {
     /// only when it validates or its `crypto` field is present. A secret with
     /// no matching keystore is a warning. Denylisted keystores are skipped.
     /// The error names the secret file and does not include the password.
+    ///
+    /// `before` is [`Self::index_keystores_before_load`]. When a secret's
+    /// keystore declaration differs between that view and the one taken here,
+    /// or `before` is `None`, the loader and this check did not see the same
+    /// directory, so startup fails with `keystore directory changed during
+    /// boot`.
     pub(crate) fn reject_undecrypted_import_secrets(
         &self,
         loaded: &crypto::KeyManager,
         denylist: Option<&HashSet<[u8; crypto::PUBLIC_KEY_BYTES_LEN]>>,
         report: &crypto::KeystoreLoadReport,
+        before: Option<&DeclaredKeystores>,
     ) -> Result<(), ConfigError> {
         let dir = self.import_secrets_dir();
         if import_secrets_absent(&dir)? {
@@ -1388,6 +1408,12 @@ impl Config {
             }
             if loaded.contains(&pubkey) {
                 continue;
+            }
+            if before.map(|index| index.get(&pubkey)) != Some(declared.get(&pubkey)) {
+                return Err(ConfigError::ImportSecret {
+                    path,
+                    reason: "keystore directory changed during boot",
+                });
             }
             let reason = if let Some(keystore) = declared.get(&pubkey) {
                 if !keystore.valid {
@@ -2152,9 +2178,12 @@ fn sweep_import_secret_partials(dir: &Path) -> Result<(), ConfigError> {
     }
 }
 
-struct DeclaredKeystore {
+#[derive(PartialEq)]
+pub(crate) struct DeclaredKeystore {
     valid: bool,
 }
+
+pub(crate) type DeclaredKeystores = HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>;
 
 fn note_declared(
     declared: &mut HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>,
