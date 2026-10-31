@@ -252,6 +252,7 @@ impl StoreState {
 
 /// One URL-owned field: `applied` is the remote value, `durable` is what the file keeps.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct OwnedValue<T> {
     applied: T,
     durable: T,
@@ -263,6 +264,7 @@ struct OwnedValue<T> {
 /// field. A delete plus re-import assigns a new generation and drops this
 /// overlay in [`StoreState::take_validator`].
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct UrlOwned {
     generation: u64,
     fee_recipient: Option<OwnedValue<Option<[u8; 20]>>>,
@@ -272,6 +274,7 @@ struct UrlOwned {
 
 /// Local defaults captured when a remote `default_config` first owned each field.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct RemoteDefaults {
     fee_recipient: Option<OwnedValue<[u8; 20]>>,
     gas_limit: Option<OwnedValue<u64>>,
@@ -6372,6 +6375,16 @@ builder_boost_factor = 175
             .unwrap();
         let gen = store.validator_generation(&pk);
         let next_gen = store.state.read().next_validator_gen;
+        let (url_owned, remote_defaults) = {
+            let state = store.state.read();
+            assert!(state.url_owned.contains_key(&pk));
+            assert!(state.url_owned[&pk].fee_recipient.is_some());
+            assert!(state.url_owned[&pk].gas_limit.is_some());
+            assert!(state.url_owned[&pk].builder_proposals.is_some());
+            assert!(state.remote_defaults.fee_recipient.is_some());
+            assert!(state.remote_defaults.gas_limit.is_some());
+            (state.url_owned.clone(), state.remote_defaults)
+        };
         let fired = reload_hook_flag();
 
         let bad = format!(
@@ -6397,10 +6410,8 @@ builder_boost_factor = 175
         assert_eq!(store.default_gas_limit(), 40_000_000);
         {
             let state = store.state.read();
-            assert!(state.url_owned.contains_key(&pk));
-            assert!(state.remote_defaults.fee_recipient.is_some());
-            assert!(state.remote_defaults.gas_limit.is_some());
-            assert_eq!(state.url_owned[&pk].generation, gen.unwrap());
+            assert_eq!(state.url_owned, url_owned);
+            assert_eq!(state.remote_defaults, remote_defaults);
         }
     }
 
@@ -6423,7 +6434,35 @@ builder_boost_factor = 175
         )
         .unwrap();
         let store = ValidatorStore::load_from_config(&path).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(5))),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(test_fee_recipient(6)),
+                gas_limit: Some(40_000_000),
+                ..DefaultUpdate::default()
+            })
+            .unwrap();
         let gen = store.validator_generation(&pk);
+        let live_fee = store.default_fee_recipient();
+        let live_gas = store.default_gas_limit();
+        let (url_owned, remote_defaults) = {
+            let state = store.state.read();
+            assert!(state.url_owned.contains_key(&pk));
+            assert!(state.url_owned[&pk].gas_limit.is_some());
+            assert!(state.remote_defaults.fee_recipient.is_some());
+            assert!(state.remote_defaults.gas_limit.is_some());
+            (state.url_owned.clone(), state.remote_defaults)
+        };
 
         let fired = reload_hook_flag();
         std::fs::write(&path, format!("[[validators]]\npubkey = \"0x{}\"\n", hex::encode(pk)))
@@ -6432,8 +6471,14 @@ builder_boost_factor = 175
         assert!(matches!(err, ValidatorStoreError::ZeroDefaultFeeRecipient), "{err:?}");
         assert!(err.to_string().contains("[defaults] fee_recipient"), "{err}");
         assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(store.default_fee_recipient(), original);
+        assert_eq!(store.default_fee_recipient(), live_fee);
+        assert_eq!(store.default_gas_limit(), live_gas);
         assert_eq!(store.validator_generation(&pk), gen);
+        {
+            let state = store.state.read();
+            assert_eq!(state.url_owned, url_owned);
+            assert_eq!(state.remote_defaults, remote_defaults);
+        }
 
         let zero = "0x0000000000000000000000000000000000000000";
         std::fs::write(
@@ -6446,9 +6491,15 @@ builder_boost_factor = 175
         .unwrap();
         let err = store.reload_config().unwrap_err();
         assert!(matches!(err, ValidatorStoreError::ZeroDefaultFeeRecipient), "{err:?}");
-        assert_eq!(store.default_fee_recipient(), original);
+        assert_eq!(store.default_fee_recipient(), live_fee);
+        assert_eq!(store.default_gas_limit(), live_gas);
         assert_eq!(store.validator_generation(&pk), gen);
         assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let state = store.state.read();
+            assert_eq!(state.url_owned, url_owned);
+            assert_eq!(state.remote_defaults, remote_defaults);
+        }
 
         // One past the zero address: the last byte is 1.
         let mut nonzero = [0u8; 20];

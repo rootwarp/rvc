@@ -2789,6 +2789,34 @@ mod tests {
         assert!(display.contains(&config_path.display().to_string()), "{display}");
     }
 
+    /// A file that parses on the second read is "changed while loading".
+    ///
+    /// The first read is a `ValidatorStoreError::TomlParse`. `raw` is valid,
+    /// so boot does not classify that first error.
+    #[test]
+    fn validators_file_changed_while_loading_names_the_path() {
+        let path = Path::new("/var/lib/rvc/validators.toml");
+        let valid = "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n";
+        let err = validator_store_config_error(
+            ValidatorStoreError::TomlParse(validator_store::ClassifiedToml {
+                unknown_key: Some("enable".to_string()),
+                line: Some(4),
+                column: Some(1),
+                kind: validator_store::ParseKind::Other,
+            }),
+            valid,
+            path,
+        );
+        let shown = err.to_string();
+        assert_eq!(
+            shown,
+            format!(
+                "validator store error: {}: validators file changed while loading",
+                path.display()
+            )
+        );
+    }
+
     /// The empty-file error points at the rejected-file recovery steps.
     #[test]
     fn test_empty_validators_config_points_at_rejected_recovery() {
@@ -3371,8 +3399,9 @@ mod tests {
     ///
     /// Both keys have recent attestation history, which would mark them Safe
     /// on a normal `register`. `enable = false` is an unknown key, so every
-    /// loaded key stays Pending. The log is the sanitized store error and
-    /// does not include the builder URL.
+    /// loaded key stays Pending. The credential is on that failing line.
+    /// `doppelganger_pre_read_error_is_value_free` asserts the returned error
+    /// string. This test asserts the log does not contain the credential.
     #[test]
     #[tracing_test::traced_test]
     fn enable_typo_in_the_validators_file_keeps_every_loaded_key_pending() {
@@ -3384,7 +3413,7 @@ mod tests {
         std::fs::write(
             &paths.validators,
             format!(
-                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false\nbuilders = [\"{SECRET}\"]\n",
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false # {SECRET}\n",
                 hex::encode(pk_a.to_bytes()),
             ),
         )
@@ -3411,6 +3440,32 @@ mod tests {
         assert!(logs_contain("cannot read validators file"));
         assert!(!logs_contain("SECRET"), "hold pre-read log quotes the validators file");
         assert!(!logs_contain(SECRET));
+        // `logs_contain` keeps only lines that carry this test's scope. A raw
+        // toml snippet is a later line, so the captured buffer is checked too.
+        let captured =
+            String::from_utf8(tracing_test::internal::global_buf().lock().unwrap().clone())
+                .unwrap();
+        assert!(!captured.contains("SECRET"), "hold pre-read log quotes the file:\n{captured}");
+    }
+
+    /// The pre-read error string names the unknown key and does not quote the file.
+    #[test]
+    fn doppelganger_pre_read_error_is_value_free() {
+        const SECRET: &str = "https://alice:SECRET@host";
+        let (_sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        std::fs::write(
+            &paths.validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false # {SECRET}\n",
+                hex::encode(pk.to_bytes()),
+            ),
+        )
+        .unwrap();
+        let err = open_doppelganger_holds(&paths.validators, &map_of(std::slice::from_ref(&pk)), 0)
+            .unwrap_err();
+        assert!(!err.contains("SECRET"), "pre-read error quotes the file: {err}");
+        assert!(!err.contains('\n'), "pre-read error spans lines: {err}");
     }
 
     /// Restart of an interrupted import: open hold, recent slashing history.
