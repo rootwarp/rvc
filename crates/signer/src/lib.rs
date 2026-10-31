@@ -26,7 +26,7 @@ pub use eth_types::is_aggregator;
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 #[cfg(any(test, feature = "test-utils"))]
 pub use core::PreReserveBarrier;
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 pub use core::StagedRow;
 #[cfg(any(test, feature = "test-utils"))]
 pub use core::{

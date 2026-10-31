@@ -11,7 +11,7 @@ mod common;
 
 use common::{stage_and_commit_attestation, stage_and_commit_block};
 use proptest::prelude::*;
-use rvc_slashing::{SlashingDb, SlashingError};
+use rvc_slashing::{AttestationSlashingViolation, SlashingDb, SlashingError};
 
 /// Zero GVR for signing-path checks (matches the historical harness).
 const SIGN_GVR: &[u8; 32] = &[0u8; 32];
@@ -96,11 +96,13 @@ proptest! {
 proptest! {
     #![proptest_config(config())]
 
+    // Targets stay above both sources: source > target is refused before
+    // the double-vote rule runs (W4-S2).
     #[test]
     fn proptest_no_double_votes(
         source_a in 0u64..50_000,
         source_b in 0u64..50_000,
-        target in 1u64..100_000,
+        target in 50_000u64..100_000,
         root_a in signing_root_strategy(),
         root_b in signing_root_strategy(),
     ) {
@@ -459,7 +461,8 @@ fn no_surround(rows: &[(u64, u64)]) {
 }
 
 // Values within 64 of `i64::MAX` keep no-double and no-surround.
-// Values above `i64::MAX` are refused and write no row.
+// Values above `i64::MAX` are refused and write no row. An in-range source
+// above its target is refused and writes no row (W4-S2).
 proptest! {
     #![proptest_config(config())]
 
@@ -526,6 +529,23 @@ proptest! {
                 "target {target} must be OutOfRange, got {err:?}"
             );
             prop_assert!(db.get_attestations(&pk).unwrap().is_empty());
+        } else if source > target {
+            let err = db
+                .reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR)
+                .unwrap_err();
+            prop_assert!(
+                matches!(
+                    err,
+                    SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::SourceExceedsTarget {
+                            source_epoch,
+                            target_epoch,
+                        }
+                    ) if source_epoch == source && target_epoch == target
+                ),
+                "({source}, {target}) must be SourceExceedsTarget, got {err:?}"
+            );
+            prop_assert!(db.get_attestations(&pk).unwrap().is_empty());
         } else {
             let first = db.reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR);
             prop_assert!(
@@ -579,19 +599,20 @@ proptest! {
             }
 
             // A second target below the stored minimum is `TargetEpochBelowMinimum`,
-            // so the extra in-range row uses a target at least as high as `source`
-            // only when that is strictly above the row already stored.
-            if source > target {
+            // so the extra in-range row takes the next target above the row already
+            // stored, sourced at the stored target (neither surrounds the other).
+            if target < limit {
                 let extra = db.reserve_attestation(
                     &pk,
-                    source,
-                    source,
+                    target,
+                    target + 1,
                     Some("0xnear-extra".into()),
                     SIGN_GVR,
                 );
                 prop_assert!(
                     extra.is_ok(),
-                    "non-surrounding ({source}, {source}) must be accepted: {:?}",
+                    "non-surrounding ({target}, {}) must be accepted: {:?}",
+                    target + 1,
                     extra.as_ref().err()
                 );
             }

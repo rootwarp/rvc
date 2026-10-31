@@ -55,13 +55,13 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       # T19 / TRC-1e: crates/slashing/src/stage.rs must stay byte-identical to the
-      # A-12 pin. W4-S1a (#820) re-pinned the bytes. The pin is a blob: the
+      # A-12 pin. W4-S2 (#832) re-pinned the bytes. The pin is a blob: the
       # redesign is one commit, and a commit cannot contain its own SHA.
       # Do not instrument stage.rs; see plan/tracing-2026-08-06/A-12-stage-rs-repin.md.
       - name: T19 — stage.rs byte-identical to A-12 pin
         run: |
           set -euo pipefail
-          PIN_BLOB=463ff36184a946a0eea0d4d4839a8bc04f74479c
+          PIN_BLOB=f0f1dc5a8890b223464c9cc85fec719158a6c44c
           ACTUAL=$(git rev-parse "HEAD:crates/slashing/src/stage.rs")
           if [ "$ACTUAL" != "$PIN_BLOB" ]; then
             echo "T19 / A-12 FAILURE: crates/slashing/src/stage.rs is not byte-identical to the A-12 pin."

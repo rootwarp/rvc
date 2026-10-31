@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use rvc_slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
-    BlockSlashingViolation, CommittedReservation, GroupCommitConfig, InterchangeAttestation,
-    InterchangeBlock, InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome,
-    ReservationKind, SlashingDb, SlashingError, ValidatorRecord,
+    AttestationSlashingViolation, BlockSlashingViolation, CommittedReservation, GroupCommitConfig,
+    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
+    PubkeyScopedDb, ReconcileOutcome, ReservationKind, SlashingDb, SlashingError, ValidatorRecord,
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -845,4 +845,195 @@ fn scoped_reserve_delegates_the_range_check() {
     assert_out_of_range(err, "slot", 1 << 63);
     assert!(db.get_attestations(PUBKEY).expect("atts").is_empty());
     assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty());
+}
+
+fn assert_source_exceeds_target(result: Result<impl std::fmt::Debug, SlashingError>, path: &str) {
+    match result {
+        Err(SlashingError::SlashableAttestation(
+            AttestationSlashingViolation::SourceExceedsTarget { source_epoch, target_epoch },
+        )) => {
+            assert_eq!((source_epoch, target_epoch), (20, 9), "{path}");
+        }
+        other => panic!("{path}: expected SourceExceedsTarget {{ 20, 9 }}, got {other:?}"),
+    }
+}
+
+/// The signer-server reserve and stage paths have no caller-side filter, so
+/// the evaluator itself refuses source > target. Source == target is not that
+/// case and is accepted.
+#[test]
+fn reserve_and_stage_refuse_an_attestation_whose_source_exceeds_its_target() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), SCOPED_CN.to_string(), *GVR);
+
+    assert_source_exceeds_target(
+        db.reserve_attestation(PUBKEY, 20, 9, Some("0xreserve".into()), GVR),
+        "reserve_attestation",
+    );
+    assert_source_exceeds_target(
+        db.stage_attestation(PUBKEY, 20, 9, Some("0xstage".into()), GVR),
+        "stage_attestation",
+    );
+    assert_source_exceeds_target(
+        scoped.reserve_attestation(PUBKEY, 20, 9, Some("0xscoped-reserve".into())),
+        "PubkeyScopedDb::reserve_attestation",
+    );
+    assert_source_exceeds_target(
+        scoped.stage_attestation(PUBKEY, 20, 9, Some("0xscoped-stage".into())).map(|(s, _)| s),
+        "PubkeyScopedDb::stage_attestation",
+    );
+    assert!(db.get_attestations(PUBKEY).expect("rows").is_empty(), "no refused row written");
+
+    // The stage refusal rolled back: the connection takes the next write.
+    let equal = db
+        .reserve_attestation(PUBKEY, 9, 9, Some("0xequal".into()), GVR)
+        .expect("source == target is not source > target");
+    assert!(equal.inserted);
+    let staged = db
+        .stage_attestation(PUBKEY2, 9, 9, Some("0xequal-stage".into()), GVR)
+        .expect("stage source == target");
+    staged.commit().expect("commit source == target");
+    for pubkey in [PUBKEY, PUBKEY2] {
+        let rows = db.get_attestations(pubkey).expect("rows");
+        assert_eq!(rows.len(), 1, "{pubkey}: {rows:?}");
+        assert_eq!((rows[0].source_epoch, rows[0].target_epoch), (9, 9));
+    }
+}
+
+/// A source > target member is evaluated inside the batch and rejected alone.
+/// The queued sibling still commits; a batch abort would return
+/// `ReserveCommitFailed` to both.
+#[test]
+fn source_exceeds_target_member_does_not_roll_back_its_group_commit_sibling() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the sibling without a leader");
+    sibling.arm();
+
+    assert_source_exceeds_target(
+        db.reserve_attestation(PUBKEY2, 20, 9, Some("0xbad".into()), GVR),
+        "batched reserve_attestation",
+    );
+    let queued = sibling.recv().expect("sibling in the same batch commits");
+    assert!(queued.inserted);
+    assert_eq!(db.get_blocks(PUBKEY).expect("blocks").len(), 1);
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+}
+
+/// `wait_eval_gate` runs before the evaluator. The connection mutex is held
+/// across the gate, so only lock-free state can tell the order apart: a strict
+/// flag set while the member is parked must be the one its decision uses.
+#[test]
+fn group_commit_evaluates_after_the_eval_gate() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.seed_block(PUBKEY, 50, None, GVR).expect("seed NULL-root block");
+    let (entered, release) = db.block_next_eval();
+
+    let db_w = Arc::clone(&db);
+    let worker = thread::spawn(move || db_w.reserve_block(PUBKEY, 50, None, GVR));
+    entered.recv().expect("member parked at the eval gate");
+    db.set_strict_semantics(true);
+    release.send(()).expect("release the gate");
+
+    match worker.join().expect("worker") {
+        Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+            slot: 50,
+        })) => {}
+        other => panic!("strict NULL == NULL must be refused after the gate, got {other:?}"),
+    }
+}
+
+/// File DB whose `table` is dropped from a second connection after `open`, so
+/// the evaluator's history read on that table fails with a SQL error inside
+/// the caller's transaction. Every other table, and the other kind's paths,
+/// keep working.
+fn open_with_dropped_history_table(table: &str) -> (tempfile::TempDir, SlashingDb) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slashing.db");
+    let db = SlashingDb::open(&path).expect("open");
+    rusqlite::Connection::open(&path)
+        .expect("second connection")
+        .execute_batch(&format!("DROP TABLE {table};"))
+        .expect("drop history table");
+    (dir, db)
+}
+
+fn assert_missing_table(err: SlashingError, table: &str, path: &str) {
+    match &err {
+        SlashingError::DatabaseError(e) => {
+            assert_eq!(e.to_string(), format!("no such table: {table}"), "{path}");
+        }
+        other => panic!("{path}: expected DatabaseError (evaluator read), got {other:?}"),
+    }
+}
+
+/// A SQL error inside `evaluate_block` goes through the one ROLLBACK, so the
+/// same connection takes the next write. Without it the next `BEGIN
+/// IMMEDIATE` fails with "cannot start a transaction within a transaction".
+#[test]
+fn stage_block_rolls_back_an_evaluator_sql_error_and_takes_the_next_write() {
+    let (_dir, db) = open_with_dropped_history_table("blocks");
+
+    let err = db
+        .stage_block(PUBKEY, 7, Some("0xblock".into()), GVR)
+        .expect_err("the blocks history read must fail");
+    assert_missing_table(err, "blocks", "stage_block");
+
+    db.stage_attestation(PUBKEY, 8, 9, Some("0xnext".into()), GVR)
+        .expect("next stage on the same connection")
+        .commit()
+        .expect("next commit");
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1);
+}
+
+/// Attestation counterpart of
+/// `stage_block_rolls_back_an_evaluator_sql_error_and_takes_the_next_write`.
+#[test]
+fn stage_attestation_rolls_back_an_evaluator_sql_error_and_takes_the_next_write() {
+    let (_dir, db) = open_with_dropped_history_table("attestations");
+
+    let err = db
+        .stage_attestation(PUBKEY, 8, 9, Some("0xatt".into()), GVR)
+        .expect_err("the attestations history read must fail");
+    assert_missing_table(err, "attestations", "stage_attestation");
+
+    db.stage_block(PUBKEY, 7, Some("0xnext".into()), GVR)
+        .expect("next stage on the same connection")
+        .commit()
+        .expect("next commit");
+    assert_eq!(db.get_blocks(PUBKEY).expect("rows").len(), 1);
+}
+
+/// A SQL error inside a member's evaluator is not a member rejection: it
+/// aborts the batch, so the sibling accepted (and inserted) before it is
+/// rolled back and every member gets the commit-failure error.
+#[test]
+fn group_commit_evaluator_sql_error_rolls_back_the_accepted_sibling() {
+    let (_dir, db) = open_with_dropped_history_table("attestations");
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the sibling without a leader");
+    sibling.arm();
+
+    let member = db.reserve_attestation(PUBKEY2, 8, 9, Some("0xbroken".into()), GVR);
+    let sibling = sibling.recv();
+    for (path, result) in [("member", member), ("sibling", sibling)] {
+        match result {
+            Err(SlashingError::ReserveCommitFailed(msg)) => {
+                assert_eq!(msg, "database error: no such table: attestations", "{path}");
+            }
+            other => panic!("{path}: expected the batch commit failure, got {other:?}"),
+        }
+    }
+    assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty(), "sibling row rolled back");
+
+    let again = db
+        .reserve_block(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("the connection takes the next batch");
+    assert!(again.inserted, "no sibling row survived the abort");
 }

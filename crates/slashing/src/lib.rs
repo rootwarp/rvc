@@ -6,6 +6,7 @@
 mod audit;
 mod db;
 mod error;
+mod evaluate;
 mod group_commit;
 mod history;
 pub mod metrics;

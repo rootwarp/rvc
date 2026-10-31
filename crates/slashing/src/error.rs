@@ -189,6 +189,12 @@ pub enum AttestationSlashingViolation {
 
     #[error("target epoch {target_epoch} is below minimum existing target epoch {min_target}")]
     TargetEpochBelowMinimum { target_epoch: Epoch, min_target: Epoch },
+
+    /// Source checkpoint after the target checkpoint. Refused on every
+    /// signing path before any history read; seeding and interchange import
+    /// still accept such a row.
+    #[error("source epoch {source_epoch} is above target epoch {target_epoch}")]
+    SourceExceedsTarget { source_epoch: Epoch, target_epoch: Epoch },
 }
 
 /// Specific types of block slashing violations per EIP-3076.
