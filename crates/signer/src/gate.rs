@@ -36,7 +36,7 @@
 //!
 //! 1. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
-//! 2. Delegate to [`crate::sign_nonslashable_core`] (same duration as slashable).
+//! 2. Delegate to [`crate::core::sign_nonslashable_core`] (same duration as slashable).
 //!    No slashing-DB staging or committing occurs — these operations are not
 //!    slashable by the Ethereum consensus spec.
 //!
