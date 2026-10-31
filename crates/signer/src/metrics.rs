@@ -178,10 +178,8 @@ pub fn sign_type_from_op_name(op_name: &str) -> &'static str {
         "sign_block" | "sign_block_header" => rejection_sign_type::BEACON_BLOCK,
         "sign_attestation" => rejection_sign_type::ATTESTATION_DATA,
         "randao" | "sign_randao_reveal" => rejection_sign_type::RANDAO_REVEAL,
-        "selection_proof"
-        | "sign_selection_proof"
-        | "sync_committee_selection_proof"
-        | "sign_sync_committee_selection_proof" => {
+        "selection_proof" | "sign_selection_proof" => rejection_sign_type::AGGREGATION_SLOT,
+        "sync_committee_selection_proof" | "sign_sync_committee_selection_proof" => {
             rejection_sign_type::SYNC_AGGREGATOR_SELECTION_DATA
         }
         "aggregate_and_proof"
@@ -358,6 +356,27 @@ mod tests {
             before,
             "HTTP 400 must not increment unsupported_type"
         );
+    }
+
+    /// `SignerService` passes `selection_proof` and `SigningGate` passes
+    /// `sign_selection_proof`; both are the attester selection proof.
+    #[test]
+    fn test_attester_selection_proof_has_its_own_rejection_label() {
+        for op_name in ["selection_proof", "sign_selection_proof"] {
+            assert_eq!(
+                sign_type_from_op_name(op_name),
+                rejection_sign_type::AGGREGATION_SLOT,
+                "{op_name} is the attester selection proof"
+            );
+        }
+        for op_name in ["sync_committee_selection_proof", "sign_sync_committee_selection_proof"] {
+            assert_eq!(
+                sign_type_from_op_name(op_name),
+                rejection_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
+                "{op_name} is the sync-committee selection proof"
+            );
+        }
+        assert!(rejection_sign_type::ALL.contains(&rejection_sign_type::AGGREGATION_SLOT));
     }
 
     #[test]

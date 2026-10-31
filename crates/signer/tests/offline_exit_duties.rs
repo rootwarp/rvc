@@ -2,8 +2,8 @@
 //!
 //! The control is `DoppelgangerDisabledByOperator` with the same keys loaded, so a
 //! refusal under `OfflineExitEnablement` is the gate and not a fixture that cannot sign.
+//! The selection-proof tests pin each surface's rejection label for the two selection duties.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,9 +16,12 @@ use crypto::{
 use doppelganger::{DoppelgangerDisabledByOperator, SigningEnablement};
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BuilderRequestAuth, Checkpoint,
-    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkSchedule,
+    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkName, ForkSchedule,
     PayloadAttestationData, ProposerPreferences, Root, SyncCommitteeContribution,
     ValidatorRegistrationV1, VoluntaryExit, SLOTS_PER_EPOCH,
+};
+use rvc_signer::metrics::{
+    rejection_reason, rejection_sign_type, version_label, RVC_SIGNER_REJECTIONS_TOTAL,
 };
 use rvc_signer::{
     BeaconBlockHeaderFields, OfflineExitEnablement, SignerError, SignerService, SigningGate,
@@ -363,59 +366,89 @@ async fn test_signing_gate_exit_only_refuses_every_non_exit_duty() {
     assert_eq!(slash_rows(&gated_wired.db, &other), (0, 0));
 }
 
-fn function_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
-    let rest = rest.strip_prefix("async ").unwrap_or(rest);
-    let rest = rest.strip_prefix("fn ")?;
-    let name = rest.split(['(', '<']).next()?.trim();
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    Some(name.to_string())
-}
+/// Refuses every root as an unsupported signing type, a classified rejection.
+struct UnsupportedType;
 
-fn duty_on_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
-        return None;
+#[async_trait]
+impl Signer for UnsupportedType {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+    ) -> Result<Signature, SigningError> {
+        Err(SigningError::UnsupportedSigningType("selection proof".to_string()))
     }
-    let idx = line.find("SigningDuty::")?;
-    let rest = &line[idx + "SigningDuty::".len()..];
-    let duty: String =
-        rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-    if duty.is_empty() {
-        None
-    } else {
-        Some(duty)
+
+    fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+        Vec::new()
     }
 }
 
-fn duty_map(src: &str) -> BTreeMap<String, BTreeSet<String>> {
-    let mut current = String::new();
-    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for line in src.lines() {
-        if let Some(name) = function_name(line) {
-            current = name;
-        }
-        if current.starts_with("test_") {
-            continue;
-        }
-        if let Some(duty) = duty_on_line(line) {
-            map.entry(current.clone()).or_default().insert(duty);
-        }
-    }
-    map
+/// The counter only grows, so callers compare with `>`. Each surface uses its
+/// own `version` label, and no other test in this binary records a rejection.
+fn unsupported_type_rejections(sign_type: &str, version: &str) -> u64 {
+    RVC_SIGNER_REJECTIONS_TOTAL
+        .with_label_values(&[rejection_reason::UNSUPPORTED_TYPE, sign_type, version])
+        .get()
 }
 
-fn expect_duties(pairs: &[(&str, &str)]) -> BTreeMap<String, BTreeSet<String>> {
-    let mut map = BTreeMap::new();
-    for (function, duty) in pairs {
-        map.entry((*function).to_string())
-            .or_insert_with(BTreeSet::new)
-            .insert((*duty).to_string());
-    }
-    map
+#[tokio::test]
+async fn test_signer_service_selection_proof_rejection_is_labelled_aggregation_slot() {
+    let key = SecretKey::generate();
+    let pk = key.public_key();
+    let svc = SignerService::new(composite([key]), open_pinned_db())
+        .with_enablement(Arc::new(DoppelgangerDisabledByOperator))
+        .with_sign_backend(Arc::new(UnsupportedType));
+    let fs = schedule();
+    let slot = 12 * SLOTS_PER_EPOCH;
+    let version = version_label(Some(ForkName::Electra));
+
+    let attester = unsupported_type_rejections(rejection_sign_type::AGGREGATION_SLOT, version);
+    let result = svc.sign_selection_proof(slot, &pk, &fs, &GVR).await;
+    assert!(result.is_err(), "the backend refuses: {result:?}");
+    assert!(
+        unsupported_type_rejections(rejection_sign_type::AGGREGATION_SLOT, version) > attester,
+        "SignerService::sign_selection_proof must count under aggregation_slot"
+    );
+
+    let sync_label = rejection_sign_type::SYNC_AGGREGATOR_SELECTION_DATA;
+    let sync = unsupported_type_rejections(sync_label, version);
+    let result = svc.sign_sync_committee_selection_proof(slot, 1, &pk, &fs, &GVR).await;
+    assert!(result.is_err(), "the backend refuses: {result:?}");
+    assert!(
+        unsupported_type_rejections(sync_label, version) > sync,
+        "SignerService::sign_sync_committee_selection_proof must count under {sync_label}"
+    );
+}
+
+#[tokio::test]
+async fn test_signing_gate_selection_proof_rejection_is_labelled_aggregation_slot() {
+    let pk = SecretKey::generate().public_key();
+    let gate = SigningGate::new_with_raw_signer(
+        open_pinned_db(),
+        Arc::new(DoppelgangerDisabledByOperator),
+        Arc::new(UnsupportedType),
+        Arc::new(ValidatorLockMap::new()),
+        Duration::from_secs(4),
+    );
+    let version = rejection_reason::UNKNOWN;
+
+    let attester = unsupported_type_rejections(rejection_sign_type::AGGREGATION_SLOT, version);
+    let result = gate.sign_selection_proof(&pk, [0x42; 32]).await;
+    assert!(result.is_err(), "the backend refuses: {result:?}");
+    assert!(
+        unsupported_type_rejections(rejection_sign_type::AGGREGATION_SLOT, version) > attester,
+        "SigningGate::sign_selection_proof must count under aggregation_slot"
+    );
+
+    let sync_label = rejection_sign_type::SYNC_AGGREGATOR_SELECTION_DATA;
+    let sync = unsupported_type_rejections(sync_label, version);
+    let result = gate.sign_sync_committee_selection_proof(&pk, [0x42; 32]).await;
+    assert!(result.is_err(), "the backend refuses: {result:?}");
+    assert!(
+        unsupported_type_rejections(sync_label, version) > sync,
+        "SigningGate::sign_sync_committee_selection_proof must count under {sync_label}"
+    );
 }
 
 fn arm_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
@@ -425,67 +458,16 @@ fn arm_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
     &rest[..stop]
 }
 
-/// Every production `SigningDuty::` site names its method. Only `sign_voluntary_exit`
-/// uses `VoluntaryExit`. Sync-committee selection is not the attester selection proof.
+/// The signer-server keeps sync-committee selection apart from the attester
+/// selection proof, in dispatch and in the gate docs.
 #[test]
-fn test_method_to_duty_mapping_reserves_voluntary_exit() {
+fn test_selection_dispatch_and_docs_stay_split() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let signer = std::fs::read_to_string(root.join("src/lib.rs")).expect("lib.rs");
     let gate = std::fs::read_to_string(root.join("src/gate.rs")).expect("gate.rs");
     let plan =
         std::fs::read_to_string(root.join("../signer-server/src/sign_plan.rs")).expect("sign_plan");
     let service =
         std::fs::read_to_string(root.join("../signer-server/src/service.rs")).expect("service");
-
-    let signer_expected = expect_duties(&[
-        ("sign_attestation", "Attestation"),
-        ("sign_block", "Block"),
-        ("sign_block_header", "Block"),
-        ("sign_randao_reveal", "RandaoReveal"),
-        ("sign_sync_committee_message", "SyncCommitteeMessage"),
-        ("sign_payload_attestation", "PayloadAttestation"),
-        ("sign_proposer_preferences", "ProposerPreferences"),
-        ("sign_builder_request_auth", "BuilderRequestAuth"),
-        ("sign_execution_payload_envelope_root", "ExecutionPayloadEnvelope"),
-        ("sign_selection_proof", "SelectionProof"),
-        ("sign_aggregate_and_proof", "AggregateAndProof"),
-        ("sign_aggregate_and_proof_root", "AggregateAndProofRoot"),
-        ("sign_electra_aggregate_and_proof", "ElectraAggregateAndProof"),
-        ("sign_voluntary_exit", "VoluntaryExit"),
-        ("sign_builder_registration", "BuilderRegistration"),
-        ("sign_sync_committee_selection_proof", "SyncCommitteeSelectionProof"),
-        ("sign_contribution_and_proof", "ContributionAndProof"),
-    ]);
-    assert_eq!(duty_map(&signer), signer_expected, "SignerService method-to-duty map");
-
-    let gate_expected = expect_duties(&[
-        ("sign_block", "Block"),
-        ("sign_attestation", "Attestation"),
-        ("sign_sync_committee_message", "SyncCommitteeMessage"),
-        ("sign_aggregate_and_proof", "AggregateAndProof"),
-        ("sign_payload_attestation", "PayloadAttestation"),
-        ("sign_proposer_preferences", "ProposerPreferences"),
-        ("sign_contribution_and_proof", "ContributionAndProof"),
-        ("sign_selection_proof", "SelectionProof"),
-        ("sign_sync_committee_selection_proof", "SyncCommitteeSelectionProof"),
-        ("sign_randao_reveal", "RandaoReveal"),
-        ("sign_voluntary_exit", "VoluntaryExit"),
-        ("sign_builder_registration", "BuilderRegistration"),
-        ("sign_builder_request_auth", "BuilderRequestAuth"),
-        ("sign_execution_payload_envelope", "ExecutionPayloadEnvelope"),
-    ]);
-    assert_eq!(duty_map(&gate), gate_expected, "SigningGate method-to-duty map");
-
-    for (label, map) in [("signer", duty_map(&signer)), ("gate", duty_map(&gate))] {
-        for (function, duties) in &map {
-            if duties.contains("VoluntaryExit") {
-                assert_eq!(
-                    function, "sign_voluntary_exit",
-                    "{label} {function} must not use VoluntaryExit"
-                );
-            }
-        }
-    }
 
     let sync_arm =
         arm_between(&plan, "PlanInput::SyncCommitteeSelection", "PlanInput::ContributionAndProof");

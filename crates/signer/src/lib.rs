@@ -33,11 +33,14 @@ pub use core::{
     block_reserve_interval_count, clear_block_reserve_intervals, take_block_reserve_intervals,
 };
 pub use core::{
-    sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
-    SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
-    TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
+    sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks, SignSlashableRequest,
+    SlashableKind, SlashableSignSession, StandardSlashableHooks, TimeoutPolicy,
+    TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 pub use doppelganger::{duty_requires_beacon_admission, SigningDuty, SigningEnablement};
+
+#[cfg(not(any(test, feature = "test-utils")))]
+use crate::core::sign_nonslashable_core;
 
 /// Revocation generation for [`with_beacon_admission`]. A missing scope fails closed.
 ///
@@ -410,8 +413,8 @@ struct VcSlashable {
 /// per per-pubkey [`TimeoutPolicy`] (fail-closed retain for remote/unknown).
 /// Metrics use [`StandardSlashableHooks`] (same families as the gate).
 ///
-/// Non-slashable paths: `ensure_signing_enabled` then
-/// [`sign_nonslashable_core`] (timeout + uniform classification). They take
+/// Non-slashable paths: `ensure_duty_enabled` then
+/// `sign_nonslashable_core` (timeout + uniform classification). They take
 /// no per-validator lock and write no slashing-DB row. VC-specific `debug!`
 /// timing stays in the wrapper.
 pub struct SignerService {
@@ -440,7 +443,7 @@ pub struct SignerService {
     /// Release `rvc-bin` does not enable that feature.
     #[cfg(any(test, feature = "test-utils"))]
     pre_reserve_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
-    /// Test-only park before [`Self::ensure_signing_enabled`].
+    /// Test-only park before [`Self::ensure_duty_enabled`].
     #[cfg(any(test, feature = "test-utils"))]
     admission_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
     /// Test-only park after the non-slashable enablement check, before the backend.
@@ -947,14 +950,7 @@ impl SignerService {
     /// a BLS call already started, including a remote request, and a
     /// non-slashable sign that already passed its check, run to the sign
     /// timeout.
-    fn ensure_signing_enabled(
-        &self,
-        pubkey: &PublicKey,
-        duty: SigningDuty,
-    ) -> Result<(), SignerError> {
-        self.ensure_duty_enabled(pubkey, duty)
-    }
-
+    ///
     /// `duty` is the typed operation. An exit-only enablement stays closed
     /// for every variant except [`SigningDuty::VoluntaryExit`].
     fn ensure_duty_enabled(
@@ -985,7 +981,7 @@ impl SignerService {
         }
         #[cfg(not(any(test, feature = "test-utils")))]
         std::future::ready(()).await;
-        self.ensure_signing_enabled(pubkey, duty)
+        self.ensure_duty_enabled(pubkey, duty)
     }
 
     /// Raw-root [`Self::sign_backend`] for local/HTTP keys; typed adapter for gRPC.
@@ -1109,7 +1105,7 @@ impl SignerService {
     //
     // Pattern (mirrors SigningGate):
     //   1. Root derivation in the public wrapper
-    //   2. `ensure_signing_enabled` (Result) then `sign_nonslashable_core`
+    //   2. `ensure_duty_enabled` (Result) then `sign_nonslashable_core`
     // No per-validator lock, no slashing-DB staging. VC `debug!`/timing stay here.
 
     async fn sign_nonslashable_checked(
@@ -1146,7 +1142,7 @@ impl SignerService {
         }
     }
 
-    /// Facade wrapper: `ensure_signing_enabled` then [`sign_nonslashable_core`].
+    /// Facade wrapper: `ensure_duty_enabled` then [`crate::core::sign_nonslashable_core`].
     ///
     /// VC-specific `debug!` / elapsed timing stay here (operator output, not
     /// core behaviour). `KeyNotFound` and other backend errors fold through
