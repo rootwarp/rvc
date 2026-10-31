@@ -402,3 +402,90 @@ async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
         "keymanager_api must be drained"
     );
 }
+
+/// The monitor `build_keymanager_api` returns skips a late cancel while a key
+/// backend holds the key, and cancels once none does.
+#[test]
+fn built_monitor_skips_cancel_while_a_backend_holds_the_key() {
+    use doppelganger::ForwardWindowStatus;
+
+    let dir = TempDir::new().unwrap();
+    let reader: Arc<dyn slashing::SlashingDbReader> =
+        Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+    let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xab; 32]));
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), Some(Arc::clone(&machine)));
+    let composite = Arc::clone(&deps.composite_signer);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    let monitor = &built.doppelganger_monitor;
+    let secret = SecretKey::generate();
+    let public = secret.public_key();
+    let pk = public.to_bytes();
+    machine.register_for_import(&public, 5);
+    let mut seen = Vec::new();
+
+    composite.add_local_key(secret);
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    assert!(composite.remove_local_key(&pk));
+    composite.add_remote_key(pk, Arc::new(LocalSigner::new(KeyManager::new())));
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    assert!(composite.remove_remote_key(&pk));
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    let grpc = add_grpc_remote_key(&composite).public_key();
+    machine.register_for_import(&grpc, 5);
+    monitor.cancel_monitoring(&grpc.to_bytes());
+    seen.push(machine.status(&grpc));
+
+    assert_eq!(
+        seen,
+        [
+            ForwardWindowStatus::Pending,
+            ForwardWindowStatus::Pending,
+            ForwardWindowStatus::Unmonitored,
+            ForwardWindowStatus::Pending,
+        ],
+        "[K local, K remote, K in no backend, gRPC key]"
+    );
+}
+
+/// 628-4: the keystore, remote and signing-quiesce adapters hold the one
+/// `TrackedKeys` the caller passes in, so every keymanager key-set writer
+/// serialises on it.
+#[test]
+fn adapters_share_one_tracked_keys() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), None);
+    let shared = Arc::clone(&deps.tracked_keys);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    let held = &built.adapter_tracked_keys;
+
+    assert_eq!(
+        [
+            Arc::ptr_eq(&shared, &held.keystore),
+            Arc::ptr_eq(&shared, &held.remote),
+            Arc::ptr_eq(&shared, &held.signing_quiesce),
+        ],
+        [true; 3],
+        "[keystore, remote, signing quiesce] adapter on deps.tracked_keys"
+    );
+}
+
+/// The remote DELETE cancels windows through the admissions the keystore
+/// adapter admits with.
+#[test]
+fn remote_adapter_cancels_windows_through_deps_admissions() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), None);
+    let admissions = Arc::clone(&deps.admissions);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert!(
+        built.remote_window_cancel.as_ref().is_some_and(|held| Arc::ptr_eq(held, &admissions)),
+        "the remote adapter must cancel through deps.admissions"
+    );
+}
