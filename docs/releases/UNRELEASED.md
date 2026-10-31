@@ -595,6 +595,19 @@ value and becomes file-owned. A remote default field is kept when
 `[defaults]` still holds its baseline and cleared when the file changed
 that field. Nothing in the shipped binary calls `reload_config`.
 
+The baseline is the live value when the URL started owning the field. It is
+not always the value in the file: an `update_config` that was not saved
+before that claim makes the two differ. The reload compares each file value
+with that baseline, so it cannot tell an untouched field from an edit
+back to the baseline. Deleting `builder_proposals = false` (a missing flag
+reads as `false`), or deleting a `[defaults] gas_limit` whose 30000000
+fallback equals the baseline, keeps the field URL-owned.
+`set_default_graffiti` does not take graffiti ownership from the URL yet
+(768-2, deferred to W4-C4): after a remote default graffiti and then
+`set_default_graffiti`, a reload whose file omits graffiti brings the remote
+graffiti back when no graffiti was set at the claim. The shipped
+proposer-config URL does not set graffiti.
+
 A 401, a body that is not JSON, a 200 whose JSON has neither
 `proposer_config` nor `default_config`, or one invalid entry leaves every
 previous URL value in place. One bad entry rejects the whole fetch: a
@@ -942,3 +955,92 @@ drains after the orchestrator tier, for up to the block-publication budget.
 A zero budget waits until the drains finish. A positive budget does not
 cancel a send that is still running. The recorder stays
 unregistered, so a sample that is only queued at process exit is not kept.
+
+## Slashing: refuse slots and epochs above i64::MAX before any lock, bind or interchange write
+
+Signing paths refuse any slot or epoch above `i64::MAX` with `SlashingError::OutOfRange` before any write. An interchange that holds such a value is rejected with HTTP 400 before the import window. A database that already holds a wrapped target, a wrapped block slot, or a wrapped block watermark still refuses a later ordinary sign of the kind covered by `legacy_wrapped_target_and_slot_refuse_later_signs_source_only_wrap_does_not` (surround, `SlotBelowMinimum`, or `BelowBlockWatermark`). A legacy source-only wrapped row, stored as `(2^63, 101)` and read back as `(i64::MIN, 101)`, does not block a later attestation `(99, 102)`. Already-wrapped values are not migrated.
+
+## Exit CLI: check the BN's GVR and Capella version, refuse pre-Capella epochs, write the BLS change as an array
+
+### Changed
+
+Exit commands check the chain before signing. `rvc voluntary-exit` and `rvc prepare-exit` compare the beacon node's genesis validators root with the local root. On mainnet, hoodi, holesky, and sepolia they also require the beacon node's Capella fork version to match that network's preset. An explicit epoch before Capella is refused. A clock-derived epoch is not refused. On a custom network the beacon node's Capella version is used as-is and is not checked against a preset.
+
+The keymanager `POST /eth/v1/validator/{pubkey}/voluntary_exit` returns 400 when the explicit epoch is before Capella, or when Capella is unscheduled. Other responses are unchanged.
+
+### Migration
+
+- If an exit is refused, pass `--network` or `--genesis-validators-root` for the chain the key should leave. A Hoodi (or other non-mainnet) `--genesis-validators-root` override **without `--network`** still runs **mainnet's** Capella-version check, so the operator must pass `--network <net>` (or `--network custom` with the override).
+- `rvc-keygen bls-to-execution` now writes a JSON array of one `SignedBLSToExecutionChange` (`[ { ... } ]`). Callers that parsed a single JSON object need to read the first element.
+
+## GCP secret provider: a strict, case-sensitive starts-with prefix, so another fleet's secrets in a shared project are never loaded
+
+GCP secret prefix is a strict, case-sensitive starts-with match. The Secret Manager list filter is only a pre-filter (`name:"<prefix>"`). A secret whose id merely contains the prefix is not loaded.
+
+Migration: rename secrets whose id only contains the prefix so the id starts with it (for example `old-validator-key-<pk>` and `b-validator-key-<pk>` are no longer selected).
+
+Ids whose suffix is not a pubkey still load and log one warning per id. This does not add project-level isolation.
+
+## Slashing: keep S* ≤ T* on every watermark writer and clamp the export floor instead of failing
+
+Import, prune, and the watermark setter now raise the attestation target watermark to at least the source watermark, including a source already stored above both incoming maxima. The raise keeps a legacy negative watermark instead of replacing it with a smaller positive value. Export clamps an inverted floor instead of failing, so DELETE no longer returns 500 for an inverted but representable floor.
+
+A legacy wrapped source does not fit in a signed epoch. An import that would write that source as the target fails closed and rolls back. Signing `(99, 102)` against a source-wrapped row still succeeds. This is not a source-greater-than-target signing refusal (W4-S2).
+
+## Secret-provider refresh: cache secret id → pubkey per provider, so a known opaque id is not fetched and decrypted every cycle
+
+Refresh no longer re-fetches a secret whose id is already known for that provider. A secret id is treated as immutable: a key rotated under the same id is picked up at the next restart.
+
+## Secret provider: keystore decrypts run off the async runtime, at most two at a time
+
+Secret-provider keystore decrypts run off the async runtime, at most two at a time per boot or refresh, so loading many keystores no longer stalls the client.
+
+## Config: fail closed on unknown `config.toml` keys, and keep config parse errors free of values
+
+Unknown config keys fail startup.
+
+A key that is not a field of its table is an error and names the key and the file. Startup does not keep the default for that field.
+
+Migration: rename or delete the removed key.
+
+- `provider` under `[secret_provider]` → `providers = ["gcp"]`
+- `gcp_project_id` under `[secret_provider]` → `[secret_provider.gcp]` `project_id`
+- `gcp_secret_prefix` under `[secret_provider]` → `[secret_provider.gcp]` `secret_prefix`
+
+Parse errors name the file, and the line and column (document syntax) or the key path (semantic errors), and a fixed category (`invalid type`, `invalid value`, `unknown variant`, `missing field`, `duplicate key`, `invalid length`, toml's `message()` for document syntax, or `unrecognized config parse error` for an unrecognised data-path message). A dotted key's name is escaped. They do not include the value or the source line.
+
+Covered: 666-AC1 (config half), 666-AC2, 666-AC4 (config half), 666-AC6 (validators-config note; running guide and UNRELEASED are W4-R1), 669-C4c.
+
+#669 stays open. Raw URLs in other validation errors (`InvalidBeaconUrl`, W4-C8 / W4-C9) remain. This note does not say config errors are fully redacted.
+
+## Validators file: fail closed on unknown keys and check the fee recipient on reload
+
+validators file rejects unknown keys. A key that is not a field of `[defaults]` or `[[validators]]` fails startup and `reload_config`. The error names the key. Migration: rename or delete the named key; `enable` is `enabled`.
+
+`reload_config` also refuses a missing or zero `[defaults] fee_recipient` and leaves the live store unchanged. Nothing in the shipped binary calls `reload_config`.
+
+The per-field URL-ownership rule of `reload_config` is stated once, in "Proposer-pool timeouts, the global selection mode, and URL proposer reset" above.
+
+## Keymanager DELETE: `not_active` for a key with history, the real GVR, and on-disk cleanup for an unloaded key
+
+DELETE `/eth/v1/keystores` now exports slashing protection per requested key (loaded members, plus keys that are neither loaded nor remote-registered) and admits that export in the free slot window. If an import holds the window past the wait bound, the DELETE returns HTTP 503 with `Retry-After` and removes nothing.
+
+A second DELETE of a key that still has slashing history returns `not_active` and the same history under the node's genesis validators root. `not_found` is a key with neither a keystore nor history; the interchange still carries an empty record under that real root, never an all-zero placeholder. A pubkey registered only as a remote key returns `error` and is left untouched; delete it through `/eth/v1/remotekeys`. A key that is not loaded but still has a keystore file on disk is removed, denylisted, and reported `deleted`.
+
+## W4.1 migration: breaking changes and operator actions
+
+These changes can stop a start, refuse a command, or change a response or a file that a script reads. Each item names the section above that describes it.
+
+1. **Unknown keys fail startup, in `config.toml` and in the validators file.** Sections: "Config: fail closed on unknown `config.toml` keys, and keep config parse errors free of values" and "Validators file: fail closed on unknown keys and check the fee recipient on reload". Rename or delete the named key. The removed `config.toml` keys and their replacements:
+   - `provider` under `[secret_provider]` → `providers = ["gcp"]`
+   - `gcp_project_id` under `[secret_provider]` → `[secret_provider.gcp]` `project_id`
+   - `gcp_secret_prefix` under `[secret_provider]` → `[secret_provider.gcp]` `secret_prefix`
+
+   In the validators file, `enable` is `enabled`.
+2. **The GCP secret prefix is a strict, case-sensitive starts-with match.** Section: "GCP secret provider: a strict, case-sensitive starts-with prefix, so another fleet's secrets in a shared project are never loaded". Rename secrets whose id only contains the prefix so the id starts with it.
+3. **Exit commands refuse a beacon node on another chain, and an explicit epoch before Capella.** Section: "Exit CLI: check the BN's GVR and Capella version, refuse pre-Capella epochs, write the BLS change as an array". Pass `--network` or `--genesis-validators-root` for the chain the key should leave. A non-mainnet `--genesis-validators-root` without `--network` still runs mainnet's Capella-version check, so pass `--network <net>` (or `--network custom` with the override). The keymanager voluntary-exit endpoint returns 400 for an explicit epoch before Capella, or when Capella is unscheduled.
+4. **`rvc-keygen bls-to-execution` writes a JSON array of one `SignedBLSToExecutionChange`.** Same section. Callers that parsed a single JSON object need to read the first element. The beacon-node submission in `docs/keygen-guide.md` posts the file as is.
+5. **Keymanager DELETE statuses.** Section: "Keymanager DELETE: `not_active` for a key with history, the real GVR, and on-disk cleanup for an unloaded key". A second DELETE of a key that still has slashing history returns `not_active`, so a script that treated `not_found` on a retry as success must accept `not_active` too. A pubkey registered only as a remote key returns `error`; delete it through `/eth/v1/remotekeys`. A key that is not loaded but still has a keystore file on disk is removed, denylisted, and reported `deleted`. A 503 with `Retry-After` removed nothing; send the DELETE again after that delay.
+6. **A secret id is treated as immutable.** Section: "Secret-provider refresh: cache secret id → pubkey per provider, so a known opaque id is not fetched and decrypted every cycle". A key rotated under the same secret id is picked up at the next restart, so restart rvc after such a rotation.
+
+The slashing changes need no operator action. An interchange that holds a slot or epoch above `i64::MAX` is rejected with HTTP 400, and values that already wrapped are not migrated. The off-runtime decrypts and the `reload_config` changes need no operator action either.
