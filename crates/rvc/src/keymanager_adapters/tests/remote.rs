@@ -1,5 +1,10 @@
 use super::*;
 
+use doppelganger::ForwardWindowStatus;
+use keymanager_api::lifecycle::ConfigTouch;
+use keymanager_api::traits::DeleteRemoteKeyError;
+use keymanager_api::ImportKind;
+
 // --- RemoteKeyManagerAdapter tests ---
 
 #[test]
@@ -366,4 +371,198 @@ fn remote_delete_waits_for_the_shared_tracked_keys_lock() {
     let deleted = delete.join().expect("delete thread");
     assert!(matches!(deleted, Ok(true)), "got {deleted:?}");
     assert!(!composite.has_remote_key(&pk));
+}
+
+// --- Remote DELETE cancels inside the `TrackedKeys` section (W4-K6b) ---
+
+const PASSWORD: &str = "testpass";
+/// Bounds a channel wait so a broken test fails instead of hanging.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Remote-only K: a remote import, then the handler's `on_import(Remote)`.
+/// The enable task `on_import` spawns is dropped unpolled with its runtime.
+fn import_remote_only(f: &RemoteAndKeystore, pk: Pubkey) {
+    f.remote.import_remote_key(pk, REMOTE_URL.to_string()).expect("remote import");
+    block_on(async { f.lifecycle.on_import(pk, ImportKind::Remote) }).expect("on_import");
+}
+
+/// Two closed not-live epochs after the import epoch (5) finish K's window.
+fn finish_window(machine: &ForwardWindowMachine, public: &crypto::PublicKey) {
+    let index = hex::encode(public.to_bytes());
+    for epoch in [6, 7] {
+        let missing = machine.observe_liveness(
+            epoch,
+            &[doppelganger::ValidatorLivenessData { index: index.clone(), is_live: false }],
+            epoch + 1,
+            doppelganger::CLOSED_EPOCH_SLOT,
+        );
+        assert!(missing.is_empty(), "epoch {epoch} left keys unobserved: {missing:?}");
+    }
+    assert_eq!(machine.status(public), ForwardWindowStatus::Safe);
+}
+
+/// `handlers::delete_remote_keys`' `remove_op`.
+fn remote_delete_op(
+    remote: &RemoteKeyManagerAdapter,
+    pk: &Pubkey,
+) -> (ConfigTouch, Result<bool, DeleteRemoteKeyError>) {
+    match remote.delete_remote_key(pk) {
+        Ok(true) => (ConfigTouch::Apply { keystore_present: true }, Ok(true)),
+        Ok(false) => (ConfigTouch::Skip, Ok(false)),
+        Err(e) => (ConfigTouch::Skip, Err(e)),
+    }
+}
+
+/// What a remote DELETE racing a keystore import of the same key leaves.
+#[derive(Debug, PartialEq)]
+struct AfterRacingImport {
+    import_ok: bool,
+    delete_ok: bool,
+    /// Read while the DELETE is parked between its removal and `cancel_monitoring`.
+    window_after_import: ForwardWindowStatus,
+    /// Read after the DELETE's late `cancel_monitoring`.
+    window_after_delete: ForwardWindowStatus,
+    local: bool,
+    sidecar_exists: bool,
+}
+
+/// 628-2: remote-only K has finished its window. A remote DELETE of K parks
+/// where the handler's `remove_op` returns, after the adapter removed K and
+/// before `on_delete`'s `cancel_monitoring`. A keystore import of K runs in
+/// that gap. K must get a fresh window, and the late cancel must not drop it.
+#[test]
+fn remote_delete_racing_local_import_keeps_the_new_window_and_sidecar() {
+    let f = remote_and_keystore_fixture();
+    let secret = SecretKey::generate();
+    let public = secret.public_key();
+    let pk = public.to_bytes();
+    let json = Keystore::encrypt(
+        &secret,
+        PASSWORD.as_bytes(),
+        "m/12381/3600/0/0/0",
+        crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+    )
+    .and_then(|keystore| keystore.to_json())
+    .expect("keystore json");
+    import_remote_only(&f, pk);
+    finish_window(&f.machine, &public);
+
+    let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let delete = std::thread::spawn({
+        let lifecycle = Arc::clone(&f.lifecycle);
+        let remote = Arc::clone(&f.remote);
+        move || {
+            let (_, deleted) = lifecycle.on_delete(&pk, ImportKind::Remote, || {
+                let op = remote_delete_op(&remote, &pk);
+                removed_tx.send(()).expect("test thread alive");
+                release_rx.recv_timeout(HANG_GUARD).expect("DELETE released");
+                op
+            });
+            deleted
+        }
+    });
+    removed_rx.recv_timeout(HANG_GUARD).expect("DELETE parked after its removal");
+    let imported = block_on(f.keystore.import_keystore(&json, PASSWORD));
+    let window_after_import = f.machine.status(&public);
+    release_tx.send(()).expect("DELETE thread alive");
+    let deleted = delete.join().expect("DELETE thread");
+
+    assert_eq!(
+        AfterRacingImport {
+            import_ok: imported.is_ok(),
+            delete_ok: matches!(deleted, Ok(true)),
+            window_after_import,
+            window_after_delete: f.machine.status(&public),
+            local: f.composite.has_local_key(&pk),
+            sidecar_exists: import_meta_path(f.keystore_dir.path(), &pk).exists(),
+        },
+        AfterRacingImport {
+            import_ok: true,
+            delete_ok: true,
+            window_after_import: ForwardWindowStatus::Pending,
+            window_after_delete: ForwardWindowStatus::Pending,
+            local: true,
+            sidecar_exists: true,
+        },
+        "import {imported:?}, delete {deleted:?}"
+    );
+}
+
+/// A remote DELETE of a key no other backend holds ends its window and drops
+/// it from the duty map.
+#[test]
+fn remote_delete_of_a_remote_only_key_cancels_its_window() {
+    let f = remote_and_keystore_fixture();
+    let public = SecretKey::generate().public_key();
+    let pk = public.to_bytes();
+    import_remote_only(&f, pk);
+    assert_eq!(f.machine.status(&public), ForwardWindowStatus::Pending);
+    assert!(f.pubkey_map.read().contains_key(&pk));
+
+    let (_, deleted) =
+        f.lifecycle.on_delete(&pk, ImportKind::Remote, || remote_delete_op(&f.remote, &pk));
+
+    assert!(matches!(deleted, Ok(true)), "got {deleted:?}");
+    assert_eq!(f.machine.status(&public), ForwardWindowStatus::Unmonitored);
+    assert!(!f.pubkey_map.read().contains_key(&pk), "K must leave the PubkeyMap");
+    assert!(!f.composite.has_any_backend(&pk));
+}
+
+/// The DELETE cancels K's window inside its `TrackedKeys` section: at the
+/// adapter's `after_change` point the window is already gone, and another
+/// `TrackedKeys` writer still has to wait.
+#[test]
+fn remote_delete_cancels_the_window_inside_its_tracked_keys_section() {
+    let f = remote_and_keystore_fixture();
+    let public = SecretKey::generate().public_key();
+    let pk = public.to_bytes();
+    import_remote_only(&f, pk);
+    let seen = Arc::new(parking_lot::Mutex::new(None));
+    f.remote.set_section_hook(Arc::new({
+        let machine = Arc::clone(&f.machine);
+        let tracked_keys = Arc::clone(&f.tracked_keys);
+        let seen = Arc::clone(&seen);
+        let public = public.clone();
+        move |point| {
+            if point != "after_change" {
+                return;
+            }
+            let before = tracked_keys.contended();
+            let writer = std::thread::spawn({
+                let tracked_keys = Arc::clone(&tracked_keys);
+                move || drop(tracked_keys.lock())
+            });
+            tracked_keys.wait_until_contended(before);
+            *seen.lock() = Some((machine.status(&public), writer));
+        }
+    }));
+
+    let deleted = f.remote.delete_remote_key(&pk);
+
+    let (window, writer) = seen.lock().take().expect("after_change ran");
+    writer.join().expect("writer thread");
+    assert!(matches!(deleted, Ok(true)), "got {deleted:?}");
+    assert_eq!(window, ForwardWindowStatus::Unmonitored, "window at after_change");
+}
+
+/// K is a remote key and also a local key that a secret-provider refresh
+/// loaded, which the keymanager duplicate checks do not see. The remote
+/// DELETE removes only the remote entry and keeps K's window.
+#[test]
+fn remote_delete_keeps_the_window_of_a_key_another_backend_holds() {
+    let f = remote_and_keystore_fixture();
+    let secret = SecretKey::generate();
+    let public = secret.public_key();
+    let pk = public.to_bytes();
+    import_remote_only(&f, pk);
+    f.composite.add_local_key(secret);
+
+    let (_, deleted) =
+        f.lifecycle.on_delete(&pk, ImportKind::Remote, || remote_delete_op(&f.remote, &pk));
+
+    assert!(matches!(deleted, Ok(true)), "got {deleted:?}");
+    assert!(!f.composite.has_remote_key(&pk));
+    assert!(f.composite.has_local_key(&pk));
+    assert_eq!(f.machine.status(&public), ForwardWindowStatus::Pending);
 }

@@ -92,6 +92,20 @@ pub struct BuiltKeymanagerApi {
     /// [`slashing::GroupCommitConfig`] into the gate.
     #[cfg(test)]
     pub(crate) import_window_gate: Arc<ImportWindowGate>,
+    /// Test-only: pins that every key-set writer holds `deps.tracked_keys`.
+    #[cfg(test)]
+    pub(crate) adapter_tracked_keys: AdapterTrackedKeys,
+    /// Test-only: pins that the remote DELETE cancels through `deps.admissions`.
+    #[cfg(test)]
+    pub(crate) remote_window_cancel: Option<Arc<KeyAdmissionService>>,
+}
+
+/// The [`crate::quiesce::TrackedKeys`] each keymanager adapter holds.
+#[cfg(test)]
+pub(crate) struct AdapterTrackedKeys {
+    pub(crate) keystore: Arc<crate::quiesce::TrackedKeys>,
+    pub(crate) remote: Arc<crate::quiesce::TrackedKeys>,
+    pub(crate) signing_quiesce: Arc<crate::quiesce::TrackedKeys>,
 }
 
 /// Errors from assembling or spawning the Keymanager API.
@@ -107,18 +121,25 @@ pub enum SpawnKeymanagerApiError {
 ///
 /// Hoists the previously duplicated `scan_and_rearm_gate` calls that lived in
 /// both branches of the forward-window vs opt-out monitor selection.
+///
+/// The forward-window monitor skips a DELETE's cancel while `composite` still
+/// holds the key in any backend.
 fn select_and_rearm_doppelganger_monitor(
     keystore_path: &Path,
     doppelganger_window: Duration,
     forward_window_machine: Option<Arc<ForwardWindowMachine>>,
     epoch_clock: Arc<MonotonicEpochClock>,
+    composite: Arc<CompositeSigner>,
 ) -> (Arc<dyn DoppelgangerMonitor>, DoppelgangerMonitorKind) {
     let (monitor, kind): (Arc<dyn DoppelgangerMonitor>, DoppelgangerMonitorKind) =
         if let Some(machine) = forward_window_machine {
             let clock = epoch_clock;
             let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> =
                 Arc::new(move || clock.current_epoch());
-            let mon = Arc::new(ForwardWindowMonitor::new(machine, epoch_provider));
+            let mon = Arc::new(
+                ForwardWindowMonitor::new(machine, epoch_provider)
+                    .with_backing(Arc::new(move |pk| composite.has_any_backend(pk))),
+            );
             (mon, DoppelgangerMonitorKind::ForwardWindow)
         } else {
             let mon = Arc::new(DoppelgangerDisabledMonitor::new());
@@ -180,6 +201,8 @@ pub fn build_keymanager_api(
     }
 
     let km_composite = deps.composite_signer;
+    // The remote DELETE cancels a key's window through the same admissions.
+    let window_cancel = Arc::clone(&deps.admissions);
     let kdf_budget = Arc::new(KdfBudget::new(KdfBudgetConfig::from_keymanager(&config.keymanager)));
     let keystore_mgr = Arc::new(
         KeystoreManagerAdapter::new(
@@ -236,6 +259,7 @@ pub fn build_keymanager_api(
         doppelganger_window,
         deps.forward_window_machine,
         deps.epoch_clock,
+        Arc::clone(&km_composite),
     );
 
     let remote_key_mgr = Arc::new(
@@ -245,7 +269,8 @@ pub fn build_keymanager_api(
             deps.pubkey_map,
             deps.key_gen_tx,
         )
-        .with_tracked_keys(Arc::clone(&deps.tracked_keys)),
+        .with_tracked_keys(Arc::clone(&deps.tracked_keys))
+        .with_window_cancel(window_cancel),
     );
 
     let config_mgr =
@@ -261,10 +286,19 @@ pub fn build_keymanager_api(
             slot_duration_ms,
         )));
 
-    let signing_quiesce: Arc<dyn SigningQuiesce> = Arc::new(
+    let signing_quiesce = Arc::new(
         SigningQuiesceAdapter::new(Arc::clone(&deps.quiesce_registry), deps.signer)
             .with_keystore_membership(tracked_keys, membership),
     );
+    #[cfg(test)]
+    let adapter_tracked_keys = AdapterTrackedKeys {
+        keystore: Arc::clone(&keystore_mgr.tracked_keys),
+        remote: Arc::clone(remote_key_mgr.tracked_keys()),
+        signing_quiesce: Arc::clone(signing_quiesce.tracked_keys()),
+    };
+    #[cfg(test)]
+    let remote_window_cancel = remote_key_mgr.window_cancel().cloned();
+    let signing_quiesce: Arc<dyn SigningQuiesce> = signing_quiesce;
 
     let server = keymanager_api::KeymanagerServer::new(
         keymanager_api::KeymanagerDeps {
@@ -304,6 +338,10 @@ pub fn build_keymanager_api(
         token_path,
         #[cfg(test)]
         import_window_gate: import_gate,
+        #[cfg(test)]
+        adapter_tracked_keys,
+        #[cfg(test)]
+        remote_window_cancel,
     }))
 }
 
