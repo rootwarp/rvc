@@ -77,7 +77,7 @@ pub const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 
 // ── Non-slashable core ────────────────────────────────────────────────────────
 
-/// Neutral failure of [`sign_nonslashable_core`].
+/// Neutral failure of `sign_nonslashable_core`.
 ///
 /// Wrappers map this onto [`SigningGateError`] or [`crate::SignerError`] so the
 /// two crate boundaries keep their own error types (ARCH-5c / ARCH-P1-6).
@@ -124,7 +124,7 @@ pub enum NonSlashableFailure {
 /// finishes inside the timeout.
 ///
 /// [`signing_allowed`]: doppelganger::signing_allowed
-pub async fn sign_nonslashable_core(
+pub(crate) async fn sign_nonslashable_core(
     enablement: &dyn SigningEnablement,
     signer: &dyn Signer,
     pubkey: &PublicKey,
