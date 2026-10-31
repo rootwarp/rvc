@@ -57,9 +57,11 @@ use doppelganger::SigningEnablement;
 use eth_types::{ForkName, Root};
 use observability::logging::TruncatedPubkey;
 use slashing::{
-    CommittedReservation, PendingAudit, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
-    SlashingDb, SlashingError, StagedAttestation, StagedBlock,
+    CommittedReservation, PubkeyScopedDb, ReconcileOutcome, ReservationKind, SlashingDb,
+    SlashingError,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use slashing::{PendingAudit, StagedAttestation, StagedBlock};
 use tracing::{error, warn};
 
 use crate::error::SigningGateError;
@@ -275,9 +277,10 @@ impl TimeoutPolicySource {
 // ── Staged row trait ──────────────────────────────────────────────────────────
 
 /// Minimal commit/discard surface shared by [`StagedBlock`] and [`StagedAttestation`].
-#[deprecated(
-    note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
-)]
+///
+/// Superseded by `reserve_then_sign` (ADR-005); compiled only for the pre/post
+/// comparison tests.
+#[cfg(any(test, feature = "test-utils"))]
 pub trait StagedRow {
     /// Persist the staged row (or close an idempotent re-sign txn).
     fn commit_row(self) -> Result<(), SlashingError>;
@@ -285,7 +288,7 @@ pub trait StagedRow {
     fn discard_row(self);
 }
 
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl StagedRow for StagedBlock<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -295,7 +298,7 @@ impl StagedRow for StagedBlock<'_> {
     }
 }
 
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl StagedRow for StagedAttestation<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -308,7 +311,7 @@ impl StagedRow for StagedAttestation<'_> {
 /// ARCH-1a compile bridge: `PubkeyScopedDb::stage_*` returns `(staged, PendingAudit)`.
 /// Emit the deferred audit only after commit/discard releases the connection mutex
 /// so a DB-reading tracing subscriber cannot deadlock (ADR-006 / C2).
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl<S: StagedRow> StagedRow for (S, PendingAudit) {
     fn commit_row(self) -> Result<(), SlashingError> {
         let result = self.0.commit_row();
@@ -406,8 +409,8 @@ impl SignHooks for StandardSlashableHooks {
 /// State for finishing a staged or reserved sign inside `spawn_blocking`.
 ///
 /// Created by [`sign_slashable`]. Production reserves through the single core
-/// consumer. Unit tests may still call [`SlashableSignSession::stage_then_sign`]
-/// directly (deprecated; retained for pre/post comparison).
+/// consumer. Tests may still call `stage_then_sign` directly (compiled only for
+/// tests and `test-utils`; retained for pre/post comparison).
 pub struct SlashableSignSession {
     handle: tokio::runtime::Handle,
     signer: Arc<dyn Signer>,
@@ -423,7 +426,7 @@ pub struct SlashableSignSession {
     hooks: Arc<dyn SignHooks>,
     op_name: &'static str,
     /// Used by [`Self::reserve_then_sign`] to build [`PubkeyScopedDb`] for
-    /// `reconcile_unsigned` (C2 / ARCH-5g). Unused by [`Self::stage_then_sign`].
+    /// `reconcile_unsigned` (C2 / ARCH-5g). Unused by `stage_then_sign`.
     slashing_db: Arc<SlashingDb>,
     /// Audit CN for scoped compensate (gate: caller mTLS CN; VC: `"local-vc"`).
     client_cn: String,
@@ -477,10 +480,9 @@ impl SlashableSignSession {
     ///
     /// `stage` is invoked on this blocking thread and must return a staged guard
     /// that lives only for the duration of this call (the `!Send` constraint).
-    #[deprecated(
-        note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
-    )]
-    #[allow(deprecated)]
+    /// Superseded by [`Self::reserve_then_sign`] (ADR-005); compiled only for the
+    /// pre/post comparison tests.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn stage_then_sign<S, F>(mut self, stage: F) -> Result<Vec<u8>, SigningGateError>
     where
         S: StagedRow,
@@ -581,8 +583,8 @@ impl SlashableSignSession {
 
     /// Reserve (commit) a history row, then sign, then dispatch on architecture §5.3.
     ///
-    /// Sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
-    /// [`StagedRow`] impl (VD-5.4): `discard_row` returns `()`, which would drop
+    /// Sibling of `stage_then_sign` (ARCH-5i / ADR-005). **Not** a
+    /// `StagedRow` impl (VD-5.4): `discard_row` returns `()`, which would drop
     /// the compensating-delete failure signal. Production calls this method
     /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
@@ -797,7 +799,7 @@ impl SlashableSignSession {
         }
     }
 
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn finish_timeout<S: StagedRow>(
         self,
         staged: S,
@@ -831,7 +833,7 @@ impl SlashableSignSession {
     }
 
     /// Ambiguous non-timeout signer failure: discard or retain per policy.
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn finish_ambiguous_error<S: StagedRow>(
         self,
         staged: S,
@@ -865,7 +867,7 @@ impl SlashableSignSession {
     }
 
     /// Commit staged row then return `SigningFailed` (history retained, not discarded).
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn retain_staged_row<S: StagedRow>(
         self,
         staged: S,
@@ -1579,6 +1581,94 @@ mod tests {
         assert_eq!(hooks.blocked.load(Ordering::SeqCst), 0);
         assert_eq!(hooks.tx_hold.load(Ordering::SeqCst), 1);
         assert_eq!(hooks.success.load(Ordering::SeqCst), 1);
+    }
+
+    /// Counts `sign` calls; a refusal on the reserve path must leave it at 0.
+    struct CountingSigner {
+        inner: Arc<dyn Signer>,
+        calls: Arc<AtomicU64>,
+    }
+    #[async_trait]
+    impl Signer for CountingSigner {
+        async fn sign(
+            &self,
+            signing_root: &Root,
+            pubkey: &[u8; 48],
+        ) -> Result<Signature, SigningError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.sign(signing_root, pubkey).await
+        }
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.inner.public_keys()
+        }
+    }
+
+    /// W4-S2: the evaluator's source > target refusal reaches the gate as a
+    /// slashable `SlashingBlocked` (HTTP 412), before any BLS call or row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sign_slashable_refuses_source_above_target_as_slashing_blocked() {
+        use slashing::AttestationSlashingViolation;
+
+        let sk = SecretKey::generate();
+        let (pubkey, inner) = make_local(sk);
+        let sign_calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> =
+            Arc::new(CountingSigner { inner, calls: Arc::clone(&sign_calls) });
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = ValidatorLockMap::new();
+        let hooks = Arc::new(CountingHooks::new());
+
+        let err = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: Arc::new(AlwaysEnabled),
+            signer,
+            signing_root: [0x55; 32],
+            sign_timeout: Duration::from_secs(4),
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+            op_name: "test_source_above_target",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Attestation { source_epoch: 20, target_epoch: 9 },
+            fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
+        })
+        .await
+        .expect_err("source above target must be refused");
+
+        assert!(
+            matches!(
+                &err,
+                SigningGateError::SlashingBlocked(SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::SourceExceedsTarget {
+                        source_epoch: 20,
+                        target_epoch: 9
+                    }
+                ))
+            ),
+            "expected SlashingBlocked(SourceExceedsTarget {{ 20, 9 }}), got {err:?}"
+        );
+        assert_eq!(hooks.blocked.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.success.load(Ordering::SeqCst), 0);
+        assert_eq!(sign_calls.load(Ordering::SeqCst), 0, "BLS must not be reached");
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        assert!(db.get_attestations(&pubkey_hex).expect("rows").is_empty());
+
+        match crate::classify(&err) {
+            crate::GateErrClass::SlashingBlocked {
+                client_message, is_slashable_violation, ..
+            } => {
+                assert!(is_slashable_violation, "a rule refusal, not a DB error");
+                assert!(
+                    client_message.contains("source epoch 20 is above target epoch 9"),
+                    "{client_message}"
+                );
+            }
+            other => panic!("expected the SlashingBlocked class, got {other:?}"),
+        }
     }
 
     /// Enablement re-check under the lock: a concurrent flip to disabled must refuse.

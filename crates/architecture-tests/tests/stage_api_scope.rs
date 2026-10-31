@@ -25,6 +25,18 @@
 //! and `.stage_then_sign(` are reported; a core.rs-shaped fixture (for_tests
 //! cfg, then production `stage_*`) is reported.
 //!
+//! W4-S2 adds two scans with their own synthetic self-tests:
+//!
+//! - 658-AC1: `stage.rs` and `group_commit.rs` make no production
+//!   `check_block(` / `check_attestation(` call; `evaluate.rs` makes exactly
+//!   one of each. The three files are named, not taken from the owner
+//!   exclusion, so `rules.rs` (definitions and `test-utils` oracles) stays out.
+//! - 660-AC1b: every `StagedRow` / `stage_then_sign` / `finish_timeout` /
+//!   `finish_ambiguous_error` / `retain_staged_row` item in
+//!   `crates/signer/src/{core,lib}.rs` carries the exact
+//!   `#[cfg(any(test, feature = "test-utils"))]` (or sits in a `#[cfg(test)]`
+//!   region), and no `#[deprecated` / `allow(deprecated)` remains.
+//!
 //! Hand-rolled walk, same idiom as `raw_spawn.rs` / `env_allowlist.rs`.
 //! No test name matches `.*(tree_hash|signing_root|_root)$` (A-5.10).
 
@@ -571,4 +583,275 @@ fn test_scan_visited_a_plausible_number_of_files() {
         files.iter().all(|(r, _)| !r.starts_with("crates/slashing/src/")),
         "owner crates/slashing/src must not be in the scanned set"
     );
+}
+
+// ── W4-S2 / 658-AC1: one EIP-3076 evaluator ───────────────────────────────────
+
+const EVALUATOR: &str = "crates/slashing/src/evaluate.rs";
+const EVALUATOR_CALLERS: &[&str] =
+    &["crates/slashing/src/stage.rs", "crates/slashing/src/group_commit.rs"];
+const RULE_FNS: &[&str] = &["check_block", "check_attestation"];
+
+/// Production `name(` calls: not a definition, not a longer identifier
+/// ending in `name`, not a comment, not inside a `#[cfg(test)]` region.
+fn find_production_rule_calls(rel: &str, src: &str, name: &str) -> Vec<StageHit> {
+    let needle = format!("{name}(");
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        if is_comment_only_line(line) {
+            continue;
+        }
+        let code = code_portion(line);
+        let calls = code
+            .match_indices(&needle)
+            .filter(|(at, _)| {
+                let before = &code[..*at];
+                let joins_ident =
+                    before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+                !joins_ident && !before.trim_end().ends_with("fn")
+            })
+            .count();
+        if calls == 0 || is_test_region(rel, src, i + 1) {
+            continue;
+        }
+        for _ in 0..calls {
+            out.push(StageHit {
+                rel_path: rel.to_string(),
+                line: (i + 1) as u32,
+                text: line.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+#[test]
+fn test_eip3076_rules_are_evaluated_in_one_place() {
+    let root = workspace_root();
+    let mut problems = Vec::new();
+    for rel in EVALUATOR_CALLERS {
+        let src = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel} must exist and be readable: {e}"));
+        for name in RULE_FNS {
+            let hits = find_production_rule_calls(rel, &src, name);
+            if !hits.is_empty() {
+                problems.push(format!(
+                    "{rel}: {} production `{name}(` call(s), expected 0 (route through \
+                     {EVALUATOR}):\n  {}",
+                    hits.len(),
+                    format_hits(&hits)
+                ));
+            }
+        }
+    }
+    match std::fs::read_to_string(root.join(EVALUATOR)) {
+        Ok(src) => {
+            for name in RULE_FNS {
+                let hits = find_production_rule_calls(EVALUATOR, &src, name);
+                if hits.len() != 1 {
+                    problems.push(format!(
+                        "{EVALUATOR}: {} production `{name}(` call(s), expected exactly 1:\n  {}",
+                        hits.len(),
+                        format_hits(&hits)
+                    ));
+                }
+            }
+        }
+        Err(e) => problems.push(format!("{EVALUATOR} must exist and be readable: {e}")),
+    }
+    assert!(
+        problems.is_empty(),
+        "658-AC1: the EIP-3076 rule assembly must live in one place.\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn test_rule_call_scanner_reports_a_synthetic_second_assembly() {
+    let rel = "crates/slashing/src/stage.rs";
+    let src = r#"
+use crate::rules::{check_attestation, check_block};
+
+pub(crate) fn check_block(pubkey: &str) {}
+
+fn stage() {
+    // let outcome = check_block(pubkey, &history, &watermarks, &candidate, strict);
+    let outcome = check_block(pubkey, &history, &watermarks, &candidate, strict)?;
+    let other = precheck_block(pubkey);
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        check_attestation(pk, &history, &watermarks, &candidate, false);
+    }
+}
+"#;
+    let hits = find_production_rule_calls(rel, src, "check_block");
+    assert_eq!(hits.len(), 1, "one production check_block( call expected; got {hits:?}");
+    assert_eq!(hits[0].line, 8);
+    assert!(hits[0].text.starts_with("let outcome = check_block("));
+    assert!(
+        find_production_rule_calls(rel, src, "check_attestation").is_empty(),
+        "a call inside #[cfg(test)] must not count"
+    );
+}
+
+// ── W4-S2 / 660-AC1b: the staged sign path is test-only ───────────────────────
+
+const STAGED_PATH_FILES: &[&str] = &["crates/signer/src/core.rs", "crates/signer/src/lib.rs"];
+const STAGED_PATH_ITEMS: &[&str] = &[
+    "StagedRow",
+    "stage_then_sign",
+    "finish_timeout",
+    "finish_ambiguous_error",
+    "retain_staged_row",
+];
+const TEST_UTILS_CFG: &str = r#"#[cfg(any(test, feature = "test-utils"))]"#;
+const DEPRECATION_NEEDLES: &[&str] = &["#[deprecated", "allow(deprecated)", "expect(deprecated)"];
+
+fn strip_visibility(code: &str) -> &str {
+    let t = code.trim_start();
+    for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(rest) = t.strip_prefix(vis) {
+            return rest.trim_start();
+        }
+    }
+    t
+}
+
+/// The `name` this line declares: `fn name`, `trait name`, `impl .. name for`,
+/// or a `use` of `name`.
+fn declared_staged_item(code: &str) -> Option<&'static str> {
+    let item = strip_visibility(code);
+    STAGED_PATH_ITEMS.iter().copied().find(|name| {
+        let after = |prefix: &str| {
+            item.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(*name))
+                .is_some_and(|rest| rest.starts_with(['(', '<', ' ', '{', ':', ';']))
+        };
+        after("fn ")
+            || after("trait ")
+            || (item.starts_with("impl") && item.contains(&format!(" {name} for ")))
+            || (item.starts_with("use ") && item.contains(&format!("::{name};")))
+    })
+}
+
+/// Attribute and doc lines directly above line `idx` (0-based).
+fn attrs_above<'a>(lines: &[&'a str], idx: usize) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for line in lines[..idx].iter().rev() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        if t.is_empty() || t.ends_with(['{', '}', ';']) {
+            break;
+        }
+        out.push(t);
+    }
+    out
+}
+
+#[derive(Debug, Default)]
+struct StagedPathScan {
+    found: Vec<&'static str>,
+    ungated: Vec<StageHit>,
+    deprecations: Vec<StageHit>,
+}
+
+fn scan_staged_path(rel: &str, src: &str, scan: &mut StagedPathScan) {
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if is_comment_only_line(line) {
+            continue;
+        }
+        let code = code_portion(line);
+        let hit = || StageHit {
+            rel_path: rel.to_string(),
+            line: (i + 1) as u32,
+            text: line.trim().into(),
+        };
+        if DEPRECATION_NEEDLES.iter().any(|n| code.contains(n)) {
+            scan.deprecations.push(hit());
+        }
+        let Some(name) = declared_staged_item(code) else {
+            continue;
+        };
+        scan.found.push(name);
+        let gated = attrs_above(&lines, i).contains(&TEST_UTILS_CFG);
+        if !gated && !is_test_region(rel, src, i + 1) {
+            scan.ungated.push(hit());
+        }
+    }
+}
+
+#[test]
+fn test_staged_row_path_is_test_only_and_not_deprecated() {
+    let root = workspace_root();
+    let mut scan = StagedPathScan::default();
+    for rel in STAGED_PATH_FILES {
+        let src = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel} must exist and be readable: {e}"));
+        scan_staged_path(rel, &src, &mut scan);
+    }
+    for name in STAGED_PATH_ITEMS {
+        assert!(
+            scan.found.contains(name),
+            "non-vacuity: no `{name}` item in {STAGED_PATH_FILES:?}; the scan no longer sees it"
+        );
+    }
+    assert!(
+        scan.ungated.is_empty() && scan.deprecations.is_empty(),
+        "660-AC1b: the staged sign path must compile only under {TEST_UTILS_CFG} and carry no \
+         deprecation.\nUngated items ({}):\n  {}\nDeprecation attributes ({}):\n  {}",
+        scan.ungated.len(),
+        format_hits(&scan.ungated),
+        scan.deprecations.len(),
+        format_hits(&scan.deprecations)
+    );
+}
+
+#[test]
+fn test_staged_path_scanner_reports_a_synthetic_ungated_item() {
+    let rel = "crates/signer/src/core.rs";
+    let src = r#"
+#[cfg(any(test, feature = "test-utils"))]
+pub use core::StagedRow;
+
+impl SlashableSignSession {
+    /// Ungated.
+    #[deprecated(
+        note = "superseded"
+    )]
+    pub fn stage_then_sign<S, F>(mut self, stage: F) {}
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn finish_timeout<S: StagedRow>(self) {}
+
+    #[cfg(feature = "test-utils")]
+    fn finish_ambiguous_error<S: StagedRow>(self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    fn retain_staged_row() {}
+}
+"#;
+    let mut scan = StagedPathScan::default();
+    scan_staged_path(rel, src, &mut scan);
+    assert_eq!(
+        scan.found,
+        [
+            "StagedRow",
+            "stage_then_sign",
+            "finish_timeout",
+            "finish_ambiguous_error",
+            "retain_staged_row"
+        ]
+    );
+    let ungated: Vec<u32> = scan.ungated.iter().map(|h| h.line).collect();
+    assert_eq!(ungated, [10, 16], "the ungated and the inexact cfg item must be reported");
+    assert_eq!(scan.deprecations.len(), 1, "#[deprecated must be reported; got {scan:?}");
+    assert_eq!(scan.deprecations[0].line, 7);
 }

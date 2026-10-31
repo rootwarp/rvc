@@ -324,6 +324,9 @@ mod tests {
                     target_epoch,
                     min_target,
                 } => AttOutcome::TargetBelowMin { target_epoch, min_target },
+                other @ AttestationSlashingViolation::SourceExceedsTarget { .. } => {
+                    AttOutcome::Other(other.to_string())
+                }
             },
             Err(SlashingError::BelowAttestationSourceWatermark {
                 source_epoch,

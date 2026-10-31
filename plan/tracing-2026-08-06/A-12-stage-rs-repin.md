@@ -8,10 +8,11 @@ architecture phase-5 entry criterion **E3**).
 
 | Field | Value |
 |---|---|
-| **A-12 / T19 pin blob** | `463ff36184a946a0eea0d4d4839a8bc04f74479c` |
+| **A-12 / T19 pin blob** | `f0f1dc5a8890b223464c9cc85fec719158a6c44c` |
+| **Previous blob pin** | `463ff36184a946a0eea0d4d4839a8bc04f74479c` (W4-S1a, #820) |
 | **Previous commit pin** | `22aa3de5bf5ed0c03ed571694dc3a5652e460613` (`22aa3de5`) |
-| **Role** | Byte baseline of `crates/slashing/src/stage.rs` after W4-S1a (#820) |
-| **Why a blob** | The range-check redesign is one commit. A commit cannot contain its own SHA, so T19 compares `git rev-parse HEAD:crates/slashing/src/stage.rs` to this blob. |
+| **Role** | Byte baseline of `crates/slashing/src/stage.rs` after W4-S2 (#832) |
+| **Why a blob** | Each redesign is one commit. A commit cannot contain its own SHA, so T19 compares `git rev-parse HEAD:crates/slashing/src/stage.rs` to this blob. |
 | **Why not `0ae9a09`** | CD-1: `stage.rs` changed under ARCH-5e (and follow-ons). Pinning `0ae9a09` would fail on tip. |
 | **CI** | `.github/workflows/ci.yml` job `check`, step **T19 — stage.rs byte-identical to A-12 pin** |
 
@@ -19,7 +20,7 @@ architecture phase-5 entry criterion **E3**).
 git rev-parse HEAD:crates/slashing/src/stage.rs
 ```
 
-must equal `463ff36184a946a0eea0d4d4839a8bc04f74479c` at every merge that retains
+must equal `f0f1dc5a8890b223464c9cc85fec719158a6c44c` at every merge that retains
 the T19 guard. Failure text in CI names **A-12** and points at this file.
 
 ## What A-12 was
@@ -64,17 +65,22 @@ When an authorized `stage.rs` redesign (ARCH-5e class) merges to `develop`:
    unchanged.
 
 A commit SHA cannot name itself, so the guard compares blobs. W4-S1a is the
-redesign that moved the pin off `22aa3de5`.
+redesign that moved the pin off `22aa3de5`; W4-S2 moved it off `463ff361`.
 
 **Previous pin** `22aa3de5bf5ed0c03ed571694dc3a5652e460613` is the tracing
 initiative-start tip (`fix(devnet): cheap k8 metrics empty-body check (#401)`).
 At that commit, `stage.rs` reflected the post-ARCH-5e surface.
 
-**Current pin** `463ff36184a946a0eea0d4d4839a8bc04f74479c` is the blob of
+**Previous blob pin** `463ff36184a946a0eea0d4d4839a8bc04f74479c` is the blob of
 `stage.rs` after W4-S1a (#820): out-of-range slots and epochs are refused
-before `pinned_gvr`, and every bind goes through `to_sql_i64`. That is not
-tracing instrumentation. T19 still rejects any other byte change, including
-`#[instrument]`.
+before `pinned_gvr`, and every bind goes through `to_sql_i64`.
+
+**Current pin** `f0f1dc5a8890b223464c9cc85fec719158a6c44c` is the blob of
+`stage.rs` after W4-S2 (#832): the two `stage_*` rule-check closures became one
+`crate::evaluate` call each (the EIP-3076 evaluator shared with group commit).
+`BEGIN IMMEDIATE`, the single `ROLLBACK` on `Err` and the guard hand-off are
+unchanged. That is not tracing instrumentation. T19 still rejects any other
+byte change, including `#[instrument]`.
 
 ## What this does *not* authorize
 

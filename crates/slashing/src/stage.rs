@@ -108,16 +108,12 @@ use parking_lot::MutexGuard;
 use rusqlite::Connection;
 
 use crate::db::to_sql_i64;
-use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
-use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
+use crate::evaluate::{evaluate_attestation, evaluate_block};
 use crate::metrics;
-use crate::rules::{
-    check_attestation, check_block, AttestationCandidate, AttestationVerdict,
-    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
-};
+use crate::rules::{AttestationVerdict, BlockVerdict};
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, Root, Slot};
 use observability::logging::TruncatedPubkey;
 
 /// Fixed audit origin written to the `client_cn` column on INSERT.
@@ -458,21 +454,13 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.fork_aware_strict(slot / SLOTS_PER_EPOCH);
-        // Run violation checks inside a closure so any error — whether a SQL
-        // I/O error from `?`-propagation or an EIP-3076 violation — funnels
-        // through a single ROLLBACK before we return. Without this wrapper a
-        // SQL error between `BEGIN IMMEDIATE` and the guard transfer would
-        // drop the MutexGuard with the transaction still open, leaving the
-        // connection in a broken "transaction within transaction" state.
-        let outcome = (|| -> Result<BlockVerdict, SlashingError> {
-            let watermark = read_watermark(&guard, pubkey.as_ref(), WatermarkKind::Block)?;
-
-            let history = TargetedSqlBlockHistory::new(&guard, pubkey.as_ref());
-            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
-            let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
-            check_block(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
-        })();
+        // Any evaluator error — whether a SQL I/O error from `?`-propagation
+        // or an EIP-3076 violation — funnels through a single ROLLBACK before
+        // we return. Without this a SQL error between `BEGIN IMMEDIATE` and
+        // the guard transfer would drop the MutexGuard with the transaction
+        // still open, leaving the connection in a broken "transaction within
+        // transaction" state.
+        let outcome = evaluate_block(self, &guard, pubkey.as_ref(), slot, signing_root_hex.clone());
 
         let outcome = match outcome {
             Ok(o) => o,
@@ -542,28 +530,17 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.fork_aware_strict(target_epoch);
-        // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
-        // funnels through a single ROLLBACK before we return.  See the
-        // matching note in `stage_block`.
-        let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
-            let wm_source =
-                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
-            let wm_target =
-                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
-
-            let history = TargetedSqlAttestationHistory::new(&guard, pubkey.as_ref());
-            let watermarks = AttestationWatermarks {
-                source: wm_source.map(|w| w as Epoch),
-                target: wm_target.map(|w| w as Epoch),
-            };
-            let candidate = AttestationCandidate {
-                source_epoch,
-                target_epoch,
-                signing_root: signing_root_hex.clone(),
-            };
-            check_attestation(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
-        })();
+        // Any evaluator error — SQL I/O or EIP-3076 — funnels through a
+        // single ROLLBACK before we return.  See the matching note in
+        // `stage_block`.
+        let outcome = evaluate_attestation(
+            self,
+            &guard,
+            pubkey.as_ref(),
+            source_epoch,
+            target_epoch,
+            signing_root_hex.clone(),
+        );
 
         let verdict = match outcome {
             Ok(v) => v,

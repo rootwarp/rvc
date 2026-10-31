@@ -19,18 +19,14 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::to_sql_i64;
-use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
-use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
-use crate::rules::{
-    check_attestation, check_block, AttestationCandidate, AttestationVerdict,
-    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
-};
+use crate::evaluate::{evaluate_attestation, evaluate_block};
+use crate::rules::{AttestationVerdict, BlockVerdict};
 use crate::stage::{
     persist_reserved_row, with_immediate_txn, CommittedReservation, ReservationKind, AUDIT_ORIGIN,
 };
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, Root, Slot};
 
 /// Operator knobs for slashing-DB group commit.
 ///
@@ -620,12 +616,7 @@ fn check_spec_in_txn(
     wait_eval_gate(db);
     match spec {
         ReserveSpec::Block { pubkey, slot, signing_root_hex, .. } => {
-            let strict = db.fork_aware_strict(*slot / SLOTS_PER_EPOCH);
-            let watermark = read_watermark(conn, pubkey, WatermarkKind::Block)?;
-            let history = TargetedSqlBlockHistory::new(conn, pubkey);
-            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
-            let candidate = BlockCandidate { slot: *slot, signing_root: signing_root_hex.clone() };
-            let outcome = check_block(pubkey, &history, &watermarks, &candidate, strict)?;
+            let outcome = evaluate_block(db, conn, pubkey, *slot, signing_root_hex.clone())?;
             let inserted = !matches!(outcome, BlockVerdict::Resign);
             Ok(CommittedReservation {
                 pubkey_hex: pubkey.clone(),
@@ -637,20 +628,14 @@ fn check_spec_in_txn(
         ReserveSpec::Attestation {
             pubkey, source_epoch, target_epoch, signing_root_hex, ..
         } => {
-            let strict = db.fork_aware_strict(*target_epoch);
-            let wm_source = read_watermark(conn, pubkey, WatermarkKind::AttestationSource)?;
-            let wm_target = read_watermark(conn, pubkey, WatermarkKind::AttestationTarget)?;
-            let history = TargetedSqlAttestationHistory::new(conn, pubkey);
-            let watermarks = AttestationWatermarks {
-                source: wm_source.map(|w| w as Epoch),
-                target: wm_target.map(|w| w as Epoch),
-            };
-            let candidate = AttestationCandidate {
-                source_epoch: *source_epoch,
-                target_epoch: *target_epoch,
-                signing_root: signing_root_hex.clone(),
-            };
-            let verdict = check_attestation(pubkey, &history, &watermarks, &candidate, strict)?;
+            let verdict = evaluate_attestation(
+                db,
+                conn,
+                pubkey,
+                *source_epoch,
+                *target_epoch,
+                signing_root_hex.clone(),
+            )?;
             let inserted = !matches!(verdict, AttestationVerdict::Duplicate);
             Ok(CommittedReservation {
                 pubkey_hex: pubkey.clone(),
