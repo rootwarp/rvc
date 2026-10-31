@@ -113,7 +113,7 @@ Import one or more keystores. Slashing protection data is imported first, before
 | Status | Meaning |
 |--------|---------|
 | `imported` | Key successfully imported and activated. The password is stored mode `0600` in `<keystore_dir>/.rvc.keymanager-secrets/` (directory mode `0700`) and is loaded on the next start, ahead of `--password-file`. The keystore file is `0x` plus the lowercase pubkey hex plus `.json`. |
-| `duplicate` | Key already exists |
+| `duplicate` | Key already exists: the pubkey is already a local key, or is already loaded in another key backend (an HTTP or gRPC remote signer). |
 | `error` | Import failed. A missing, non-lowercase, `0x`-prefixed, or mismatched `pubkey` field is reported by name and writes nothing. |
 
 ---
@@ -207,6 +207,8 @@ Import remote keys with their Web3Signer URLs.
   ]
 }
 ```
+
+- `duplicate`: the pubkey is already a remote key, or is already loaded in another key backend (a local key or a gRPC remote signer).
 
 ---
 
