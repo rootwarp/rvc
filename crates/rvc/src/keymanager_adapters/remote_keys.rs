@@ -197,8 +197,8 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
             self.composite_signer.remove_remote_key(pubkey);
 
             // Still under `tracked_keys`, and before K leaves `PubkeyMap`. A
-            // key that another backend holds keeps its window. The cancel may
-            // remove the force-window file.
+            // key that another backend holds keeps its window. The cancel never
+            // removes the force-window file.
             #[cfg(test)]
             self.run_section_hook("before_window_cancel");
             if let Some(admissions) = &self.window_cancel {

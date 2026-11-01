@@ -71,8 +71,9 @@ struct MachineStates {
     window_skip_blocked: bool,
     /// Pubkeys registered while the force-window file was present.
     ///
-    /// The file is one record for that whole set. It is removed only after
-    /// every one of them has reached `Safe` or been dropped.
+    /// The file is one record for that whole set. A cancel drops a key from
+    /// the set. The file is removed only when a window completes while the set
+    /// is empty.
     force_window_keys: HashSet<String>,
     /// `true` after at least one key was charged to the force-window file.
     force_window_owed: bool,
@@ -241,8 +242,9 @@ impl ForwardWindowMachine {
     }
 
     /// Remember the one-shot force-window file. `register` will not skip while
-    /// it is present. The file is deleted only after every key registered
-    /// while it was present has finished a full window.
+    /// it is present. The file is deleted only when a window completes, no key
+    /// registered while it was present is still in its window, and the latch
+    /// is clear. [`Self::cancel`] never deletes it.
     pub fn with_force_window_path(mut self, path: PathBuf) -> Self {
         self.force_window_path = Some(path);
         self
@@ -263,8 +265,9 @@ impl ForwardWindowMachine {
             || self.force_window_path.as_deref().is_some_and(path_blocks_skip)
     }
 
-    /// Delete the force-window file after every key that was registered while
-    /// it was present has finished, or been dropped.
+    /// Delete the force-window file. Only a completed window calls this, and
+    /// only when at least one key was charged to the file, the forced set is
+    /// empty, and the latch is clear. [`Self::cancel`] never calls it.
     ///
     /// A failed delete leaves the file, so the next boot still withholds skip.
     fn consume_force_window(&self) {
@@ -706,22 +709,17 @@ impl ForwardWindowMachine {
     ///
     /// [`ValidatorState::Detected`] stays. A DELETE then re-import in this process
     /// does not open a new window (FU-A2a).
+    ///
+    /// The key also leaves the force-window set, but a cancel never releases the
+    /// forced window: the file stays until a window completes.
     pub fn cancel(&self, pubkey: &crypto::PublicKey) {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let clear = {
-            let mut states = self.states.lock();
-            if matches!(states.by_pubkey.get(&pubkey_hex), Some(ValidatorState::Detected)) {
-                return;
-            }
-            states.by_pubkey.remove(&pubkey_hex);
-            states.force_window_keys.remove(&pubkey_hex);
-            states.force_window_owed
-                && states.force_window_keys.is_empty()
-                && !states.detected_latch
-        };
-        if clear {
-            self.consume_force_window();
+        let mut states = self.states.lock();
+        if matches!(states.by_pubkey.get(&pubkey_hex), Some(ValidatorState::Detected)) {
+            return;
         }
+        states.by_pubkey.remove(&pubkey_hex);
+        states.force_window_keys.remove(&pubkey_hex);
     }
 
     /// Drop finished keys from the force-window set. `true` when that set is
@@ -1130,6 +1128,26 @@ mod tests {
         ValidatorLivenessData { index: hex::encode(pk.to_bytes()), is_live: false }
     }
 
+    /// Set the latch through an imported key, which is not charged to the force file.
+    fn latch_through_an_imported_key(machine: &ForwardWindowMachine) {
+        let imported = pubkey();
+        machine.register_for_import(&imported, 100);
+        detect(machine, &imported, 101);
+        assert!(machine.detected_latch());
+    }
+
+    /// A new machine on the same path must not restart-skip a key with recent history.
+    fn assert_a_fresh_boot_does_not_skip(path: &std::path::Path) {
+        let later = force_machine(path.to_path_buf());
+        let again = pubkey();
+        later.register(&again, 100);
+        assert_eq!(
+            later.status(&again),
+            ForwardWindowStatus::Pending,
+            "epoch 100 with Prior(99) must not skip while the force file is there"
+        );
+    }
+
     /// F5: dropping one mid-window key leaves the force file for the other.
     #[test]
     fn cancel_one_forced_key_mid_window_keeps_the_file() {
@@ -1147,9 +1165,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F6: dropping the only mid-window key removes the file, so a later boot may skip.
+    /// F6: dropping the only mid-window key keeps the file. A later boot does
+    /// not skip, and the next completed window consumes the file.
     #[test]
-    fn cancel_the_only_forced_key_mid_window_removes_the_file() {
+    fn cancel_the_only_forced_key_mid_window_keeps_the_file_until_a_window_completes() {
         let (dir, path) = force_paths();
         let machine = force_machine(path.clone());
         let key = pubkey();
@@ -1157,15 +1176,107 @@ mod tests {
         assert_eq!(machine.status(&key), ForwardWindowStatus::Pending);
         machine.cancel(&key);
         assert_eq!(machine.status(&key), ForwardWindowStatus::Unmonitored);
-        assert!(!path.exists(), "no remaining forced key means the file is gone");
+        assert!(path.exists(), "a cancel does not release the forced window");
 
-        let later = force_machine(path);
+        let later = force_machine(path.clone());
         let again = pubkey();
         later.register(&again, 100);
-        assert!(
-            later.is_signing_enabled(&again),
-            "epoch 100 with Prior(99) skips once the force file is gone"
+        assert_eq!(
+            later.status(&again),
+            ForwardWindowStatus::Pending,
+            "epoch 100 with Prior(99) must not skip while the force file is there"
         );
+
+        let next = pubkey();
+        machine.register(&next, 100);
+        let _ = machine.observe_liveness(100, &[not_live(&next)], 101, crate::CLOSED_EPOCH_SLOT);
+        let _ = machine.observe_liveness(101, &[not_live(&next)], 102, crate::CLOSED_EPOCH_SLOT);
+        assert_eq!(machine.status(&next), ForwardWindowStatus::Safe);
+        assert!(!path.exists(), "a completed window consumes the force file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 747-3: with the latch set, cancelling the last forced `Pending` key keeps the file.
+    ///
+    /// The latch comes from an imported key, which is not charged to the file.
+    /// A detected forced key would stay in the forced set, so the set would not
+    /// be empty after the cancel and the latch would not be what keeps the file.
+    #[test]
+    fn cancel_a_pending_forced_key_while_latched_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        latch_through_an_imported_key(&machine);
+        let pending = pubkey();
+        machine.register(&pending, 101);
+        assert_eq!(machine.status(&pending), ForwardWindowStatus::Pending);
+        machine.cancel(&pending);
+        assert_eq!(machine.status(&pending), ForwardWindowStatus::Unmonitored);
+        assert!(path.exists(), "a cancel while latched keeps the force file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The production paths, after the only forced key is deleted: a live-only
+    /// pass or a tick that completes no window keeps the file, and a completed
+    /// window consumes it.
+    #[test]
+    fn production_ticks_after_a_cancel_keep_the_file_until_a_window_completes() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let deleted = pubkey();
+        machine.register(&deleted, 100);
+        machine.cancel(&deleted);
+        let _ = machine.apply_live_answers_only(&[]);
+        assert!(path.exists(), "a live-only pass with no answers keeps the file");
+        let in_flight = EpochLiveness { epoch: 100, samples: Some(vec![not_live(&deleted)]) };
+        let _ = machine.apply_live_answers_only(&[in_flight]);
+        assert!(path.exists(), "a live-only pass with a not-live answer keeps the file");
+        let _ = machine.apply_liveness_tick(&[], 101, crate::CLOSED_EPOCH_SLOT);
+        assert!(path.exists(), "a tick that completes no window keeps the file");
+
+        let key = pubkey();
+        machine.register(&key, 101);
+        let tick = |current: Epoch| {
+            let answers = [current - 1, current]
+                .map(|epoch| EpochLiveness { epoch, samples: Some(vec![not_live(&key)]) });
+            let _ = machine.apply_liveness_tick(&answers, current, crate::CLOSED_EPOCH_SLOT);
+        };
+        tick(102);
+        assert_eq!(machine.status(&key), ForwardWindowStatus::Pending);
+        assert!(path.exists(), "one epoch is not the window");
+        tick(103);
+        assert_eq!(machine.status(&key), ForwardWindowStatus::Safe);
+        assert!(!path.exists(), "a completed window consumes the force file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A forced key that completes its window while the latch is set keeps the file.
+    #[test]
+    fn a_window_completed_while_latched_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        latch_through_an_imported_key(&machine);
+        let forced = pubkey();
+        machine.register(&forced, 101);
+        let _ = machine.observe_liveness(101, &[not_live(&forced)], 102, crate::CLOSED_EPOCH_SLOT);
+        let _ = machine.observe_liveness(102, &[not_live(&forced)], 103, crate::CLOSED_EPOCH_SLOT);
+        assert_eq!(machine.status(&forced), ForwardWindowStatus::Safe);
+        assert!(path.exists(), "the latch keeps the force file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window completed by a key that was never charged to the file keeps it.
+    #[test]
+    fn a_window_completed_by_an_uncharged_key_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let imported = pubkey();
+        machine.register_for_import(&imported, 100);
+        let _ =
+            machine.observe_liveness(101, &[not_live(&imported)], 102, crate::CLOSED_EPOCH_SLOT);
+        let _ =
+            machine.observe_liveness(102, &[not_live(&imported)], 103, crate::CLOSED_EPOCH_SLOT);
+        assert_eq!(machine.status(&imported), ForwardWindowStatus::Safe);
+        assert!(path.exists(), "no key was charged to the force file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1187,6 +1298,94 @@ mod tests {
         assert_eq!(machine.status(&first), ForwardWindowStatus::Unmonitored);
         assert_eq!(machine.status(&second), ForwardWindowStatus::Pending);
         assert!(path.exists(), "the pending sibling keeps the force file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancel drops only its own key from the forced set.
+    #[test]
+    fn cancel_then_another_completed_window_keeps_the_file_while_a_forced_sibling_is_pending() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let first = pubkey();
+        let second = pubkey();
+        machine.register(&first, 100);
+        machine.register(&second, 100);
+        machine.cancel(&first);
+        let imported = pubkey();
+        machine.register_for_import(&imported, 100);
+        let _ =
+            machine.observe_liveness(101, &[not_live(&imported)], 102, crate::CLOSED_EPOCH_SLOT);
+        let _ =
+            machine.observe_liveness(102, &[not_live(&imported)], 103, crate::CLOSED_EPOCH_SLOT);
+        assert_eq!(machine.status(&imported), ForwardWindowStatus::Safe);
+        assert_eq!(machine.status(&second), ForwardWindowStatus::Pending);
+        assert!(path.exists(), "a forced sibling still in its window keeps the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling the last forced key while a finished sibling is still loaded keeps the file.
+    #[test]
+    fn cancel_the_last_forced_key_after_a_sibling_finished_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let pending = pubkey();
+        let finished = pubkey();
+        machine.register(&pending, 100);
+        machine.register(&finished, 100);
+        let _ =
+            machine.observe_liveness(100, &[not_live(&finished)], 101, crate::CLOSED_EPOCH_SLOT);
+        let _ =
+            machine.observe_liveness(101, &[not_live(&finished)], 102, crate::CLOSED_EPOCH_SLOT);
+        assert_eq!(machine.status(&finished), ForwardWindowStatus::Safe);
+        machine.cancel(&pending);
+        assert_eq!(machine.status(&finished), ForwardWindowStatus::Safe);
+        assert!(path.exists(), "a cancel keeps the force file while a finished key is loaded");
+        assert_a_fresh_boot_does_not_skip(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling an import, which was never charged to the file, keeps it.
+    #[test]
+    fn cancel_an_uncharged_import_after_the_forced_set_emptied_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let forced = pubkey();
+        let imported = pubkey();
+        machine.register(&forced, 100);
+        machine.register_for_import(&imported, 100);
+        machine.cancel(&forced);
+        assert!(path.exists(), "a cancel keeps the force file while an import is loaded");
+        machine.cancel(&imported);
+        assert_eq!(machine.status(&imported), ForwardWindowStatus::Unmonitored);
+        assert!(path.exists(), "cancelling an uncharged import keeps the force file");
+        assert_a_fresh_boot_does_not_skip(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling a key the machine never registered keeps the file.
+    #[test]
+    fn cancel_an_unknown_key_after_the_forced_set_emptied_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let forced = pubkey();
+        machine.register(&forced, 100);
+        machine.cancel(&forced);
+        machine.cancel(&pubkey());
+        assert!(path.exists(), "cancelling an unknown key keeps the force file");
+        assert_a_fresh_boot_does_not_skip(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no key charged to the file, a cancel keeps it.
+    #[test]
+    fn cancel_with_no_key_charged_keeps_the_file() {
+        let (dir, path) = force_paths();
+        let machine = force_machine(path.clone());
+        let imported = pubkey();
+        machine.register_for_import(&imported, 100);
+        machine.cancel(&imported);
+        assert!(path.exists(), "a cancel keeps the force file when no key was charged to it");
+        assert_a_fresh_boot_does_not_skip(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

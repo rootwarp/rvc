@@ -267,3 +267,77 @@ fn test_import_with_recent_history_stays_pending() {
     );
     assert!(!machine.is_signing_enabled(&pk));
 }
+
+/// W4-K6c: a keymanager DELETE never releases the doppelganger force window.
+///
+/// Each delete meets a different condition a consume-on-cancel could key off:
+/// no key charged, a finished key still loaded, an uncharged import, and a
+/// key the machine never registered.
+#[test]
+fn test_keymanager_delete_never_releases_the_force_window() {
+    use doppelganger::{EpochLiveness, ForwardWindowStatus, ValidatorLivenessData};
+
+    struct RecentPrior;
+    impl slashing::SlashingDbReader for RecentPrior {
+        fn last_signed_attestation(
+            &self,
+            _pubkey: &str,
+            _gvr: &Root,
+        ) -> Option<slashing::TargetEpoch> {
+            Some(99)
+        }
+    }
+    let boot = || ForwardWindowMachine::new(Arc::new(RecentPrior), 1, [0xaeu8; 32]);
+    let new_key = || SecretKey::generate().public_key();
+
+    let data_dir = TempDir::new().unwrap();
+    crate::detection_marker::write_force_window(data_dir.path()).expect("force file");
+    let force_file = crate::detection_marker::force_window_path(data_dir.path());
+    let machine = Arc::new(boot().with_force_window_path(force_file.clone()));
+    let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 100);
+    let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch_provider);
+    let delete = |pk: &crypto::PublicKey| monitor.cancel_monitoring(&pk.to_bytes());
+
+    let imported = new_key();
+    monitor.start_monitoring(imported.to_bytes());
+    delete(&imported);
+    assert!(force_file.exists(), "a DELETE with no key charged keeps the force file");
+
+    let deleted = new_key();
+    let finished = new_key();
+    machine.register(&deleted, 100);
+    machine.register(&finished, 100);
+    for current in [101, 102] {
+        let answers = [current - 1, current].map(|epoch| EpochLiveness {
+            epoch,
+            samples: Some(vec![ValidatorLivenessData {
+                index: hex::encode(finished.to_bytes()),
+                is_live: false,
+            }]),
+        });
+        let _ = machine.apply_liveness_tick(&answers, current, doppelganger::CLOSED_EPOCH_SLOT);
+    }
+    assert_eq!(machine.status(&finished), ForwardWindowStatus::Safe);
+    delete(&deleted);
+    assert!(force_file.exists(), "a DELETE with a finished key loaded keeps the force file");
+
+    let later_import = new_key();
+    monitor.start_monitoring(later_import.to_bytes());
+    delete(&later_import);
+    assert!(force_file.exists(), "a DELETE of an uncharged import keeps the force file");
+    delete(&new_key());
+    assert!(force_file.exists(), "a DELETE of an unknown key keeps the force file");
+
+    let control = new_key();
+    let without = boot();
+    without.register(&control, 100);
+    assert_eq!(without.status(&control), ForwardWindowStatus::Safe, "this history skips");
+    let restarted = boot().with_force_window_path(force_file);
+    let again = new_key();
+    restarted.register(&again, 100);
+    assert_eq!(
+        restarted.status(&again),
+        ForwardWindowStatus::Pending,
+        "the next boot must not restart-skip while the force file is there"
+    );
+}
