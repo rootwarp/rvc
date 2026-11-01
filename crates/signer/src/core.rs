@@ -436,6 +436,12 @@ pub struct SlashableSignSession {
     fork_name: Option<ForkName>,
     /// Re-checked after the slashing-DB reservation and before the BLS call.
     enablement: Arc<dyn SigningEnablement>,
+    /// The caller task's beacon admission, captured right after the
+    /// under-lock check (task-locals are not readable on the blocking
+    /// thread). Re-checked after the doppelganger check, before BLS.
+    admission: crate::CapturedAdmission,
+    /// Duty `admission` is checked for.
+    duty: doppelganger::SigningDuty,
 }
 
 impl SlashableSignSession {
@@ -473,6 +479,8 @@ impl SlashableSignSession {
             gvr: [0u8; 32],
             fork_name: None,
             enablement: Arc::new(crate::AlwaysEnabled),
+            admission: crate::CapturedAdmission::Missing { revokes: false },
+            duty: doppelganger::SigningDuty::Block,
         }
     }
 
@@ -588,9 +596,13 @@ impl SlashableSignSession {
     /// the compensating-delete failure signal. Production calls this method
     /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
-    /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → sign →
-    /// §5.3 table. `on_tx_hold_ms` keeps the ARCH-5b window (reserve-start →
-    /// sign-return). The reserve-only series is observed at reserve return.
+    /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → doppelganger
+    /// → beacon admission → sign → §5.3 table. A doppelganger refusal keeps the
+    /// reserved row. An admission refusal deletes the row this call inserted
+    /// (no backend has seen the root; a failed delete keeps it) and returns
+    /// [`SigningGateError::BeaconAdmissionRevoked`]. `on_tx_hold_ms` keeps the
+    /// ARCH-5b window (reserve-start → sign-return, or → the admission
+    /// refusal). The reserve-only series is observed at reserve return.
     pub fn reserve_then_sign<F>(mut self, reserve: F) -> Result<Vec<u8>, SigningGateError>
     where
         F: FnOnce() -> Result<CommittedReservation, SlashingError>,
@@ -645,6 +657,20 @@ impl SlashableSignSession {
                 "sign_slashable: blocked by doppelganger gate after reserve, before BLS"
             );
             return Err(SigningGateError::BlockedByDoppelganger);
+        }
+
+        // Last check before BLS, on the admission captured on the caller task.
+        // No backend has seen the root, so the row this call inserted is deleted.
+        if crate::admission_revoked_by(&self.admission, self.duty) {
+            let reconciled = self.reconcile_reservation(&reservation);
+            self.hooks.on_tx_hold_ms(tx_start.elapsed().as_secs_f64() * 1000.0);
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                reconciled,
+                "reserve_then_sign: beacon node admission revoked after reserve, before BLS"
+            );
+            return Err(SigningGateError::BeaconAdmissionRevoked);
         }
 
         let sign_result = self.handle.block_on(tokio::time::timeout(
@@ -1005,15 +1031,19 @@ pub trait PreReserveBarrier: Send + Sync {
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU),
 ///    then the caller task's beacon admission scope: a generation that moved
 ///    during the lock wait returns [`SigningGateError::BeaconAdmissionRevoked`]
-///    before any reservation. Test builds may then park on a pre-reserve
-///    barrier while that lock is still held. The hook is compiled out unless
-///    `test` / `test-utils` is on.
+///    before any reservation. That scope is then captured for step 4, on this
+///    task. Test builds may then park on a pre-reserve barrier while that lock
+///    is still held. The hook is compiled out unless `test` / `test-utils` is
+///    on.
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
 /// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
-///    re-check enablement after that reservation and before the BLS call,
-///    then [`SlashableSignSession::reserve_then_sign`] signs with timeout and
-///    reconciles per policy. A refusal after reserve leaves the committed row.
+///    re-check enablement, then the admission captured in step 2, after that
+///    reservation and before the BLS call, then
+///    [`SlashableSignSession::reserve_then_sign`] signs with timeout and
+///    reconciles per policy. A doppelganger refusal after reserve leaves the
+///    committed row. An admission refusal deletes the row this call inserted
+///    (a failed delete keeps it).
 ///
 /// # Errors
 ///
@@ -1192,6 +1222,8 @@ where
         );
         return Err(SigningGateError::BeaconAdmissionRevoked);
     }
+    // On this task: the blocking thread cannot read the task-locals.
+    let admission = crate::capture_admission();
 
     // Test-only: still holding the per-pubkey lock, after the enablement and
     // admission re-checks and before reserve. Production builds skip this entirely.
@@ -1228,6 +1260,8 @@ where
         gvr: req.gvr,
         fork_name: req.fork_name,
         enablement: Arc::clone(&req.enablement),
+        admission,
+        duty: req.kind.signing_duty(),
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1259,6 +1293,7 @@ mod tests {
 
     use async_trait::async_trait;
     use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError};
+    use slashing::metrics::reconcile_outcome;
     use slashing::SlashingDb;
 
     const GVR: Root = [0xc0; 32];
@@ -1300,6 +1335,12 @@ mod tests {
                 tx_hold: AtomicU64::new(0),
                 success: AtomicU64::new(0),
             }
+        }
+
+        /// `[safe, blocked, tx_hold, success]`.
+        fn counts(&self) -> [u64; 4] {
+            [&self.safe, &self.blocked, &self.tx_hold, &self.success]
+                .map(|c| c.load(Ordering::SeqCst))
         }
     }
     impl SignHooks for CountingHooks {
@@ -1703,6 +1744,7 @@ mod tests {
         kind: SlashableKind,
         /// `None` installs no scope (the `test-utils` missing-scope rule).
         admission: Option<crate::BeaconAdmission>,
+        hooks: Arc<dyn SignHooks>,
     }
 
     /// Spawn [`sign_slashable`] while the caller holds the per-pubkey lock and
@@ -1714,7 +1756,7 @@ mod tests {
     async fn spawn_parked_on_lock(
         p: ParkedSign,
     ) -> tokio::task::JoinHandle<Result<Vec<u8>, SigningGateError>> {
-        let ParkedSign { locks, pubkey, enablement, signer, db, kind, admission } = p;
+        let ParkedSign { locks, pubkey, enablement, signer, db, kind, admission, hooks } = p;
         let pubkey_bytes = pubkey.to_bytes();
         let probe = Arc::clone(&locks);
         let before = lock_handles(&probe, &pubkey_bytes);
@@ -1731,7 +1773,7 @@ mod tests {
                     signing_root: [0x44; 32],
                     sign_timeout: Duration::from_secs(4),
                     policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                    hooks: Arc::new(NoopSignHooks),
+                    hooks,
                     op_name: "test_parked_sign",
                     slashing_db: db,
                     client_cn: "test".into(),
@@ -1778,6 +1820,7 @@ mod tests {
             db: Arc::clone(&db),
             kind: SlashableKind::Block { slot: 13 },
             admission: None,
+            hooks: Arc::new(NoopSignHooks),
         })
         .await;
 
@@ -1817,6 +1860,7 @@ mod tests {
                 crate::BeaconAdmission::new(0, Arc::clone(&generations[0])),
                 |admission, g| admission.and_generation(g.load(Ordering::Acquire), Arc::clone(g)),
             );
+            let hooks = Arc::new(CountingHooks::new());
 
             let held = locks.lock(&pubkey_bytes).await;
             let join = spawn_parked_on_lock(ParkedSign {
@@ -1827,6 +1871,7 @@ mod tests {
                 db: Arc::clone(&db),
                 kind: SlashableKind::Attestation { source_epoch: 3, target_epoch: 4 },
                 admission: Some(admission),
+                hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
             })
             .await;
             if let Some(i) = bumped {
@@ -1847,6 +1892,11 @@ mod tests {
                 assert!(
                     matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
                     "{case}: expected BeaconAdmissionRevoked, got {result:?}"
+                );
+                assert_eq!(
+                    hooks.counts(),
+                    [0, 0, 0, 0],
+                    "{case}: refused before reserve: hooks [safe, blocked, tx_hold, success]"
                 );
             } else {
                 result.unwrap_or_else(|e| panic!("{case}: an unchanged admission signs: {e:?}"));
@@ -1878,6 +1928,7 @@ mod tests {
             db: Arc::clone(&db),
             kind: SlashableKind::Block { slot: 21 },
             admission: Some(crate::BeaconAdmission::new(0, Arc::clone(&generation))),
+            hooks: Arc::new(NoopSignHooks),
         })
         .await;
         enablement.enabled.store(false, Ordering::SeqCst);
@@ -1911,6 +1962,7 @@ mod tests {
                 Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
             let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
             let locks = ValidatorLockMap::new();
+            let hooks = Arc::new(CountingHooks::new());
 
             let result =
                 crate::require_beacon_admission_scope(sign_slashable(SignSlashableRequest {
@@ -1921,7 +1973,7 @@ mod tests {
                     signing_root: [0x66; 32],
                     sign_timeout: Duration::from_secs(4),
                     policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                    hooks: Arc::new(NoopSignHooks),
+                    hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
                     op_name: "test_missing_scope",
                     slashing_db: Arc::clone(&db),
                     client_cn: "test".into(),
@@ -1944,9 +1996,451 @@ mod tests {
                 blocks.is_empty() && attestations.is_empty(),
                 "{kind:?}: no slashing row may be written: {blocks:?} {attestations:?}"
             );
+            assert_eq!(
+                hooks.counts(),
+                [0, 0, 0, 0],
+                "{kind:?}: refused before reserve: hooks [safe, blocked, tx_hold, success]"
+            );
             assert!(
                 locks.get(&pubkey_bytes).try_lock().is_ok(),
                 "{kind:?}: the per-validator lock must be free once the sign returns"
+            );
+        }
+    }
+
+    // ── W4-S4b: admission re-check after the reservation ──────────────────────
+
+    /// Doppelganger double: detection closes `is_signing_enabled` and opens
+    /// `blocked_by_doppelganger` at once.
+    struct DetectableEnablement {
+        detected: AtomicBool,
+    }
+    impl SigningEnablement for DetectableEnablement {
+        fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+            !self.detected.load(Ordering::SeqCst)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            self.detected.load(Ordering::SeqCst)
+        }
+    }
+
+    fn reconcile_count(kind: &str, outcome: &str) -> u64 {
+        slashing::metrics::RVC_SLASHING_RECONCILE_TOTAL.with_label_values(&[kind, outcome]).get()
+    }
+
+    fn slashing_rows(db: &SlashingDb, pubkey_hex: &str, kind: SlashableKind) -> usize {
+        match kind {
+            SlashableKind::Block { .. } => db.get_blocks(pubkey_hex).expect("block rows").len(),
+            SlashableKind::Attestation { .. } => {
+                db.get_attestations(pubkey_hex).expect("attestation rows").len()
+            }
+        }
+    }
+
+    struct AfterReserveRun {
+        result: Result<Vec<u8>, SigningGateError>,
+        bls_calls: u64,
+        /// Slashing rows for the pubkey once the sign returned.
+        rows: usize,
+        hooks: Arc<CountingHooks>,
+    }
+
+    /// `sign_slashable` under `admission`, with a `ResolveUnderLock` closure
+    /// that runs `after_reserve` on its second call. That call is the SEC-1
+    /// re-resolve inside `reserve_then_sign`: after the reservation, before the
+    /// doppelganger and admission checks and BLS.
+    ///
+    /// Deliberately not inside `require_beacon_admission_scope`: a capture
+    /// that lost the scope to the blocking thread reads as open and signs.
+    async fn sign_with_after_reserve_hook(
+        kind: SlashableKind,
+        policy: TimeoutPolicy,
+        admission: crate::BeaconAdmission,
+        enablement: Arc<dyn SigningEnablement>,
+        db: Arc<SlashingDb>,
+        after_reserve: impl Fn() + Send + Sync + 'static,
+    ) -> AfterReserveRun {
+        let (pubkey, inner) = make_local(SecretKey::generate());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> = Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+        let hooks = Arc::new(CountingHooks::new());
+        let locks = ValidatorLockMap::new();
+        let resolves = Arc::new(AtomicU64::new(0));
+        let rows_at_hook = Arc::new(AtomicU64::new(u64::MAX));
+        let (resolves_c, rows_c, db_c, pk_c) =
+            (Arc::clone(&resolves), Arc::clone(&rows_at_hook), Arc::clone(&db), pubkey_hex.clone());
+        let resolve = move || {
+            if resolves_c.fetch_add(1, Ordering::SeqCst) == 1 {
+                rows_c.store(slashing_rows(&db_c, &pk_c, kind) as u64, Ordering::SeqCst);
+                after_reserve();
+            }
+            policy
+        };
+
+        let result = crate::with_beacon_admission(
+            admission,
+            sign_slashable(SignSlashableRequest {
+                locks: &locks,
+                pubkey: &pubkey,
+                enablement,
+                signer,
+                signing_root: [0x77; 32],
+                sign_timeout: Duration::from_secs(4),
+                policy: TimeoutPolicySource::ResolveUnderLock(Arc::new(resolve)),
+                hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+                op_name: "test_after_reserve",
+                slashing_db: Arc::clone(&db),
+                client_cn: "test".into(),
+                gvr: GVR,
+                kind,
+                fork_name: None,
+                #[cfg(any(test, feature = "test-utils"))]
+                pre_reserve_barrier: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resolves.load(Ordering::SeqCst), 2, "{kind:?}: policy resolved twice");
+        assert_eq!(
+            rows_at_hook.load(Ordering::SeqCst),
+            1,
+            "{kind:?}: the hook must run after the reservation committed"
+        );
+        assert!(
+            locks.get(&pubkey_bytes).try_lock().is_ok(),
+            "{kind:?}: the per-validator lock must be free once the sign returns"
+        );
+        AfterReserveRun {
+            result,
+            bls_calls: calls.load(Ordering::SeqCst),
+            rows: slashing_rows(&db, &pubkey_hex, kind),
+            hooks,
+        }
+    }
+
+    /// W4-S4b (766-1): a generation that moves after the reservation refuses
+    /// before BLS and deletes the reserved row under either timeout policy:
+    /// no backend has seen the root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_admission_recheck_after_reserve_before_bls() {
+        let cases = [
+            ("discard, bumped", TimeoutPolicy::DiscardStagedRow, true),
+            ("retain, bumped", TimeoutPolicy::RetainStagedRow, true),
+            ("discard, unchanged (control)", TimeoutPolicy::DiscardStagedRow, false),
+        ];
+        for (case, policy, bump) in cases {
+            let generation = Arc::new(AtomicU64::new(0));
+            let moved = Arc::clone(&generation);
+            let deleted_before = reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::DELETED);
+            let run = sign_with_after_reserve_hook(
+                SlashableKind::Block { slot: 51 },
+                policy,
+                crate::BeaconAdmission::new(0, generation),
+                Arc::new(AlwaysEnabled),
+                Arc::new(SlashingDb::open_in_memory().expect("db")),
+                move || {
+                    if bump {
+                        moved.fetch_add(1, Ordering::Release);
+                    }
+                },
+            )
+            .await;
+            let hooks = run.hooks.counts();
+
+            if !bump {
+                run.result
+                    .unwrap_or_else(|e| panic!("{case}: an unchanged admission signs: {e:?}"));
+                assert_eq!(run.bls_calls, 1, "{case}: one BLS call");
+                assert_eq!(run.rows, 1, "{case}: the block row stays");
+                continue;
+            }
+            assert_eq!(run.bls_calls, 0, "{case}: BLS must not be reached");
+            assert_eq!(run.rows, 0, "{case}: the reserved block row must be deleted");
+            // Lower bound: the counter is process-global (`cargo test` shares it).
+            assert!(
+                reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::DELETED) > deleted_before,
+                "{case}: rvc_slashing_reconcile_total{{kind=block,outcome=deleted}} must move"
+            );
+            assert!(
+                matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{case}: expected BeaconAdmissionRevoked, got {:?}",
+                run.result
+            );
+            assert_eq!(hooks, [1, 0, 1, 0], "{case}: hooks [safe, blocked, tx_hold, success]");
+        }
+    }
+
+    /// W4-S4b: the compensating delete fails, so the reserved row stays
+    /// (fail closed) and the sign is still refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_refusal_keeps_the_row_when_reconcile_fails() {
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (moved, faulty) = (Arc::clone(&generation), Arc::clone(&db));
+        let failed_before = reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::FAILED);
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Block { slot: 53 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, generation),
+            Arc::new(AlwaysEnabled),
+            db,
+            move || {
+                moved.fetch_add(1, Ordering::Release);
+                faulty.fail_next_commits(1);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 1, "a failed delete keeps the reserved row");
+        assert!(
+            reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::FAILED) > failed_before,
+            "rvc_slashing_reconcile_total{{kind=block,outcome=failed}} must move"
+        );
+        assert!(
+            matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+            "a failed delete still refuses; got {:?}",
+            run.result
+        );
+    }
+
+    /// W4-S4b: the second of two attached generations moves after the
+    /// reservation of an attestation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_admission_recheck_after_reserve_for_an_attestation() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let proposer = Arc::new(AtomicU64::new(7));
+        let moved = Arc::clone(&proposer);
+        let deleted_before = reconcile_count(tx_hold_kind::ATTESTATION, reconcile_outcome::DELETED);
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Attestation { source_epoch: 8, target_epoch: 9 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, primary).and_generation(7, proposer),
+            Arc::new(AlwaysEnabled),
+            Arc::new(SlashingDb::open_in_memory().expect("db")),
+            move || {
+                moved.fetch_add(1, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 0, "the reserved attestation row must be deleted");
+        assert!(
+            reconcile_count(tx_hold_kind::ATTESTATION, reconcile_outcome::DELETED) > deleted_before,
+            "rvc_slashing_reconcile_total{{kind=attestation,outcome=deleted}} must move"
+        );
+        assert!(
+            matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+            "expected BeaconAdmissionRevoked, got {:?}",
+            run.result
+        );
+    }
+
+    /// W4-S4b: detected and revoked after the reservation. Doppelganger is
+    /// checked first, so the refusal is `BlockedByDoppelganger` and the row
+    /// stays (a doppelganger may sign the same duty).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doppelganger_wins_after_reserve_and_keeps_the_row() {
+        let enablement = Arc::new(DetectableEnablement { detected: AtomicBool::new(false) });
+        let generation = Arc::new(AtomicU64::new(0));
+        let (detect, moved) = (Arc::clone(&enablement), Arc::clone(&generation));
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Block { slot: 55 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, generation),
+            enablement,
+            Arc::new(SlashingDb::open_in_memory().expect("db")),
+            move || {
+                detect.detected.store(true, Ordering::SeqCst);
+                moved.fetch_add(1, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 1, "a doppelganger refusal keeps the reserved row");
+        assert!(
+            matches!(run.result, Err(SigningGateError::BlockedByDoppelganger)),
+            "doppelganger must win over a moved admission after reserve; got {:?}",
+            run.result
+        );
+    }
+
+    /// `fmt` output buffer for a thread-local subscriber.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// W4-S4b: the after-reserve refusal logs one WARN with `reconciled` and
+    /// a truncated pubkey; `reconciled=false` when the delete fails. The
+    /// refusal returns before `block_on`, so the session runs on this thread
+    /// and a thread-local subscriber sees it.
+    #[test]
+    fn test_reserve_then_sign_admission_refusal_warns_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let _context = runtime.enter();
+        for (case, delete_fails) in [("row deleted", false), ("delete fails", true)] {
+            let (pubkey, signer) = make_local(SecretKey::generate());
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let mut session = session_for_reserve(
+                signer,
+                &pubkey,
+                [0x78; 32],
+                Duration::from_secs(4),
+                TimeoutPolicy::DiscardStagedRow,
+                None,
+                Arc::clone(&db),
+                Arc::new(NoopSignHooks),
+            );
+            session.admission = crate::CapturedAdmission::Missing { revokes: true };
+            let logs = LogBuf::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let (db_r, pk) = (Arc::clone(&db), pubkey_hex.clone());
+            let result = tracing::subscriber::with_default(subscriber, || {
+                session.reserve_then_sign(move || {
+                    let reservation =
+                        db_r.reserve_block(&pk, 57, Some(hex::encode([0x78; 32])), &GVR);
+                    if delete_fails {
+                        db_r.fail_next_commits(1);
+                    }
+                    reservation
+                })
+            });
+
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{case}: expected BeaconAdmissionRevoked, got {result:?}"
+            );
+            let rows = db.get_blocks(&pubkey_hex).expect("rows").len();
+            assert_eq!(rows, usize::from(delete_fails), "{case}: block rows after the refusal");
+            let text = String::from_utf8(logs.0.lock().clone()).expect("utf8 log");
+            let warns: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("beacon node admission revoked after reserve, before BLS"))
+                .collect();
+            assert_eq!(warns.len(), 1, "{case}: one refusal line: {text}");
+            let reconciled = format!("reconciled={}", !delete_fails);
+            assert!(
+                warns[0].contains("WARN") && warns[0].contains(&reconciled),
+                "{case}: expected {reconciled}: {}",
+                warns[0]
+            );
+            assert_eq!(
+                text.lines()
+                    .filter(|l| {
+                        l.contains("ERROR")
+                            && l.contains("reserve_then_sign: compensating delete failed")
+                    })
+                    .count(),
+                usize::from(delete_fails),
+                "{case}: retained-row ERROR lines: {text}"
+            );
+            assert!(
+                !text.contains(&pubkey_hex),
+                "{case}: the full pubkey must not be logged: {text}"
+            );
+        }
+    }
+
+    /// W4-S4b: a refused identical re-sign (`inserted: false`) keeps the
+    /// earlier row, which backs a completed sign. Only the row this call
+    /// inserted may be deleted.
+    #[test]
+    fn admission_refusal_keeps_a_preexisting_identical_row() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let _context = runtime.enter();
+        let root = [0x79; 32];
+        for kind in [
+            SlashableKind::Block { slot: 61 },
+            SlashableKind::Attestation { source_epoch: 3, target_epoch: 4 },
+        ] {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let reserve = {
+                let (db, pk) = (Arc::clone(&db), pubkey_hex.clone());
+                move || match kind {
+                    SlashableKind::Block { slot } => {
+                        db.reserve_block(&pk, slot, Some(hex::encode(root)), &GVR)
+                    }
+                    SlashableKind::Attestation { source_epoch, target_epoch } => db
+                        .reserve_attestation(
+                            &pk,
+                            source_epoch,
+                            target_epoch,
+                            Some(hex::encode(root)),
+                            &GVR,
+                        ),
+                }
+            };
+            let earlier = reserve().expect("earlier reserve");
+            assert!(earlier.inserted, "{kind:?}: the earlier sign inserted the row");
+            let label = reservation_metric_kind(earlier.kind);
+
+            let mut session = session_for_reserve(
+                signer,
+                &pubkey,
+                root,
+                Duration::from_secs(4),
+                TimeoutPolicy::DiscardStagedRow,
+                None,
+                Arc::clone(&db),
+                Arc::new(NoopSignHooks),
+            );
+            session.admission = crate::CapturedAdmission::Missing { revokes: true };
+            session.duty = kind.signing_duty();
+            let resign_inserted = Arc::new(AtomicBool::new(true));
+            let seen = Arc::clone(&resign_inserted);
+            let not_applicable_before = reconcile_count(label, reconcile_outcome::NOT_APPLICABLE);
+            let result = session.reserve_then_sign(move || {
+                let reservation = reserve()?;
+                seen.store(reservation.inserted, Ordering::SeqCst);
+                Ok(reservation)
+            });
+
+            assert!(
+                !resign_inserted.load(Ordering::SeqCst),
+                "{kind:?}: the identical re-sign reserves as inserted: false"
+            );
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{kind:?}: expected BeaconAdmissionRevoked, got {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{kind:?}: BLS must not be reached");
+            assert_eq!(
+                slashing_rows(&db, &pubkey_hex, kind),
+                1,
+                "{kind:?}: the earlier identical row must stay"
+            );
+            // Lower bound: the counter is process-global (`cargo test` shares it).
+            assert!(
+                reconcile_count(label, reconcile_outcome::NOT_APPLICABLE) > not_applicable_before,
+                "{kind:?}: rvc_slashing_reconcile_total{{kind={label},outcome=not_applicable}} must move"
             );
         }
     }
@@ -2030,6 +2524,8 @@ mod tests {
             gvr: GVR,
             fork_name: None,
             enablement: Arc::new(crate::AlwaysEnabled),
+            admission: crate::CapturedAdmission::Missing { revokes: false },
+            duty: doppelganger::SigningDuty::Block,
         }
     }
 

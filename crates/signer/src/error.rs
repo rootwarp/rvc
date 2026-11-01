@@ -34,11 +34,14 @@ pub enum SigningGateError {
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
 
-    /// The caller's beacon admission moved while the sign waited for the
-    /// per-validator lock.
+    /// A slashable sign's admission re-check refused: a generation in the
+    /// caller's beacon admission scope moved, or the scope is missing where
+    /// the missing-scope rule refuses.
     ///
-    /// Checked under that lock, before the reservation: no slashing-DB row
-    /// was written by this call and no signature was produced.
+    /// No signature was produced. The check under the per-validator lock runs
+    /// before the reservation, so that refusal wrote no slashing-DB row. The
+    /// check after the reservation runs before the BLS call and deletes the
+    /// row this call inserted; if that delete fails, the row is kept.
     #[error("beacon node admission revoked")]
     BeaconAdmissionRevoked,
 
