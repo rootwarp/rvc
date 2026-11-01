@@ -598,16 +598,7 @@ impl ValidatorStore {
         if self.state.read().validators.contains_key(&config.pubkey) {
             return Ok(false);
         }
-        let Some(path) = self.config_path.clone() else {
-            self.state.write().insert_validator(config);
-            return Ok(true);
-        };
-        let live = self.state.read().clone();
-        let previous = self.disk_toml(&live);
-        let mut candidate = live;
-        candidate.insert_validator(config.clone());
-        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
-        self.state.write().insert_validator(config);
+        self.commit_then_publish(|state| state.insert_validator(config.clone()))?;
         Ok(true)
     }
 
@@ -625,18 +616,10 @@ impl ValidatorStore {
         pubkey: &[u8; 48],
     ) -> Result<Option<ValidatorConfig>, ValidatorStoreError> {
         let _save_guard = self.save_lock.lock();
-        let live = self.state.read().clone();
-        if !live.validators.contains_key(pubkey) {
+        if !self.state.read().validators.contains_key(pubkey) {
             return Ok(None);
         }
-        let Some(path) = self.config_path.clone() else {
-            return Ok(self.state.write().take_validator(pubkey));
-        };
-        let previous = self.disk_toml(&live);
-        let mut candidate = live;
-        candidate.take_validator(pubkey);
-        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
-        Ok(self.state.write().take_validator(pubkey))
+        self.commit_then_publish(|state| state.take_validator(pubkey))
     }
 
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
@@ -1195,13 +1178,36 @@ impl ValidatorStore {
 
     /// Validators-file document for `state`.
     ///
-    /// Reverts the proposer-URL overlay on a clone, then snapshots. RV-4.5's
-    /// `commit_then_publish` must persist this document. [`snapshot_toml`] of
-    /// the live state still contains URL-owned values and is not a file write.
+    /// Reverts the proposer-URL overlay on a clone, then snapshots.
+    /// [`Self::commit_then_publish`] persists this document. [`snapshot_toml`]
+    /// of the live state still contains URL-owned values and is not a file write.
     fn disk_toml(&self, state: &StoreState) -> TomlConfig {
         let mut durable = state.clone();
         revert_remote_overlay(&mut durable);
         snapshot_toml(&durable)
+    }
+
+    /// Persist `mutate` applied to a clone of live state, then apply it to live.
+    ///
+    /// The caller holds `save_lock` and has run its pre-check. Without a
+    /// validators file, `mutate` runs on live state only. Otherwise the file
+    /// gets [`Self::disk_toml`] of the candidate, and a failed write returns
+    /// `Err` with live state unchanged. On success `mutate` runs again on live
+    /// state instead of replacing it, so a `set_enabled` that does not take
+    /// `save_lock` is kept. Returns the live run's result.
+    fn commit_then_publish<R>(
+        &self,
+        mutate: impl Fn(&mut StoreState) -> R,
+    ) -> Result<R, ValidatorStoreError> {
+        let Some(path) = self.config_path.as_deref() else {
+            return Ok(mutate(&mut self.state.write()));
+        };
+        let live = self.state.read().clone();
+        let previous = self.disk_toml(&live);
+        let mut candidate = live;
+        mutate(&mut candidate);
+        commit_less_safe(path, &self.disk_toml(&candidate), &previous)?;
+        Ok(mutate(&mut self.state.write()))
     }
 
     #[tracing::instrument(name = "validator_store.save_config", skip_all)]
@@ -6999,5 +7005,660 @@ builder_boost_factor = 175
         assert!(live.contains(&url_fee), "{live}");
         assert!(disk.contains(&base_fee), "{disk}");
         assert!(!disk.contains(&url_fee), "{disk}");
+    }
+
+    // RV-4.5 (#662) persist-then-publish protocol: fixture, writer table, guards.
+
+    const HOLD_UNTIL: u64 = 4_102_444_800;
+
+    /// The URL owns this row's fee recipient.
+    fn url_pk() -> [u8; 48] {
+        test_pubkey(0x51)
+    }
+
+    /// A plain file row: the delete target.
+    fn row_pk() -> [u8; 48] {
+        test_pubkey(0x52)
+    }
+
+    /// Absent from the fixture: the import target.
+    fn new_pk() -> [u8; 48] {
+        test_pubkey(0x53)
+    }
+
+    /// An operator-disabled row: the enable target.
+    fn disabled_pk() -> [u8; 48] {
+        test_pubkey(0x54)
+    }
+
+    /// Absent from the fixture: the new-hold target.
+    fn hold_pk() -> [u8; 48] {
+        test_pubkey(0x55)
+    }
+
+    /// A hold with deadline 0, due without reading the clock.
+    fn held_pk() -> [u8; 48] {
+        test_pubkey(0x56)
+    }
+
+    /// File fee for `url_pk`, file default fee, then the URL values for both.
+    const FILE_ROW_FEE: u8 = 0x0a;
+    const FILE_DEFAULT_FEE: u8 = 0x0b;
+    const URL_ROW_FEE: u8 = 0x0c;
+    const URL_DEFAULT_FEE: u8 = 0x0d;
+
+    /// In-memory store with every fixture row, and a URL that owns
+    /// `url_pk`'s fee and the default fee.
+    fn durable_fixture_store() -> ValidatorStore {
+        let store = ValidatorStore::new(test_fee_recipient(FILE_DEFAULT_FEE), 30_000_000);
+        let mut url_row = ValidatorConfig::new(url_pk());
+        url_row.fee_recipient = Some(test_fee_recipient(FILE_ROW_FEE));
+        store.add_validator(url_row).unwrap();
+        store.add_validator(ValidatorConfig::new(row_pk())).unwrap();
+        let mut disabled = ValidatorConfig::new(disabled_pk());
+        disabled.enabled = false;
+        store.add_validator(disabled).unwrap();
+        let mut held = ValidatorConfig::new(held_pk());
+        held.enabled = false;
+        held.doppelganger_hold_until = Some(0);
+        store.add_validator(held).unwrap();
+        store
+            .apply_remote_document(
+                vec![(
+                    url_pk(),
+                    ValidatorConfigUpdate {
+                        fee_recipient: Some(Some(test_fee_recipient(URL_ROW_FEE))),
+                        ..ValidatorConfigUpdate::default()
+                    },
+                )],
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(test_fee_recipient(URL_DEFAULT_FEE)),
+                ..DefaultUpdate::default()
+            })
+            .unwrap();
+        assert_eq!(store.effective_fee_recipient(&url_pk()), test_fee_recipient(URL_ROW_FEE));
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(URL_DEFAULT_FEE));
+        store
+    }
+
+    struct DurableFixture {
+        store: Arc<ValidatorStore>,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    /// [`durable_fixture_store`] with a validators file holding the local baseline.
+    fn durable_fixture() -> DurableFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let mut store = durable_fixture_store();
+        store.config_path = Some(path.clone());
+        store.save_config().unwrap();
+        let disk = ValidatorStore::load_from_config(&path).unwrap();
+        assert_eq!(disk.effective_fee_recipient(&url_pk()), test_fee_recipient(FILE_ROW_FEE));
+        assert_eq!(disk.default_fee_recipient(), test_fee_recipient(FILE_DEFAULT_FEE));
+        DurableFixture { store: Arc::new(store), path, _dir: dir }
+    }
+
+    /// Every field of live state, independent of map order.
+    fn live_fingerprint(store: &ValidatorStore) -> String {
+        let state = store.state.read();
+        let mut validators: Vec<String> =
+            state.validators.values().map(|row| format!("{row:?}")).collect();
+        validators.sort();
+        let mut gens: Vec<_> = state.validator_gen.iter().collect();
+        gens.sort();
+        let mut owned: Vec<String> =
+            state.url_owned.iter().map(|(pk, fields)| format!("{pk:?}={fields:?}")).collect();
+        owned.sort();
+        format!(
+            "{validators:?} {:?} {gens:?} {} {owned:?} {:?} {:?} {:?} {:?} {:?}",
+            state.defaults,
+            state.next_validator_gen,
+            state.remote_defaults,
+            state.global_block_selection_mode,
+            state.global_builders,
+            state.global_min_bid,
+            state.global_builder_boost_factor,
+        )
+    }
+
+    /// The parsed validators file, independent of row order.
+    fn file_fingerprint(path: &Path) -> String {
+        let mut doc: TomlConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        doc.validators.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+        format!("{doc:?}")
+    }
+
+    /// One durable writer: it persists a less-safe change, then publishes it.
+    struct DurableCaller {
+        name: &'static str,
+        /// Runs the writer once against the fixture.
+        call: fn(&ValidatorStore) -> Result<(), ValidatorStoreError>,
+        /// True once the writer's change is in `store`.
+        applied: fn(&ValidatorStore) -> bool,
+    }
+
+    /// Writers routed through `commit_then_publish`.
+    fn routed_durable_callers() -> [DurableCaller; 2] {
+        [
+            DurableCaller {
+                name: "add_validator_durable",
+                call: |store| {
+                    store
+                        .add_validator_durable(ValidatorConfig::new(new_pk()))
+                        .map(|added| assert!(added, "the import target is absent"))
+                },
+                applied: |store| store.has_validator(&new_pk()),
+            },
+            DurableCaller {
+                name: "remove_validator_durable",
+                call: |store| {
+                    store.remove_validator_durable(&row_pk()).map(|removed| {
+                        assert_eq!(removed.map(|row| row.pubkey), Some(row_pk()));
+                    })
+                },
+                applied: |store| !store.has_validator(&row_pk()),
+            },
+        ]
+    }
+
+    /// Writers that still run the protocol inline (W4-K5b routes them).
+    fn inline_durable_callers() -> [DurableCaller; 3] {
+        [
+            DurableCaller {
+                name: "persist_signing_enable",
+                call: |store| store.persist_signing_enable(&disabled_pk()),
+                applied: |store| store.is_signing_enabled(&disabled_pk()),
+            },
+            DurableCaller {
+                name: "begin_doppelganger_hold",
+                call: |store| {
+                    store
+                        .begin_doppelganger_hold(&hold_pk(), HOLD_UNTIL)
+                        .map(|held| assert!(held, "a new row is a hold"))
+                },
+                applied: |store| {
+                    store.get_config(&hold_pk()).is_some_and(|row| {
+                        !row.enabled && row.doppelganger_hold_until == Some(HOLD_UNTIL)
+                    })
+                },
+            },
+            DurableCaller {
+                name: "release_doppelganger_hold",
+                call: |store| {
+                    store
+                        .release_doppelganger_hold(&held_pk())
+                        .map(|released| assert!(released, "a deadline of 0 is due"))
+                },
+                applied: |store| {
+                    store
+                        .get_config(&held_pk())
+                        .is_some_and(|row| row.enabled && row.doppelganger_hold_until.is_none())
+                },
+            },
+        ]
+    }
+
+    /// 662-AC3: a failed write leaves live state and the previous document in
+    /// place, at every fault step. Without a validators file the writer
+    /// publishes in memory and never writes.
+    #[test]
+    fn a_failed_commit_leaves_live_state_unchanged_for_every_durable_caller() {
+        let steps = [
+            super::TomlWriteFault::Serialize,
+            super::TomlWriteFault::CreateTemp,
+            super::TomlWriteFault::Write,
+            super::TomlWriteFault::SyncFile,
+            super::TomlWriteFault::Rename,
+            super::TomlWriteFault::SyncDir,
+        ];
+        for caller in routed_durable_callers() {
+            for step in steps {
+                let fixture = durable_fixture();
+                let live_before = live_fingerprint(&fixture.store);
+                let file_before = file_fingerprint(&fixture.path);
+                let _clear = ClearHooks;
+                super::TOML_WRITE_FAULT.with(|cell| {
+                    cell.set(Some(super::FaultPlan { skip: 0, step }));
+                });
+                let result = (caller.call)(&fixture.store);
+                clear_test_hooks();
+                assert!(result.is_err(), "{} at {step:?} must fail", caller.name);
+                assert_eq!(
+                    live_fingerprint(&fixture.store),
+                    live_before,
+                    "{} at {step:?} must leave live state unchanged",
+                    caller.name
+                );
+                assert_eq!(
+                    file_fingerprint(&fixture.path),
+                    file_before,
+                    "{} at {step:?} must leave the previous document on disk",
+                    caller.name
+                );
+            }
+
+            let store = durable_fixture_store();
+            let _clear = ClearHooks;
+            super::KEEP_TOML_WRITE_FAULT.with(|keep| keep.set(true));
+            super::TOML_WRITE_FAULT.with(|cell| {
+                cell.set(Some(super::FaultPlan {
+                    skip: 0,
+                    step: super::TomlWriteFault::Serialize,
+                }));
+            });
+            let result = (caller.call)(&store);
+            clear_test_hooks();
+            assert!(result.is_ok(), "{} without a file must not write: {result:?}", caller.name);
+            assert!((caller.applied)(&store), "{} without a file must publish", caller.name);
+        }
+    }
+
+    /// INV1 (FU-A8): every durable writer persists the local baseline, never a
+    /// URL-owned value, while live state keeps the URL values.
+    #[test]
+    fn commit_then_publish_persists_the_local_baseline_not_url_values() {
+        let fixture = durable_fixture();
+        let store = &fixture.store;
+        for caller in routed_durable_callers().into_iter().chain(inline_durable_callers()) {
+            (caller.call)(store).unwrap_or_else(|e| panic!("{}: {e}", caller.name));
+            let disk = ValidatorStore::load_from_config(&fixture.path).unwrap();
+            assert!((caller.applied)(store), "{}: published", caller.name);
+            assert!((caller.applied)(&disk), "{}: persisted", caller.name);
+            assert_eq!(
+                disk.effective_fee_recipient(&url_pk()),
+                test_fee_recipient(FILE_ROW_FEE),
+                "{}: the file keeps the local fee",
+                caller.name
+            );
+            assert_eq!(
+                disk.default_fee_recipient(),
+                test_fee_recipient(FILE_DEFAULT_FEE),
+                "{}: the file keeps the local default fee",
+                caller.name
+            );
+            assert_eq!(
+                store.effective_fee_recipient(&url_pk()),
+                test_fee_recipient(URL_ROW_FEE),
+                "{}: live keeps the URL fee",
+                caller.name
+            );
+            assert_eq!(
+                store.default_fee_recipient(),
+                test_fee_recipient(URL_DEFAULT_FEE),
+                "{}: live keeps the URL default fee",
+                caller.name
+            );
+        }
+    }
+
+    /// A `set_enabled` between the durable write and the publish is not
+    /// overwritten: the writer re-applies its change onto live state.
+    #[test]
+    fn commit_then_publish_reapplies_onto_live() {
+        for caller in routed_durable_callers() {
+            let fixture = durable_fixture();
+            assert!(fixture.store.is_signing_enabled(&url_pk()));
+            let _clear = ClearHooks;
+            let hooked = Arc::clone(&fixture.store);
+            super::DURABLE_WRITE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || hooked.set_enabled(&url_pk(), false)));
+            });
+            let result = (caller.call)(&fixture.store);
+            clear_test_hooks();
+            result.unwrap_or_else(|e| panic!("{}: {e}", caller.name));
+            assert!(
+                !fixture.store.is_signing_enabled(&url_pk()),
+                "{}: the concurrent disable must survive the publish",
+                caller.name
+            );
+            assert!((caller.applied)(&fixture.store), "{}: published", caller.name);
+        }
+    }
+
+    /// Import of a present row and delete of an unknown pubkey return before
+    /// any write: they succeed while every write would fail.
+    #[test]
+    fn durable_import_of_a_present_row_and_delete_of_an_unknown_key_do_not_write() {
+        let fixture = durable_fixture();
+        let live_before = live_fingerprint(&fixture.store);
+        let file_before = file_fingerprint(&fixture.path);
+        let _clear = ClearHooks;
+        super::KEEP_TOML_WRITE_FAULT.with(|keep| keep.set(true));
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Serialize }));
+        });
+        let added = fixture.store.add_validator_durable(ValidatorConfig::new(row_pk()));
+        let removed = fixture.store.remove_validator_durable(&new_pk());
+        clear_test_hooks();
+        assert!(matches!(added, Ok(false)), "{added:?}");
+        assert!(matches!(removed, Ok(None)), "{removed:?}");
+        assert_eq!(live_fingerprint(&fixture.store), live_before);
+        assert_eq!(file_fingerprint(&fixture.path), file_before);
+    }
+
+    /// E11: each routed writer takes `save_lock` before its pre-check reads
+    /// state, and holds it across the durable write.
+    #[test]
+    fn routed_writers_hold_save_lock_from_the_pre_check_through_the_write() {
+        for caller in routed_durable_callers() {
+            let fixture = durable_fixture();
+            let _clear = ClearHooks;
+            let held = std::rc::Rc::new(std::cell::Cell::new(None));
+            let (hooked, seen) = (Arc::clone(&fixture.store), std::rc::Rc::clone(&held));
+            super::DURABLE_WRITE_HOOK.with(|slot| {
+                *slot.borrow_mut() =
+                    Some(Box::new(move || seen.set(Some(hooked.save_lock.try_lock().is_none()))));
+            });
+            let result = (caller.call)(&fixture.store);
+            clear_test_hooks();
+            result.unwrap_or_else(|e| panic!("{}: {e}", caller.name));
+            assert_eq!(held.get(), Some(true), "{}: save_lock across the write", caller.name);
+        }
+
+        for caller in routed_durable_callers() {
+            let fixture = durable_fixture();
+            let state = fixture.store.state.write();
+            let (store, call) = (Arc::clone(&fixture.store), caller.call);
+            let writer = std::thread::spawn(move || call(&store));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let locked = loop {
+                if fixture.store.save_lock.is_locked() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            drop(state);
+            let result = writer.join().expect("the writer thread");
+            assert!(locked, "{}: save_lock is taken before the pre-check reads state", caller.name);
+            result.unwrap_or_else(|e| panic!("{}: {e}", caller.name));
+            assert!((caller.applied)(&fixture.store), "{}: published", caller.name);
+        }
+    }
+
+    /// R6: durable import rejects a config the file cannot hold, before its
+    /// pre-check, with and without a validators file.
+    #[test]
+    fn durable_import_rejects_invalid_ingress_with_and_without_a_file() {
+        let mut bad_url = ValidatorConfig::new(new_pk());
+        bad_url.builders = Some(vec!["file:///builder".to_string()]);
+        let mut bad_gas = ValidatorConfig::new(new_pk());
+        bad_gas.gas_limit = Some(i64::MAX as u64 + 1);
+        for (reason, invalid) in [
+            ("builder URL must start with http:// or https://", bad_url),
+            ("exceeds i64::MAX", bad_gas),
+        ] {
+            for (target, pk) in [("absent", new_pk()), ("present", row_pk())] {
+                let fixture = durable_fixture();
+                let no_file = durable_fixture_store();
+                let file_before = file_fingerprint(&fixture.path);
+                for (mode, store) in
+                    [("with a file", &*fixture.store), ("without a file", &no_file)]
+                {
+                    let live_before = live_fingerprint(store);
+                    let config = ValidatorConfig { pubkey: pk, ..invalid.clone() };
+                    let result = store.add_validator_durable(config);
+                    assert!(
+                        matches!(&result, Err(ValidatorStoreError::Config(msg)) if msg.contains(reason)),
+                        "{reason}, {target} row, {mode}: {result:?}"
+                    );
+                    assert_eq!(live_fingerprint(store), live_before, "{reason}, {target}, {mode}");
+                }
+                assert_eq!(file_fingerprint(&fixture.path), file_before, "{reason}, {target}");
+            }
+        }
+    }
+
+    /// C2: DELETE returns the row its live run took, not the candidate's copy
+    /// from before a concurrent `set_enabled`.
+    #[test]
+    fn durable_delete_returns_the_row_taken_from_live_state() {
+        let fixture = durable_fixture();
+        assert!(fixture.store.is_signing_enabled(&row_pk()));
+        let _clear = ClearHooks;
+        let hooked = Arc::clone(&fixture.store);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || hooked.set_enabled(&row_pk(), false)));
+        });
+        let removed = fixture.store.remove_validator_durable(&row_pk());
+        clear_test_hooks();
+        let removed = removed.expect("the delete persists").expect("the row was present");
+        assert_eq!(removed.pubkey, row_pk());
+        assert!(!removed.enabled, "the live row was disabled after the candidate was cloned");
+        assert!(!fixture.store.has_validator(&row_pk()));
+    }
+
+    /// Writers whose production body must persist through `commit_then_publish`.
+    const ROUTED_WRITERS: [&str; 2] = ["add_validator_durable", "remove_validator_durable"];
+
+    /// Everything before the file's `#[cfg(test)] mod tests`.
+    fn production_source(src: &str) -> &str {
+        src.split_once("#[cfg(test)]\nmod tests {").expect("a #[cfg(test)] mod tests").0
+    }
+
+    /// `src` with comments and string, raw-string and char literals blanked.
+    /// Newlines are kept.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let rest = &chars[i..];
+            let closing = |from: usize, close: &[char]| {
+                (from..rest.len())
+                    .find(|&at| rest[at..].starts_with(close))
+                    .map(|at| at + close.len())
+            };
+            let skip = match rest {
+                ['/', '/', ..] => Some(rest.iter().position(|&c| c == '\n').unwrap_or(rest.len())),
+                ['/', '*', ..] => closing(2, &['*', '/']),
+                ['"', ..] => {
+                    let mut at = 1;
+                    while at < rest.len() && rest[at] != '"' {
+                        at += if rest[at] == '\\' { 2 } else { 1 };
+                    }
+                    Some(at + 1)
+                }
+                ['r', '#' | '"', ..] => {
+                    let hashes = rest[1..].iter().take_while(|&&c| c == '#').count();
+                    if rest.get(1 + hashes) == Some(&'"') {
+                        let close: Vec<char> =
+                            std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                        closing(2 + hashes, &close)
+                    } else {
+                        None
+                    }
+                }
+                ['\'', '\\', ..] => closing(3, &['\'']),
+                ['\'', _, '\'', ..] => Some(3),
+                _ => None,
+            };
+            match skip {
+                Some(len) => {
+                    let len = len.min(rest.len());
+                    out.extend(rest[..len].iter().map(|&c| if c == '\n' { '\n' } else { ' ' }));
+                    i += len;
+                }
+                None => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Body of the first `fn <name>(` in `code`, from its `{` to the matching `}`.
+    fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+        let start = code.find(&format!("fn {name}("))?;
+        let open = start + code[start..].find('{')?;
+        let mut depth = 0usize;
+        for (offset, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&code[open..=open + offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Each [`ROUTED_WRITERS`] body that does not persist through `commit_then_publish`.
+    fn routing_violations(src: &str) -> Vec<String> {
+        let code = code_only(production_source(src));
+        let mut violations = Vec::new();
+        for name in ROUTED_WRITERS {
+            let definitions = code.matches(&format!("fn {name}(")).count();
+            if definitions != 1 {
+                violations.push(format!("{name}: {definitions} definitions"));
+            }
+            let Some(body) = fn_body(&code, name) else {
+                violations.push(format!("{name}: no body"));
+                continue;
+            };
+            if !body.contains("commit_then_publish(") {
+                violations.push(format!("{name}: no commit_then_publish("));
+            }
+            if body.contains("commit_less_safe(") {
+                violations.push(format!("{name}: calls commit_less_safe("));
+            }
+        }
+        violations
+    }
+
+    const ROUTING_FIXTURE: &str = r##"
+impl ValidatorStore {
+    pub fn add_validator_durable(&self, config: ValidatorConfig) -> Result<bool, E> {
+        if config.enabled {
+            let _ = ("}", r#"a"}"#, '"', '{', '{');
+            let _ = ['\'','}'];
+        }
+        // commit_less_safe( in a comment is not a call.
+        /* } */
+        self.commit_then_publish(|state| state.insert_validator(config.clone()))?;
+        Ok(true)
+    }
+
+    pub fn remove_validator_durable(&self, pubkey: &[u8; 48]) -> Result<(), E> {
+        commit_less_safe(&path, &next, &previous)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn only_in_tests() {
+        commit_less_safe(&path, &next, &previous);
+    }
+}
+"##;
+
+    #[test]
+    fn routing_scan_finds_both_bodies_in_a_fixture() {
+        let code = code_only(production_source(ROUTING_FIXTURE));
+        let add = fn_body(&code, "add_validator_durable").expect("add body");
+        assert!(add.starts_with('{') && add.ends_with('}'), "{add}");
+        assert!(add.contains("commit_then_publish(") && add.contains("Ok(true)"), "{add}");
+        assert!(!add.contains("commit_less_safe("), "comments are not code: {add}");
+        let remove = fn_body(&code, "remove_validator_durable").expect("remove body");
+        assert!(remove.contains("commit_less_safe(") && remove.contains("Ok(())"), "{remove}");
+        assert!(fn_body(&code, "only_in_tests").is_none(), "the test module is cut off");
+        assert_eq!(
+            routing_violations(ROUTING_FIXTURE),
+            [
+                "remove_validator_durable: no commit_then_publish(",
+                "remove_validator_durable: calls commit_less_safe(",
+            ]
+        );
+        let doubled = ROUTING_FIXTURE.replacen(
+            "#[cfg(test)]",
+            "fn add_validator_durable() {}\n#[cfg(test)]",
+            1,
+        );
+        assert!(
+            routing_violations(&doubled).contains(&"add_validator_durable: 2 definitions".into()),
+            "a second definition is reported"
+        );
+    }
+
+    /// 662-AC1 (import and delete): both keymanager key-set writers persist
+    /// through `commit_then_publish` and never call `commit_less_safe(` directly.
+    #[test]
+    fn durable_import_and_delete_publish_through_commit_then_publish() {
+        let violations = routing_violations(include_str!("store.rs"));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// How the code after `commit_less_safe(` in `commit_then_publish` fails
+    /// to publish by re-applying `mutate` onto the live guard.
+    fn publish_violations(code: &str) -> Vec<&'static str> {
+        let Some(body) = fn_body(code, "commit_then_publish<R>") else {
+            return vec!["no body"];
+        };
+        let Some((_, publish)) =
+            body.split_once("commit_less_safe(").and_then(|(_, at)| at.split_once(';'))
+        else {
+            return vec!["no commit_less_safe("];
+        };
+        let mut violations = Vec::new();
+        if !publish.contains("mutate(&mut self.state.write())") {
+            violations.push("mutate is not re-applied onto the live guard");
+        }
+        if publish.matches("self.state").count() != 1 {
+            violations.push("live state is accessed more than once");
+        }
+        violations
+    }
+
+    /// R4: after the commit, live state is re-applied, never replaced by a
+    /// fresh clone or by the candidate.
+    #[test]
+    fn commit_then_publish_never_replaces_live_state_after_the_commit() {
+        let code = code_only(production_source(include_str!("store.rs")));
+        assert_eq!(publish_violations(&code), Vec::<&str>::new());
+
+        let fixture = |publish: &str| {
+            code_only(&format!(
+                "fn commit_then_publish<R>(&self) -> R {{
+                    let Some(path) = self.config_path.as_deref() else {{
+                        return Ok(mutate(&mut self.state.write()));
+                    }};
+                    commit_less_safe(path, &next, &previous)?;
+                    {publish}
+                }}"
+            ))
+        };
+        let not_reapplied = "mutate is not re-applied onto the live guard";
+        let twice = "live state is accessed more than once";
+        for (publish, expected) in [
+            ("Ok(mutate(&mut self.state.write()))", vec![]),
+            ("let out = mutate(&mut self.state.write()); Ok(out)", vec![]),
+            (
+                "let mut fresh = self.state.read().clone(); let out = mutate(&mut fresh); \
+                 *self.state.write() = fresh; Ok(out)",
+                vec![not_reapplied, twice],
+            ),
+            ("*self.state.write() = candidate; Ok(out)", vec![not_reapplied]),
+            (
+                "let out = mutate(&mut self.state.write()); *self.state.write() = candidate; Ok(out)",
+                vec![twice],
+            ),
+        ] {
+            assert_eq!(publish_violations(&fixture(publish)), expected, "{publish}");
+        }
     }
 }
