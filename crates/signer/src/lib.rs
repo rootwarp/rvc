@@ -987,19 +987,19 @@ impl SignerService {
         pubkey: &PublicKey,
         duty: SigningDuty,
     ) -> Result<(), SignerError> {
+        if !doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty) {
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            warn!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                "SignerService: signing blocked by doppelganger enablement gate"
+            );
+            return Err(SignerError::BlockedByDoppelganger);
+        }
         if beacon_admission_revoked(duty) {
             warn!("SignerService: beacon node admission revoked");
             return Err(SignerError::BeaconAdmissionRevoked);
         }
-        if doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty) {
-            return Ok(());
-        }
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        warn!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            "SignerService: signing blocked by doppelganger enablement gate"
-        );
-        Err(SignerError::BlockedByDoppelganger)
+        Ok(())
     }
 
     /// Outer admission check, after an optional test rendezvous.
@@ -3462,8 +3462,133 @@ mod tests {
         assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
     }
 
+    /// Run `fut` under a thread-local [`Capture`] and return its WARN events.
+    ///
+    /// The default `#[tokio::test]` runtime is current-thread and the service
+    /// entry check runs on the caller's task, so the capture sees its WARN.
+    async fn with_warns<T>(fut: impl std::future::Future<Output = T>) -> (T, Vec<CapturedEvent>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry::Registry::default()
+            .with(Capture { events: Arc::clone(&events), spans: Spans::default() });
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = fut.await;
+        drop(guard);
+        let warns =
+            events.lock().iter().filter(|e| e.level == tracing::Level::WARN).cloned().collect();
+        (out, warns)
+    }
+
+    /// Exactly one WARN, the service entry refusal, with `message` and
+    /// `fields` verbatim and without the full pubkey hex.
+    fn assert_one_service_entry_warn(
+        warns: &[CapturedEvent],
+        message: &str,
+        fields: &str,
+        pubkey_hex: &str,
+    ) {
+        let lines: Vec<String> =
+            warns.iter().map(|w| format!("{} {}", w.message, w.fields_text)).collect();
+        assert_eq!(warns.len(), 1, "one service entry WARN, got {lines:?}");
+        assert_eq!(warns[0].message, message, "entry WARN text");
+        assert_eq!(warns[0].fields_text, fields, "entry WARN fields");
+        assert!(!lines[0].contains(pubkey_hex), "full pubkey in the entry WARN: {}", lines[0]);
+    }
+
+    /// W4-S4c (750-9, #736): a detected key reports `BlockedByDoppelganger`
+    /// at the service entry even when its admission also moved, writes no
+    /// row, and logs only the doppelganger WARN, with the pubkey truncated.
+    #[tokio::test]
+    async fn doppelganger_block_wins_over_revoked_admission() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Detected;
+        impl SigningEnablement for Detected {
+            fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+                false
+            }
+
+            fn voluntary_exit_only(&self) -> bool {
+                false
+            }
+
+            fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+                true
+            }
+        }
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, Arc::clone(&slashing_db))
+            .with_enablement(Arc::new(Detected));
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let attestation = create_test_attestation_data(3, 4);
+        let generation = Arc::new(AtomicU64::new(0));
+        let admission = BeaconAdmission::new(0, Arc::clone(&generation));
+        generation.fetch_add(1, Ordering::Release);
+
+        let (result, warns) = with_warns(with_beacon_admission(
+            admission,
+            service.sign_attestation(&attestation, &pubkey, &fork_schedule, &[0xaa; 32]),
+        ))
+        .await;
+        let err = result.expect_err("a detected key must not sign");
+
+        assert!(matches!(err, SignerError::BlockedByDoppelganger), "{err:?}");
+        let rows = slashing_db.get_attestations(&pubkey_hex).expect("attestation rows");
+        assert!(rows.is_empty(), "the entry refusal must not write a row: {rows:?}");
+        let truncated = TruncatedPubkey::new(&pubkey_hex).to_string();
+        assert_one_service_entry_warn(
+            &warns,
+            "SignerService: signing blocked by doppelganger enablement gate",
+            &format!("pubkey={truncated} "),
+            &pubkey_hex,
+        );
+    }
+
+    /// With enablement open, a moved admission is refused at the service
+    /// entry with only the admission WARN, which logs no pubkey.
+    #[tokio::test]
+    async fn revoked_admission_with_open_enablement_warns_once_at_service_entry() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let attestation = create_test_attestation_data(3, 4);
+        let generation = Arc::new(AtomicU64::new(0));
+        let admission = BeaconAdmission::new(0, Arc::clone(&generation));
+        generation.fetch_add(1, Ordering::Release);
+
+        let (result, warns) = with_warns(with_beacon_admission(
+            admission,
+            service.sign_attestation(&attestation, &pubkey, &fork_schedule, &[0xaa; 32]),
+        ))
+        .await;
+        let err = result.expect_err("a moved admission must not sign");
+
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
+        let rows = slashing_db.get_attestations(&pubkey_hex).expect("attestation rows");
+        assert!(rows.is_empty(), "the entry refusal must not write a row: {rows:?}");
+        assert_one_service_entry_warn(
+            &warns,
+            "SignerService: beacon node admission revoked",
+            "",
+            &pubkey_hex,
+        );
+    }
+
     /// Always enabled; sends on `entered` from its first `is_signing_enabled`
-    /// call, which is the entry check (admission is read just before it).
+    /// call, which is the entry check (admission is read just after it).
     struct EnteredOnce {
         inner: Arc<dyn SigningEnablement>,
         entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
