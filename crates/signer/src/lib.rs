@@ -1017,6 +1017,7 @@ impl SignerService {
     fn map_gate_error(err: SigningGateError, pubkey_hex: &str) -> SignerError {
         match err {
             SigningGateError::BlockedByDoppelganger => SignerError::BlockedByDoppelganger,
+            SigningGateError::BeaconAdmissionRevoked => SignerError::BeaconAdmissionRevoked,
             SigningGateError::SlashingBlocked(e) => SignerError::SlashingBlocked(e),
             SigningGateError::CommitFailed { signing_root, source } => {
                 SignerError::CommitFailed { signing_root, source }
@@ -3409,6 +3410,97 @@ mod tests {
         .await
         .expect_err("the second generation must refuse the real signer");
         assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
+    }
+
+    /// Always enabled; sends on `entered` from its first `is_signing_enabled`
+    /// call, which is the entry check (admission is read just before it).
+    struct EnteredOnce {
+        inner: Arc<dyn SigningEnablement>,
+        entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl SigningEnablement for EnteredOnce {
+        fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            self.inner.is_signing_enabled(pubkey)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            self.inner.voluntary_exit_only()
+        }
+
+        fn blocked_by_doppelganger(&self, pubkey: &PublicKey) -> bool {
+            self.inner.blocked_by_doppelganger(pubkey)
+        }
+    }
+
+    /// W4-S4a (766-2): the entry check passes, the sign waits for a held
+    /// per-validator lock, and the generation moves during that wait. The sign
+    /// is refused under the lock: no block row and no signature.
+    ///
+    /// Current-thread: the sign task runs from its entry check to the lock
+    /// wait without yielding, so the test resumes only once it is parked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signer_service_refuses_block_header_after_lock_wait_when_admission_moves() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let enablement = EnteredOnce {
+            inner: always_enabled(),
+            entered: parking_lot::Mutex::new(Some(entered_tx)),
+        };
+        let service = Arc::new(
+            SignerService::new(signer, Arc::clone(&slashing_db))
+                .with_enablement(Arc::new(enablement)),
+        );
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let header = BeaconBlockHeaderFields {
+            slot: 64,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x12; 32],
+            body_root: [0x13; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        let generation = Arc::new(AtomicU64::new(0));
+        let lock_handles = || Arc::strong_count(&service.validator_locks.get(&pubkey_bytes));
+
+        let held = service.acquire_signing_lock_for_test(&pubkey_bytes).await;
+        let before = lock_handles();
+        let sign = tokio::spawn(with_beacon_admission(
+            BeaconAdmission::new(0, Arc::clone(&generation)),
+            {
+                let service = Arc::clone(&service);
+                let pubkey = pubkey.clone();
+                async move {
+                    service.sign_block_header(&header, &pubkey, &schedule, &genesis_root).await
+                }
+            },
+        ));
+        entered_rx.await.expect("the entry check must run");
+        assert_eq!(lock_handles(), before + 1, "the sign must be parked on the held lock");
+        generation.fetch_add(1, Ordering::Release);
+        drop(held);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), sign)
+            .await
+            .expect("hang guard")
+            .expect("join");
+        let rows = slashing_db.get_blocks(&hex::encode(pubkey_bytes)).expect("rows");
+        assert!(rows.is_empty(), "no block row may be written: {rows:?}");
+        assert!(
+            matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+            "expected BeaconAdmissionRevoked and no signature, got {result:?}"
+        );
     }
 
     #[tokio::test]

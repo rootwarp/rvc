@@ -978,7 +978,7 @@ pub struct SignSlashableRequest<'a> {
     pub kind: SlashableKind,
     /// Resolved fork when known (VC path). Gate callers pass `None`.
     pub fork_name: Option<ForkName>,
-    /// Park after the under-lock enablement check and before reserve.
+    /// Park after the under-lock enablement and admission checks and before reserve.
     ///
     /// `None` in every production call. The field itself is compiled out of
     /// builds that do not enable `test-utils` (and are not this crate's tests).
@@ -987,7 +987,7 @@ pub struct SignSlashableRequest<'a> {
 }
 
 /// Test-only park on the slashable path, between the under-lock enablement
-/// re-check and reserve.
+/// and admission re-checks and reserve.
 ///
 /// Present only under `cfg(test)` or `rvc-signer`'s `test-utils` feature so a
 /// release build of `rvc-bin` does not contain it. `None` does not park.
@@ -1002,9 +1002,12 @@ pub trait PreReserveBarrier: Send + Sync {
 ///
 /// 1. Acquire the per-validator async lock (moved into `spawn_blocking` so a
 ///    dropped caller cannot release it while the blocking body is still running).
-/// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
-///    Test builds may then park on a pre-reserve barrier while that lock is
-///    still held. The hook is compiled out unless `test` / `test-utils` is on.
+/// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU),
+///    then the caller task's beacon admission scope: a generation that moved
+///    during the lock wait returns [`SigningGateError::BeaconAdmissionRevoked`]
+///    before any reservation. Test builds may then park on a pre-reserve
+///    barrier while that lock is still held. The hook is compiled out unless
+///    `test` / `test-utils` is on.
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
 /// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
@@ -1146,7 +1149,7 @@ fn log_stage_rejected(pubkey_hex: &str, kind: SlashableKind, err: SlashingError)
     err
 }
 
-/// Lock → enablement re-check → policy resolve → `spawn_blocking(body)`.
+/// Lock → enablement and admission re-check → policy resolve → `spawn_blocking(body)`.
 async fn sign_slashable_with_body<F>(
     req: SignSlashableRequest<'_>,
     body: F,
@@ -1168,7 +1171,8 @@ where
     // blocking body returns.
     let guard = req.locks.lock(&pubkey_bytes).await;
 
-    // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
+    // Step 2: re-check enablement, then beacon admission, under the lock
+    // (SigningGate / SignerService parity). Doppelganger stays first.
     if !doppelganger::signing_allowed(req.enablement.as_ref(), req.pubkey, req.kind.signing_duty())
     {
         warn!(
@@ -1178,9 +1182,19 @@ where
         );
         return Err(SigningGateError::BlockedByDoppelganger);
     }
+    // Same task-local scope the entry check read, so this can only turn a
+    // hold into a refusal. No slashing row exists yet.
+    if crate::beacon_admission_revoked(req.kind.signing_duty()) {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            op = op_name,
+            "sign_slashable: beacon node admission revoked (under lock)"
+        );
+        return Err(SigningGateError::BeaconAdmissionRevoked);
+    }
 
-    // Test-only: still holding the per-pubkey lock, after the enablement
-    // re-check and before reserve. Production builds skip this entirely.
+    // Test-only: still holding the per-pubkey lock, after the enablement and
+    // admission re-checks and before reserve. Production builds skip this entirely.
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(barrier) = req.pre_reserve_barrier.clone() {
         barrier.wait().await;
@@ -1671,8 +1685,81 @@ mod tests {
         }
     }
 
-    /// Enablement re-check under the lock: a concurrent flip to disabled must refuse.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Hang guard for joins on the parked-sign tests. Not an ordering wait.
+    const JOIN_GUARD: Duration = Duration::from_secs(30);
+
+    /// Live `Arc`s on `pubkey`'s lock: the map entry, each guard, each parked
+    /// `lock_owned` future and this probe.
+    fn lock_handles(locks: &ValidatorLockMap, pubkey: &[u8; 48]) -> usize {
+        Arc::strong_count(&locks.get(pubkey))
+    }
+
+    struct ParkedSign {
+        locks: Arc<ValidatorLockMap>,
+        pubkey: PublicKey,
+        enablement: Arc<dyn SigningEnablement>,
+        signer: Arc<dyn Signer>,
+        db: Arc<SlashingDb>,
+        kind: SlashableKind,
+        /// `None` installs no scope (the `test-utils` missing-scope rule).
+        admission: Option<crate::BeaconAdmission>,
+    }
+
+    /// Spawn [`sign_slashable`] while the caller holds the per-pubkey lock and
+    /// return once the sign is parked on that lock.
+    ///
+    /// Needs a current-thread runtime. The spawned task fires `parked`, then
+    /// runs without yielding until the held lock parks it, so the caller
+    /// resumes only after that. The `lock_handles` assertion checks it.
+    async fn spawn_parked_on_lock(
+        p: ParkedSign,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, SigningGateError>> {
+        let ParkedSign { locks, pubkey, enablement, signer, db, kind, admission } = p;
+        let pubkey_bytes = pubkey.to_bytes();
+        let probe = Arc::clone(&locks);
+        let before = lock_handles(&probe, &pubkey_bytes);
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let fired = Arc::clone(&parked);
+        let join = tokio::spawn(async move {
+            let sign = async move {
+                fired.notify_one();
+                sign_slashable(SignSlashableRequest {
+                    locks: locks.as_ref(),
+                    pubkey: &pubkey,
+                    enablement,
+                    signer,
+                    signing_root: [0x44; 32],
+                    sign_timeout: Duration::from_secs(4),
+                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                    hooks: Arc::new(NoopSignHooks),
+                    op_name: "test_parked_sign",
+                    slashing_db: db,
+                    client_cn: "test".into(),
+                    gvr: GVR,
+                    kind,
+                    fork_name: None,
+                    #[cfg(any(test, feature = "test-utils"))]
+                    pre_reserve_barrier: None,
+                })
+                .await
+            };
+            match admission {
+                Some(admission) => crate::with_beacon_admission(admission, sign).await,
+                None => sign.await,
+            }
+        });
+        parked.notified().await;
+        assert_eq!(
+            lock_handles(&probe, &pubkey_bytes),
+            before + 1,
+            "the sign must be parked on the held per-pubkey lock"
+        );
+        join
+    }
+
+    /// Enablement re-check under the lock: a flip to disabled during the lock
+    /// wait must refuse.
+    #[tokio::test(flavor = "current_thread")]
     async fn test_core_enablement_recheck_under_lock() {
         let sk = SecretKey::generate();
         let (pubkey, signer) = make_local(sk);
@@ -1683,43 +1770,185 @@ mod tests {
 
         // Hold the per-pubkey lock so sign_slashable blocks before recheck.
         let held = locks.lock(&pubkey_bytes).await;
+        let join = spawn_parked_on_lock(ParkedSign {
+            locks: Arc::clone(&locks),
+            pubkey: pubkey.clone(),
+            enablement: Arc::clone(&enablement) as Arc<dyn SigningEnablement>,
+            signer,
+            db: Arc::clone(&db),
+            kind: SlashableKind::Block { slot: 13 },
+            admission: None,
+        })
+        .await;
 
-        let locks_c = Arc::clone(&locks);
-        let en_c = Arc::clone(&enablement);
-        let db_c = Arc::clone(&db);
-        let pk = pubkey.clone();
-        let join = tokio::spawn(async move {
-            sign_slashable(SignSlashableRequest {
-                locks: locks_c.as_ref(),
-                pubkey: &pk,
-                enablement: en_c,
-                signer,
-                signing_root: [0x44; 32],
-                sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(NoopSignHooks),
-                op_name: "test_recheck",
-                slashing_db: db_c,
-                client_cn: "test".into(),
-                gvr: GVR,
-                kind: SlashableKind::Block { slot: 13 },
-                fork_name: None,
-                #[cfg(any(test, feature = "test-utils"))]
-                pre_reserve_barrier: None,
-            })
-            .await
-        });
-
-        // Give the spawned task time to block on the lock, then flip closed and release.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         enablement.enabled.store(false, Ordering::SeqCst);
         drop(held);
 
-        let result = join.await.expect("join");
+        let result =
+            tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
         assert!(
             matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
             "recheck under lock must refuse after flip; got {result:?}"
         );
+    }
+
+    /// W4-S4a (766-1, 766-2): a generation that moves while the sign waits for
+    /// the per-validator lock refuses under the lock, before any reserve.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_admission_recheck_under_lock() {
+        // (case, generation count, index bumped during the lock wait)
+        let cases: [(&str, usize, Option<usize>); 3] = [
+            ("one generation, bumped", 1, Some(0)),
+            ("three generations, middle bumped", 3, Some(1)),
+            ("one generation, unchanged (control)", 1, None),
+        ];
+        for (case, count, bumped) in cases {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_bytes = pubkey.to_bytes();
+            let pubkey_hex = hex::encode(pubkey_bytes);
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let locks = Arc::new(ValidatorLockMap::new());
+            let generations: Vec<Arc<AtomicU64>> =
+                (0..count).map(|i| Arc::new(AtomicU64::new(10 * i as u64))).collect();
+            let admission = generations.iter().skip(1).fold(
+                crate::BeaconAdmission::new(0, Arc::clone(&generations[0])),
+                |admission, g| admission.and_generation(g.load(Ordering::Acquire), Arc::clone(g)),
+            );
+
+            let held = locks.lock(&pubkey_bytes).await;
+            let join = spawn_parked_on_lock(ParkedSign {
+                locks: Arc::clone(&locks),
+                pubkey: pubkey.clone(),
+                enablement: Arc::new(AlwaysEnabled),
+                signer,
+                db: Arc::clone(&db),
+                kind: SlashableKind::Attestation { source_epoch: 3, target_epoch: 4 },
+                admission: Some(admission),
+            })
+            .await;
+            if let Some(i) = bumped {
+                generations[i].fetch_add(1, Ordering::Release);
+            }
+            drop(held);
+
+            let result =
+                tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
+            let rows = db.get_attestations(&pubkey_hex).expect("rows");
+            assert!(
+                locks.get(&pubkey_bytes).try_lock().is_ok(),
+                "{case}: the per-validator lock must be free once the sign returns"
+            );
+            if bumped.is_some() {
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}: BLS must not be reached");
+                assert!(rows.is_empty(), "{case}: no attestation row may be written: {rows:?}");
+                assert!(
+                    matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                    "{case}: expected BeaconAdmissionRevoked, got {result:?}"
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("{case}: an unchanged admission signs: {e:?}"));
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{case}: one BLS call");
+                assert_eq!(rows.len(), 1, "{case}: one attestation row: {rows:?}");
+            }
+        }
+    }
+
+    /// Detected and revoked during the same lock wait: doppelganger is checked
+    /// first, so the refusal stays `BlockedByDoppelganger` (#736 contract).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_doppelganger_wins_under_lock_when_admission_also_moved() {
+        let (pubkey, inner) = make_local(SecretKey::generate());
+        let pubkey_bytes = pubkey.to_bytes();
+        let calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> = Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = Arc::new(ValidatorLockMap::new());
+        let enablement = Arc::new(FlipEnablement { enabled: AtomicBool::new(true) });
+        let generation = Arc::new(AtomicU64::new(0));
+
+        let held = locks.lock(&pubkey_bytes).await;
+        let join = spawn_parked_on_lock(ParkedSign {
+            locks: Arc::clone(&locks),
+            pubkey: pubkey.clone(),
+            enablement: Arc::clone(&enablement) as Arc<dyn SigningEnablement>,
+            signer,
+            db: Arc::clone(&db),
+            kind: SlashableKind::Block { slot: 21 },
+            admission: Some(crate::BeaconAdmission::new(0, Arc::clone(&generation))),
+        })
+        .await;
+        enablement.enabled.store(false, Ordering::SeqCst);
+        generation.fetch_add(1, Ordering::Release);
+        drop(held);
+
+        let result =
+            tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "BLS must not be reached");
+        let rows = db.get_blocks(&hex::encode(pubkey_bytes)).expect("rows");
+        assert!(rows.is_empty(), "no block row may be written: {rows:?}");
+        assert!(
+            matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+            "doppelganger must win over a moved admission; got {result:?}"
+        );
+    }
+
+    /// W4-S4a (D5): a direct core caller with no admission scope fails closed
+    /// under the lock, as in a production build. The core has no entry check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_missing_scope_refused_under_lock() {
+        for kind in [
+            SlashableKind::Block { slot: 31 },
+            SlashableKind::Attestation { source_epoch: 5, target_epoch: 6 },
+        ] {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_bytes = pubkey.to_bytes();
+            let pubkey_hex = hex::encode(pubkey_bytes);
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let locks = ValidatorLockMap::new();
+
+            let result =
+                crate::require_beacon_admission_scope(sign_slashable(SignSlashableRequest {
+                    locks: &locks,
+                    pubkey: &pubkey,
+                    enablement: Arc::new(AlwaysEnabled),
+                    signer,
+                    signing_root: [0x66; 32],
+                    sign_timeout: Duration::from_secs(4),
+                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                    hooks: Arc::new(NoopSignHooks),
+                    op_name: "test_missing_scope",
+                    slashing_db: Arc::clone(&db),
+                    client_cn: "test".into(),
+                    gvr: GVR,
+                    kind,
+                    fork_name: None,
+                    #[cfg(any(test, feature = "test-utils"))]
+                    pre_reserve_barrier: None,
+                }))
+                .await;
+
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{kind:?}: a missing scope must be refused; got {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{kind:?}: BLS must not be reached");
+            let blocks = db.get_blocks(&pubkey_hex).expect("block rows");
+            let attestations = db.get_attestations(&pubkey_hex).expect("attestation rows");
+            assert!(
+                blocks.is_empty() && attestations.is_empty(),
+                "{kind:?}: no slashing row may be written: {blocks:?} {attestations:?}"
+            );
+            assert!(
+                locks.get(&pubkey_bytes).try_lock().is_ok(),
+                "{kind:?}: the per-validator lock must be free once the sign returns"
+            );
+        }
     }
 
     /// TimeoutPolicy has no Default (compile-time contract documented via explicit use).
