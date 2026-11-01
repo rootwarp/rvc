@@ -7,8 +7,8 @@
 //!
 //! For each slashable operation (`sign_block`, `sign_attestation`):
 //!
-//! 1. Cheap outer `gate_decision` — if false, return
-//!    `Err(SigningGateError::BlockedByDoppelganger)` immediately (no lock).
+//! 1. Cheap outer `gate_decision` (doppelganger, then beacon admission) — on
+//!    `Err`, return that error immediately (no lock).
 //! 2. Delegate to [`crate::core::sign_slashable`] with
 //!    [`TimeoutPolicy::DiscardStagedRow`] (in-process / gate backends):
 //!    - acquire the per-pubkey async lock;
@@ -34,8 +34,8 @@
 //! `sign_randao_reveal`, `sign_voluntary_exit`,
 //! `sign_builder_registration`):
 //!
-//! 1. Check `gate_decision` — if false, return
-//!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
+//! 1. Check `gate_decision` (doppelganger, then beacon admission) — on `Err`,
+//!    return that error immediately.
 //! 2. Delegate to [`crate::core::sign_nonslashable_core`] (same duration as slashable).
 //!    No slashing-DB staging or committing occurs — these operations are not
 //!    slashable by the Ethereum consensus spec.
@@ -182,9 +182,11 @@ impl SigningGate {
         Self { slashing_db, enablement, signer, locks, sign_timeout }
     }
 
-    /// Evaluate the doppelganger gate for `pubkey`.
+    /// Entry check for `pubkey` and `duty`: doppelganger first, then beacon admission.
     ///
-    /// Returns `true` when signing is permitted, `false` when it is denied.
+    /// Returns [`SigningGateError::BlockedByDoppelganger`] when the enablement
+    /// denies the key, else [`SigningGateError::BeaconAdmissionRevoked`] when
+    /// the caller's admission scope refuses `duty`.
     ///
     /// # Fail-closed default (PRD §6.3 — unknown → denied)
     ///
@@ -206,11 +208,7 @@ impl SigningGate {
     /// again after the slashing-DB reservation and before BLS. That second
     /// check is the admission boundary: it is not atomic with the backend
     /// call. A BLS call already started finishes or hits the sign timeout.
-    fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> bool {
-        if crate::beacon_admission_revoked(duty) {
-            warn!("SigningGate: beacon node admission revoked");
-            return false;
-        }
+    fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> Result<(), SigningGateError> {
         let enabled = doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty);
         // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
         // the gate decision must equal the fail-closed default.  This assert fires
@@ -220,7 +218,13 @@ impl SigningGate {
             !<bool as FailClosedDefault>::default_when_unknown(),
             "FailClosedDefault::default_when_unknown() must remain false (PRD §6.3)"
         );
-        enabled
+        if !enabled {
+            return Err(SigningGateError::BlockedByDoppelganger);
+        }
+        if crate::beacon_admission_revoked(duty) {
+            return Err(SigningGateError::BeaconAdmissionRevoked);
+        }
+        Ok(())
     }
 
     /// Sign a beacon block proposal.
@@ -242,7 +246,7 @@ impl SigningGate {
     ///
     /// # Defense-in-depth
     ///
-    /// 1. Outer `gate_decision` — fails closed on false (unknown pubkey → denied).
+    /// 1. Outer `gate_decision` — fails closed with its error (unknown pubkey → denied).
     /// 2. [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`]: lock →
     ///    re-check enablement under lock → reserve → sign (timeout) → reconcile.
     ///    On reserve error → `SlashingBlocked`. On reserve-time persist failure →
@@ -261,14 +265,14 @@ impl SigningGate {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
         // Cheap outer enablement check (no lock). Core re-checks under the lock.
-        if !self.gate_decision(pubkey, SigningDuty::Block) {
+        self.gate_decision(pubkey, SigningDuty::Block).inspect_err(|e| {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 slot,
-                "SigningGate: sign_block blocked by doppelganger gate"
+                error = %e,
+                "SigningGate: sign_block refused at entry"
             );
-            return Err(SigningGateError::BlockedByDoppelganger);
-        }
+        })?;
 
         // Explicit policy: gate backends are in-process — discard on timeout.
         sign_slashable(SignSlashableRequest {
@@ -333,15 +337,15 @@ impl SigningGate {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
         // Cheap outer enablement check (no lock). Core re-checks under the lock.
-        if !self.gate_decision(pubkey, SigningDuty::Attestation) {
+        self.gate_decision(pubkey, SigningDuty::Attestation).inspect_err(|e| {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 source_epoch,
                 target_epoch,
-                "SigningGate: sign_attestation blocked by doppelganger gate"
+                error = %e,
+                "SigningGate: sign_attestation refused at entry"
             );
-            return Err(SigningGateError::BlockedByDoppelganger);
-        }
+        })?;
 
         // Explicit policy: gate backends are in-process — discard on timeout.
         sign_slashable(SignSlashableRequest {
@@ -367,7 +371,7 @@ impl SigningGate {
 
     // ── Non-slashable signing methods ─────────────────────────────────────────
     //
-    // Non-slashable methods: `gate_decision` (bool, fail-closed) then
+    // Non-slashable methods: `gate_decision` (`Result`, fail-closed) then
     // [`sign_nonslashable_core`]. No slashing DB, no spawn_blocking.
     //
     // Error mapping is uniform: timeout/generic → SigningFailed,
@@ -388,14 +392,14 @@ impl SigningGate {
 
         // Same gate_decision point as slashable paths. `op_name` is the log
         // and metrics label. The exit unlock is `duty`.
-        if !self.gate_decision(pubkey, duty) {
+        self.gate_decision(pubkey, duty).inspect_err(|e| {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 op = op_name,
-                "SigningGate: non-slashable sign blocked by doppelganger gate"
+                error = %e,
+                "SigningGate: non-slashable sign refused at entry"
             );
-            return Err(SigningGateError::BlockedByDoppelganger);
-        }
+        })?;
 
         match sign_nonslashable_core(
             self.enablement.as_ref(),
