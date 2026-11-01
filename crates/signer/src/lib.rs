@@ -153,12 +153,39 @@ pub async fn require_beacon_admission_scope<R>(fut: impl std::future::Future<Out
 }
 
 pub(crate) fn beacon_admission_revoked(duty: SigningDuty) -> bool {
+    admission_revoked_by(&capture_admission(), duty)
+}
+
+/// The caller task's admission, read once so a check on another thread
+/// (the slashable `spawn_blocking` body) applies the same rule.
+///
+/// A clone shares the live generation atomics, so a revoke after the
+/// capture is still seen.
+#[derive(Clone, Debug)]
+pub(crate) enum CapturedAdmission {
+    Scoped(BeaconAdmission),
+    /// No scope on the caller task; `revokes` is the missing-scope rule there.
+    Missing {
+        revokes: bool,
+    },
+}
+
+/// Read both admission task-locals. Call it on the task that owns them.
+pub(crate) fn capture_admission() -> CapturedAdmission {
+    match BEACON_ADMISSION.try_with(BeaconAdmission::clone) {
+        Ok(admission) => CapturedAdmission::Scoped(admission),
+        Err(_) => CapturedAdmission::Missing { revokes: missing_admission_scope_revokes() },
+    }
+}
+
+/// The one admission rule for the entry, under-lock and after-reserve checks.
+pub(crate) fn admission_revoked_by(captured: &CapturedAdmission, duty: SigningDuty) -> bool {
     if !duty_requires_beacon_admission(duty) {
         return false;
     }
-    match BEACON_ADMISSION.try_with(|admission| !admission.holds()) {
-        Ok(revoked) => revoked,
-        Err(_) => missing_admission_scope_revokes(),
+    match captured {
+        CapturedAdmission::Scoped(admission) => !admission.holds(),
+        CapturedAdmission::Missing { revokes } => *revokes,
     }
 }
 
@@ -255,7 +282,9 @@ pub enum SignerError {
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
 
-    /// Beacon-node revocation after this duty captured chain data. No slashing row.
+    /// Beacon-node revocation after this duty captured chain data. No
+    /// signature. A refusal after the slashing reservation deletes the row
+    /// this call inserted; if that delete fails, the row is kept.
     #[error("signing blocked: beacon node admission revoked")]
     BeaconAdmissionRevoked,
 
@@ -2624,6 +2653,27 @@ mod tests {
         assert_eq!(err.to_string(), "unsupported duty: payload_attestation");
     }
 
+    /// W4-S4b: the one rule behind the entry, under-lock and after-reserve
+    /// admission checks. A duty without the admission requirement is never
+    /// refused.
+    #[test]
+    fn admission_revoked_by_table() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let scoped = CapturedAdmission::Scoped(BeaconAdmission::new(3, Arc::clone(&generation)));
+        let revokes = CapturedAdmission::Missing { revokes: true };
+        let open = CapturedAdmission::Missing { revokes: false };
+        let check = |case: &str, captured: &CapturedAdmission, duty: SigningDuty, want: bool| {
+            assert_eq!(admission_revoked_by(captured, duty), want, "{case} ({duty:?})");
+        };
+        check("scoped, holding", &scoped, SigningDuty::Block, false);
+        check("missing, revokes", &revokes, SigningDuty::Attestation, true);
+        check("missing, open", &open, SigningDuty::Block, false);
+        check("missing revokes, no admission duty", &revokes, SigningDuty::VoluntaryExit, false);
+        generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        check("scoped, moved", &scoped, SigningDuty::Attestation, true);
+        check("scoped moved, no admission duty", &scoped, SigningDuty::VoluntaryExit, false);
+    }
+
     /// A duty that requires beacon admission is refused when no task-local
     /// admission scope is installed. Voluntary exit does not require that
     /// scope. The keymanager may still read the validator index from a beacon
@@ -3438,7 +3488,8 @@ mod tests {
 
     /// W4-S4a (766-2): the entry check passes, the sign waits for a held
     /// per-validator lock, and the generation moves during that wait. The sign
-    /// is refused under the lock: no block row and no signature.
+    /// is refused under the lock, before any reserve: no block row and no
+    /// signature.
     ///
     /// Current-thread: the sign task runs from its entry check to the lock
     /// wait without yielding, so the test resumes only once it is parked.
@@ -3489,6 +3540,8 @@ mod tests {
         entered_rx.await.expect("the entry check must run");
         assert_eq!(lock_handles(), before + 1, "the sign must be parked on the held lock");
         generation.fetch_add(1, Ordering::Release);
+        // A reserve attempted after this point fails as `CommitFailed`.
+        slashing_db.fail_next_commits(1);
         drop(held);
 
         let result = tokio::time::timeout(Duration::from_secs(30), sign)
@@ -3499,7 +3552,7 @@ mod tests {
         assert!(rows.is_empty(), "no block row may be written: {rows:?}");
         assert!(
             matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
-            "expected BeaconAdmissionRevoked and no signature, got {result:?}"
+            "expected BeaconAdmissionRevoked before any reserve, got {result:?}"
         );
     }
 
