@@ -242,6 +242,11 @@ impl SigningQuiesceAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn tracked_keys(&self) -> &Arc<TrackedKeys> {
+        &self.tracked_keys
+    }
+
+    #[cfg(test)]
     pub(crate) fn quiesce_inserts(&self) -> u64 {
         self.inserts.load(Ordering::SeqCst)
     }

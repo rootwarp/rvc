@@ -141,6 +141,9 @@ impl DoppelgangerMonitor for DoppelgangerDisabledMonitor {
     }
 }
 
+/// `true` while some key backend holds the pubkey.
+pub type BackingPredicate = Arc<dyn Fn(&Pubkey) -> bool + Send + Sync>;
+
 /// [`DoppelgangerMonitor`] that registers keymanager-imported keys with a
 /// production [`ForwardWindowMachine`] (SEC-2b).
 ///
@@ -148,7 +151,7 @@ impl DoppelgangerMonitor for DoppelgangerDisabledMonitor {
 /// |------|----------------|
 /// | `start_monitoring` | [`ForwardWindowMachine::register_for_import`] (always Pending) |
 /// | `stop_monitoring` | **no-op** — M-12 wall-clock elapsed must not cancel machine state |
-/// | `cancel_monitoring` | [`ForwardWindowMachine::cancel`] — DELETE drops `Pending`/`Safe`; `Detected` stays |
+/// | `cancel_monitoring` | [`ForwardWindowMachine::cancel`] — DELETE drops `Pending`/`Safe`; `Detected` stays. Skipped while [`Self::with_backing`] reports the key held |
 ///
 /// Safety is the machine's `SigningEnablement` status (fail-closed for
 /// Pending/Detected/Unmonitored).
@@ -157,6 +160,8 @@ pub struct ForwardWindowMonitor {
     /// Supplies the current epoch for `register_for_import` (prefer
     /// [`doppelganger::MonotonicEpochClock`] shared with boot registration).
     epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync>,
+    /// `None`: `cancel_monitoring` always cancels.
+    backing: Option<BackingPredicate>,
 }
 
 impl ForwardWindowMonitor {
@@ -164,7 +169,18 @@ impl ForwardWindowMonitor {
         machine: Arc<ForwardWindowMachine>,
         epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync>,
     ) -> Self {
-        Self { machine, epoch_provider }
+        Self { machine, epoch_provider, backing: None }
+    }
+
+    /// Skip `cancel_monitoring` while `backing` reports that a key backend
+    /// holds the pubkey.
+    ///
+    /// A DELETE cancels after the key-set lock is released. By then a
+    /// re-import may hold the key again, inside a fresh window.
+    #[must_use]
+    pub fn with_backing(mut self, backing: BackingPredicate) -> Self {
+        self.backing = Some(backing);
+        self
     }
 
     /// Shared handle to the underlying machine (for tests / advanced wiring).
@@ -221,6 +237,13 @@ impl DoppelgangerMonitor for ForwardWindowMonitor {
     }
 
     fn cancel_monitoring(&self, pubkey: &Pubkey) {
+        if self.backing.as_ref().is_some_and(|held| held(pubkey)) {
+            info!(
+                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                "ForwardWindowMonitor: cancel skipped; a key backend still holds this key"
+            );
+            return;
+        }
         match PublicKey::from_bytes(pubkey) {
             Ok(pk) => {
                 self.machine.cancel(&pk);

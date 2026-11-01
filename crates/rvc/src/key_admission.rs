@@ -21,6 +21,7 @@ use validator_store::{ValidatorConfig, ValidatorStore};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::keymanager_adapters::KeyChangeNotifier;
 use crate::orchestrator::PubkeyMap;
+use crate::quiesce::TrackedKeys;
 
 /// Where an admitted key came from.
 ///
@@ -84,6 +85,8 @@ pub struct KeyAdmissionService {
     denylist: Arc<DeletionDenylist>,
     machine: Option<Arc<ForwardWindowMachine>>,
     epoch_clock: Arc<MonotonicEpochClock>,
+    /// The keymanager key-set lock a `RawSecret` admit holds throughout.
+    tracked_keys: Option<Arc<TrackedKeys>>,
     /// Test pause after the pubkey-map insert and before the generation bump.
     #[cfg(test)]
     after_map_insert: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -108,9 +111,22 @@ impl KeyAdmissionService {
             denylist,
             machine,
             epoch_clock,
+            tracked_keys: None,
             #[cfg(test)]
             after_map_insert: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Serialise `RawSecret` admits on the keymanager adapters' key-set lock.
+    ///
+    /// Production passes the [`TrackedKeys`] the keymanager adapters share,
+    /// so a secret-provider admit cannot land inside a keymanager import or
+    /// DELETE section. The keystore adapter already holds that lock when it
+    /// admits, so `Keystore` admits do not take it here.
+    #[must_use]
+    pub fn with_tracked_keys(mut self, tracked_keys: Arc<TrackedKeys>) -> Self {
+        self.tracked_keys = Some(tracked_keys);
+        self
     }
 
     /// Run `hook` once, after the next admit inserts the pubkey map entry.
@@ -180,6 +196,11 @@ impl KeyAdmissionService {
     /// 7. doppelganger `register_for_import` (when enabled)
     /// 8. `key_gen_tx` bump
     ///
+    /// # Key-set lock
+    ///
+    /// A `RawSecret` admit holds the [`Self::with_tracked_keys`] lock for every
+    /// step, its rollbacks included. Never call it with that lock held.
+    ///
     /// # Synchronous by necessity
     ///
     /// This method is **synchronous** (not `async`) so it is usable from
@@ -213,6 +234,10 @@ impl KeyAdmissionService {
             AdmissionSource::Keystore { .. } => "keystore",
         };
         let enforce_denylist = matches!(source, AdmissionSource::RawSecret);
+        let _key_set = match &source {
+            AdmissionSource::RawSecret => self.tracked_keys.as_ref().map(|keys| keys.lock()),
+            AdmissionSource::Keystore { .. } => None,
+        };
 
         // 1. Early denylist re-check (DELETE-races-refresh). Skip is not Err.
         if enforce_denylist && self.denylist.contains(&pubkey) {
@@ -272,7 +297,8 @@ impl KeyAdmissionService {
         // 5. ValidatorStore, when this import is not already a hold.
         // Insert only when the pubkey is absent, inside `save_lock`, so a
         // slashed `enabled = false` is not replaced. A failed write publishes
-        // nothing; roll the signer and map back too.
+        // nothing; roll the signer and map back too, and end any window the
+        // key had, so a retry starts a fresh one.
         if hold_until.is_none() {
             inserted_row =
                 match self.validator_store.add_validator_durable(ValidatorConfig::new(pubkey)) {
@@ -280,6 +306,7 @@ impl KeyAdmissionService {
                     Err(e) => {
                         let _ = self.composite_signer.remove_local_key(&pubkey);
                         self.notifier.pubkey_map().write().remove(&pubkey);
+                        self.cancel_forward_window(&pubkey);
                         return Err(AdmissionError::Persist(e.to_string()));
                     }
                 };
@@ -867,6 +894,92 @@ mod tests {
             .expect("admit");
         assert!(matches!(outcome, AdmissionOutcome::Admitted { pubkey, .. } if pubkey == pk));
         assert!(h.pubkey_map.read().contains_key(&pk));
+    }
+
+    /// A refresh admit whose validators-row write fails also ends the window
+    /// the key had, so the retry starts a fresh one instead of keeping `Safe`.
+    #[test]
+    fn failed_row_write_ends_the_window_so_the_retry_starts_pending() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("validators dir");
+        let path = dir.path().join("validators.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+        )
+        .expect("seed validators file");
+        let validator_store = Arc::new(ValidatorStore::load_from_config(&path).expect("load"));
+        let denylist_dir = TempDir::new().expect("denylist");
+        let denylist =
+            Arc::new(DeletionDenylist::empty_at(denylist_dir.path().join(".rvc.deleted_keys")));
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let (key_gen_tx, _key_gen_rx) = watch::channel(0u64);
+        let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let db: Arc<dyn slashing::SlashingDbReader> =
+            Arc::new(SlashingDb::open_in_memory().expect("in-memory slashing db"));
+        // Two closed not-live epochs take a key registered at epoch 5 to `Safe`.
+        let machine = Arc::new(ForwardWindowMachine::new(db, 1, [0xabu8; 32]));
+        let service = KeyAdmissionService::new(
+            Arc::clone(&pubkey_map),
+            key_gen_tx,
+            Arc::clone(&composite_signer),
+            validator_store,
+            denylist,
+            Some(Arc::clone(&machine)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
+        );
+        let sk = SecretKey::generate();
+        let public = sk.public_key();
+        let pk = public.to_bytes();
+        // Test-only: the retry needs the same key. Never log these bytes.
+        #[allow(clippy::disallowed_methods)]
+        let secret_bytes = sk.to_bytes();
+        // K finished a window under a backend that no longer holds it.
+        machine.register_for_import(&public, 5);
+        for epoch in [6, 7] {
+            let liveness =
+                doppelganger::ValidatorLivenessData { index: hex::encode(pk), is_live: false };
+            let missing = machine.observe_liveness(
+                epoch,
+                &[liveness],
+                epoch + 1,
+                doppelganger::CLOSED_EPOCH_SLOT,
+            );
+            assert!(missing.is_empty(), "epoch {epoch} left keys unobserved: {missing:?}");
+        }
+        assert_eq!(machine.status(&public), ForwardWindowStatus::Safe);
+        let set_mode = |mode| {
+            let mut perms = std::fs::metadata(dir.path()).expect("dir").permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(dir.path(), perms).expect("chmod");
+        };
+
+        let observe = || {
+            (
+                composite_signer.has_local_key(&pk),
+                pubkey_map.read().contains_key(&pk),
+                machine.status(&public),
+            )
+        };
+
+        set_mode(0o555);
+        let failed = service.admit(sk, AdmissionSource::RawSecret);
+        set_mode(0o755);
+        let after_failure = observe();
+        let secret = SecretKey::from_bytes(&secret_bytes).expect("secret");
+        let retried = service.admit(secret, AdmissionSource::RawSecret);
+
+        assert!(matches!(failed, Err(AdmissionError::Persist(_))), "got {failed:?}");
+        assert!(matches!(retried, Ok(AdmissionOutcome::Admitted { .. })), "got {retried:?}");
+        assert_eq!(
+            [after_failure, observe()],
+            [
+                (false, false, ForwardWindowStatus::Unmonitored),
+                (true, true, ForwardWindowStatus::Pending)
+            ],
+            "(local, in PubkeyMap, window) [after the failed admit, after the retry]"
+        );
     }
 
     /// Revoke drops only a row this admission inserted, and bumps key_gen.

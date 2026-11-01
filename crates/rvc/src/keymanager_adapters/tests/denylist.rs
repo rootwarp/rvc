@@ -105,21 +105,33 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
     assert!(monitor.is_doppelganger_safe(&pk), "Disabled monitor stays safe after re-arm");
 }
 
-/// Leftover `.removing.*` set-asides must re-arm like a final sidecar.
+/// Leftover `.removing.*` set-asides must re-arm like a final sidecar: the
+/// re-arm reaches the forward-window machine.
 #[test]
-#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_rearms_leftover_removing_sidecar() {
-    let dir = TempDir::new().unwrap();
-    let pk: Pubkey = [0xAEu8; 48];
-    let now_unix =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let removing =
-        dir.path().join(format!("0x{}.import_meta.json.removing.{now_unix}", hex::encode(pk)));
-    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{now_unix}}}")).unwrap();
+    use doppelganger::ForwardWindowStatus;
 
-    let monitor = DoppelgangerDisabledMonitor::new();
+    let dir = TempDir::new().unwrap();
+    let public = SecretKey::generate().public_key();
+    let pk: Pubkey = public.to_bytes();
+    // A far-future import time saturates `elapsed` to 0 for any clock value.
+    let imported_unix = u64::MAX / 2;
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.{imported_unix}", hex::encode(pk)));
+    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{imported_unix}}}")).unwrap();
+    let reader: Arc<dyn slashing::SlashingDbReader> =
+        Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+    let machine = Arc::new(ForwardWindowMachine::new(reader, 1, [0x11; 32]));
+    let epoch: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 5);
+    let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch);
+
     scan_and_rearm_gate(dir.path(), &monitor, 768);
-    assert!(logs_contain("re-arming"), "leftover .removing.* must re-arm within the window");
+
+    assert_eq!(
+        machine.status(&public),
+        ForwardWindowStatus::Pending,
+        "leftover .removing.* must re-arm within the window"
+    );
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.

@@ -215,6 +215,11 @@ impl KeystoreManagerAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn admissions(&self) -> &Arc<KeyAdmissionService> {
+        &self.admissions
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_before_admit_hook(&self, hook: TestHook) {
         *self.before_admit.lock() = Some(hook);
     }

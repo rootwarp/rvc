@@ -239,15 +239,19 @@ pub async fn run(
     );
 
     // ARCH-2c: single admission choke point for provider refresh + keymanager import.
-    let admissions = Arc::new(KeyAdmissionService::new(
-        Arc::clone(&pubkey_map),
-        key_gen_tx.clone(),
-        Arc::clone(&composite_signer),
-        Arc::clone(&validator_store),
-        Arc::clone(&deletion_denylist),
-        forward_window_machine.clone(),
-        Arc::clone(&epoch_clock),
-    ));
+    // A refresh admit takes the keymanager adapters' key-set lock.
+    let admissions = Arc::new(
+        KeyAdmissionService::new(
+            Arc::clone(&pubkey_map),
+            key_gen_tx.clone(),
+            Arc::clone(&composite_signer),
+            Arc::clone(&validator_store),
+            Arc::clone(&deletion_denylist),
+            forward_window_machine.clone(),
+            Arc::clone(&epoch_clock),
+        )
+        .with_tracked_keys(Arc::clone(&tracked_keys)),
+    );
 
     // ARCH-2a / VD-E1: refresh after key_gen_tx + validator_store are in scope
     // (RefreshService sleeps `interval` before first fetch — no startup timing change).
@@ -1561,6 +1565,23 @@ mod tests {
             !body.contains("denylist_for_callback"),
             "denylist guard must live inside admit, not at the call site"
         );
+    }
+
+    /// The refresh admits through the service the keymanager adapters get,
+    /// serialised on the `TrackedKeys` they share.
+    #[test]
+    fn refresh_admissions_take_the_keymanager_tracked_keys() {
+        let src = include_str!("run.rs");
+        let after = src.split("let admissions = Arc::new(").nth(1).expect("admissions in run");
+        let built = after.split("spawn_secret_provider_refresh(").next().expect("built first");
+        assert!(
+            built.contains(".with_tracked_keys(Arc::clone(&tracked_keys))"),
+            "the refresh admissions must take the keymanager TrackedKeys"
+        );
+        let deps = after.split("KeymanagerApiDeps {").nth(1).expect("keymanager deps");
+        let deps = deps.split("listeners.keymanager").next().expect("deps literal");
+        assert!(deps.contains("admissions,"), "the keymanager must get the same admissions");
+        assert!(deps.contains("tracked_keys,"), "and the same TrackedKeys");
     }
 
     /// ARCH-2c: DELETE then refresh skips the denylisted key via admit.
