@@ -13,6 +13,7 @@ use remote_signer_client::{RemoteSigner, RemoteSignerConfig};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::key_admission::KeyAdmissionService;
 use crate::orchestrator::PubkeyMap;
 use crate::quiesce::TrackedKeys;
 
@@ -22,10 +23,15 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 ///
 /// # Lock order
 ///
-/// `state_lock` (DELETE only) → [`TrackedKeys`] → `remote_keys` → composite
-/// maps → `PubkeyMap`, the order the keystore adapter's DELETE uses. Import
-/// and delete hold `tracked_keys` for the whole section, so the cross-backend
-/// duplicate check and the insert cannot interleave with a keystore import.
+/// `state_lock` (DELETE only) → [`TrackedKeys`] → `remote_keys` → one of the
+/// composite maps, the forward-window machine or `PubkeyMap`, each taken
+/// alone. The keystore adapter's DELETE uses the same order. Import and
+/// delete hold `tracked_keys` for the whole section, so the cross-backend
+/// duplicate check and the insert cannot interleave with a keystore import or
+/// a secret-provider admit, and a DELETE's window cancel cannot land after a
+/// re-import's fresh window. DELETE cancels the window before the key leaves
+/// `PubkeyMap`, so an admit that sees the key gone registers after that
+/// cancel.
 pub struct RemoteKeyManagerAdapter {
     composite_signer: Arc<CompositeSigner>,
     /// Keymanager-imported remote keys and their URLs. Changed only while
@@ -38,8 +44,12 @@ pub struct RemoteKeyManagerAdapter {
     warned_no_allowlist: AtomicBool,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
     notifier: KeyChangeNotifier,
+    /// Cancels a deleted key's forward window inside the delete section.
+    window_cancel: Option<Arc<KeyAdmissionService>>,
     /// Runs inside import and delete with both locks held, at
-    /// `"before_change"` and at `"after_change"`.
+    /// `"before_change"` and at `"after_change"`. Delete also runs it around
+    /// the window cancel, at `"before_window_cancel"` and
+    /// `"after_window_cancel"`.
     #[cfg(test)]
     section_hook: Mutex<Option<SectionHook>>,
 }
@@ -58,6 +68,7 @@ impl RemoteKeyManagerAdapter {
             allowed_hosts,
             warned_no_allowlist: AtomicBool::new(false),
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
+            window_cancel: None,
             #[cfg(test)]
             section_hook: Mutex::new(None),
         }
@@ -72,6 +83,17 @@ impl RemoteKeyManagerAdapter {
         self.tracked_keys = tracked_keys;
         self
     }
+
+    /// Cancel a deleted key's forward window before `tracked_keys` drops,
+    /// unless another backend still holds the key.
+    ///
+    /// Production passes the keystore adapter's [`KeyAdmissionService`], so a
+    /// remote DELETE cancels in its section as the keystore DELETE does.
+    #[must_use]
+    pub fn with_window_cancel(mut self, admissions: Arc<KeyAdmissionService>) -> Self {
+        self.window_cancel = Some(admissions);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +101,14 @@ type SectionHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 #[cfg(test)]
 impl RemoteKeyManagerAdapter {
+    pub(crate) fn tracked_keys(&self) -> &Arc<TrackedKeys> {
+        &self.tracked_keys
+    }
+
+    pub(crate) fn window_cancel(&self) -> Option<&Arc<KeyAdmissionService>> {
+        self.window_cancel.as_ref()
+    }
+
     pub(crate) fn set_section_hook(&self, hook: SectionHook) {
         *self.section_hook.lock() = Some(hook);
     }
@@ -166,6 +196,18 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
             keys.remove(pos);
             self.composite_signer.remove_remote_key(pubkey);
 
+            // Still under `tracked_keys`, and before K leaves `PubkeyMap`. A
+            // key that another backend holds keeps its window. The cancel may
+            // remove the force-window file.
+            #[cfg(test)]
+            self.run_section_hook("before_window_cancel");
+            if let Some(admissions) = &self.window_cancel {
+                if !self.composite_signer.has_any_backend(pubkey) {
+                    admissions.cancel_forward_window(pubkey);
+                }
+            }
+            #[cfg(test)]
+            self.run_section_hook("after_window_cancel");
             // Map remove + notify under the same lock as registry mutation (S1).
             self.notifier.remove_and_notify(pubkey);
             #[cfg(test)]

@@ -322,7 +322,9 @@ impl DoppelgangerLifecycle {
     ///
     /// On `removed == true`:
     /// - Local: [`ValidatorManager::remove_validator`]
-    /// - both kinds: [`DoppelgangerMonitor::cancel_monitoring`]
+    /// - both kinds: [`DoppelgangerMonitor::cancel_monitoring`]. The monitor may
+    ///   skip it while another key backend holds the key, such as a re-import
+    ///   that landed after `remove_op` released the key-set lock.
     pub fn on_delete<T>(
         &self,
         pubkey: &Pubkey,
