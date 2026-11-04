@@ -30,9 +30,14 @@ use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContents
 ///
 /// Produce and publish go to the proposer pool while it has an admitted
 /// node. The duty fence watches the main pool and the proposer pool's
-/// revocation generation, including when that pool is empty. A node granted
-/// after the fence and revoked before the signature is dropped. No admitted
-/// main node fails the fence even when a proposer node is admitted.
+/// revocation generation, including when that pool is empty, so a node
+/// granted after the fence is still watched. If either generation moves
+/// before the signer's last check before BLS (after the slashing
+/// reservation), the block is not signed. A BLS call already started is not
+/// stopped. For Gloas, a move before the signer's entry check for the
+/// envelope drops the envelope; a move after that check, or after it is
+/// signed, does not stop its publish. No admitted main node fails the fence
+/// even when a proposer node is admitted.
 pub struct BeaconBlockAdapter {
     main: Arc<dyn BeaconNodeClient>,
     proposer: Option<Arc<dyn BeaconNodeClient>>,

@@ -7,13 +7,17 @@
 //!
 //! For each slashable operation (`sign_block`, `sign_attestation`):
 //!
-//! 1. Cheap outer `gate_decision` (doppelganger, then beacon admission) — on
-//!    `Err`, return that error immediately (no lock).
+//! 1. Entry `gate_decision`: doppelganger, then beacon admission. On `Err`
+//!    ([`SigningGateError::BlockedByDoppelganger`] or
+//!    [`SigningGateError::BeaconAdmissionRevoked`]) return it before the lock.
 //! 2. Delegate to [`crate::core::sign_slashable`] with
 //!    [`TimeoutPolicy::DiscardStagedRow`] (in-process / gate backends):
 //!    - acquire the per-pubkey async lock;
-//!    - **re-check** enablement under the lock (Safe→Detected TOCTOU);
-//!    - `spawn_blocking` reserve → sign (with timeout) → reconcile;
+//!    - check doppelganger, then admission, again under the lock (after the
+//!      lock wait, before any reservation);
+//!    - `spawn_blocking`: reserve, check doppelganger, then admission, once
+//!      more (the last check before BLS; an admission refusal deletes the
+//!      row this call reserved), then sign (with timeout) → reconcile;
 //!    - record the standard RVC slashable metric families via
 //!      [`crate::core::StandardSlashableHooks`].
 //!
@@ -34,11 +38,17 @@
 //! `sign_randao_reveal`, `sign_voluntary_exit`,
 //! `sign_builder_registration`):
 //!
-//! 1. Check `gate_decision` (doppelganger, then beacon admission) — on `Err`,
-//!    return that error immediately.
-//! 2. Delegate to [`crate::core::sign_nonslashable_core`] (same duration as slashable).
-//!    No slashing-DB staging or committing occurs — these operations are not
-//!    slashable by the Ethereum consensus spec.
+//! 1. Entry `gate_decision` (doppelganger, then beacon admission); on `Err`,
+//!    return that error immediately. For these duties it is the last
+//!    admission check before BLS.
+//! 2. Delegate to [`crate::core::sign_nonslashable_core`] (same duration as slashable),
+//!    which re-checks doppelganger only, then signs. No slashing-DB staging or
+//!    committing occurs — these operations are not slashable by the Ethereum
+//!    consensus spec.
+//!
+//! The gate has no method for `SigningDuty::ElectraAggregateAndProof` or
+//! `SigningDuty::AggregateAndProofRoot`; only [`crate::SignerService`] signs
+//! those duties.
 //!
 //! Because non-slashable signs carry no `!Send` staging guard, they are plain
 //! `async` with a direct `.await` on the signer — no `spawn_blocking` needed.
@@ -50,11 +60,20 @@
 //!
 //! # Gate decision and fail-closed default
 //!
-//! The single `gate_decision` helper centralises the doppelganger check for
-//! all paths (slashable and non-slashable).  It calls `is_signing_enabled` and
-//! returns the result.  For unknown pubkeys the `SigningEnablement`
-//! implementation (e.g. `ForwardWindowMachine`) returns `false`, matching the
-//! fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
+//! `gate_decision` is the entry check of every gate method, slashable and
+//! non-slashable. It returns `Result<(), SigningGateError>`: doppelganger
+//! first (`signing_allowed`, [`SigningGateError::BlockedByDoppelganger`]),
+//! then the caller task's beacon admission for the duty
+//! ([`SigningGateError::BeaconAdmissionRevoked`]; a missing scope refuses in
+//! production builds, and `VoluntaryExit` needs no admission). For unknown
+//! pubkeys the `SigningEnablement` implementation (e.g. `ForwardWindowMachine`)
+//! returns `false`, matching the fail-closed default
+//! `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
+//!
+//! The admission boundary is the last check before BLS: after the slashing
+//! reservation for `sign_block` / `sign_attestation`, and `gate_decision`
+//! itself for the non-slashable methods. It is not atomic with the backend
+//! call: a BLS call already started finishes or hits the sign timeout.
 //!
 //! # Cancellation safety and the sign-span lock
 //!
@@ -195,19 +214,22 @@ impl SigningGate {
     /// `is_signing_enabled` returns `false`.  This matches the explicit
     /// fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
     ///
-    /// The `debug_assert_eq!` below makes this codification executable: in debug
+    /// The `debug_assert!` below makes this codification executable: in debug
     /// and test builds it fires if the `FailClosedDefault` contract is ever
     /// changed to a non-false value without updating the gate logic.
     ///
-    /// This helper is the single gate-decision point for BOTH slashable and
+    /// This helper is the single entry check for BOTH slashable and
     /// non-slashable signing paths, ensuring the fail-closed semantics are
     /// applied uniformly.
     ///
     /// `signing_allowed` reads the process detection latch. After that latch
-    /// is stored this returns false for every key. Slashable signing checks
-    /// again after the slashing-DB reservation and before BLS. That second
-    /// check is the admission boundary: it is not atomic with the backend
-    /// call. A BLS call already started finishes or hits the sign timeout.
+    /// is stored this returns `Err(BlockedByDoppelganger)` for every key,
+    /// before admission is read. Slashable signs check doppelganger, then
+    /// admission, again under the per-validator lock and after the slashing-DB
+    /// reservation. The last check before BLS (after the reservation for a
+    /// slashable sign, this one for a non-slashable sign) is the admission
+    /// boundary: it is not atomic with the backend call. A BLS call already
+    /// started finishes or hits the sign timeout.
     fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> Result<(), SigningGateError> {
         let enabled = doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty);
         // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
