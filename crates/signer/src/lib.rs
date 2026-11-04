@@ -189,18 +189,30 @@ pub(crate) fn admission_revoked_by(captured: &CapturedAdmission, duty: SigningDu
     }
 }
 
-fn missing_admission_scope_revokes() -> bool {
-    // `test-utils` keeps existing fixtures signing unless the test opts in
-    // with `require_beacon_admission_scope`. Production builds fail closed.
-    #[cfg(feature = "test-utils")]
-    {
-        ADMISSION_SCOPE_REQUIRED.try_with(|_| ()).is_ok()
-    }
-    #[cfg(not(feature = "test-utils"))]
-    {
-        true
-    }
+/// The missing-scope rule. `test_utils` is whether the build has the
+/// `test-utils` feature; `opted_in` is whether the caller runs under
+/// [`require_beacon_admission_scope`]. Only a `test-utils` build that did not
+/// opt in leaves a missing scope open.
+const fn missing_scope_revokes(test_utils: bool, opted_in: bool) -> bool {
+    !test_utils || opted_in
 }
+
+/// `test-utils` keeps existing fixtures signing unless the test opts in.
+#[cfg(feature = "test-utils")]
+fn missing_admission_scope_revokes() -> bool {
+    missing_scope_revokes(true, ADMISSION_SCOPE_REQUIRED.try_with(|_| ()).is_ok())
+}
+
+/// Production builds have no opt-in, so a missing scope always refuses.
+#[cfg(not(feature = "test-utils"))]
+const fn missing_admission_scope_revokes() -> bool {
+    missing_scope_revokes(false, false)
+}
+
+// Every build without `test-utils` evaluates the production arm here: release
+// binaries, `cargo check -p rvc-signer`, and the `rvc-signer-server` test build.
+#[cfg(not(feature = "test-utils"))]
+const _: () = assert!(missing_admission_scope_revokes(), "a missing admission scope must refuse");
 pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
@@ -963,22 +975,29 @@ impl SignerService {
         }))
     }
 
-    /// Refuse signing when the doppelganger enablement gate is closed.
+    /// Entry check: doppelganger enablement first, then beacon admission.
     ///
-    /// Called **before** any slashing stage or BLS sign so a closed gate never
-    /// stages a row or produces a signature. On slashable paths the shared
-    /// core re-checks enablement **under** the per-validator lock (closes
-    /// Safe→Detected TOCTOU vs concurrent liveness) and again after the
-    /// slashing reservation, before BLS.
+    /// Runs before any slashing reservation or BLS call, so a refusal here
+    /// writes no row and produces no signature. A closed enablement returns
+    /// [`SignerError::BlockedByDoppelganger`]. Otherwise a moved generation, or
+    /// a missing scope where the missing-scope rule refuses, returns
+    /// [`SignerError::BeaconAdmissionRevoked`] for every duty except
+    /// [`SigningDuty::VoluntaryExit`].
     ///
-    /// The process detection latch is read inside `signing_allowed`. Once that
-    /// latch is stored, this check and every later admission check return
-    /// [`SignerError::BlockedByDoppelganger`]. A slashable sign that has not
-    /// called BLS is refused and keeps its reserved row. The post-reserve
-    /// check is the admission boundary, not an atomic pair with the backend:
-    /// a BLS call already started, including a remote request, and a
-    /// non-slashable sign that already passed its check, run to the sign
-    /// timeout.
+    /// The process detection latch is read inside `signing_allowed`. Once it
+    /// is stored, every later check point refuses with
+    /// [`SignerError::BlockedByDoppelganger`] before it reads admission, so a
+    /// detected key reports doppelganger even when its admission also moved.
+    ///
+    /// Slashable signs check both again, in the same order, under the
+    /// per-validator lock (after the lock wait) and after the slashing
+    /// reservation. A doppelganger refusal after the reservation keeps the
+    /// row; an admission refusal there deletes the row this call inserted.
+    /// The last check before BLS is the boundary: the after-reservation check
+    /// for a slashable sign, this entry check for a non-slashable one (its
+    /// core re-checks doppelganger only). It is not atomic with the backend:
+    /// a BLS call already started, including a remote request, finishes or
+    /// hits the sign timeout.
     ///
     /// `duty` is the typed operation. An exit-only enablement stays closed
     /// for every variant except [`SigningDuty::VoluntaryExit`].
@@ -2674,6 +2693,21 @@ mod tests {
         check("scoped moved, no admission duty", &scoped, SigningDuty::VoluntaryExit, false);
     }
 
+    /// 751-6: the missing-scope rule for both builds. `(false, _)` is the
+    /// production arm, which no test build compiles as a `cfg` branch.
+    #[test]
+    fn missing_scope_revokes_table() {
+        let cases = [
+            ("production, no opt-in", false, false, true),
+            ("production, opt-in flag ignored", false, true, true),
+            ("test-utils fixture, no opt-in", true, false, false),
+            ("test-utils, opted in", true, true, true),
+        ];
+        for (case, test_utils, opted_in, revokes) in cases {
+            assert_eq!(missing_scope_revokes(test_utils, opted_in), revokes, "{case}");
+        }
+    }
+
     /// A duty that requires beacon admission is refused when no task-local
     /// admission scope is installed. Voluntary exit does not require that
     /// scope. The keymanager may still read the validator index from a beacon
@@ -2718,258 +2752,390 @@ mod tests {
         .expect("a holding scope allows the attestation");
     }
 
-    /// Every admission duty hits the production missing-scope branch.
-    /// `test-utils` would otherwise leave the scope open.
-    #[tokio::test]
-    async fn every_signing_duty_without_an_admission_scope_is_refused() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let signer = create_test_composite_signer_with_key(secret_key);
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
-        let schedule = create_test_fork_schedule();
+    /// Every `SigningDuty` variant once, in [`duty_ordinal`] order.
+    const ALL_SIGNING_DUTIES: [SigningDuty; 16] = [
+        SigningDuty::Attestation,
+        SigningDuty::Block,
+        SigningDuty::RandaoReveal,
+        SigningDuty::SyncCommitteeMessage,
+        SigningDuty::SelectionProof,
+        SigningDuty::AggregateAndProof,
+        SigningDuty::ElectraAggregateAndProof,
+        SigningDuty::AggregateAndProofRoot,
+        SigningDuty::SyncCommitteeSelectionProof,
+        SigningDuty::ContributionAndProof,
+        SigningDuty::PayloadAttestation,
+        SigningDuty::ProposerPreferences,
+        SigningDuty::BuilderRegistration,
+        SigningDuty::BuilderRequestAuth,
+        SigningDuty::ExecutionPayloadEnvelope,
+        SigningDuty::VoluntaryExit,
+    ];
+
+    /// No wildcard: a new `SigningDuty` variant does not compile until it has
+    /// an ordinal here and a call in [`call_without_scope`]. Add it to
+    /// [`ALL_SIGNING_DUTIES`] in the same edit and raise the `16`s; nothing
+    /// else can enforce that.
+    fn duty_ordinal(duty: SigningDuty) -> usize {
+        match duty {
+            SigningDuty::Attestation => 0,
+            SigningDuty::Block => 1,
+            SigningDuty::RandaoReveal => 2,
+            SigningDuty::SyncCommitteeMessage => 3,
+            SigningDuty::SelectionProof => 4,
+            SigningDuty::AggregateAndProof => 5,
+            SigningDuty::ElectraAggregateAndProof => 6,
+            SigningDuty::AggregateAndProofRoot => 7,
+            SigningDuty::SyncCommitteeSelectionProof => 8,
+            SigningDuty::ContributionAndProof => 9,
+            SigningDuty::PayloadAttestation => 10,
+            SigningDuty::ProposerPreferences => 11,
+            SigningDuty::BuilderRegistration => 12,
+            SigningDuty::BuilderRequestAuth => 13,
+            SigningDuty::ExecutionPayloadEnvelope => 14,
+            SigningDuty::VoluntaryExit => 15,
+        }
+    }
+
+    struct NoScopeFixture {
+        service: SignerService,
+        pubkey: PublicKey,
+        schedule: ForkSchedule,
+    }
+
+    impl NoScopeFixture {
+        fn new() -> Self {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let signer = create_test_composite_signer_with_key(secret_key);
+            let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+            let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+            Self { service, pubkey, schedule: create_test_fork_schedule() }
+        }
+    }
+
+    /// Every `SignerService` method that signs `duty`, each run under
+    /// `require_beacon_admission_scope` with no admission scope. `Block` has
+    /// two (`sign_block`, `sign_block_header`). The payloads are the ones the
+    /// hand-written per-duty list used.
+    async fn call_without_scope(
+        fx: &NoScopeFixture,
+        duty: SigningDuty,
+    ) -> Vec<(&'static str, Result<(), SignerError>)> {
+        let NoScopeFixture { service, pubkey, schedule } = fx;
         let genesis_root = [0xaa; 32];
         let root = [0x11; 32];
-        let attestation = create_test_attestation_data(1, 2);
-        let header = BeaconBlockHeaderFields {
-            slot: 1,
-            proposer_index: 1,
-            parent_root: root,
-            state_root: root,
-            body_root: root,
-            body_ssz: Vec::new(),
-            is_blinded: false,
-        };
-        let aggregate = create_test_aggregate_and_proof(100);
         let electra_slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
-        let electra = create_test_electra_aggregate_and_proof(electra_slot);
-        let contribution = eth_types::ContributionAndProof {
-            aggregator_index: 1,
-            contribution: eth_types::SyncCommitteeContribution {
-                slot: 1,
-                beacon_block_root: root,
-                subcommittee_index: 0,
-                aggregation_bits: vec![0xff],
-                signature: vec![0xaa; 96],
-            },
-            selection_proof: vec![0xbb; 96],
-        };
-        let payload = eth_types::PayloadAttestationData {
-            beacon_block_root: root,
-            slot: 1,
-            payload_present: true,
-            blob_data_available: false,
-        };
-        let prefs = eth_types::ProposerPreferences {
-            dependent_root: root,
-            proposal_slot: 1,
-            validator_index: 1,
-            fee_recipient: [0x22; 20],
-            target_gas_limit: 30_000_000,
-        };
-        let registration = eth_types::ValidatorRegistrationV1 {
-            fee_recipient: [0x22; 20],
-            gas_limit: 30_000_000,
-            timestamp: 1,
-            pubkey: pubkey.to_bytes(),
-        };
-        let auth = eth_types::BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1)
-            .expect("auth");
-        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 1 };
+        match duty {
+            SigningDuty::Attestation => {
+                let attestation = create_test_attestation_data(1, 2);
+                vec![(
+                    "sign_attestation",
+                    require_beacon_admission_scope(service.sign_attestation(
+                        &attestation,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::Block => {
+                let header = BeaconBlockHeaderFields {
+                    slot: 1,
+                    proposer_index: 1,
+                    parent_root: root,
+                    state_root: root,
+                    body_root: root,
+                    body_ssz: Vec::new(),
+                    is_blinded: false,
+                };
+                vec![
+                    (
+                        "sign_block",
+                        require_beacon_admission_scope(service.sign_block(
+                            &root,
+                            1,
+                            pubkey,
+                            schedule,
+                            &genesis_root,
+                        ))
+                        .await
+                        .map(drop),
+                    ),
+                    (
+                        "sign_block_header",
+                        require_beacon_admission_scope(service.sign_block_header(
+                            &header,
+                            pubkey,
+                            schedule,
+                            &genesis_root,
+                        ))
+                        .await
+                        .map(drop),
+                    ),
+                ]
+            }
+            SigningDuty::RandaoReveal => vec![(
+                "sign_randao_reveal",
+                require_beacon_admission_scope(service.sign_randao_reveal(
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SyncCommitteeMessage => vec![(
+                "sign_sync_committee_message",
+                require_beacon_admission_scope(service.sign_sync_committee_message(
+                    &root,
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SelectionProof => vec![(
+                "sign_selection_proof",
+                require_beacon_admission_scope(service.sign_selection_proof(
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::AggregateAndProof => {
+                let aggregate = create_test_aggregate_and_proof(100);
+                vec![(
+                    "sign_aggregate_and_proof",
+                    require_beacon_admission_scope(service.sign_aggregate_and_proof(
+                        &aggregate,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ElectraAggregateAndProof => {
+                let electra = create_test_electra_aggregate_and_proof(electra_slot);
+                vec![(
+                    "sign_electra_aggregate_and_proof",
+                    require_beacon_admission_scope(service.sign_electra_aggregate_and_proof(
+                        &electra,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::AggregateAndProofRoot => vec![(
+                "sign_aggregate_and_proof_root",
+                require_beacon_admission_scope(service.sign_aggregate_and_proof_root(
+                    &root,
+                    electra_slot,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SyncCommitteeSelectionProof => vec![(
+                "sign_sync_committee_selection_proof",
+                require_beacon_admission_scope(service.sign_sync_committee_selection_proof(
+                    1,
+                    0,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::ContributionAndProof => {
+                let contribution = eth_types::ContributionAndProof {
+                    aggregator_index: 1,
+                    contribution: eth_types::SyncCommitteeContribution {
+                        slot: 1,
+                        beacon_block_root: root,
+                        subcommittee_index: 0,
+                        aggregation_bits: vec![0xff],
+                        signature: vec![0xaa; 96],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                };
+                vec![(
+                    "sign_contribution_and_proof",
+                    require_beacon_admission_scope(service.sign_contribution_and_proof(
+                        &contribution,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::PayloadAttestation => {
+                let payload = eth_types::PayloadAttestationData {
+                    beacon_block_root: root,
+                    slot: 1,
+                    payload_present: true,
+                    blob_data_available: false,
+                };
+                vec![(
+                    "sign_payload_attestation",
+                    require_beacon_admission_scope(service.sign_payload_attestation(
+                        &payload,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ProposerPreferences => {
+                let prefs = eth_types::ProposerPreferences {
+                    dependent_root: root,
+                    proposal_slot: 1,
+                    validator_index: 1,
+                    fee_recipient: [0x22; 20],
+                    target_gas_limit: 30_000_000,
+                };
+                vec![(
+                    "sign_proposer_preferences",
+                    require_beacon_admission_scope(service.sign_proposer_preferences(
+                        &prefs,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::BuilderRegistration => {
+                let registration = eth_types::ValidatorRegistrationV1 {
+                    fee_recipient: [0x22; 20],
+                    gas_limit: 30_000_000,
+                    timestamp: 1,
+                    pubkey: pubkey.to_bytes(),
+                };
+                vec![(
+                    "sign_builder_registration",
+                    require_beacon_admission_scope(service.sign_builder_registration(
+                        &registration,
+                        pubkey,
+                        schedule.genesis_fork_version,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::BuilderRequestAuth => {
+                let auth =
+                    eth_types::BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1)
+                        .expect("auth");
+                vec![(
+                    "sign_builder_request_auth",
+                    require_beacon_admission_scope(service.sign_builder_request_auth(
+                        &auth,
+                        pubkey,
+                        schedule.genesis_fork_version,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ExecutionPayloadEnvelope => vec![(
+                "sign_execution_payload_envelope_root",
+                require_beacon_admission_scope(service.sign_execution_payload_envelope_root(
+                    &root,
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::VoluntaryExit => {
+                let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 1 };
+                vec![(
+                    "sign_voluntary_exit",
+                    require_beacon_admission_scope(service.sign_voluntary_exit(
+                        &exit,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+        }
+    }
 
-        let refused = |err: SignerError, duty: &str| {
-            assert!(
-                matches!(err, SignerError::BeaconAdmissionRevoked),
-                "{duty} missing scope must fail closed, got {err:?}"
+    /// 751-6: every `SigningDuty` variant runs through the exhaustive
+    /// [`call_without_scope`] with the missing-scope rule opted in. Every
+    /// call of an admission duty is refused at the service entry: one entry
+    /// WARN per call, so the under-lock re-check is not the one that refused.
+    /// Voluntary exit signs. `ElectraAggregateAndProof` and
+    /// `AggregateAndProofRoot` have no `SigningGate` method, so this is their
+    /// only missing-scope test.
+    #[tokio::test]
+    async fn every_signing_duty_variant_has_a_missing_scope_case() {
+        let mut ordinals: Vec<usize> = ALL_SIGNING_DUTIES.into_iter().map(duty_ordinal).collect();
+        ordinals.sort_unstable();
+        assert_eq!(
+            ordinals,
+            (0..16).collect::<Vec<_>>(),
+            "ALL_SIGNING_DUTIES must list every variant exactly once"
+        );
+
+        let fx = NoScopeFixture::new();
+        for duty in ALL_SIGNING_DUTIES {
+            let (calls, warns) = with_warns(call_without_scope(&fx, duty)).await;
+            let lines: Vec<String> =
+                warns.iter().map(|w| format!("{} {}", w.message, w.fields_text)).collect();
+            if duty == SigningDuty::VoluntaryExit {
+                for (method, result) in &calls {
+                    assert!(result.is_ok(), "{method}: an exit needs no admission, got {result:?}");
+                }
+                assert!(warns.is_empty(), "{duty:?}: no WARN, got {lines:?}");
+                continue;
+            }
+            for (method, result) in &calls {
+                assert!(
+                    matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+                    "{method} ({duty:?}): a missing scope must fail closed, got {result:?}"
+                );
+            }
+            assert_eq!(
+                warns.len(),
+                calls.len(),
+                "{duty:?}: one entry WARN per call, got {lines:?}"
             );
-        };
-        refused(
-            require_beacon_admission_scope(service.sign_attestation(
-                &attestation,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("attestation"),
-            "attestation",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_block(
-                &root,
-                1,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("block"),
-            "block",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_block_header(
-                &header,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("block header"),
-            "block header",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_randao_reveal(
-                1,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("randao"),
-            "randao",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_sync_committee_message(
-                &root,
-                1,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("sync message"),
-            "sync message",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_selection_proof(
-                1,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("selection proof"),
-            "selection proof",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_aggregate_and_proof(
-                &aggregate,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("aggregate"),
-            "aggregate",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_electra_aggregate_and_proof(
-                &electra,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("electra aggregate"),
-            "electra aggregate",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_aggregate_and_proof_root(
-                &root,
-                electra_slot,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("aggregate root"),
-            "aggregate root",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_sync_committee_selection_proof(
-                1,
-                0,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("sync selection"),
-            "sync selection",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_contribution_and_proof(
-                &contribution,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("contribution"),
-            "contribution",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_payload_attestation(
-                &payload,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("payload attestation"),
-            "payload attestation",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_proposer_preferences(
-                &prefs,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("proposer preferences"),
-            "proposer preferences",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_builder_registration(
-                &registration,
-                &pubkey,
-                schedule.genesis_fork_version,
-            ))
-            .await
-            .expect_err("builder registration"),
-            "builder registration",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_builder_request_auth(
-                &auth,
-                &pubkey,
-                schedule.genesis_fork_version,
-            ))
-            .await
-            .expect_err("builder request auth"),
-            "builder request auth",
-        );
-        refused(
-            require_beacon_admission_scope(service.sign_execution_payload_envelope_root(
-                &root,
-                1,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            ))
-            .await
-            .expect_err("envelope"),
-            "envelope",
-        );
-        require_beacon_admission_scope(service.sign_voluntary_exit(
-            &exit,
-            &pubkey,
-            &schedule,
-            &genesis_root,
-        ))
-        .await
-        .expect("voluntary exit does not require beacon admission");
+            assert!(
+                warns.iter().all(|w| {
+                    w.message == "SignerService: beacon node admission revoked"
+                        && w.fields_text.is_empty()
+                }),
+                "{duty:?}: refused at the service entry, got {lines:?}"
+            );
+        }
     }
 
     /// RF4-03 (M1): production `sign_block` commit arm returns `CommitFailed`
