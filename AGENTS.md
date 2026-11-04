@@ -14,7 +14,7 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
 ## Before opening the PR
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test` (workspace, or `-p` for touched crates plus dependents)
+- `cargo nextest run --workspace --all-features` (or `-p` for touched crates plus dependents)
 - `python3 scripts/gitleaks_strict_config.py --out-dir target/gitleaks` writes the strict configs that CI scans with. `useDefault` alone merges default allowlist entries that hide real secrets, so do not scan with `.gitleaks.toml` directly.
 - `gitleaks detect --no-git --source . --config target/gitleaks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
 - History scan: `./scripts/gitleaks_range_scan.sh "$PWD/target/gitleaks/gitleaks.toml" --history`. Run it in a full clone, not a shallow or `blob:none` clone. CI runs it weekly in `secret-history-scan.yml`.
@@ -27,7 +27,7 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
   - [ ] Signing-root / `hash_tree_root` tests are KAT-anchored or `kat_exempt` with a reason.
 
 ## Tests
-`cargo nextest run --workspace --all-features` is the default. `cargo test` still runs the suite and is what the pre-PR line below names; it shares one process per test binary, so process-global metrics can race. Timing tests use paused tokio time. Do not synchronize a test on a wall-clock sleep.
+`cargo nextest run --workspace --all-features` is the gate, and the pre-PR line above names it. Plain `cargo test` is best-effort: it shares one process per test binary, so process-global metrics can race. Timing tests use paused tokio time. Do not synchronize a test on a wall-clock sleep.
 
 ## Coding
 Follow `.cursor/rules/rust-code.mdc` (TDD, idiomatic Rust, conventions) and `CLAUDE.md`.

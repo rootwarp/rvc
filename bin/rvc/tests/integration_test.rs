@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -37,8 +37,11 @@ const STARTUP_SEQUENCE: &[&str] = &[
     "Slashing DB integrity check passed",
     "Genesis validators root validated successfully",
     "Loaded validator keys",
-    "Starting duty orchestrator",
+    ORCHESTRATOR_MARKER,
 ];
+
+/// Startup log line that ends the ready path. Matched on stdout only.
+const ORCHESTRATOR_MARKER: &str = "Starting duty orchestrator";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(35);
@@ -54,6 +57,41 @@ fn child_status(child: &mut Child) -> Option<ExitStatus> {
     match child.try_wait() {
         Ok(status) => status,
         Err(err) => panic!("error waiting for process: {err}"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExitAction {
+    Respawn,
+    Fail,
+}
+
+/// Classify an exited child once its log readers have drained.
+///
+/// The readers are joined first, so the marker check sees every byte the
+/// child wrote before it exited.
+fn classify_exit(code: Option<i32>, logs: &mut LogCapture) -> ExitAction {
+    logs.drain();
+    if is_port_bind_race(code, logs.saw_orchestrator()) {
+        ExitAction::Respawn
+    } else {
+        ExitAction::Fail
+    }
+}
+
+/// Return only when `status` is a port-bind race and `attempt` is not the
+/// last one. Every other exit panics with the drained log.
+fn expect_respawn(status: ExitStatus, attempt: u32, logs: &mut LogCapture) {
+    match classify_exit(status.code(), logs) {
+        ExitAction::Respawn if attempt < READY_ATTEMPTS => {}
+        action => panic!(
+            "startup exited {status} on attempt {attempt}/{READY_ATTEMPTS} ({action:?}, \
+             orchestrator log seen: {}); respawn is only for exit {} before that log\n\
+             --- log ---\n{}",
+            logs.saw_orchestrator(),
+            rvc::startup::EXIT_LISTENER_BIND,
+            logs.snapshot(),
+        ),
     }
 }
 
@@ -204,88 +242,451 @@ fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
 
 /// Drain child stdout and stderr so the process cannot block on a full pipe.
 ///
-/// The orchestrator flag is set only from stdout. Stderr is appended so a
-/// failed attempt's panic includes both streams.
+/// The orchestrator flag is set only from stdout: the stdout reader matches
+/// the marker on its own text. Both streams append to `buffer`, so a failed
+/// attempt's panic includes both.
 struct LogCapture {
     buffer: Arc<Mutex<String>>,
     handles: Vec<JoinHandle<()>>,
-    orchestrator: Arc<(Mutex<bool>, Condvar)>,
+    readers: Arc<(Mutex<ReaderState>, Condvar)>,
+    /// Held by the stdout reader until [`Self::drain`] waits on it too.
+    gate: Option<Arc<Barrier>>,
+}
+
+struct ReaderState {
+    orchestrator: bool,
+    open_streams: usize,
+    /// Times a [`LogCapture::wait_for_orchestrator`] caller went to sleep. It
+    /// rises under the lock just before the caller sleeps, so a test that
+    /// reads a non-zero count knows only a notify can wake that caller.
+    parked: usize,
+}
+
+/// How [`LogCapture::wait_for_orchestrator`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyWait {
+    Ready,
+    /// Every stream reached EOF without the marker: the child is exiting.
+    StreamsClosed,
+    TimedOut,
 }
 
 fn spawn_log_reader(
     mut reader: impl Read + Send + 'static,
-    buf: Arc<Mutex<String>>,
-    orchestrator: Option<Arc<(Mutex<bool>, Condvar)>>,
+    buffer: Arc<Mutex<String>>,
+    readers: Arc<(Mutex<ReaderState>, Condvar)>,
+    match_marker: bool,
+    gate: Option<Arc<Barrier>>,
 ) -> JoinHandle<()> {
+    let update = move |change: fn(&mut ReaderState)| {
+        let (lock, cv) = &*readers;
+        if let Ok(mut state) = lock.lock() {
+            change(&mut state);
+            cv.notify_all();
+        }
+    };
     thread::spawn(move || {
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+        let mut own = String::new();
         let mut chunk = [0u8; 4096];
         loop {
             match reader.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let text = String::from_utf8_lossy(&chunk[..n]);
-                    let mut saw = false;
-                    if let Ok(mut guard) = buf.lock() {
-                        guard.push_str(&text);
-                        saw =
-                            orchestrator.is_some() && guard.contains("Starting duty orchestrator");
+                    if let Ok(mut all) = buffer.lock() {
+                        all.push_str(&text);
                     }
-                    if let Some(ready) = orchestrator.as_ref().filter(|_| saw) {
-                        let (lock, cv) = &**ready;
-                        if let Ok(mut flag) = lock.lock() {
-                            *flag = true;
-                            cv.notify_all();
+                    if match_marker {
+                        own.push_str(&text);
+                        if own.contains(ORCHESTRATOR_MARKER) {
+                            update(|state| state.orchestrator = true);
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
+        update(|state| state.open_streams -= 1);
     })
 }
 
 impl LogCapture {
     fn start(stdout: ChildStdout, stderr: ChildStderr) -> Self {
+        Self::start_from(stdout, stderr, None)
+    }
+
+    /// `gate` holds the stdout reader before its first read until this
+    /// capture drains, so a test can observe an exit before the marker.
+    fn start_from(
+        stdout: impl Read + Send + 'static,
+        stderr: impl Read + Send + 'static,
+        gate: Option<Arc<Barrier>>,
+    ) -> Self {
         let buffer = Arc::new(Mutex::new(String::new()));
-        let orchestrator = Arc::new((Mutex::new(false), Condvar::new()));
+        let readers = Arc::new((
+            Mutex::new(ReaderState { orchestrator: false, open_streams: 2, parked: 0 }),
+            Condvar::new(),
+        ));
         let handles = vec![
-            spawn_log_reader(stdout, Arc::clone(&buffer), Some(Arc::clone(&orchestrator))),
-            spawn_log_reader(stderr, Arc::clone(&buffer), None),
+            spawn_log_reader(stdout, Arc::clone(&buffer), Arc::clone(&readers), true, gate.clone()),
+            spawn_log_reader(stderr, Arc::clone(&buffer), Arc::clone(&readers), false, None),
         ];
-        Self { buffer, handles, orchestrator }
+        Self { buffer, handles, readers, gate }
     }
 
     fn saw_orchestrator(&self) -> bool {
-        let (lock, _) = &*self.orchestrator;
-        *lock.lock().expect("orchestrator log")
+        let (lock, _) = &*self.readers;
+        lock.lock().expect("log readers").orchestrator
     }
 
-    fn wait_for_orchestrator(&self, timeout: Duration) -> bool {
-        let (lock, cv) = &*self.orchestrator;
-        let guard = lock.lock().expect("orchestrator log");
-        let (guard, _) =
-            cv.wait_timeout_while(guard, timeout, |flag| !*flag).expect("orchestrator log");
-        *guard
+    /// Wait for the marker. Returns at once when every stream closes first.
+    fn wait_for_orchestrator(&self, timeout: Duration) -> ReadyWait {
+        let (lock, cv) = &*self.readers;
+        let guard = lock.lock().expect("log readers");
+        let (state, _) = cv
+            .wait_timeout_while(guard, timeout, |state| {
+                let sleeps = !state.orchestrator && state.open_streams > 0;
+                state.parked += usize::from(sleeps);
+                sleeps
+            })
+            .expect("log readers");
+        if state.orchestrator {
+            ReadyWait::Ready
+        } else if state.open_streams == 0 {
+            ReadyWait::StreamsClosed
+        } else {
+            ReadyWait::TimedOut
+        }
     }
 
     fn snapshot(&self) -> String {
         self.buffer.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    fn finish(&mut self) -> String {
+    /// Release a gated reader, then join every reader.
+    fn drain(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.wait();
+        }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+
+    fn finish(&mut self) -> String {
+        self.drain();
         self.snapshot()
     }
 }
 
 impl Drop for LogCapture {
     fn drop(&mut self) {
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
+        self.drain();
     }
+}
+
+// ── Harness tests on fake children ──────────────────────────────────────
+// The child's stdin pipe and the gate order each step. The hang guards only
+// turn a hang into a failure; no test asserts on elapsed time.
+
+#[cfg(unix)]
+const HANG_GUARD: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+fn fake_child(script: &str) -> Child {
+    Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sh")
+}
+
+#[cfg(unix)]
+fn capture(child: &mut Child, gate: Option<Arc<Barrier>>) -> LogCapture {
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    LogCapture::start_from(stdout, stderr, gate)
+}
+
+/// Take stdin after the capture: a failed assertion then drops (closes) it
+/// first, so the child exits and the capture's join does not hang.
+#[cfg(unix)]
+fn stdin_of(child: &mut Child) -> std::process::ChildStdin {
+    child.stdin.take().expect("stdin piped")
+}
+
+#[cfg(unix)]
+fn release(stdin: &mut std::process::ChildStdin) {
+    stdin.write_all(b"go\n").expect("release the child");
+}
+
+#[cfg(unix)]
+fn poll_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{what} not seen within {HANG_GUARD:?}");
+        thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn on_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::sync::mpsc::Receiver<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx
+}
+
+#[cfg(unix)]
+fn hang_guarded<T>(what: &str, result: std::sync::mpsc::Receiver<T>) -> T {
+    match result.recv_timeout(HANG_GUARD) {
+        Ok(value) => value,
+        Err(err) => panic!("{what} did not return: {err}"),
+    }
+}
+
+#[cfg(unix)]
+fn within_hang_guard<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    hang_guarded(what, on_thread(f))
+}
+
+/// See [`ReaderState::parked`].
+#[cfg(unix)]
+fn parked(readers: &(Mutex<ReaderState>, Condvar)) -> usize {
+    readers.0.lock().expect("log readers").parked
+}
+
+#[cfg(unix)]
+#[test]
+fn log_capture_ignores_the_marker_on_stderr() {
+    let mut child = fake_child(&format!("echo '{ORCHESTRATOR_MARKER}' >&2; read line; echo x"));
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut logs = LogCapture::start(stdout, stderr);
+    let mut stdin = stdin_of(&mut child);
+    poll_until("the stderr marker", || logs.snapshot().contains(ORCHESTRATOR_MARKER));
+    release(&mut stdin);
+    assert!(child.wait().expect("wait").success());
+    let log = logs.finish();
+    assert!(
+        log.lines().any(|line| line == "x"),
+        "stdout must be read after the marker; log:\n{log}"
+    );
+    assert!(!logs.saw_orchestrator(), "a marker on stderr must not set the flag; log:\n{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn log_capture_sees_a_marker_split_across_reads() {
+    let (head, tail) = ORCHESTRATOR_MARKER.split_at(8);
+    let mut child = fake_child(&format!("printf '%s' '{head}'; read line; echo '{tail}'"));
+    let mut logs = capture(&mut child, None);
+    let mut stdin = stdin_of(&mut child);
+    poll_until("the first half of the marker", || logs.snapshot().contains(head));
+    assert_eq!(logs.wait_for_orchestrator(Duration::ZERO), ReadyWait::TimedOut);
+    release(&mut stdin);
+    assert_eq!(logs.wait_for_orchestrator(HANG_GUARD), ReadyWait::Ready);
+    assert!(child.wait().expect("wait").success());
+    assert!(logs.saw_orchestrator(), "log:\n{}", logs.finish());
+}
+
+#[cfg(unix)]
+#[test]
+fn wait_for_orchestrator_returns_when_the_child_exits_before_the_marker() {
+    let mut child = fake_child("read line; exit 0");
+    let logs = capture(&mut child, None);
+    let readers = Arc::clone(&logs.readers);
+    let stdin = stdin_of(&mut child);
+    let wait = on_thread(move || logs.wait_for_orchestrator(Duration::from_secs(3600)));
+    // The child holds both pipes open until its stdin closes, so the EOFs
+    // arrive while the waiter sleeps and only their notify can wake it.
+    poll_until("wait_for_orchestrator to park", || parked(&readers) > 0);
+    drop(stdin);
+    assert_eq!(
+        hang_guarded("wait_for_orchestrator after the child exited", wait),
+        ReadyWait::StreamsClosed
+    );
+    assert!(child.wait().expect("wait").success());
+}
+
+#[cfg(unix)]
+#[test]
+fn retry_classifies_after_the_log_readers_drain() {
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    let mut child = fake_child(&format!("echo '{ORCHESTRATOR_MARKER}'; exit {bind}"));
+    let mut logs = capture(&mut child, Some(Arc::new(Barrier::new(2))));
+    let status = child.wait().expect("wait");
+    assert_eq!(child_status(&mut child), Some(status));
+    assert_eq!(status.code(), Some(bind));
+    assert!(!logs.saw_orchestrator(), "the gate holds the stdout reader past the exit");
+    let (action, saw) = within_hang_guard("classify_exit", move || {
+        let action = classify_exit(status.code(), &mut logs);
+        (action, logs.saw_orchestrator())
+    });
+    assert!(saw, "the drain must read the marker written before exit {bind}");
+    assert_eq!(action, ExitAction::Fail, "exit {bind} after the marker is not a bind race");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_1_is_not_respawned() {
+    let mut child = fake_child("exit 1");
+    let mut logs = capture(&mut child, None);
+    let status = child.wait().expect("wait");
+    assert_eq!(classify_exit(status.code(), &mut logs), ExitAction::Fail);
+
+    let mut harness =
+        SmokeHarness::start_with(MockBn::start().await, None, |_, _| fake_child("exit 1"));
+    let fake = harness.child.id();
+    assert_eq!(harness.child.wait().expect("wait").code(), Some(1));
+    let attempt =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.retry_port_bind_race(1)));
+    assert!(attempt.is_err(), "exit 1 must fail the attempt");
+    assert_eq!(harness.child.id(), fake, "exit 1 must not respawn the child");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_15_before_the_marker_respawns_the_child() {
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    let mut harness = SmokeHarness::start_with(MockBn::start().await, None, move |_, _| {
+        fake_child(&format!("echo 'Binding listeners'; exit {bind}"))
+    });
+    let fake = harness.child.id();
+    assert_eq!(harness.child.wait().expect("wait").code(), Some(bind));
+    assert!(harness.retry_port_bind_race(1), "exit {bind} before the marker is retried");
+    assert_ne!(harness.child.id(), fake, "the bind race must respawn the child");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_port_bind_race_drains_before_it_classifies() {
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    let gate = Some(Arc::new(Barrier::new(2)));
+    let mut harness = SmokeHarness::start_with(MockBn::start().await, gate, move |_, _| {
+        fake_child(&format!("echo '{ORCHESTRATOR_MARKER}'; exit {bind}"))
+    });
+    let fake = harness.child.id();
+    assert_eq!(harness.child.wait().expect("wait").code(), Some(bind));
+    assert!(!harness.logs.saw_orchestrator(), "the gate holds the stdout reader past the exit");
+    let attempt =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.retry_port_bind_race(1)));
+    assert!(attempt.is_err(), "exit {bind} after the marker must fail the attempt");
+    assert!(harness.logs.saw_orchestrator(), "the drain must read the marker");
+    assert_eq!(harness.child.id(), fake, "exit {bind} after the marker must not respawn");
+}
+
+#[cfg(unix)]
+#[test]
+fn classify_exit_retries_exit_15_before_the_marker() {
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    let mut child = fake_child(&format!("echo 'Binding listeners'; exit {bind}"));
+    let mut logs = capture(&mut child, None);
+    let status = child.wait().expect("wait");
+    assert_eq!(classify_exit(status.code(), &mut logs), ExitAction::Respawn);
+    expect_respawn(status, 1, &mut logs);
+    let last = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        expect_respawn(status, READY_ATTEMPTS, &mut logs)
+    }));
+    assert!(last.is_err(), "the last attempt is not respawned");
+}
+
+// ── `wait_until_ready` when the streams close before the marker ─────────
+// A stand-in answers `/health` 200, so attempt 1 reaches the orchestrator wait
+// while the fake child still runs.
+
+#[cfg(unix)]
+async fn fake_start(script: &str) -> (SmokeHarness, wiremock::MockServer) {
+    let health = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/health"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&health)
+        .await;
+    let script = script.to_owned();
+    let mut harness =
+        SmokeHarness::start_with(MockBn::start().await, None, move |_, _| fake_child(&script));
+    harness.ports = TestPorts { metrics: health.address().port() };
+    (harness, health)
+}
+
+/// Close the first child's stdin once `wait_until_ready` sleeps in the
+/// orchestrator wait, which comes after both of attempt 1's exit checks.
+#[cfg(unix)]
+fn release_when_parked(harness: &mut SmokeHarness) -> JoinHandle<()> {
+    let stdin = stdin_of(&mut harness.child);
+    let readers = Arc::clone(&harness.logs.readers);
+    thread::spawn(move || {
+        poll_until("wait_for_orchestrator to park", || parked(&readers) > 0);
+        drop(stdin);
+    })
+}
+
+/// `wait_until_ready` to its end; `Err` carries its panic message.
+#[cfg(unix)]
+fn ready_or_panic(harness: &mut SmokeHarness) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Handle::current().block_on(harness.wait_until_ready())
+        }))
+    })
+    .map_err(|panic| match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => panic.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_default(),
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_closed_then_exit_15_respawns_the_child() {
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    let (mut harness, _health) = fake_start(&format!("read line; exit {bind}")).await;
+    let fake = harness.child.id();
+    let release = release_when_parked(&mut harness);
+    let ready = ready_or_panic(&mut harness);
+    release.join().expect("the child is released from the orchestrator wait");
+    if let Err(panic) = ready {
+        panic!("exit {bind} after the streams closed must respawn: {panic}");
+    }
+    assert_ne!(harness.child.id(), fake, "the bind race must respawn the child");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_closed_then_exit_1_fails_without_a_respawn() {
+    let (mut harness, _health) = fake_start("read line; exit 1").await;
+    let fake = harness.child.id();
+    let release = release_when_parked(&mut harness);
+    let ready = ready_or_panic(&mut harness);
+    release.join().expect("the child is released from the orchestrator wait");
+    let panic = ready.expect_err("exit 1 after the streams closed must fail the attempt");
+    assert!(panic.contains("startup exited exit status: 1 on attempt 1/"), "{panic}");
+    assert_eq!(harness.child.id(), fake, "exit 1 must not respawn the child");
+}
+
+/// The child closes its streams and never exits, so only the reap bound ends
+/// the attempt (about `SHUTDOWN_TIMEOUT`).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_closed_waits_for_the_exit_before_another_attempt() {
+    use std::os::unix::process::ExitStatusExt;
+    let (mut harness, _health) = fake_start("exec >&- 2>&-; read line").await;
+    let fake = harness.child.id();
+    let panic = ready_or_panic(&mut harness).expect_err("a child that never exits fails");
+    assert!(
+        panic.contains(&format!("process did not exit within {SHUTDOWN_TIMEOUT:?}")),
+        "closed streams must be followed by a wait for the exit: {panic}"
+    );
+    assert_eq!(harness.child.id(), fake, "no respawn without an exit status");
+    let status = harness.child.try_wait().expect("try_wait").expect("reaped after the kill");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "the reap bound kills the child");
 }
 
 /// Poll until `url` returns HTTP 200 (503 / connection errors are not ready).
@@ -386,6 +787,16 @@ impl SmokeHarness {
     }
 
     async fn start_with_bn(mock_bn: MockBn) -> Self {
+        Self::start_with(mock_bn, None, spawn_validator)
+    }
+
+    /// `spawn` starts the first child; respawns always run `rvc start`.
+    /// `gate` holds the first child's stdout reader until its log drains.
+    fn start_with(
+        mock_bn: MockBn,
+        gate: Option<Arc<Barrier>>,
+        spawn: impl FnOnce(&Path, &TestPorts) -> Child,
+    ) -> Self {
         let keystore_dir = TempDir::new().expect("keystore dir");
         let password_file = install_smoke_keystore(&keystore_dir);
         let slashing_db_dir = TempDir::new().expect("slashing db dir");
@@ -401,10 +812,10 @@ impl SmokeHarness {
             &ports,
         );
 
-        let mut child = spawn_validator(config_file.path(), &ports);
+        let mut child = spawn(config_file.path(), &ports);
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
-        let logs = LogCapture::start(stdout, stderr);
+        let logs = LogCapture::start_from(stdout, stderr, gate);
 
         Self {
             beacon_url: mock_bn.uri(),
@@ -481,11 +892,17 @@ impl SmokeHarness {
                 READY_TIMEOUT,
                 self.logs.snapshot()
             );
-            let saw = self.logs.wait_for_orchestrator(READY_TIMEOUT);
+            let wait = self.logs.wait_for_orchestrator(READY_TIMEOUT);
+            if wait == ReadyWait::StreamsClosed {
+                // Both pipes closed before the marker, so the child is exiting.
+                let status = wait_for_exit(&mut self.child, SHUTDOWN_TIMEOUT);
+                self.respawn_after(status, attempt);
+                continue;
+            }
             if self.retry_port_bind_race(attempt) {
                 continue;
             }
-            if saw {
+            if wait == ReadyWait::Ready {
                 assert_health_json_healthy(&self.health_url()).await;
                 return;
             }
@@ -501,18 +918,13 @@ impl SmokeHarness {
         let Some(status) = child_status(&mut self.child) else {
             return false;
         };
-        let saw = self.logs.saw_orchestrator();
-        let logs = self.logs.snapshot();
-        if is_port_bind_race(status.code(), saw) && attempt < READY_ATTEMPTS {
-            self.respawn();
-            return true;
-        }
-        panic!(
-            "startup exited {status} on attempt {attempt}/{READY_ATTEMPTS} \
-             (orchestrator log seen: {saw}); respawn is only for exit {} before that log\n\
-             --- log ---\n{logs}",
-            rvc::startup::EXIT_LISTENER_BIND,
-        );
+        self.respawn_after(status, attempt);
+        true
+    }
+
+    fn respawn_after(&mut self, status: ExitStatus, attempt: u32) {
+        expect_respawn(status, attempt, &mut self.logs);
+        self.respawn();
     }
 
     #[cfg(unix)]

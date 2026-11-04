@@ -2,7 +2,8 @@
 //!
 //! One `#[test]` per cell so a failing cell names itself. Each cell asserts
 //! (a) `SigningGateError`, (b) DB row presence and signing-root hex, (c)
-//! `rvc_slashing_reconcile_total` **deltas** (process-global).
+//! `rvc_slashing_reconcile_total` **deltas** (process-global, read under
+//! [`RECONCILE_LOCK`]).
 //!
 //! `test_today_*` runs the same classes through `stage_then_sign`. The two
 //! designs agree where architecture §5.3 says identical and differ only on
@@ -25,6 +26,7 @@ use slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_
 use slashing::{
     BlockSlashingViolation, CommittedReservation, GroupCommitConfig, SlashingDb, SlashingError,
 };
+use tokio::sync::{Mutex, MutexGuard};
 
 use common::{
     AmbiguousErrorSigner, HangingSigner, KeyNotFoundSigner, LocalRejectedSigner, PanickingSigner,
@@ -47,7 +49,12 @@ struct ReconcileSnap {
     failed: u64,
 }
 
-fn snap_reconcile() -> ReconcileSnap {
+/// Serialises every test that reads the process-global reconcile series:
+/// plain `cargo test` runs this file's tests in one process.
+static RECONCILE_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Takes the [`RECONCILE_LOCK`] guard, so a test that skips the lock does not compile.
+fn snap_reconcile(_held: &MutexGuard<'static, ()>) -> ReconcileSnap {
     let kind = tx_hold_kind::BLOCK;
     ReconcileSnap {
         deleted: RVC_SLASHING_RECONCILE_TOTAL
@@ -62,8 +69,14 @@ fn snap_reconcile() -> ReconcileSnap {
     }
 }
 
-fn assert_reconcile_delta(before: ReconcileSnap, deleted: u64, not_applicable: u64, failed: u64) {
-    let after = snap_reconcile();
+fn assert_reconcile_delta(
+    held: &MutexGuard<'static, ()>,
+    before: ReconcileSnap,
+    deleted: u64,
+    not_applicable: u64,
+    failed: u64,
+) {
+    let after = snap_reconcile(held);
     assert_eq!(
         after.deleted - before.deleted,
         deleted,
@@ -306,6 +319,7 @@ fn test_matrix_unambiguous_backends_follow_signing_error_classifier() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_reserve_rule_violation_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -318,17 +332,18 @@ async fn test_matrix_reserve_rule_violation_discard() {
         Arc::clone(&db),
         "matrix_rule_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("rule violation must fail");
     assert_slashing_blocked(&err);
     assert_one_row(&db, &pubkey_hex, OTHER_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_reserve_rule_violation_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -341,17 +356,18 @@ async fn test_matrix_reserve_rule_violation_retain() {
         Arc::clone(&db),
         "matrix_rule_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("rule violation must fail");
     assert_slashing_blocked(&err);
     assert_one_row(&db, &pubkey_hex, OTHER_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_sign_success_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, signer) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -363,17 +379,18 @@ async fn test_matrix_sign_success_discard() {
         Arc::clone(&db),
         "matrix_ok_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let sig = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect("sign must succeed");
     assert_eq!(sig.len(), 96);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_sign_success_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, signer) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -385,17 +402,18 @@ async fn test_matrix_sign_success_retain() {
         Arc::clone(&db),
         "matrix_ok_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let sig = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect("sign must succeed");
     assert_eq!(sig.len(), 96);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_timeout_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -407,17 +425,18 @@ async fn test_matrix_timeout_discard_reconciles() {
         Arc::clone(&db),
         "matrix_timeout_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("timeout must fail");
     assert_timed_out(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 1, 0, 0);
+    assert_reconcile_delta(&held, before, 1, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_timeout_retain_keeps_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -429,18 +448,19 @@ async fn test_matrix_timeout_retain_keeps_row() {
         Arc::clone(&db),
         "matrix_timeout_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("timeout must fail");
     assert_timed_out(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 /// RED-named cell: Retain + ambiguous must keep the row (C1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_retain_matrix_ambiguous_error_retain_policy_keeps_the_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -452,17 +472,18 @@ async fn test_retain_matrix_ambiguous_error_retain_policy_keeps_the_row() {
         Arc::clone(&db),
         "matrix_ambiguous_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("ambiguous error must surface");
     assert_signing_failed(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_ambiguous_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -474,17 +495,18 @@ async fn test_matrix_ambiguous_discard_reconciles() {
         Arc::clone(&db),
         "matrix_ambiguous_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("ambiguous error must surface");
     assert_signing_failed(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 1, 0, 0);
+    assert_reconcile_delta(&held, before, 1, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_unambiguous_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -496,17 +518,18 @@ async fn test_matrix_unambiguous_discard_reconciles() {
         Arc::clone(&db),
         "matrix_unamb_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("unambiguous no-signature must fail");
     assert_key_not_found(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 1, 0, 0);
+    assert_reconcile_delta(&held, before, 1, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_unambiguous_retain_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -518,18 +541,19 @@ async fn test_matrix_unambiguous_retain_reconciles() {
         Arc::clone(&db),
         "matrix_unamb_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("unambiguous no-signature must fail");
     assert_signing_failed(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 1, 0, 0);
+    assert_reconcile_delta(&held, before, 1, 0, 0);
 }
 
 /// Stricter-than-today: failed compensating delete retains under Retain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_unambiguous_retain_failed_delete_keeps_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -541,17 +565,18 @@ async fn test_matrix_unambiguous_retain_failed_delete_keeps_row() {
         Arc::clone(&db),
         "matrix_unamb_retain_fail_del",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailReconcile)
         .await
         .expect_err("original KeyNotFound must surface");
     assert_key_not_found(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 1);
+    assert_reconcile_delta(&held, before, 0, 0, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_reserve_commit_failed_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, inner) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -564,18 +589,19 @@ async fn test_matrix_reserve_commit_failed_discard() {
         Arc::clone(&db),
         "matrix_commit_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailPersist)
         .await
         .expect_err("reserve inject must fail");
     assert_commit_failed(&err);
     assert_no_row(&db, &pubkey_hex);
     assert_eq!(attempts.load(Ordering::SeqCst), 0, "reserve commit failure must not sign");
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_reserve_commit_failed_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, inner) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -588,18 +614,19 @@ async fn test_matrix_reserve_commit_failed_retain() {
         Arc::clone(&db),
         "matrix_commit_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailPersist)
         .await
         .expect_err("reserve inject must fail");
     assert_commit_failed(&err);
     assert_no_row(&db, &pubkey_hex);
     assert_eq!(attempts.load(Ordering::SeqCst), 0, "reserve commit failure must not sign");
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_panic_discard_keeps_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -611,17 +638,18 @@ async fn test_matrix_panic_discard_keeps_row() {
         Arc::clone(&db),
         "matrix_panic_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("panic must surface as SigningFailed");
     assert_task_panicked(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_matrix_panic_retain_keeps_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -633,19 +661,20 @@ async fn test_matrix_panic_retain_keeps_row() {
         Arc::clone(&db),
         "matrix_panic_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_reserve(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("panic must surface as SigningFailed");
     assert_task_panicked(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 // ── today: stage_then_sign comparison table ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_reserve_rule_violation_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -658,17 +687,18 @@ async fn test_today_reserve_rule_violation_discard() {
         Arc::clone(&db),
         "today_rule_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("rule violation must fail");
     assert_slashing_blocked(&err);
     assert_one_row(&db, &pubkey_hex, OTHER_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_reserve_rule_violation_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -681,17 +711,18 @@ async fn test_today_reserve_rule_violation_retain() {
         Arc::clone(&db),
         "today_rule_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("rule violation must fail");
     assert_slashing_blocked(&err);
     assert_one_row(&db, &pubkey_hex, OTHER_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_sign_success_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, signer) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -703,17 +734,18 @@ async fn test_today_sign_success_discard() {
         Arc::clone(&db),
         "today_ok_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let sig = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect("sign must succeed");
     assert_eq!(sig.len(), 96);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_sign_success_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, signer) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -725,17 +757,18 @@ async fn test_today_sign_success_retain() {
         Arc::clone(&db),
         "today_ok_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let sig = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect("sign must succeed");
     assert_eq!(sig.len(), 96);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_timeout_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -747,18 +780,19 @@ async fn test_today_timeout_discard_reconciles() {
         Arc::clone(&db),
         "today_timeout_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("timeout must fail");
     assert_timed_out(&err);
     assert_no_row(&db, &pubkey_hex);
     // Today ROLLBACKs; it does not increment reconcile.
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_timeout_retain_keeps_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -770,17 +804,18 @@ async fn test_today_timeout_retain_keeps_row() {
         Arc::clone(&db),
         "today_timeout_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("timeout must fail");
     assert_timed_out(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_ambiguous_error_retain_policy_keeps_the_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -792,17 +827,18 @@ async fn test_today_ambiguous_error_retain_policy_keeps_the_row() {
         Arc::clone(&db),
         "today_ambiguous_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("ambiguous error must surface");
     assert_signing_failed(&err);
     assert_one_row(&db, &pubkey_hex, SIGNING_ROOT);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_ambiguous_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -814,17 +850,18 @@ async fn test_today_ambiguous_discard_reconciles() {
         Arc::clone(&db),
         "today_ambiguous_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("ambiguous error must surface");
     assert_signing_failed(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_unambiguous_discard_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -836,17 +873,18 @@ async fn test_today_unambiguous_discard_reconciles() {
         Arc::clone(&db),
         "today_unamb_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("unambiguous no-signature must fail");
     assert_key_not_found(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_unambiguous_retain_reconciles() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -858,18 +896,19 @@ async fn test_today_unambiguous_retain_reconciles() {
         Arc::clone(&db),
         "today_unamb_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("unambiguous no-signature must fail");
     assert_signing_failed(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 /// Today always `discard_row()` on unambiguous — row gone even under Retain + leftover inject.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_unambiguous_retain_failed_delete_drops_row() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -881,17 +920,18 @@ async fn test_today_unambiguous_retain_failed_delete_drops_row() {
         Arc::clone(&db),
         "today_unamb_retain_fail_del",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailReconcile)
         .await
         .expect_err("unambiguous no-signature must fail");
     assert_key_not_found(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_reserve_commit_failed_discard() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, inner) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -904,7 +944,7 @@ async fn test_today_reserve_commit_failed_discard() {
         Arc::clone(&db),
         "today_commit_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailPersist)
         .await
         .expect_err("commit inject must fail");
@@ -915,11 +955,12 @@ async fn test_today_reserve_commit_failed_discard() {
         1,
         "today commit inject is consumed after a successful sign"
     );
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_reserve_commit_failed_retain() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let (pubkey, inner) = succeeding_pair();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -932,7 +973,7 @@ async fn test_today_reserve_commit_failed_retain() {
         Arc::clone(&db),
         "today_commit_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::FailPersist)
         .await
         .expect_err("commit inject must fail");
@@ -943,12 +984,13 @@ async fn test_today_reserve_commit_failed_retain() {
         1,
         "today commit inject is consumed after a successful sign"
     );
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 /// Today: guard `Drop` rolls back; new design keeps the already-committed row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_panic_discard_rolls_back() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -960,17 +1002,18 @@ async fn test_today_panic_discard_rolls_back() {
         Arc::clone(&db),
         "today_panic_discard",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("panic must surface as SigningFailed");
     assert_task_panicked(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_today_panic_retain_rolls_back() {
+    let held = RECONCILE_LOCK.lock().await;
     let db = common::open_db();
     let pubkey = fresh_pubkey();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -982,13 +1025,13 @@ async fn test_today_panic_retain_rolls_back() {
         Arc::clone(&db),
         "today_panic_retain",
     );
-    let before = snap_reconcile();
+    let before = snap_reconcile(&held);
     let err = run_stage(session, Arc::clone(&db), pubkey_hex.clone(), Inject::None)
         .await
         .expect_err("panic must surface as SigningFailed");
     assert_task_panicked(&err);
     assert_no_row(&db, &pubkey_hex);
-    assert_reconcile_delta(before, 0, 0, 0);
+    assert_reconcile_delta(&held, before, 0, 0, 0);
 }
 
 /// Batch-boundary (#205): a failed group COMMIT rejects every member before

@@ -355,6 +355,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanNames {
 /// `maybe_propose_block`.
 #[tokio::test(flavor = "current_thread")]
 async fn test_proposal_is_attempted_before_any_epoch_duty_fetch() {
+    let _metrics = m2_metric_lock().await;
     let parts = build_proposal_first(ProposalFirstOpts {
         slot: 65,
         seed_proposer: true,
@@ -389,6 +390,7 @@ async fn test_proposal_is_attempted_before_any_epoch_duty_fetch() {
 /// `maybe_propose_block`.
 #[tokio::test(flavor = "current_thread")]
 async fn test_proposal_still_happens_when_duty_fetches_stall() {
+    let _metrics = m2_metric_lock().await;
     use wiremock::matchers::path;
 
     let slot = 65u64;
@@ -514,6 +516,7 @@ async fn test_proposal_still_happens_when_duty_fetches_stall() {
 /// `slot.phase.block` / `slot.phase.aggregation`.
 #[tokio::test(flavor = "current_thread")]
 async fn test_epoch_boundary_prep_runs_in_the_post_duty_window() {
+    let _metrics = m2_metric_lock().await;
     async fn drive(slot: Slot) -> Vec<String> {
         let parts = build_proposal_first(ProposalFirstOpts {
             slot,
@@ -563,6 +566,7 @@ async fn test_epoch_boundary_prep_runs_in_the_post_duty_window() {
 /// Which duties run is unchanged by the reorder — only when they run.
 #[tokio::test(flavor = "current_thread")]
 async fn test_duties_performed_are_unchanged_by_the_reorder() {
+    let _metrics = m2_metric_lock().await;
     let parts = build_proposal_first(ProposalFirstOpts {
         slot: 65,
         seed_proposer: true,

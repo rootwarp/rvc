@@ -381,6 +381,7 @@ async fn run_until_shutdown(
 
 #[tokio::test]
 async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
+    let _metrics = m2_metric_lock().await;
     let mock_server = wiremock::MockServer::start().await;
 
     // Slot 2240 = epoch 70 = gloas_fork_epoch
@@ -431,6 +432,7 @@ async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
 /// per validator without writing a slashing row.
 #[tokio::test]
 async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
+    let _metrics = m2_metric_lock().await;
     use timing::{due_ms, SlotClock};
 
     // Park at the pre-Gloas aggregate offset so att/agg remaining are zero and
@@ -552,6 +554,7 @@ async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
 /// attestation duty for the same Gloas slot still succeeds.
 #[tokio::test]
 async fn test_payload_attestation_204_skips_submission_attestation_still_succeeds() {
+    let _metrics = m2_metric_lock().await;
     let slot = 2240u64;
     let epoch = slot / SLOTS_PER_EPOCH;
     assert_eq!(epoch, 70, "Slot 2240 should be epoch 70");
