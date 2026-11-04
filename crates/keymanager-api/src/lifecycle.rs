@@ -24,6 +24,10 @@
 //! The protected paths take the locks in that order:
 //! - **import** ([`Self::on_import`]): holds the lock across `add_validator`
 //!   (Local only) + `start_monitoring` + cancel-token insert (PRD §KM-2 (a)+(b)).
+//! - **arming**: `spawn_enable_task` is the only place that inserts a cancel
+//!   token and spawns the enable task. Import, the boot re-arm
+//!   ([`DoppelgangerLifecycle::rearm_persisted_hold`]) and an early wake call it
+//!   under the lock.
 //! - **disable** ([`Self::disable_for_delete`]): holds `state_lock` across
 //!   cancel-token remove/cancel, then `set_validator_enabled(false)`. The token
 //!   is cancelled even when the write fails. No `.await`.
@@ -255,7 +259,6 @@ impl DoppelgangerLifecycle {
         if FAIL_NEXT_IMPORT.with(|cell| cell.replace(false)) {
             return Err("injected import failure".into());
         }
-        let cancel_token = CancellationToken::new();
         let _guard = self.lock_state();
 
         if kind == ImportKind::Local {
@@ -274,42 +277,8 @@ impl DoppelgangerLifecycle {
             }
         }
         self.monitor.start_monitoring(pubkey);
-
-        // SF-3 / KM-2 (a): register the cancellation token. If a token was
-        // already present for this pubkey (e.g. a stale task from a prior import
-        // that a racing delete had not yet cancelled), cancel the DISPLACED token
-        // so it can never enable a key that is now inside a fresh window. No
-        // token is ever dropped from the map without being cancelled.
-        //
-        // The `.cancel()` runs WHILE the `cancel_tokens` guard is held so that
-        // "insert new + cancel old" is atomic against a concurrent task's
-        // self-prune (KM-2 (c)): a displaced task observes its token cancelled
-        // before it can prune the fresh entry.
-        {
-            let mut tokens = self.cancel_tokens.lock().expect("cancel_tokens poisoned");
-            if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
-                displaced.cancel();
-            }
-        }
-
-        let this = Arc::clone(self);
-        let token = cancel_token;
-        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-        // Sleep until the stored deadline, and no longer than the window.
-        // Capture the `Instant` before spawn so a paused test clock still
-        // sees a fixed deadline.
-        let residual = if kind == ImportKind::Local {
-            match self.validator_manager.armed_hold_unix(&pubkey) {
-                Some(stored) => self.clamped_hold_wait(stored),
-                None => self.window,
-            }
-        } else {
-            self.window
-        };
-        let deadline = tokio::time::Instant::now() + residual;
-        tokio::spawn(async move {
-            this.run_enable_task(pubkey, kind, token, deadline, pubkey_hex).await;
-        });
+        let residual = self.hold_residual(&pubkey, kind);
+        self.spawn_enable_task(pubkey, kind, residual);
         Ok(())
     }
 
@@ -335,11 +304,7 @@ impl DoppelgangerLifecycle {
         let (touch, value) = remove_op();
 
         // KM-2 Finding 3: cancel any live token unconditionally.
-        if let Some(token) =
-            self.cancel_tokens.lock().expect("cancel_tokens poisoned").remove(pubkey)
-        {
-            token.cancel();
-        }
+        self.cancel_enable_token(pubkey);
 
         let config = match touch {
             ConfigTouch::Skip => ConfigRemoval::NotAttempted,
@@ -432,11 +397,7 @@ impl DoppelgangerLifecycle {
                             }
                             Ok(false) => {
                                 if self.validator_manager.is_doppelganger_hold(&pubkey) {
-                                    let residual =
-                                        match self.validator_manager.armed_hold_unix(&pubkey) {
-                                            Some(stored) => self.clamped_hold_wait(stored),
-                                            None => self.window,
-                                        };
+                                    let residual = self.hold_residual(&pubkey, kind);
                                     // Spawn from a sync helper. Building that future
                                     // inside this async fn, while `state_lock` is
                                     // held, makes the enable task `!Send`.
@@ -558,9 +519,36 @@ impl DoppelgangerLifecycle {
         }
     }
 
+    /// How long a new enable task sleeps. A `Local` hold waits until its
+    /// stored deadline, and no longer than the window. Without a stored
+    /// deadline, and for a `Remote` import, it waits the window.
+    fn hold_residual(&self, pubkey: &Pubkey, kind: ImportKind) -> Duration {
+        if kind == ImportKind::Local {
+            match self.validator_manager.armed_hold_unix(pubkey) {
+                Some(stored) => self.clamped_hold_wait(stored),
+                None => self.window,
+            }
+        } else {
+            self.window
+        }
+    }
+
+    /// Arm the enable task for `pubkey`: the only cancel-token insert and the
+    /// only spawn of [`Self::run_enable_task`].
+    ///
     /// Caller holds `state_lock`. The spawned task is built in this sync fn.
     fn spawn_enable_task(self: &Arc<Self>, pubkey: Pubkey, kind: ImportKind, residual: Duration) {
         let cancel_token = CancellationToken::new();
+        // SF-3 / KM-2 (a): if a token was already present for this pubkey
+        // (e.g. a stale task from a prior import that a racing delete had not
+        // yet cancelled), cancel the DISPLACED token so it can never enable a
+        // key that is now inside a fresh window. No token is ever dropped from
+        // the map without being cancelled.
+        //
+        // The `.cancel()` runs WHILE the `cancel_tokens` guard is held so that
+        // "insert new + cancel old" is atomic against a concurrent task's
+        // self-prune (KM-2 (c)): a displaced task observes its token cancelled
+        // before it can prune the fresh entry.
         {
             let mut tokens = self.cancel_tokens.lock().expect("cancel_tokens poisoned");
             if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
@@ -570,6 +558,8 @@ impl DoppelgangerLifecycle {
         let this = Arc::clone(self);
         let token = cancel_token;
         let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+        // Capture the `Instant` before spawn so a paused test clock still
+        // sees a fixed deadline.
         let deadline = tokio::time::Instant::now() + residual;
         tokio::spawn(async move {
             this.run_enable_task(pubkey, kind, token, deadline, pubkey_hex).await;
@@ -577,28 +567,10 @@ impl DoppelgangerLifecycle {
     }
 
     /// Re-arm a hold that was already persisted. Does not write the validators file.
-    pub fn rearm_persisted_hold(
-        self: &Arc<Self>,
-        pubkey: Pubkey,
-        residual: Duration,
-    ) -> Result<(), String> {
-        let cancel_token = CancellationToken::new();
+    pub fn rearm_persisted_hold(self: &Arc<Self>, pubkey: Pubkey, residual: Duration) {
         let _guard = self.lock_state();
         self.monitor.start_monitoring(pubkey);
-        {
-            let mut tokens = self.cancel_tokens.lock().expect("cancel_tokens poisoned");
-            if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
-                displaced.cancel();
-            }
-        }
-        let this = Arc::clone(self);
-        let token = cancel_token;
-        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-        let deadline = tokio::time::Instant::now() + residual;
-        tokio::spawn(async move {
-            this.run_enable_task(pubkey, ImportKind::Local, token, deadline, pubkey_hex).await;
-        });
-        Ok(())
+        self.spawn_enable_task(pubkey, ImportKind::Local, residual);
     }
 
     /// Cancel a pending enable task because the key was disabled outside the
@@ -917,7 +889,7 @@ mod tests {
         let pk = test_pubkey(11);
         vm.add_validator(pk, false).expect("row survived the restart");
 
-        life.rearm_persisted_hold(pk, Duration::from_secs(30)).expect("re-arm");
+        life.rearm_persisted_hold(pk, Duration::from_secs(30));
         tokio::task::yield_now().await;
         assert!(
             !vm.is_enabled(&pk),
@@ -1458,5 +1430,1037 @@ mod tests {
         }
         assert!(persisted, "the retry must persist enabled=false");
         assert!(*vm.attempts.lock().unwrap() >= 2, "the failed write must be attempted again");
+    }
+
+    /// INV2 (FU-A2a) on the boot re-arm path: detection between the re-armed
+    /// task's hold check and its store write. The key must end disabled and
+    /// the task must drop its cancel token.
+    #[tokio::test(start_paused = true)]
+    async fn rearmed_hold_racing_detection_never_leaves_a_detected_key_enabled() {
+        let vm = Arc::new(SpyValidatorManager::new());
+        let pk = test_pubkey(43);
+        vm.add_validator(pk, false).expect("the held row survived the restart");
+        let monitor = Arc::new(RaceMonitor {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicU64::new(0),
+            events: StdMutex::new(Vec::new()),
+            only: Some(pk),
+        });
+        let life = Arc::new(DoppelgangerLifecycle::new(
+            Duration::from_secs(3600),
+            monitor.clone() as Arc<dyn DoppelgangerMonitor>,
+            vm.clone() as Arc<dyn ValidatorManager>,
+        ));
+        let hooked = Arc::clone(&monitor);
+        life.set_before_enable_write_hook(Some(Arc::new(move || {
+            hooked.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        life.rearm_persisted_hold(pk, Duration::from_secs(30));
+        assert!(life.current_cancel_token(&pk).is_some(), "the re-armed task holds a token");
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let mut finished = false;
+        for _ in 0..200 {
+            if monitor.closed.load(std::sync::atomic::Ordering::SeqCst)
+                && life.current_cancel_token(&pk).is_none()
+            {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished, "the re-armed task must reach its write, see detection and finish");
+        assert!(!vm.is_enabled(&pk), "a re-armed Detected key must not end enabled");
+        assert!(vm.is_tracked(&pk), "the rollback keeps the row");
+    }
+
+    /// The hold stays set, and its stored deadline is `ahead` seconds past the
+    /// wall clock whenever it is read, so every release is too early. Records
+    /// the paused-clock instant of each release.
+    struct RollingHold {
+        ahead: u64,
+        releases: StdMutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl ValidatorManager for RollingHold {
+        fn add_validator(&self, _pubkey: Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn remove_validator(&self, _pubkey: &Pubkey) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn set_validator_enabled(&self, _pubkey: &Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn armed_hold_unix(&self, _pubkey: &Pubkey) -> Option<u64> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Some(now + self.ahead)
+        }
+
+        fn release_doppelganger_hold(&self, _pubkey: &Pubkey) -> Result<bool, String> {
+            self.releases.lock().unwrap().push(tokio::time::Instant::now());
+            Ok(false)
+        }
+    }
+
+    /// An early wake re-arms for the rest of the stored deadline: not a fresh
+    /// window, and not a part of it. The deadline is always 10 s ahead, so
+    /// each wait is 10 s, or 9 s if a wall-clock second ticks between the
+    /// store's read and the lifecycle's.
+    #[tokio::test(start_paused = true)]
+    async fn early_release_rearms_for_the_rest_of_the_stored_deadline() {
+        let vm = Arc::new(RollingHold { ahead: 10, releases: StdMutex::new(Vec::new()) });
+        let life = Arc::new(DoppelgangerLifecycle::new(
+            Duration::from_secs(30),
+            Arc::new(PendingSetMonitor::new()),
+            Arc::clone(&vm) as Arc<dyn ValidatorManager>,
+        ));
+        let pk = test_pubkey(15);
+        let imported = tokio::time::Instant::now();
+        life.on_import(pk, ImportKind::Local).expect("import");
+        // Paused clock: every timer due before 25 s fires, in order, first.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        let releases = vm.releases.lock().unwrap().clone();
+        let waits: Vec<Duration> = std::iter::once(&imported)
+            .chain(&releases)
+            .zip(&releases)
+            .map(|(from, to)| *to - *from)
+            .collect();
+        let rest = Duration::from_secs(9)..=Duration::from_secs(10);
+        assert!(
+            waits.iter().all(|wait| rest.contains(wait)),
+            "each wait must be the rest of the stored deadline: {waits:?}"
+        );
+        assert_eq!(waits.len(), 2, "two early wakes by 25 s: {waits:?}");
+    }
+
+    /// A validators double whose `remove_validator` returns the given result.
+    struct RemoveOutcome(Result<bool, String>);
+
+    impl ValidatorManager for RemoveOutcome {
+        fn add_validator(&self, _pubkey: Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn remove_validator(&self, _pubkey: &Pubkey) -> Result<bool, String> {
+            self.0.clone()
+        }
+
+        fn set_validator_enabled(&self, _pubkey: &Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// KM-2 Finding 3: `on_delete` cancels and removes the enable token on
+    /// every path: either touch, either kind, every validators-file result.
+    #[tokio::test]
+    async fn on_delete_cancels_the_enable_token_on_every_path() {
+        let present = ConfigTouch::Apply { keystore_present: true };
+        let gone = ConfigTouch::Apply { keystore_present: false };
+        let write_failed = "validators file write failed".to_string();
+        let cases = [
+            (ImportKind::Local, ConfigTouch::Skip, Ok(true), ConfigRemoval::NotAttempted),
+            (ImportKind::Remote, ConfigTouch::Skip, Ok(true), ConfigRemoval::NotAttempted),
+            (ImportKind::Local, present, Ok(true), ConfigRemoval::Removed),
+            (ImportKind::Local, gone, Ok(false), ConfigRemoval::Absent),
+            (
+                ImportKind::Local,
+                present,
+                Err(write_failed.clone()),
+                ConfigRemoval::Failed(write_failed),
+            ),
+            (ImportKind::Remote, present, Ok(true), ConfigRemoval::NotAttempted),
+        ];
+        for (kind, touch, removal, expected) in cases {
+            let life = Arc::new(DoppelgangerLifecycle::new(
+                Duration::from_secs(3600),
+                Arc::new(PendingSetMonitor::new()),
+                Arc::new(RemoveOutcome(removal)),
+            ));
+            let pk = test_pubkey(16);
+            life.on_import(pk, kind).expect("import");
+            let token = life.current_cancel_token(&pk).expect("the enable task is armed");
+
+            let (config, ()) = life.on_delete(&pk, kind, || (touch, ()));
+
+            assert_eq!(config, expected, "{kind:?} {touch:?}");
+            assert!(token.is_cancelled(), "{kind:?} {touch:?} {config:?}: token cancelled");
+            assert!(life.current_cancel_token(&pk).is_none(), "{kind:?} {touch:?}: token removed");
+        }
+    }
+
+    fn stored_hold(until: u64) -> Arc<dyn ValidatorManager> {
+        Arc::new(ShortPersistedHold { until, enabled: StdMutex::new(StdHashMap::new()) })
+    }
+
+    fn residual_life(vm: Arc<dyn ValidatorManager>) -> DoppelgangerLifecycle {
+        DoppelgangerLifecycle::new(Duration::from_secs(30), Arc::new(PendingSetMonitor::new()), vm)
+    }
+
+    /// A remote import has no hold of its own: it waits the window even when
+    /// the manager reports a deadline that has passed.
+    #[test]
+    fn hold_residual_uses_the_window_for_remote_imports() {
+        let life = residual_life(stored_hold(0));
+        assert_eq!(
+            life.hold_residual(&test_pubkey(1), ImportKind::Remote),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// A local hold waits until its stored deadline and never past the window.
+    /// Deadlines 0 and `u64::MAX` give the same answer at any wall-clock time.
+    #[test]
+    fn hold_residual_clamps_a_stored_deadline_to_the_window() {
+        let pk = test_pubkey(1);
+        assert_eq!(
+            residual_life(stored_hold(u64::MAX)).hold_residual(&pk, ImportKind::Local),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            residual_life(stored_hold(0)).hold_residual(&pk, ImportKind::Local),
+            Duration::ZERO
+        );
+    }
+
+    /// A local key whose manager stores no deadline waits the window.
+    #[test]
+    fn hold_residual_uses_the_window_without_a_stored_deadline() {
+        let life = residual_life(Arc::new(SpyValidatorManager::new()));
+        assert_eq!(life.hold_residual(&test_pubkey(1), ImportKind::Local), Duration::from_secs(30));
+    }
+
+    // 662-AC1: a source scan of the production part of this file.
+
+    /// Identifiers that only one production `fn` may name, and how often it
+    /// names them: the enable task, the task spawn and the token insert.
+    const ARMING_OWNERS: [(&str, &str, usize); 3] = [
+        ("run_enable_task", "spawn_enable_task", 1),
+        ("spawn", "spawn_enable_task", 1),
+        ("insert", "spawn_enable_task", 1),
+    ];
+
+    /// The stored-deadline read and its clamp: only `hold_residual` names them.
+    const RESIDUAL_OWNERS: [(&str, &str, usize); 2] =
+        [("armed_hold_unix", "hold_residual", 1), ("clamped_hold_wait", "hold_residual", 1)];
+
+    /// `fn` items each scan reads, each defined once.
+    const ARMING_FNS: [&str; 2] = ["spawn_enable_task", "run_enable_task"];
+    const RESIDUAL_FNS: [&str; 2] = ["hold_residual", "clamped_hold_wait"];
+
+    /// What `cancel_tokens` may be followed by outside `spawn_enable_task`
+    /// (whitespace removed, literals blanked): a remove or a read through a
+    /// temporary guard.
+    const TOKEN_TAKES: [&str; 2] = [".lock().expect().remove(", ".lock().expect().get("];
+
+    /// The field's type and its initialiser, the only other places that may
+    /// name `cancel_tokens`. A pattern cannot take either shape.
+    const TOKEN_FIELD: [&str; 2] =
+        [":Mutex<HashMap<Pubkey,CancellationToken>>", ":Mutex::new(HashMap::new())"];
+
+    /// Identifiers the production part may not name: a child module, an
+    /// included file or `unsafe` code could reach the private items unseen,
+    /// and these map writes and blocking runs are not counted as arming.
+    /// Every `spawn*` name other than `spawn` and `spawn_enable_task` is
+    /// reported too.
+    const FORBIDDEN: [&str; 9] = [
+        "mod",
+        "include",
+        "unsafe",
+        "entry",
+        "or_insert",
+        "or_insert_with",
+        "or_default",
+        "get_mut",
+        "block_on",
+    ];
+
+    /// The macros, attributes and derives the production part may use. Any
+    /// other one, `macro_rules!` included, could expand to code the scan
+    /// never reads.
+    const MACROS: [&str; 6] = ["error", "format", "info", "matches", "select", "thread_local"];
+    const ATTRIBUTES: [&str; 4] = ["async_trait", "cfg", "derive", "must_use"];
+    const DERIVES: [&str; 5] = ["Clone", "Copy", "Debug", "Eq", "PartialEq"];
+
+    /// Words in a block header or a statement that let the code after them
+    /// run later than the statement: an async block or a nested `fn`. A
+    /// closure is found by its `|`.
+    const DEFERRED: [&str; 2] = ["async", "fn"];
+
+    /// Length of the block comment that opens `rest`. Block comments nest.
+    fn block_comment_len(rest: &[char]) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = 0;
+        while let Some(pair) = rest.get(at..at + 2) {
+            if pair == ['/', '*'] {
+                depth += 1;
+                at += 2;
+            } else if pair == ['*', '/'] {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return Some(at);
+                }
+            } else {
+                at += 1;
+            }
+        }
+        None
+    }
+
+    /// `src` with comments and string, raw-string and char literals blanked.
+    /// Newlines are kept, so line numbers do not move.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let rest = &chars[i..];
+            let until = |from: usize, close: &[char]| {
+                (from..rest.len())
+                    .find(|&at| rest[at..].starts_with(close))
+                    .map(|at| at + close.len())
+            };
+            let blank = match rest {
+                ['/', '/', ..] => Some(rest.iter().position(|&c| c == '\n').unwrap_or(rest.len())),
+                ['/', '*', ..] => block_comment_len(rest),
+                ['"', ..] => {
+                    let mut at = 1;
+                    while at < rest.len() && rest[at] != '"' {
+                        at += if rest[at] == '\\' { 2 } else { 1 };
+                    }
+                    Some(at + 1)
+                }
+                ['r', '#' | '"', ..] => {
+                    let hashes = rest[1..].iter().take_while(|&&c| c == '#').count();
+                    let close: Vec<char> =
+                        std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                    if rest.get(1 + hashes) == Some(&'"') {
+                        until(2 + hashes, &close)
+                    } else {
+                        None
+                    }
+                }
+                ['\'', '\\', ..] => until(3, &['\'']),
+                ['\'', _, '\'', ..] => Some(3),
+                _ => None,
+            };
+            if let Some(len) = blank {
+                let len = len.min(rest.len());
+                out.extend(rest[..len].iter().map(|&c| if c == '\n' { '\n' } else { ' ' }));
+                i += len;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn ident_char(c: char) -> bool {
+        c == '_' || c.is_alphanumeric()
+    }
+
+    /// Byte offsets of `ident` in `code` as a whole identifier.
+    fn ident_offsets<'a>(code: &'a str, ident: &'a str) -> impl Iterator<Item = usize> + 'a {
+        code.match_indices(ident).map(|(at, _)| at).filter(move |&at| {
+            !code[..at].ends_with(ident_char) && !code[at + ident.len()..].starts_with(ident_char)
+        })
+    }
+
+    /// Whether the identifier at `at` is the name in a `fn` definition.
+    fn is_definition(code: &str, at: usize) -> bool {
+        code[..at].trim_end().strip_suffix("fn").is_some_and(|before| !before.ends_with(ident_char))
+    }
+
+    fn line_of(code: &str, at: usize) -> usize {
+        code[..at].matches('\n').count() + 1
+    }
+
+    /// Offset just past the `}` that closes the `{` at `open`.
+    fn block_end(code: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, c) in code[open..].char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// The `{` of the innermost block around `at`.
+    fn block_open(code: &str, at: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, c) in code[..at].char_indices().rev() {
+            if c == '}' {
+                depth += 1;
+            } else if c == '{' {
+                if depth == 0 {
+                    return Some(offset);
+                }
+                depth -= 1;
+            }
+        }
+        None
+    }
+
+    /// Where the statement or block header around `at` starts.
+    fn statement_start(code: &str, at: usize) -> usize {
+        code[..at].rfind([';', '{', '}']).map_or(0, |end| end + 1)
+    }
+
+    fn collapsed(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The statement around `at` with its whitespace collapsed, and where it ends.
+    fn statement_at(code: &str, at: usize) -> (String, usize) {
+        let end = code[at..].find(';').map_or(code.len(), |len| at + len);
+        (collapsed(&code[statement_start(code, at)..end]), end)
+    }
+
+    /// Each identifier (or number) in `code` and its offset.
+    fn idents(code: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+        code.char_indices()
+            .filter(move |&(at, c)| ident_char(c) && !code[..at].ends_with(ident_char))
+            .map(move |(at, _)| {
+                let len = code[at..].find(|c: char| !ident_char(c)).unwrap_or(code.len() - at);
+                (at, &code[at..at + len])
+            })
+    }
+
+    /// Keywords a `!` negation may follow. Any other identifier before a `!`
+    /// that is not `!=` names a macro.
+    const NEGATING_KEYWORDS: [&str; 7] = ["break", "if", "in", "match", "return", "while", "yield"];
+
+    /// Code the scan cannot read, and writes and runs the arming rules do
+    /// not count: each `FORBIDDEN` identifier, each other `spawn*` name,
+    /// and each macro, attribute or derive that is not on its list.
+    fn scope_violations(code: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (at, ident) in idents(code) {
+            let line = line_of(code, at);
+            let after = code[at + ident.len()..].trim_start();
+            let spawn =
+                ident.starts_with("spawn") && !["spawn", "spawn_enable_task"].contains(&ident);
+            let keyword = NEGATING_KEYWORDS.contains(&ident) && !code[..at].ends_with('#');
+            let macro_call = after.starts_with('!') && !after.starts_with("!=") && !keyword;
+            if spawn || FORBIDDEN.contains(&ident) {
+                found.push(format!("line {line}: {ident} is not allowed"));
+            } else if macro_call && !MACROS.contains(&ident) {
+                found.push(format!("line {line}: macro {ident}! is not on the list"));
+            }
+        }
+        for (at, _) in code.match_indices('#') {
+            let rest = code[at + 1..].trim_start();
+            let rest = rest.strip_prefix('!').map_or(rest, str::trim_start);
+            let Some(attribute) = rest.strip_prefix('[') else {
+                continue;
+            };
+            let attribute = &attribute[..attribute.find(']').unwrap_or(attribute.len())];
+            let mut names = attribute.split(|c: char| !ident_char(c)).filter(|n| !n.is_empty());
+            let line = line_of(code, at);
+            match names.next() {
+                Some("derive") => found.extend(
+                    names
+                        .filter(|name| !DERIVES.contains(name))
+                        .map(|name| format!("line {line}: derive {name} is not on the list")),
+                ),
+                Some(name) if ATTRIBUTES.contains(&name) => {}
+                name => found.push(format!(
+                    "line {line}: attribute {} is not on the list",
+                    name.unwrap_or_default()
+                )),
+            }
+        }
+        found
+    }
+
+    /// Whether `text` holds a closure, an async block or a nested `fn`.
+    fn defers(text: &str) -> bool {
+        text.contains('|') || DEFERRED.iter().any(|word| ident_offsets(text, word).next().is_some())
+    }
+
+    /// Whether the code at `at` runs while the block opened at `open` runs:
+    /// no block header between them, and no part of `at`'s own statement
+    /// before it, starts a closure, an async block or a nested `fn`.
+    fn runs_inline(code: &str, open: usize, at: usize) -> bool {
+        let mut inner = at;
+        loop {
+            if defers(&code[statement_start(code, inner)..inner]) {
+                return false;
+            }
+            match block_open(code, inner) {
+                Some(block) if block == open => return true,
+                Some(block) => inner = block,
+                None => return false,
+            }
+        }
+    }
+
+    /// Every `fn` item with a body: its name, and the range from `fn` through
+    /// the closing `}`.
+    fn fn_items(code: &str) -> Vec<(&str, std::ops::Range<usize>)> {
+        ident_offsets(code, "fn")
+            .filter_map(|at| {
+                let name_at = at + 2 + (code[at + 2..].len() - code[at + 2..].trim_start().len());
+                let len = code[name_at..].find(|c: char| !ident_char(c))?;
+                let open = name_at + code[name_at..].find(['{', ';'])?;
+                let body_end = (len > 0 && code[open..].starts_with('{'))
+                    .then(|| block_end(code, open))
+                    .flatten()?;
+                Some((&code[name_at..name_at + len], at..body_end))
+            })
+            .collect()
+    }
+
+    /// The innermost `fn` item around `at`.
+    fn owner_of<'a>(items: &[(&'a str, std::ops::Range<usize>)], at: usize) -> Option<&'a str> {
+        items
+            .iter()
+            .filter(|(_, item)| item.contains(&at))
+            .min_by_key(|(_, item)| item.len())
+            .map(|&(name, _)| name)
+    }
+
+    /// The production part of `src` with literals and comments blanked. The
+    /// `#[cfg(test)] mod tests` it cuts off must be the last item.
+    fn production_code(src: &str, found: &mut Vec<String>) -> String {
+        let Some((production, tests)) = src.split_once("#[cfg(test)]\nmod tests {") else {
+            found.push("no #[cfg(test)] mod tests".into());
+            return code_only(src);
+        };
+        let tests = code_only(&format!("{{{tests}"));
+        if block_end(&tests, 0).is_none_or(|end| !tests[end..].trim().is_empty()) {
+            found.push("code after the test module".into());
+        }
+        code_only(production)
+    }
+
+    /// Each break of the single-owner rules in `code`: a `defined` item not
+    /// defined exactly once, or an `owners` identifier named outside its owner
+    /// (definitions aside) or named there other than the expected number of
+    /// times.
+    fn owner_violations(
+        code: &str,
+        defined: &[&str],
+        owners: &[(&str, &str, usize)],
+    ) -> Vec<String> {
+        let items = fn_items(code);
+        let mut found = Vec::new();
+        for &name in defined {
+            let count = items.iter().filter(|(item, _)| *item == name).count();
+            if count != 1 {
+                found.push(format!("{name}: {count} definitions"));
+            }
+        }
+        for &(ident, owner, expected) in owners {
+            let mut inside = 0;
+            for at in ident_offsets(code, ident).filter(|&at| !is_definition(code, at)) {
+                if owner_of(&items, at) == Some(owner) {
+                    inside += 1;
+                } else {
+                    found.push(format!("line {}: {ident} outside {owner}", line_of(code, at)));
+                }
+            }
+            if inside != expected {
+                found.push(format!("{owner}: names {ident} {inside} times, not {expected}"));
+            }
+        }
+        found
+    }
+
+    /// The token write in `spawn_enable_task`: one `cancel_tokens` guard,
+    /// bound in a block and named once more, in
+    /// `if let Some(<old>) = <guard>.insert(..) { <old>.cancel(); }`, which
+    /// closes before that block does (KM-2 (a)/(c)).
+    fn token_guard_violations(code: &str, owner: std::ops::Range<usize>) -> Vec<String> {
+        let uses: Vec<usize> =
+            ident_offsets(code, "cancel_tokens").filter(|at| owner.contains(at)).collect();
+        let [at] = uses[..] else {
+            return vec![format!("spawn_enable_task: names cancel_tokens {} times", uses.len())];
+        };
+        let (statement, bound) = statement_at(code, at);
+        let guard = statement
+            .strip_prefix("let mut ")
+            .and_then(|rest| rest.strip_suffix(" = self.cancel_tokens.lock().expect( )"))
+            .filter(|guard| guard.chars().all(ident_char));
+        let (Some(guard), Some(end)) =
+            (guard, block_open(code, at).and_then(|o| block_end(code, o)))
+        else {
+            return vec![format!(
+                "spawn_enable_task: cancel_tokens guard is not bound: {statement}"
+            )];
+        };
+        let named: Vec<usize> =
+            ident_offsets(&code[bound..end], guard).map(|at| bound + at).collect();
+        let inserted = match named[..] {
+            [at] if code[at + guard.len()..].trim_start().starts_with(".insert(") => at,
+            _ => {
+                return vec![format!(
+                    "spawn_enable_task: guard {guard} is named {} times after its binding, \
+                     not once for the insert",
+                    named.len()
+                )]
+            }
+        };
+        let binding = collapsed(&code[statement_start(code, inserted)..inserted]);
+        let displaced =
+            binding.strip_prefix("if let Some(").and_then(|rest| rest.strip_suffix(") ="));
+        let then = code[inserted..end].find('{').map(|at| inserted + at);
+        let cancelled = displaced.zip(then).is_some_and(|(old, then)| {
+            block_end(code, then).is_some_and(|close| {
+                collapsed(&code[then..close]) == format!("{{ {old}.cancel(); }}")
+            })
+        });
+        if cancelled {
+            Vec::new()
+        } else {
+            vec!["spawn_enable_task: the displaced token is not cancelled under the guard".into()]
+        }
+    }
+
+    /// A `spawn_enable_task` call that is not `self.spawn_enable_task(`
+    /// inside the block of an earlier `let <guard> = self.lock_state();`,
+    /// with the guard never named again and no closure, async block or
+    /// nested `fn` between that block and the call.
+    fn unlocked_arming_calls(code: &str) -> Vec<String> {
+        let held = |call: usize| {
+            ident_offsets(code, "lock_state").filter(|&at| at < call).any(|at| {
+                let (statement, bound) = statement_at(code, at);
+                let guard = statement
+                    .strip_prefix("let ")
+                    .and_then(|rest| rest.strip_suffix(" = self.lock_state()"))
+                    .filter(|guard| *guard != "_" && guard.chars().all(ident_char));
+                let open = block_open(code, at);
+                let end = open.and_then(|open| block_end(code, open));
+                match (guard, open, end) {
+                    (Some(guard), Some(open), Some(end)) => {
+                        call < end
+                            && ident_offsets(&code[bound..end], guard).next().is_none()
+                            && runs_inline(code, open, call)
+                    }
+                    _ => false,
+                }
+            })
+        };
+        let on_self = |call: usize| {
+            code[..call].strip_suffix("self.").is_some_and(|before| !before.ends_with(ident_char))
+        };
+        ident_offsets(code, "spawn_enable_task")
+            .filter(|&at| !is_definition(code, at))
+            .filter_map(|at| {
+                let line = line_of(code, at);
+                if !on_self(at) {
+                    Some(format!(
+                        "line {line}: spawn_enable_task is not called as self.spawn_enable_task("
+                    ))
+                } else if !held(at) {
+                    Some(format!("line {line}: spawn_enable_task( without state_lock"))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Each break of the arming rules (662-AC1) in the production part of `src`.
+    fn arming_violations(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let code = production_code(src, &mut found);
+        let items = fn_items(&code);
+        found.extend(owner_violations(&code, &ARMING_FNS, &ARMING_OWNERS));
+        for at in ident_offsets(&code, "cancel_tokens") {
+            if owner_of(&items, at) == Some("spawn_enable_task") {
+                continue;
+            }
+            let next: String = code[at + "cancel_tokens".len()..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .take(48)
+                .collect();
+            let take =
+                code[..at].ends_with("self.") && TOKEN_TAKES.iter().any(|t| next.starts_with(t));
+            let field = TOKEN_FIELD.iter().any(|shape| next.starts_with(shape));
+            if !take && !field {
+                found.push(format!(
+                    "line {}: cancel_tokens is not a field, remove or get",
+                    line_of(&code, at)
+                ));
+            }
+        }
+        match items.iter().find(|(item, _)| *item == "spawn_enable_task") {
+            Some((_, owner)) => found.extend(token_guard_violations(&code, owner.clone())),
+            None => found.push("spawn_enable_task: no body".into()),
+        }
+        found.extend(unlocked_arming_calls(&code));
+        found.extend(scope_violations(&code));
+        found
+    }
+
+    /// 662-AC1: only `spawn_enable_task` inserts an enable-task token and
+    /// spawns `run_enable_task`. It holds one `cancel_tokens` guard across the
+    /// insert and the displaced cancel, and every caller holds `state_lock`.
+    #[test]
+    fn enable_task_arming_has_one_owner() {
+        let violations = arming_violations(include_str!("lifecycle.rs"));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// Each break of the residual rule (662-AC1) in the production part of `src`.
+    fn residual_violations(src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let code = production_code(src, &mut found);
+        found.extend(owner_violations(&code, &RESIDUAL_FNS, &RESIDUAL_OWNERS));
+        found.extend(scope_violations(&code));
+        found
+    }
+
+    /// 662-AC1: the residual rule has one owner. Only `hold_residual` reads
+    /// the stored deadline and clamps it to the window, and no code the scan
+    /// cannot read could hold a copy.
+    #[test]
+    fn hold_residual_has_one_owner() {
+        let violations = residual_violations(include_str!("lifecycle.rs"));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    const ARMING_FIXTURE: &str = r##"
+impl Life {
+    fn spawn_enable_task(self: &Arc<Self>, pk: Pubkey, residual: Duration) {
+        let token = CancellationToken::new();
+        {
+            let mut map = self.cancel_tokens.lock().expect("map");
+            if let Some(old) = map.insert(pk, token.clone()) {
+                old.cancel();
+            }
+        }
+        let this = Arc::clone(self);
+        let label = ("}", r#"a"{"#, '}', '\'', "tokio::spawn(");
+        tokio::spawn(async move { this.run_enable_task(pk, token, label).await });
+    }
+
+    async fn run_enable_task(self: Arc<Self>, pk: Pubkey, token: CancellationToken) {
+        // self.run_enable_task( in a comment is not a call
+        self.finish(pk, token).await;
+    }
+
+    fn on_import(self: &Arc<Self>, pk: Pubkey) -> Result<(), String> {
+        let _held = self.lock_state();
+        /* outer /* inner */ map.insert( } */
+        self.spawn_enable_task(pk, self.hold_residual(&pk));
+        Ok(())
+    }
+
+    fn rearm(self: &Arc<Self>, pk: Pubkey, residual: Duration) {
+        self.spawn_enable_task(pk, residual);
+    }
+
+    fn on_delete(&self, pk: &Pubkey) {
+        let _held = self.lock_state();
+        if let Some(old) = self.cancel_tokens.lock().expect("map").remove(pk) {
+            old.cancel();
+        }
+    }
+
+    fn second_arm(&self, pk: Pubkey, token: CancellationToken) {
+        self.cancel_tokens.lock().expect("map").entry(pk).or_insert(token);
+        tokio::task::spawn(Self::run_enable_task);
+    }
+
+    fn hold_residual(&self, pk: &Pubkey) -> Duration {
+        self.vm.armed_hold_unix(pk).map_or(self.window, |at| self.clamped_hold_wait(at))
+    }
+
+    fn clamped_hold_wait(&self, at: u64) -> Duration {
+        Duration::from_secs(at).min(self.window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn decoy(life: Life) {
+        life.cancel_tokens.lock().unwrap().insert(pk, token);
+        tokio::spawn(life.run_enable_task(pk));
+    }
+}
+"##;
+
+    /// The arming violations of `ARMING_FIXTURE` with `from` replaced once.
+    fn fixture(from: &str, to: &str) -> Vec<String> {
+        assert!(ARMING_FIXTURE.contains(from), "{from}");
+        arming_violations(&ARMING_FIXTURE.replacen(from, to, 1))
+    }
+
+    fn reported(violations: Vec<String>, violation: &str) {
+        assert!(violations.iter().any(|v| v == violation), "{violation}: {violations:#?}");
+    }
+
+    /// The scan cannot pass vacuously: it sees every `fn` body, the lexer
+    /// blanks each literal and comment kind (nested block comments too), the
+    /// test module is cut off, and each rule reports its own violation.
+    #[test]
+    fn arming_scan_sees_every_fn_body_in_a_fixture() {
+        let mut cut = Vec::new();
+        let code = production_code(ARMING_FIXTURE, &mut cut);
+        assert!(cut.is_empty(), "{cut:?}");
+        let items = fn_items(&code);
+        let names: Vec<&str> = items.iter().map(|&(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "spawn_enable_task",
+                "run_enable_task",
+                "on_import",
+                "rearm",
+                "on_delete",
+                "second_arm",
+                "hold_residual",
+                "clamped_hold_wait",
+            ]
+        );
+        for (name, item) in &items {
+            assert!(code[item.clone()].ends_with('}'), "{name}: {}", &code[item.clone()]);
+        }
+        let on_import = items.iter().find(|(name, _)| *name == "on_import").expect("on_import");
+        assert!(
+            code[on_import.1.clone()].contains("Ok(())"),
+            "a nested comment ends at its own */"
+        );
+        assert_eq!(
+            arming_violations(ARMING_FIXTURE),
+            [
+                "line 41: run_enable_task outside spawn_enable_task",
+                "line 41: spawn outside spawn_enable_task",
+                "line 40: cancel_tokens is not a field, remove or get",
+                "line 29: spawn_enable_task( without state_lock",
+                "line 40: entry is not allowed",
+                "line 40: or_insert is not allowed",
+            ]
+        );
+        let residual = owner_violations(&code, &RESIDUAL_FNS, &RESIDUAL_OWNERS);
+        assert!(residual.is_empty(), "{residual:?}");
+
+        let guard = "                old.cancel();\n            }\n";
+        reported(
+            fixture(guard, "            }\n"),
+            "spawn_enable_task: the displaced token is not cancelled under the guard",
+        );
+        reported(
+            fixture(
+                "        {\n            let mut map = self.cancel_tokens.lock().expect(\"map\");\n            \
+                 if let Some(old) = map.insert(pk, token.clone()) {\n                old.cancel();\n            \
+                 }\n        }\n",
+                "        let old = {\n            let mut map = self.cancel_tokens.lock().expect(\"map\");\n            \
+                 map.insert(pk, token.clone())\n        };\n        if let Some(old) = old {\n            \
+                 old.cancel();\n        }\n",
+            ),
+            "spawn_enable_task: the displaced token is not cancelled under the guard",
+        );
+        reported(
+            fixture(
+                "                old.cancel();\n",
+                "                drop(map);\nold.cancel();\n",
+            ),
+            "spawn_enable_task: guard map is named 2 times after its binding, not once for the \
+             insert",
+        );
+        reported(
+            fixture(
+                "            let mut map = self.cancel_tokens.lock().expect(\"map\");\n            if \
+                 let Some(old) = map.insert(pk, token.clone()) {",
+                "            if let Some(old) = \
+                 self.cancel_tokens.lock().expect(\"map\").insert(pk, token.clone()) {",
+            ),
+            "spawn_enable_task: cancel_tokens guard is not bound: if let Some(old) = \
+             self.cancel_tokens.lock().expect( ).insert(pk, token.clone()) { old.cancel()",
+        );
+        reported(
+            fixture(
+                "        let this =",
+                "        self.cancel_tokens.lock().expect(\"\");\nlet this =",
+            ),
+            "spawn_enable_task: names cancel_tokens 2 times",
+        );
+        reported(
+            fixture("        let _held = self.lock_state();\n        /*", "        /*"),
+            "line 23: spawn_enable_task( without state_lock",
+        );
+        reported(
+            fixture(
+                "let _held = self.lock_state();\n        /*",
+                "let _ = self.lock_state();\n        /*",
+            ),
+            "line 24: spawn_enable_task( without state_lock",
+        );
+        reported(
+            fixture("        /* outer", "        drop(_held);\n        /* outer"),
+            "line 25: spawn_enable_task( without state_lock",
+        );
+        reported(
+            fixture("        tokio::spawn(async", "        (async"),
+            "spawn_enable_task: names spawn 0 times, not 1",
+        );
+        reported(
+            fixture("    fn rearm(", "    fn spawn_enable_task() {}\n    fn rearm("),
+            "spawn_enable_task: 2 definitions",
+        );
+        reported(
+            fixture("    async fn run_enable_task(", "    async fn run_enable_task_v2("),
+            "run_enable_task: 0 definitions",
+        );
+        reported(
+            fixture("    fn spawn_enable_task(", "    fn spawn_enable_task_v2("),
+            "spawn_enable_task: no body",
+        );
+        reported(
+            fixture(
+                "            let mut map",
+                "            map.insert(pk, token.clone());\nlet mut map",
+            ),
+            "spawn_enable_task: names insert 2 times, not 1",
+        );
+        reported(
+            arming_violations(&format!("{ARMING_FIXTURE}fn after_tests() {{}}\n")),
+            "code after the test module",
+        );
+        reported(arming_violations("fn spawn_enable_task() {}"), "no #[cfg(test)] mod tests");
+        assert_eq!(
+            owner_violations(
+                &code,
+                &["hold_residual", "rearm_v2"],
+                &[("clamped_hold_wait", "hold_residual", 1), ("armed_hold_unix", "on_import", 1)]
+            ),
+            [
+                "rearm_v2: 0 definitions",
+                "line 45: armed_hold_unix outside on_import",
+                "on_import: names armed_hold_unix 0 times, not 1",
+            ]
+        );
+    }
+
+    /// The shapes the PR #952 R1 reviews found the scan missing, one fixture
+    /// each: code the scan cannot read (Z1-Z3, Z5, Z6), a destructured field
+    /// (Z5), arming that runs after `state_lock` drops (Z7, P15), and a
+    /// displaced cancel that runs after the guard drops or names another
+    /// token (Z4, Z8).
+    #[test]
+    fn arming_scan_reports_each_known_bypass() {
+        for (item, violation) in [
+            ("mod rearm_path;", "line 2: mod is not allowed"),
+            ("#[path = \"arm.rs\"] mod arm;", "line 2: attribute path is not on the list"),
+            ("include!(\"lifecycle_arm.rs\");", "line 2: include is not allowed"),
+            ("macro_rules! arm { () => {}; }", "line 2: macro macro_rules! is not on the list"),
+            ("fn arm() { arm!(); }", "line 2: macro arm! is not on the list"),
+            ("fn arm() { r#if!(); }", "line 2: macro if! is not on the list"),
+            ("#[arm] fn arm() {}", "line 2: attribute arm is not on the list"),
+            ("#![arm]", "line 2: attribute arm is not on the list"),
+            ("#[derive(Debug, Arm)] struct Arm;", "line 2: derive Arm is not on the list"),
+            ("unsafe fn arm() {}", "line 2: unsafe is not allowed"),
+            ("fn arm(m: M) { m.entry(K); }", "line 2: entry is not allowed"),
+            ("fn arm(e: E) { e.or_insert(V); }", "line 2: or_insert is not allowed"),
+            ("fn arm(e: E) { e.or_insert_with(V); }", "line 2: or_insert_with is not allowed"),
+            ("fn arm(e: E) { e.or_default(); }", "line 2: or_default is not allowed"),
+            ("fn arm(m: M) { m.get_mut(K); }", "line 2: get_mut is not allowed"),
+            ("fn arm(h: H) { h.block_on(F); }", "line 2: block_on is not allowed"),
+            (
+                "fn arm() { tokio::task::spawn_blocking(F); }",
+                "line 2: spawn_blocking is not allowed",
+            ),
+            ("fn arm() { tokio::task::spawn_local(F); }", "line 2: spawn_local is not allowed"),
+        ] {
+            reported(fixture("impl Life {", &format!("{item}\nimpl Life {{")), violation);
+        }
+        reported(
+            residual_violations(&ARMING_FIXTURE.replacen(
+                "impl Life {",
+                "mod copy;\nimpl Life {",
+                1,
+            )),
+            "line 2: mod is not allowed",
+        );
+
+        assert_eq!(
+            fixture(
+                "#[cfg(test)]",
+                "struct Life {\n    cancel_tokens: Mutex<HashMap<Pubkey, CancellationToken>>,\n}\n\
+                 impl Life {\n    fn new() -> Self {\n        \
+                 Self { cancel_tokens: Mutex::new(HashMap::new()) }\n    }\n}\n\
+                 #[derive(Clone, Copy, Debug, Eq, PartialEq)]\nstruct Shape;\n\
+                 #[must_use]\nfn negated(map: u8, b: bool) -> bool {\n    \
+                 if !b && map != 0 {\n        return !b;\n    }\n    matches!(map, 1)\n}\n\
+                 #[cfg(test)]",
+            ),
+            arming_violations(ARMING_FIXTURE),
+            "the field, its initialiser, the listed derives, macros and attributes, a `!=`, \
+             a negation, and the guard's name outside its block are allowed"
+        );
+        reported(
+            fixture(
+                "        if let Some(old) = self.cancel_tokens.lock().expect(\"map\").remove(pk) {",
+                "        let Self { cancel_tokens: map, .. } = self;\n        \
+                 if let Some(old) = map.lock().expect(\"map\").remove(pk) {",
+            ),
+            "line 34: cancel_tokens is not a field, remove or get",
+        );
+
+        let rearm = "        self.spawn_enable_task(pk, residual);\n    }\n\n    fn on_delete";
+        let guarded = |arm: &str| {
+            fixture(
+                rearm,
+                &format!(
+                    "        let arm = {{\n            let _held = self.lock_state();\n            \
+                     {arm}\n        }};\n        arm();\n    }}\n\n    fn on_delete"
+                ),
+            )
+        };
+        let inline = guarded("self.spawn_enable_task(pk, residual)");
+        assert!(!inline.iter().any(|v| v.contains("without state_lock")), "{inline:#?}");
+        for arm in [
+            "move || self.spawn_enable_task(pk, residual)",
+            "async move { self.spawn_enable_task(pk, residual) }",
+            "impl Life { fn arm(self: &Arc<Self>) { self.spawn_enable_task(PK, R) } }",
+        ] {
+            reported(guarded(arm), "line 31: spawn_enable_task( without state_lock");
+        }
+        for receiver in ["this.", "myself.", "Self::"] {
+            reported(
+                fixture(
+                    "        self.spawn_enable_task(pk, self.hold_residual(&pk));",
+                    &format!("        {receiver}spawn_enable_task(pk, self.hold_residual(&pk));"),
+                ),
+                "line 24: spawn_enable_task is not called as self.spawn_enable_task(",
+            );
+        }
+
+        let cancel =
+            "            if let Some(old) = map.insert(pk, token.clone()) {\n                \
+             old.cancel();\n            }\n        }\n";
+        for split in [
+            "            old = map.insert(pk, token.clone());\n            \
+             CancellationToken::new().cancel();\n        }\n        \
+             if let Some(old) = old {\n            old.cancel();\n        }\n",
+            "            cancel = map\n                .insert(pk, token.clone())\n                \
+             .and_then(|old| Some(move || old.cancel()));\n        }\n",
+            "            if let Some(old) = map.insert(pk, token.clone()) {\n                \
+             token.cancel();\n            }\n        }\n",
+        ] {
+            reported(
+                fixture(cancel, split),
+                "spawn_enable_task: the displaced token is not cancelled under the guard",
+            );
+        }
     }
 }

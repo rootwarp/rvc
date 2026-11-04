@@ -1056,7 +1056,7 @@ fn tombstone_disable_does_not_deadlock_with_delete() {
     let sk = SecretKey::generate();
     let pk = sk.public_key().to_bytes();
     block_on(async {
-        life.rearm_persisted_hold(pk, std::time::Duration::from_secs(60)).expect("arm enable task");
+        life.rearm_persisted_hold(pk, std::time::Duration::from_secs(60));
     });
     assert!(life.current_cancel_token(&pk).is_some(), "the real enable token must be armed");
 
