@@ -184,11 +184,9 @@ impl KeymanagerServer {
 
     /// Spawn enable tasks for doppelganger holds that are still inside their window.
     pub fn rearm_persisted_doppelganger_holds(&self, holds: Vec<(crate::traits::Pubkey, u64)>) {
+        let life = Arc::clone(&self.state.doppelganger);
         for (pk, residual_secs) in holds {
-            let life = Arc::clone(&self.state.doppelganger);
-            if let Err(e) = life.rearm_persisted_hold(pk, Duration::from_secs(residual_secs)) {
-                tracing::warn!(error = %e, "failed to re-arm a persisted doppelganger hold");
-            }
+            life.rearm_persisted_hold(pk, Duration::from_secs(residual_secs));
         }
     }
 
@@ -330,9 +328,15 @@ mod tests {
         }
     }
 
-    struct StubDoppelganger;
+    /// Records each `start_monitoring` call, so a hold armed twice shows up.
+    #[derive(Default)]
+    struct StubDoppelganger {
+        started: std::sync::Mutex<Vec<Pubkey>>,
+    }
     impl DoppelgangerMonitor for StubDoppelganger {
-        fn start_monitoring(&self, _pubkey: Pubkey) {}
+        fn start_monitoring(&self, pubkey: Pubkey) {
+            self.started.lock().expect("started").push(pubkey);
+        }
         fn stop_monitoring(&self, _pubkey: &Pubkey) {}
         fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
             true
@@ -395,7 +399,7 @@ mod tests {
             keystore_manager: Arc::new(StubKeystore),
             slashing_protection: Arc::new(StubSlashing),
             validator_manager: Arc::new(StubValidator),
-            doppelganger_monitor: Arc::new(StubDoppelganger),
+            doppelganger_monitor: Arc::new(StubDoppelganger::default()),
             remote_key_manager: Arc::new(StubRemote),
             config_manager: Arc::new(StubConfig),
             exit_manager: None,
@@ -632,5 +636,56 @@ mod tests {
             .await
             .expect("serve_on must return within 2s after cancel");
         finished.expect("server task must not panic").expect("server must exit cleanly");
+    }
+
+    /// Yield until `done` holds, at most a bounded number of times.
+    async fn settles(done: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        done()
+    }
+
+    /// 662-AC4: the boot re-arm arms every persisted hold once, each for its
+    /// own residual.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_persisted_doppelganger_holds_arms_every_hold() {
+        let recorder = Arc::new(StubDoppelganger::default());
+        let deps = KeymanagerDeps {
+            doppelganger_monitor: Arc::clone(&recorder) as Arc<dyn DoppelgangerMonitor>,
+            ..stub_deps()
+        };
+        let server = KeymanagerServer::new(deps, KeymanagerSettings::default());
+        let life = server.doppelganger_lifecycle();
+        let (first, second): (Pubkey, Pubkey) = ([1; 48], [2; 48]);
+        let unarmed = Arc::strong_count(&life);
+
+        server.rearm_persisted_doppelganger_holds(vec![(first, 30), (second, 60)]);
+
+        assert!(life.current_cancel_token(&first).is_some(), "the first hold is armed");
+        assert!(life.current_cancel_token(&second).is_some(), "the second hold is armed");
+        assert_eq!(
+            *recorder.started.lock().expect("started"),
+            [first, second],
+            "each hold is monitored once"
+        );
+        // Each enable task holds the lifecycle until it runs, and none has run
+        // yet. A second arming cancels the first token, but not its task.
+        assert_eq!(Arc::strong_count(&life), unarmed + 2, "each hold spawns one enable task");
+
+        let done = |pk: Pubkey| life.current_cancel_token(&pk).is_none();
+        let just_before = Duration::from_secs(30) - Duration::from_millis(1);
+        tokio::time::advance(just_before).await;
+        assert!(!settles(|| done(first)).await, "the first hold's task waits its whole 30 s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(settles(|| done(first)).await, "the first hold's task finishes at 30 s");
+        assert!(!done(second), "the second hold's task waits for its own 60 s residual");
+        tokio::time::advance(just_before).await;
+        assert!(!settles(|| done(second)).await, "the second hold's task waits its whole 60 s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(settles(|| done(second)).await, "the second hold's task finishes at 60 s");
     }
 }
