@@ -251,6 +251,11 @@ impl StoreState {
         self.url_owned.remove(pubkey);
         self.validators.remove(pubkey)
     }
+
+    /// `enabled = true` with the hold cleared. `false` when `pubkey` has no row.
+    fn enable_signing(&mut self, pubkey: &[u8; 48]) -> bool {
+        self.validators.get_mut(pubkey).map(|cfg| set_enabled_fields(cfg, true, None)).is_some()
+    }
 }
 
 /// One URL-owned field: `applied` is the remote value, `durable` is what the file keeps.
@@ -660,19 +665,9 @@ impl ValidatorStore {
         if !self.state.read().validators.contains_key(pubkey) {
             return Ok(());
         }
-        let Some(path) = self.config_path.clone() else {
-            publish_enabled(&mut self.state.write(), pubkey, true);
-            return Ok(());
-        };
-        let live = self.state.read().clone();
-        let previous = self.disk_toml(&live);
-        let mut candidate = live;
-        if let Some(cfg) = candidate.validators.get_mut(pubkey) {
-            cfg.enabled = true;
-            cfg.doppelganger_hold_until = None;
+        if self.commit_then_publish(|state| state.enable_signing(pubkey))? {
+            log_validator_enabled(pubkey);
         }
-        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
-        publish_enabled(&mut self.state.write(), pubkey, true);
         Ok(())
     }
 
@@ -770,18 +765,8 @@ impl ValidatorStore {
             return Ok(true);
         }
         let mut config = ValidatorConfig::new(*pubkey);
-        config.enabled = false;
-        config.doppelganger_hold_until = Some(until_unix);
-        let Some(path) = self.config_path.clone() else {
-            self.state.write().insert_validator(config);
-            return Ok(true);
-        };
-        let live = self.state.read().clone();
-        let previous = self.disk_toml(&live);
-        let mut candidate = live;
-        candidate.insert_validator(config.clone());
-        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
-        self.state.write().insert_validator(config);
+        set_enabled_fields(&mut config, false, Some(until_unix));
+        self.commit_then_publish(|state| state.insert_validator(config.clone()))?;
         Ok(true)
     }
 
@@ -808,19 +793,9 @@ impl ValidatorStore {
         if now < until {
             return Ok(false);
         }
-        let Some(path) = self.config_path.clone() else {
-            publish_enabled(&mut self.state.write(), pubkey, true);
-            return Ok(true);
-        };
-        let live = self.state.read().clone();
-        let previous = self.disk_toml(&live);
-        let mut candidate = live;
-        if let Some(cfg) = candidate.validators.get_mut(pubkey) {
-            cfg.enabled = true;
-            cfg.doppelganger_hold_until = None;
+        if self.commit_then_publish(|state| state.enable_signing(pubkey))? {
+            log_validator_enabled(pubkey);
         }
-        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
-        publish_enabled(&mut self.state.write(), pubkey, true);
         Ok(true)
     }
 
@@ -1939,6 +1914,17 @@ fn log_moved_validators_file(rejected: &Path) {
             warn!(rejected = %rejected.display(), "moved validators file off the boot path");
         }
     }
+}
+
+/// Set a row's signing fields. Silent: it also runs on the candidate before the
+/// write, so callers log only once the change is live.
+fn set_enabled_fields(cfg: &mut ValidatorConfig, enabled: bool, hold: Option<u64>) {
+    cfg.enabled = enabled;
+    cfg.doppelganger_hold_until = hold;
+}
+
+fn log_validator_enabled(pubkey: &[u8; 48]) {
+    info!(pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)), "validator enabled");
 }
 
 fn publish_enabled(state: &mut StoreState, pubkey: &[u8; 48], enabled: bool) {
@@ -5332,7 +5318,8 @@ builder_boost_factor = 175
             !store.add_validator_durable(ValidatorConfig::new(pk)).unwrap(),
             "the disabled row is already present"
         );
-        store.begin_doppelganger_hold(&pk, 1_700_000_100).unwrap();
+        let held = store.begin_doppelganger_hold(&pk, 1_700_000_100);
+        assert!(matches!(held, Ok(false)), "no hold, so no timer: {held:?}");
         assert!(
             store.get_config(&pk).unwrap().doppelganger_hold_until.is_none(),
             "a pre-existing disable must not gain a doppelganger hold"
@@ -7144,8 +7131,8 @@ builder_boost_factor = 175
         applied: fn(&ValidatorStore) -> bool,
     }
 
-    /// Writers routed through `commit_then_publish`.
-    fn routed_durable_callers() -> [DurableCaller; 2] {
+    /// Writers routed through `commit_then_publish`, in [`ROUTED_WRITERS`] order.
+    fn routed_durable_callers() -> [DurableCaller; 5] {
         [
             DurableCaller {
                 name: "add_validator_durable",
@@ -7165,15 +7152,9 @@ builder_boost_factor = 175
                 },
                 applied: |store| !store.has_validator(&row_pk()),
             },
-        ]
-    }
-
-    /// Writers that still run the protocol inline (W4-K5b routes them).
-    fn inline_durable_callers() -> [DurableCaller; 3] {
-        [
             DurableCaller {
                 name: "persist_signing_enable",
-                call: |store| store.persist_signing_enable(&disabled_pk()),
+                call: |store| store.set_enabled_durable(&disabled_pk(), true),
                 applied: |store| store.is_signing_enabled(&disabled_pk()),
             },
             DurableCaller {
@@ -7266,7 +7247,7 @@ builder_boost_factor = 175
     fn commit_then_publish_persists_the_local_baseline_not_url_values() {
         let fixture = durable_fixture();
         let store = &fixture.store;
-        for caller in routed_durable_callers().into_iter().chain(inline_durable_callers()) {
+        for caller in routed_durable_callers() {
             (caller.call)(store).unwrap_or_else(|e| panic!("{}: {e}", caller.name));
             let disk = ValidatorStore::load_from_config(&fixture.path).unwrap();
             assert!((caller.applied)(store), "{}: published", caller.name);
@@ -7345,6 +7326,11 @@ builder_boost_factor = 175
 
     /// E11: each routed writer takes `save_lock` before its pre-check reads
     /// state, and holds it across the durable write.
+    ///
+    /// No hook runs between the pre-check and the write, so a guard dropped
+    /// and re-taken there is invisible to both probes. The third part reads
+    /// the production bodies instead: one guard, bound at the top of the body
+    /// and never named again, lives from the pre-check to the write.
     #[test]
     fn routed_writers_hold_save_lock_from_the_pre_check_through_the_write() {
         for caller in routed_durable_callers() {
@@ -7383,6 +7369,9 @@ builder_boost_factor = 175
             result.unwrap_or_else(|e| panic!("{}: {e}", caller.name));
             assert!((caller.applied)(&fixture.store), "{}: published", caller.name);
         }
+
+        let violations = save_lock_violations(include_str!("store.rs"));
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     /// R6: durable import rejects a config the file cannot hold, before its
@@ -7437,12 +7426,195 @@ builder_boost_factor = 175
         assert!(!fixture.store.has_validator(&row_pk()));
     }
 
+    /// `"<LEVEL> <message and fields>"` of one captured fmt line.
+    fn log_event(line: &str) -> String {
+        let levels = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+        let level = line.split_whitespace().find(|word| levels.contains(word)).unwrap_or("?");
+        let event = line.rsplit_once(": ").map_or(line, |(_, event)| event);
+        format!("{level} {event}")
+    }
+
+    /// The enable mutation is silent. A routed enable or release logs exactly
+    /// one INFO "validator enabled" event, whose only field is the truncated
+    /// pubkey, once its write succeeds, with or without a validators file. A
+    /// failed write logs none. So does a write whose live row is gone when it
+    /// publishes; release still returns `Ok(true)` then, because its write
+    /// succeeded.
+    #[test]
+    #[tracing_test::traced_test]
+    fn routed_enables_log_only_once_the_write_succeeds() {
+        let [_, _, enable, _, release] = routed_durable_callers();
+        assert_eq!(
+            [enable.name, release.name],
+            ["persist_signing_enable", "release_doppelganger_hold"]
+        );
+        let enable_events_are = |expected: &[String], at: &str| {
+            logs_assert(|lines| {
+                let seen: Vec<String> = lines
+                    .iter()
+                    .filter(|line| line.contains("validator enabled"))
+                    .map(|line| log_event(line))
+                    .collect();
+                if seen == expected {
+                    Ok(())
+                } else {
+                    Err(format!("{at}: {seen:#?} != {expected:#?}"))
+                }
+            });
+        };
+        let mut expected = Vec::new();
+        for (caller, pk) in [(enable, disabled_pk()), (release, held_pk())] {
+            let event =
+                format!("INFO validator enabled pubkey={}", TruncatedPubkey::new(&hex::encode(pk)));
+            let fixture = durable_fixture();
+            let _clear = ClearHooks;
+            super::TOML_WRITE_FAULT.with(|cell| {
+                cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }));
+            });
+            let failed = (caller.call)(&fixture.store);
+            clear_test_hooks();
+            assert!(failed.is_err(), "{}: {failed:?}", caller.name);
+            enable_events_are(&expected, &format!("{}: failed write", caller.name));
+
+            (caller.call)(&fixture.store).unwrap_or_else(|e| panic!("{}: {e}", caller.name));
+            expected.push(event.clone());
+            enable_events_are(&expected, &format!("{}: published", caller.name));
+
+            (caller.call)(&durable_fixture_store())
+                .unwrap_or_else(|e| panic!("{} without a file: {e}", caller.name));
+            expected.push(event);
+            enable_events_are(&expected, &format!("{}: published without a file", caller.name));
+
+            let gone = durable_fixture();
+            let hooked = Arc::clone(&gone.store);
+            super::DURABLE_WRITE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    hooked.remove_validator(&pk);
+                }));
+            });
+            let result = (caller.call)(&gone.store);
+            clear_test_hooks();
+            result.unwrap_or_else(|e| panic!("{} with the row gone: {e}", caller.name));
+            assert!(!gone.store.has_validator(&pk), "{}: the hook removed the row", caller.name);
+            enable_events_are(&expected, &format!("{}: live row gone at publish", caller.name));
+        }
+    }
+
+    /// The enable and release pre-checks return before any write: an unknown
+    /// pubkey, a row without a hold and a hold before its deadline each succeed
+    /// while every write would fail.
+    #[test]
+    fn routed_enable_and_release_pre_checks_do_not_write() {
+        let fixture = durable_fixture();
+        fixture.store.begin_doppelganger_hold(&hold_pk(), HOLD_UNTIL).expect("a future hold");
+        let live_before = live_fingerprint(&fixture.store);
+        let file_before = file_fingerprint(&fixture.path);
+        let _clear = ClearHooks;
+        super::KEEP_TOML_WRITE_FAULT.with(|keep| keep.set(true));
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Serialize }));
+        });
+        let unknown = fixture.store.set_enabled_durable(&new_pk(), true);
+        let no_hold = fixture.store.release_doppelganger_hold(&row_pk());
+        let early = fixture.store.release_doppelganger_hold(&hold_pk());
+        clear_test_hooks();
+        assert!(matches!(unknown, Ok(())), "{unknown:?}");
+        assert!(matches!(no_hold, Ok(false)), "{no_hold:?}");
+        assert!(matches!(early, Ok(false)), "{early:?}");
+        assert_eq!(live_fingerprint(&fixture.store), live_before);
+        assert_eq!(file_fingerprint(&fixture.path), file_before);
+    }
+
+    /// H2: live `next_validator_gen` advances exactly once per inserted row.
+    /// The imported row and the new hold row get the value from before the
+    /// call. Delete drops its row's gen. Enable and release change neither,
+    /// with or without a validators file.
+    #[test]
+    fn routed_writers_advance_next_validator_gen_once_per_new_row() {
+        let gens = |store: &ValidatorStore| {
+            let state = store.state.read();
+            (state.next_validator_gen, state.validator_gen.clone())
+        };
+        for caller in routed_durable_callers() {
+            let new_row = match caller.name {
+                "add_validator_durable" => Some(new_pk()),
+                "begin_doppelganger_hold" => Some(hold_pk()),
+                _ => None,
+            };
+            let fixture = durable_fixture();
+            let no_file = durable_fixture_store();
+            for (mode, store) in [("with a file", &*fixture.store), ("without a file", &no_file)] {
+                let (next, mut expected) = gens(store);
+                (caller.call)(store).unwrap_or_else(|e| panic!("{} {mode}: {e}", caller.name));
+                expected.retain(|pk, _| store.has_validator(pk));
+                if let Some(pk) = new_row {
+                    expected.insert(pk, next);
+                }
+                let advanced = next + u64::from(new_row.is_some());
+                assert_eq!(gens(store), (advanced, expected), "{} {mode}", caller.name);
+            }
+        }
+    }
+
     /// Writers whose production body must persist through `commit_then_publish`.
-    const ROUTED_WRITERS: [&str; 2] = ["add_validator_durable", "remove_validator_durable"];
+    const ROUTED_WRITERS: [&str; 5] = [
+        "add_validator_durable",
+        "remove_validator_durable",
+        "persist_signing_enable",
+        "begin_doppelganger_hold",
+        "release_doppelganger_hold",
+    ];
+
+    /// The production items that may name `commit_less_safe`, once each: its
+    /// definition and the two owners of the persist-then-publish write.
+    const COMMIT_LESS_SAFE_OWNERS: [&str; 3] =
+        ["commit_less_safe", "commit_then_publish<R>", "update_config_durable"];
+
+    /// What else writes or moves the validators file without `save_lock`. A
+    /// [`ROUTED_WRITERS`] body names none of these directly, apart from
+    /// [`ROUTED_DIRECT_WRITES`].
+    const FILE_WRITERS: [&str; 6] = [
+        "write_toml_atomic",
+        "commit_snapshot",
+        "persist_disabled_snapshot",
+        "quarantine_held_validators_file",
+        "quarantine_validators_file",
+        "fs",
+    ];
+
+    /// The most direct uses of a [`FILE_WRITERS`] item in a routed body: the
+    /// two publish-first existing-row branches of `begin_doppelganger_hold`.
+    const ROUTED_DIRECT_WRITES: [(&str, &str, usize); 2] = [
+        ("begin_doppelganger_hold", "persist_disabled_snapshot", 2),
+        ("begin_doppelganger_hold", "quarantine_held_validators_file", 2),
+    ];
 
     /// Everything before the file's `#[cfg(test)] mod tests`.
     fn production_source(src: &str) -> &str {
         src.split_once("#[cfg(test)]\nmod tests {").expect("a #[cfg(test)] mod tests").0
+    }
+
+    /// Length of the block comment that opens `rest`. Block comments nest.
+    fn block_comment_len(rest: &[char]) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = 0;
+        while let Some(pair) = rest.get(at..at + 2) {
+            match pair {
+                ['/', '*'] => {
+                    depth += 1;
+                    at += 2;
+                }
+                ['*', '/'] => {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => at += 1,
+            }
+        }
+        None
     }
 
     /// `src` with comments and string, raw-string and char literals blanked.
@@ -7460,7 +7632,7 @@ builder_boost_factor = 175
             };
             let skip = match rest {
                 ['/', '/', ..] => Some(rest.iter().position(|&c| c == '\n').unwrap_or(rest.len())),
-                ['/', '*', ..] => closing(2, &['*', '/']),
+                ['/', '*', ..] => block_comment_len(rest),
                 ['"', ..] => {
                     let mut at = 1;
                     while at < rest.len() && rest[at] != '"' {
@@ -7497,8 +7669,9 @@ builder_boost_factor = 175
         out
     }
 
-    /// Body of the first `fn <name>(` in `code`, from its `{` to the matching `}`.
-    fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    /// The first `fn <name>(` in `code`: where it starts, and its body from
+    /// `{` through the matching `}`.
+    fn fn_item(code: &str, name: &str) -> Option<(usize, std::ops::Range<usize>)> {
         let start = code.find(&format!("fn {name}("))?;
         let open = start + code[start..].find('{')?;
         let mut depth = 0usize;
@@ -7508,7 +7681,7 @@ builder_boost_factor = 175
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(&code[open..=open + offset]);
+                        return Some((start, open..open + offset + 1));
                     }
                 }
                 _ => {}
@@ -7517,7 +7690,29 @@ builder_boost_factor = 175
         None
     }
 
-    /// Each [`ROUTED_WRITERS`] body that does not persist through `commit_then_publish`.
+    /// Body of the first `fn <name>(` in `code`, from its `{` to the matching `}`.
+    fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+        fn_item(code, name).map(|(_, body)| &code[body])
+    }
+
+    /// Byte offsets of `ident` in `code` as a whole identifier, called or not.
+    fn ident_offsets<'a>(code: &'a str, ident: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let part = |c: char| c == '_' || c.is_alphanumeric();
+        code.match_indices(ident).map(|(at, _)| at).filter(move |&at| {
+            !code[..at].ends_with(part) && !code[at + ident.len()..].starts_with(part)
+        })
+    }
+
+    /// Whether `code` calls `ident`: the whole identifier, then `(`.
+    fn calls(code: &str, ident: &str) -> bool {
+        ident_offsets(code, ident).any(|at| code[at + ident.len()..].starts_with('('))
+    }
+
+    /// Each break of the single-owner rule in the production part of `src`: a
+    /// [`ROUTED_WRITERS`] body that does not call `commit_then_publish` or
+    /// names a [`FILE_WRITERS`] item more often than [`ROUTED_DIRECT_WRITES`]
+    /// allows, or a `commit_less_safe` outside [`COMMIT_LESS_SAFE_OWNERS`].
+    /// A write reached through another fn is not seen.
     fn routing_violations(src: &str) -> Vec<String> {
         let code = code_only(production_source(src));
         let mut violations = Vec::new();
@@ -7530,11 +7725,37 @@ builder_boost_factor = 175
                 violations.push(format!("{name}: no body"));
                 continue;
             };
-            if !body.contains("commit_then_publish(") {
+            if !calls(body, "commit_then_publish") {
                 violations.push(format!("{name}: no commit_then_publish("));
             }
-            if body.contains("commit_less_safe(") {
-                violations.push(format!("{name}: calls commit_less_safe("));
+            for writer in FILE_WRITERS {
+                let allowed = ROUTED_DIRECT_WRITES
+                    .iter()
+                    .find(|&&(owner, item, _)| owner == name && item == writer)
+                    .map_or(0, |&(_, _, most)| most);
+                let named = ident_offsets(body, writer).count();
+                if named > allowed {
+                    violations
+                        .push(format!("{name}: names {writer} directly ({named} > {allowed})"));
+                }
+            }
+        }
+        let mut owned = Vec::new();
+        for owner in COMMIT_LESS_SAFE_OWNERS {
+            let Some((start, body)) = fn_item(&code, owner) else {
+                violations.push(format!("{owner}: no body"));
+                continue;
+            };
+            let named = ident_offsets(&code[start..body.end], "commit_less_safe").count();
+            if named != 1 {
+                violations.push(format!("{owner}: names commit_less_safe {named} times"));
+            }
+            owned.push(start..body.end);
+        }
+        for at in ident_offsets(&code, "commit_less_safe") {
+            if !owned.iter().any(|item| item.contains(&at)) {
+                let line = code[..at].matches('\n').count() + 1;
+                violations.push(format!("line {line}: commit_less_safe outside its owners"));
             }
         }
         violations
@@ -7542,6 +7763,11 @@ builder_boost_factor = 175
 
     const ROUTING_FIXTURE: &str = r##"
 impl ValidatorStore {
+    pub fn update_config_durable(&self, update: U) -> Result<(), E> {
+        commit_less_safe(config_path, &next_doc, &previous_doc)?;
+        Ok(())
+    }
+
     pub fn add_validator_durable(&self, config: ValidatorConfig) -> Result<bool, E> {
         if config.enabled {
             let _ = ("}", r#"a"}"#, '"', '{', '{');
@@ -7549,58 +7775,264 @@ impl ValidatorStore {
         }
         // commit_less_safe( in a comment is not a call.
         /* } */
-        self.commit_then_publish(|state| state.insert_validator(config.clone()))?;
+        self.commit_then_publish(|s| s.insert_validator(config.clone()))?;
         Ok(true)
     }
 
     pub fn remove_validator_durable(&self, pubkey: &[u8; 48]) -> Result<(), E> {
-        commit_less_safe(&path, &next, &previous)?;
+        commit_less_safe(&path, &next_doc, &previous_doc)?;
+        let helper = Self::commit_then_publish;
         Ok(())
     }
+
+    fn persist_signing_enable(&self, pubkey: &[u8; 48]) -> Result<(), E> {
+        /* outer /* inner */ self.commit_then_publish( } */
+        (commit_less_safe)(&path, &next_doc, &previous_doc)?;
+        Ok(())
+    }
+
+    pub fn begin_doppelganger_hold(&self, pubkey: &[u8; 48]) -> Result<bool, E> {
+        let write = commit_less_safe;
+        self.commit_then_publish(|s| s.insert_validator(row.clone()))?;
+        Ok(true)
+    }
+
+    pub fn release_doppelganger_hold(&self, pubkey: &[u8; 48]) -> Result<bool, E> {
+        let _ = (commit_less_safe_v2, recommit_less_safe);
+        self.re_commit_then_publish(|s| s.enable_signing(pubkey)).map(|_| true)
+    }
+
+    fn commit_then_publish<R>(&self, mutate: impl Fn(&mut StoreState) -> R) -> Result<R, E> {
+        commit_less_safe(path, &next_doc, &previous_doc)?;
+        Ok(mutate(&mut live))
+    }
+}
+
+fn commit_less_safe(config_path: &Path) -> Result<(), E> {
+    write_toml_atomic(config_path)
+}
+
+#[cfg(any())]
+fn second_owner(path: &Path) {
+    commit_less_safe(path, &next_doc, &previous_doc).ok();
 }
 
 #[cfg(test)]
 mod tests {
     fn only_in_tests() {
-        commit_less_safe(&path, &next, &previous);
+        commit_less_safe(&path, &next_doc, &previous_doc);
     }
 }
 "##;
 
+    /// The scan cannot pass vacuously: it sees every `fn` body, the lexer
+    /// blanks each literal and comment kind (nested block comments included),
+    /// and every kind of violation is reported.
     #[test]
-    fn routing_scan_finds_both_bodies_in_a_fixture() {
+    fn routing_scan_sees_every_fn_body_in_a_fixture() {
         let code = code_only(production_source(ROUTING_FIXTURE));
+        for name in ROUTED_WRITERS.into_iter().chain(COMMIT_LESS_SAFE_OWNERS) {
+            let body = fn_body(&code, name).unwrap_or_else(|| panic!("{name}: no body"));
+            assert!(body.starts_with('{') && body.ends_with('}'), "{name}: {body}");
+        }
         let add = fn_body(&code, "add_validator_durable").expect("add body");
-        assert!(add.starts_with('{') && add.ends_with('}'), "{add}");
         assert!(add.contains("commit_then_publish(") && add.contains("Ok(true)"), "{add}");
-        assert!(!add.contains("commit_less_safe("), "comments are not code: {add}");
-        let remove = fn_body(&code, "remove_validator_durable").expect("remove body");
-        assert!(remove.contains("commit_less_safe(") && remove.contains("Ok(())"), "{remove}");
+        assert!(!add.contains("commit_less_safe"), "comments are not code: {add}");
+        let enable = fn_body(&code, "persist_signing_enable").expect("enable body");
+        assert!(enable.contains("Ok(())"), "a nested comment ends at its own */: {enable}");
+        assert!(!enable.contains("commit_then_publish"), "{enable}");
         assert!(fn_body(&code, "only_in_tests").is_none(), "the test module is cut off");
         assert_eq!(
             routing_violations(ROUTING_FIXTURE),
             [
                 "remove_validator_durable: no commit_then_publish(",
-                "remove_validator_durable: calls commit_less_safe(",
+                "persist_signing_enable: no commit_then_publish(",
+                "release_doppelganger_hold: no commit_then_publish(",
+                "line 20: commit_less_safe outside its owners",
+                "line 27: commit_less_safe outside its owners",
+                "line 32: commit_less_safe outside its owners",
+                "line 54: commit_less_safe outside its owners",
             ]
         );
-        let doubled = ROUTING_FIXTURE.replacen(
-            "#[cfg(test)]",
-            "fn add_validator_durable() {}\n#[cfg(test)]",
-            1,
+
+        let reported = |src: String, violation: &str| {
+            assert!(routing_violations(&src).iter().any(|v| v == violation), "{violation}");
+        };
+        let fixture = |from: &str, to: &str| ROUTING_FIXTURE.replacen(from, to, 1);
+        reported(
+            fixture("#[cfg(any())]", "fn add_validator_durable() {}\n#[cfg(any())]"),
+            "add_validator_durable: 2 definitions",
         );
-        assert!(
-            routing_violations(&doubled).contains(&"add_validator_durable: 2 definitions".into()),
-            "a second definition is reported"
+        reported(
+            fixture(
+                "commit_less_safe(config_path, &next_doc, &previous_doc)?;",
+                "commit_less_safe(config_path, &next_doc, &previous_doc)?;\ncommit_less_safe(x)?;",
+            ),
+            "update_config_durable: names commit_less_safe 2 times",
+        );
+        reported(
+            fixture("commit_less_safe(path, &next_doc, &previous_doc)?;", "write(path)?;"),
+            "commit_then_publish<R>: names commit_less_safe 0 times",
+        );
+        let unclosed = "fn add_validator_durable(&self) {\n    self.commit_then_publish(|s| s)\n\
+                        #[cfg(test)]\nmod tests {\n}\n";
+        reported(unclosed.to_string(), "add_validator_durable: no body");
+        reported(unclosed.to_string(), "update_config_durable: no body");
+
+        let after_add = "Ok(true)\n    }\n\n    pub fn remove";
+        reported(
+            fixture(
+                after_add,
+                &format!("persist_disabled_snapshot(self, &cfg.pubkey)?;\n{after_add}"),
+            ),
+            "add_validator_durable: names persist_disabled_snapshot directly (1 > 0)",
+        );
+        let release = "self.re_commit_then_publish(";
+        reported(
+            fixture(release, &format!("std::fs::write(&path, doc)?;\n{release}")),
+            "release_doppelganger_hold: names fs directly (1 > 0)",
+        );
+        let hold = "let write = commit_less_safe;\n";
+        let hold_writes = |times: usize| -> Vec<String> {
+            let write = "persist_disabled_snapshot(self, pk)?;\n\
+                         quarantine_held_validators_file(self);\n";
+            routing_violations(&fixture(hold, &format!("{hold}{}", write.repeat(times))))
+                .into_iter()
+                .filter(|v| v.starts_with("begin_doppelganger_hold: names"))
+                .collect()
+        };
+        assert_eq!(hold_writes(2), Vec::<String>::new(), "the two publish-first branches");
+        assert_eq!(
+            hold_writes(3),
+            [
+                "begin_doppelganger_hold: names persist_disabled_snapshot directly (3 > 2)",
+                "begin_doppelganger_hold: names quarantine_held_validators_file directly (3 > 2)",
+            ]
         );
     }
 
-    /// 662-AC1 (import and delete): both keymanager key-set writers persist
-    /// through `commit_then_publish` and never call `commit_less_safe(` directly.
+    /// 662-AC1: production names `commit_less_safe` only in its definition,
+    /// `commit_then_publish` and `update_config_durable`. Every routed writer
+    /// persists through `commit_then_publish` and names no other file writer,
+    /// except in the publish-first branches of `begin_doppelganger_hold`.
     #[test]
-    fn durable_import_and_delete_publish_through_commit_then_publish() {
+    fn commit_less_safe_has_one_publish_owner() {
+        assert_eq!(routed_durable_callers().map(|caller| caller.name), ROUTED_WRITERS);
         let violations = routing_violations(include_str!("store.rs"));
         assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// How a [`ROUTED_WRITERS`] body in the production part of `src` fails to
+    /// keep one `save_lock` guard from its binding to the end of the body: a
+    /// second `save_lock`, a lock that is not a top-level
+    /// `let <guard> = self.save_lock.lock();`, or a guard named again (a
+    /// `drop`, a move, `MutexGuard::unlocked`).
+    fn save_lock_violations(src: &str) -> Vec<String> {
+        let production = code_only(production_source(src));
+        let mut found = Vec::new();
+        for name in ROUTED_WRITERS {
+            let Some(body) = fn_body(&production, name) else {
+                found.push(format!("{name}: no body"));
+                continue;
+            };
+            let uses: Vec<usize> = ident_offsets(body, "save_lock").collect();
+            let [at] = uses[..] else {
+                found.push(format!("{name}: names save_lock {} times", uses.len()));
+                continue;
+            };
+            let start = body[..at].rfind([';', '{', '}']).map_or(0, |end| end + 1);
+            let end = body[at..].find(';').map_or(body.len(), |len| at + len);
+            let statement = body[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+            let depth = body[..start]
+                .matches('{')
+                .count()
+                .saturating_sub(body[..start].matches('}').count());
+            let guard = statement
+                .strip_prefix("let ")
+                .and_then(|rest| rest.strip_suffix(" = self.save_lock.lock()"))
+                .filter(|guard| {
+                    *guard != "_" && guard.chars().all(|c| c == '_' || c.is_alphanumeric())
+                });
+            let (1, Some(guard)) = (depth, guard) else {
+                found.push(format!("{name}: save_lock is not a top-level guard: {statement}"));
+                continue;
+            };
+            let again = ident_offsets(body, guard).filter(|at| !(start..end).contains(at)).count();
+            if again != 0 {
+                found.push(format!("{name}: names its save_lock guard again ({again})"));
+            }
+        }
+        found
+    }
+
+    /// The `save_lock` scan accepts one top-level guard and reports each way of
+    /// releasing it early: dropped and re-taken (RSA K10/K11), dropped,
+    /// unlocked for a closure, never named, bound to `_`, or scoped to a block.
+    #[test]
+    fn save_lock_scan_reports_a_guard_released_before_the_write_in_a_fixture() {
+        let enable = "persist_signing_enable";
+        let scan = |body: &str| {
+            let mut src = String::new();
+            for name in ROUTED_WRITERS {
+                let body = if name == enable {
+                    body
+                } else {
+                    "let lock = self.save_lock.lock();\nwrite()"
+                };
+                src.push_str(&format!("fn {name}(&self) {{\n{body}\n}}\n"));
+            }
+            src.push_str("#[cfg(test)]\nmod tests {\n}\n");
+            save_lock_violations(&src)
+        };
+        let violation = |what: &str| vec![format!("{enable}: {what}")];
+        let not_a_guard = |statement: &str| {
+            violation(&format!("save_lock is not a top-level guard: {statement}"))
+        };
+        for (body, expected) in [
+            (
+                "check(&cfg)?;\n\
+                 let lock = self.save_lock.lock();\n\
+                 if absent() {\n\
+                     return Ok(());\n\
+                 }\n\
+                 write()",
+                vec![],
+            ),
+            ("let lock = self.save_lock.lock();\n// drop(lock); \"lock\"\nwrite()", vec![]),
+            (
+                "let lock = self.save_lock.lock();\n\
+                 check()?;\n\
+                 drop(lock);\n\
+                 let lock = self.save_lock.lock();\n\
+                 write()",
+                violation("names save_lock 2 times"),
+            ),
+            (
+                "let lock = self.save_lock.lock();\ncheck()?;\ndrop(lock);\nwrite()",
+                violation("names its save_lock guard again (1)"),
+            ),
+            (
+                "let lock = self.save_lock.lock();\n\
+                 MutexGuard::unlocked(&mut lock, || check());\n\
+                 write()",
+                violation("names its save_lock guard again (1)"),
+            ),
+            ("write()", violation("names save_lock 0 times")),
+            (
+                "let _ = self.save_lock.lock();\nwrite()",
+                not_a_guard("let _ = self.save_lock.lock()"),
+            ),
+            (
+                "if ready() {\n\
+                     let lock = self.save_lock.lock();\n\
+                     check()?;\n\
+                 }\n\
+                 write()",
+                not_a_guard("let lock = self.save_lock.lock()"),
+            ),
+        ] {
+            assert_eq!(scan(body), expected, "{body}");
+        }
     }
 
     /// How the code after `commit_less_safe(` in `commit_then_publish` fails
