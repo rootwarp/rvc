@@ -258,11 +258,13 @@ async fn hung_head_submits_before_slot_end(equal_sync: bool) {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn hung_head_does_not_delay_attestations_or_the_next_slot() {
+    let _metrics = m2_metric_lock().await;
     hung_head_submits_before_slot_end(true).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn unequal_attestation_arm_does_not_await_head_capture() {
+    let _metrics = m2_metric_lock().await;
     hung_head_submits_before_slot_end(false).await;
 }
 
@@ -489,11 +491,13 @@ async fn equal_deadlines_run_contributions_with_aggregation(sync_enabled: bool) 
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn equal_contribution_and_aggregate_deadlines_start_together() {
+    let _metrics = m2_metric_lock().await;
     equal_deadlines_run_contributions_with_aggregation(true).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn sync_disabled_does_not_fetch_contributions_or_delay_aggregation() {
+    let _metrics = m2_metric_lock().await;
     equal_deadlines_run_contributions_with_aggregation(false).await;
 }
 
@@ -659,6 +663,7 @@ async fn head_delay_publishes(head_delay: Duration, expect: [u8; 32], submit_ms:
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn gloas_timings_publish_a_head_that_returns_inside_the_fetch_budget() {
+    let _metrics = m2_metric_lock().await;
     head_delay_publishes(Duration::from_millis(2_500), [0xab; 32], 6_000).await;
     head_delay_publishes(Duration::from_millis(3_500), [0xab; 32], 6_500).await;
     head_delay_publishes(Duration::from_secs(5), [0x11; 32], 7_000).await;
@@ -904,6 +909,7 @@ async fn shared_contribution_head_fetch_stops_at_slot_end() {
 /// starts rather than at slot end.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn shared_contribution_head_fetch_stops_at_the_attestation_fetch_budget() {
+    let _metrics = m2_metric_lock().await;
     let run = run_hung_contribution_head(
         contribution_owns_head_deadlines(),
         Duration::from_secs(1),
@@ -923,6 +929,7 @@ async fn shared_contribution_head_fetch_stops_at_the_attestation_fetch_budget() 
 /// than both slot end and the 30 s attestation-fetch budget.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn split_contribution_head_deadline_is_capped_by_sign_deadline() {
+    let _metrics = m2_metric_lock().await;
     let deadlines = DeadlineBps {
         attestation: 7_500,
         sync_message: 7_500,

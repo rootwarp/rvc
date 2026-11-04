@@ -1294,11 +1294,6 @@ mod tests {
     use super::utils;
     use super::{AggregationService, OrchestratorConfig};
 
-    /// Process-wide aggregations-failed counter; serialize exact-delta assertions.
-    async fn agg_fail_metric_lock() {
-        // The failed-count readers use a thread-local delta. Nothing to hold.
-    }
-
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         Arc::new(ForkSchedule {
             genesis_fork_version: [0, 0, 0, 1],
@@ -1953,7 +1948,6 @@ mod tests {
     /// The island encode is a different reject; a short selection proof is.
     #[tokio::test(flavor = "current_thread")]
     async fn short_committee_bits_fail_the_request_check() {
-        let _guard = agg_fail_metric_lock().await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
         let pk_bytes = pk.to_bytes();
@@ -2005,7 +1999,7 @@ mod tests {
         assert_eq!(
             failed_after.saturating_sub(failed_before),
             1,
-            "a request-check reject must increment RVC_AGGREGATIONS_TOTAL failed"
+            "a request-check reject must add 1 to the thread-local failed mirror"
         );
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
@@ -2017,7 +2011,6 @@ mod tests {
     /// Empty, sentinel-less, and over-long bitlists fail the request check.
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_aggregation_bits_fail_the_request_check() {
-        let _guard = agg_fail_metric_lock().await;
         const OVER_LEN: usize = 16_386;
         for (label, bits, mismatch) in [
             ("empty", vec![], "attester_bits"),
@@ -2075,7 +2068,7 @@ mod tests {
             assert_eq!(
                 failed_after.saturating_sub(failed_before),
                 1,
-                "{label}: must increment RVC_AGGREGATIONS_TOTAL failed"
+                "{label}: must add 1 to the thread-local failed mirror"
             );
             assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "{label}: must not submit");
         }
@@ -2738,7 +2731,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_mismatched_aggregate_is_not_signed() {
-        let _guard = agg_fail_metric_lock().await;
         let electra_epoch = 50u64;
         let slot = electra_epoch * SLOTS_PER_EPOCH;
         let cases: &[(&str, VersionedAggregateAttestation)] = &[
@@ -2874,7 +2866,6 @@ mod tests {
     /// Pre-Electra roots can match on the wrong committee. The duty index binds.
     #[tokio::test(flavor = "current_thread")]
     async fn pre_electra_data_index_must_match_the_duty_committee() {
-        let _metrics = agg_fail_metric_lock().await;
         let logs = Arc::new(Mutex::new(String::new()));
         let subscriber =
             tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
@@ -2908,7 +2899,6 @@ mod tests {
     /// Variants the later wrap would still sign. Only `aggregate_fork_matches` rejects them.
     #[tokio::test(flavor = "current_thread")]
     async fn cross_fork_aggregates_fail_the_early_fork_check() {
-        let _guard = agg_fail_metric_lock().await;
         let electra_epoch = 50u64;
         let electra_slot = electra_epoch * SLOTS_PER_EPOCH;
         let fulu_epoch = 60u64;
@@ -2962,7 +2952,6 @@ mod tests {
     /// above the pre-Electra maximum, so a 2049-bit list is not oversized there.
     #[tokio::test(flavor = "current_thread")]
     async fn attester_bit_caps_reject_each_boundary() {
-        let _guard = agg_fail_metric_lock().await;
         let pre_max = MAX_VALIDATORS_PER_COMMITTEE as usize;
         let electra_max = pre_max * MAX_COMMITTEES_PER_SLOT as usize;
 
@@ -3171,7 +3160,6 @@ mod tests {
     /// including when the bitlist matches that length and fits the Electra spec max.
     #[tokio::test(flavor = "current_thread")]
     async fn committee_length_above_2048_is_not_signed_on_electra_or_fulu() {
-        let _metrics = agg_fail_metric_lock().await;
         for (label, epoch) in [("electra", 50u64), ("fulu", 60u64)] {
             let slot = epoch * SLOTS_PER_EPOCH;
             let mut body = matching_electra_body(slot);
@@ -3200,7 +3188,6 @@ mod tests {
     /// Fulu zeroes `data.index`. A non-zero index is `data_index`, not a root miss.
     #[tokio::test(flavor = "current_thread")]
     async fn fulu_data_index_must_be_zero() {
-        let _metrics = agg_fail_metric_lock().await;
         let fulu_epoch = 60u64;
         let slot = fulu_epoch * SLOTS_PER_EPOCH;
         let mut body = matching_electra_body(slot);
@@ -3228,7 +3215,6 @@ mod tests {
 
         use crate::orchestrator::dispatch::Phase2SignerPermits;
 
-        let _metrics = agg_fail_metric_lock().await;
         let permits = Phase2SignerPermits::new(1);
         let held = permits
             .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
@@ -3289,7 +3275,7 @@ mod tests {
         assert_eq!(
             failed_after.saturating_sub(failed_before),
             1,
-            "an expired final-sign wait must increment RVC_AGGREGATIONS_TOTAL failed"
+            "an expired final-sign wait must add 1 to the thread-local failed mirror"
         );
         assert_eq!(
             service.slot_end_drops.get(),
@@ -3311,5 +3297,20 @@ mod tests {
             "a matching Electra aggregate is signed once; calls={calls:?}"
         );
         assert_eq!(submits, 1, "a matching Electra aggregate is published once");
+    }
+
+    /// The exported series moves with the thread-local mirror. Other tests in
+    /// this process can only raise it, so the `>=` delta cannot fail on them.
+    #[test]
+    fn note_aggregations_failed_increments_the_prometheus_failed_series() {
+        let series = || {
+            crate::metrics::RVC_AGGREGATIONS_TOTAL
+                .with_label_values(&[crate::metrics::attestation_status::FAILED])
+                .get()
+        };
+        let before = series();
+        super::note_aggregations_failed(1_000);
+        let added = series() - before;
+        assert!(added >= 1_000, "rvc_aggregations_total{{status=failed}} rose by {added}");
     }
 }

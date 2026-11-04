@@ -571,11 +571,12 @@ async fn serve_until_shutdown(
                     tests::note_http_accepts_stopped();
                 }
             }
-            grpc_stop.cancel();
             #[cfg(test)]
             tests::note_grpc_drain_started(
-                http_shutdown.as_ref().is_some_and(|token| token.is_cancelled()),
+                http_shutdown.as_ref().is_some_and(|token| token.is_cancelled())
+                    && !grpc_stop.is_cancelled(),
             );
+            grpc_stop.cancel();
             #[cfg(test)]
             if tests::wedge_grpc_drain() {
                 // Reach serve.await so the real drain path runs, then hang as if
@@ -622,7 +623,8 @@ mod tests {
         joined_http: bool,
         drop_guard_ran: bool,
         http_accepts_stopped: bool,
-        /// `http_shutdown.is_cancelled()` at `GrpcDrainStarted`, before Drop.
+        /// Right before `grpc_stop.cancel()`: `http_shutdown` is cancelled and
+        /// the gRPC drain signal is not.
         http_accepts_cancelled_before_drain: bool,
         events: Vec<ProbeEvent>,
         wedge_reloader: bool,
@@ -1490,6 +1492,43 @@ mod tests {
         expect_abort_finished("reloader", &snap.reloader).await;
         expect_abort_finished("metrics", &snap.metrics).await;
         expect_abort_finished("http", &snap.http).await;
+    }
+
+    /// A healthy shutdown cancels HTTP accepts before it signals the gRPC drain.
+    /// The probe runs right before `grpc_stop.cancel()`.
+    #[tokio::test]
+    async fn shutdown_cancels_http_accepts_before_the_grpc_drain() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let resolved = http_and_reloader(&tmp);
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let probe_for_wait = Arc::clone(&probe);
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                let shutdown = CancellationToken::new();
+                let run_fut = run(resolved, shutdown.clone());
+                tokio::pin!(run_fut);
+                wait_for_probe(
+                    &probe_for_wait,
+                    &mut run_fut,
+                    |s| s.http_shutdown.is_some(),
+                    "http",
+                )
+                .await;
+                shutdown.cancel();
+                tokio::time::timeout(Duration::from_secs(10), run_fut).await
+            })
+            .await;
+
+        outcome.expect("shutdown must finish").expect("a healthy shutdown returns Ok");
+        let snap = probe_snapshot(&probe);
+        assert_eq!(snap.events, vec![ProbeEvent::HttpAcceptsStopped, ProbeEvent::GrpcDrainStarted]);
+        assert!(
+            snap.http_accepts_cancelled_before_drain,
+            "HTTP accepts must be cancelled, and the gRPC drain not yet signalled, at the probe"
+        );
     }
 
     /// The deadline constant outlasts a healthy HTTP drain.

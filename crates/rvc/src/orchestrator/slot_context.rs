@@ -1665,4 +1665,27 @@ mod tests {
             assert!(paths.iter().all(|path| path.ends_with("/99")), "{paths:?}");
         }
     }
+
+    /// The exported series moves with the thread-local mirror, per reason.
+    /// Other tests in this process can only raise it, so `>=` cannot fail on them.
+    #[test]
+    fn note_parent_fallback_increments_the_prometheus_series() {
+        let series = |reason: &str| {
+            RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL.with_label_values(&[reason]).get()
+        };
+        for reason in [
+            slot_context_parent_fallback::WALK_BACK_EXHAUSTED,
+            slot_context_parent_fallback::UNCHECKED_PARSE,
+            slot_context_parent_fallback::UNCHECKED_ERROR,
+            slot_context_parent_fallback::UNCONFIRMED,
+            slot_context_parent_fallback::CAPTURE_TIMEOUT,
+        ] {
+            let before = series(reason);
+            for _ in 0..1_000 {
+                note_parent_fallback(reason);
+            }
+            let added = series(reason) - before;
+            assert!(added >= 1_000, "parent fallback {{reason={reason}}} rose by {added}");
+        }
+    }
 }

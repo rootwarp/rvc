@@ -229,6 +229,7 @@ fn production_src(src: &str) -> &str {
 /// Last pre-Gloas slot (epoch 0 with Gloas at epoch 1): attestation 3999 ms, aggregate 8000 ms.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_attestation_and_aggregate_times_at_last_pre_gloas_slot() {
+    let _metrics = m2_metric_lock().await;
     let times = observe_duty_times(31, observe_config(spec_gloas_bps())).await;
     assert_eq!(first_ms(&times, PROCESS_SLOT), 3999);
     assert_eq!(first_ms(&times, PRODUCE_AGGREGATIONS), 8000);
@@ -237,6 +238,7 @@ async fn test_attestation_and_aggregate_times_at_last_pre_gloas_slot() {
 /// First Gloas slot: attestation 3000 ms (2500 bps), aggregate 6000 ms (5000 bps).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_attestation_and_aggregate_times_at_first_gloas_slot() {
+    let _metrics = m2_metric_lock().await;
     let times = observe_duty_times(32, observe_config(spec_gloas_bps())).await;
     assert_eq!(first_ms(&times, PROCESS_SLOT), 3000);
     assert_eq!(first_ms(&times, PRODUCE_AGGREGATIONS), 6000);
@@ -246,6 +248,7 @@ async fn test_attestation_and_aggregate_times_at_first_gloas_slot() {
 /// two distinct observed times in the same slot.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_contributions_and_aggregates_use_distinct_offsets_when_bps_differ() {
+    let _metrics = m2_metric_lock().await;
     let gloas = DeadlineBps {
         attestation: 2500,
         aggregate: 6667,
@@ -261,6 +264,7 @@ async fn test_contributions_and_aggregates_use_distinct_offsets_when_bps_differ(
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_sync_messages_share_attestation_wait_when_bps_equal() {
+    let _metrics = m2_metric_lock().await;
     let times = observe_duty_times(32, observe_config(spec_gloas_bps())).await;
     assert_eq!(first_ms(&times, PROCESS_SLOT), 3000);
     assert_eq!(first_ms(&times, PRODUCE_SYNC_MESSAGES), 3000);
@@ -268,6 +272,7 @@ async fn test_sync_messages_share_attestation_wait_when_bps_equal() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_sync_messages_fire_at_own_offset_when_bps_unequal() {
+    let _metrics = m2_metric_lock().await;
     let gloas = DeadlineBps {
         attestation: 2500,
         aggregate: 5000,
@@ -285,6 +290,7 @@ async fn test_sync_messages_fire_at_own_offset_when_bps_unequal() {
 /// fork (8000 bps → 9600 ms), not pre-Gloas 3333/6667 or a hardcoded 7500.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_ptc_phase_fires_at_configured_bps() {
+    let _metrics = m2_metric_lock().await;
     let gloas = DeadlineBps {
         attestation: 2500,
         aggregate: 5000,
@@ -318,6 +324,7 @@ fn test_ptc_path_contains_no_payload_attestation_due_bps_read() {
 /// Last pre-Gloas slot: the PTC phase does not run (no produce span).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_pre_gloas_epoch_does_not_run_ptc_phase() {
+    let _metrics = m2_metric_lock().await;
     let times = observe_duty_times_for(31, observe_config(spec_gloas_bps()), 11000).await;
     assert!(
         times.iter().all(|(n, _)| n != PRODUCE_PAYLOAD_ATTESTATIONS),
@@ -328,6 +335,7 @@ async fn test_pre_gloas_epoch_does_not_run_ptc_phase() {
 /// Pre-Gloas with cached PTC duties still must not hit the PTC data endpoint.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_pre_gloas_epoch_does_not_call_ptc_endpoint() {
+    let _metrics = m2_metric_lock().await;
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));

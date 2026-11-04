@@ -41,6 +41,7 @@ fn test_duty_orchestrator_run_future_is_send() {
         pubkey_map,
     ));
 
+    // m2_lock_exempt: builds the run future to check Send and never polls it
     let fut = orchestrator.run();
     assert_send(&fut);
     // Drop without polling; this test only proves Send.
@@ -102,6 +103,7 @@ fn test_orchestrator_config_default_timeouts() {
 
 #[tokio::test]
 async fn test_orchestrator_handle_shutdown() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(100);
 
@@ -148,6 +150,7 @@ async fn test_orchestrator_handle_shutdown() {
 /// asserts the far-future epoch is no longer cached.
 #[tokio::test(flavor = "current_thread")]
 async fn test_key_gen_notification_clears_duty_cache() {
+    let _metrics = m2_metric_lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

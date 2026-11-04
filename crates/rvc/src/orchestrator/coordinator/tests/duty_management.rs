@@ -678,179 +678,86 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches_ptc_when_gloas_acti
     assert!(duty_tracker.is_ptc_epoch_cached(gloas_epoch + 1).await);
 }
 
-#[tokio::test]
-async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-
-    let slow_response = serde_json::json!({
-        "data": [],
-        "dependent_root": "0xslow_root",
-        "execution_optimistic": false
-    });
+/// Runs `check_reorg_at_epoch_boundary(epoch)` on paused time against a
+/// beacon node that holds every duty call for `duty_fetch + 500 ms`, and
+/// asserts each call in `expected` is cut at `duty_fetch`: call `k` arrives
+/// at `k × duty_fetch` and the check ends at `expected.len() × duty_fetch`.
+async fn assert_reorg_check_cuts_each_call_at_duty_fetch(
+    epoch: u64,
+    expected: &[bn_manager::MockMethod],
+) {
+    use bn_manager::MockMethod;
 
     let timeouts = fast_timeouts();
-
-    // Respond slower than duty_fetch timeout (200ms)
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    // HTTP timeout must exceed duty_fetch timeout so the tokio timeout fires first
-    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
-        .with_timeout(Duration::from_secs(30))
-        .with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let held = timeouts.duty_fetch + Duration::from_millis(500);
+    let beacon = Arc::new(
+        bn_manager::MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetAttesterDuties, held)
+            .with_method_delay(MockMethod::GetProposerDuties, held)
+            .with_method_delay(MockMethod::PostPtcDuties, held),
+    );
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-    clock.set_slot(320);
+    clock.set_slot(epoch * ::timing::SLOTS_PER_EPOCH);
 
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-    let submitter = Arc::new(MockSubmitter::new());
-    let propagator = Arc::new(Propagator::new(submitter));
-    let config = create_test_config().with_timeouts(timeouts.clone());
-    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
         duty_tracker,
         signer,
         propagator,
-        beacon,
+        beacon.clone(),
         create_mock_block_beacon(),
         None,
         create_mock_validator_store(),
-        config,
-        pubkey_map,
+        create_test_config().with_timeouts(timeouts.clone()),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    let start = std::time::Instant::now();
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    let start = tokio::time::Instant::now();
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(epoch).await;
     let elapsed = start.elapsed();
 
-    // Pre-Gloas: 4 calls (attester+proposer × current/next), each bounded by
-    // duty_fetch (200ms). PTC is gated out. Without timeout wrapping this would
-    // take 4 * 700ms ≈ 2.8s. With timeouts: 4 * 200ms = 800ms + margin.
-    assert!(
-        elapsed < timeouts.duty_fetch * 5,
-        "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
-        elapsed,
-        timeouts.duty_fetch * 5
-    );
+    let calls: Vec<_> =
+        beacon.call_stamps().into_iter().map(|stamp| (stamp.method, stamp.at - start)).collect();
+    let want: Vec<_> =
+        expected.iter().zip(0u32..).map(|(&method, k)| (method, timeouts.duty_fetch * k)).collect();
+    assert_eq!(calls, want, "each duty call starts when the one before it is cut at duty_fetch");
+    let count = u32::try_from(expected.len()).expect("a handful of calls");
+    assert_eq!(elapsed, timeouts.duty_fetch * count, "the check ends when the last call is cut");
 }
 
-#[tokio::test]
+/// Pre-Gloas: attester and proposer for the epoch and the next (PTC is gated
+/// out). Without the timeout each call would take `duty_fetch + 500 ms`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
+    use bn_manager::MockMethod::{GetAttesterDuties, GetProposerDuties};
+
+    let expected = [GetAttesterDuties, GetProposerDuties, GetAttesterDuties, GetProposerDuties];
+    assert_reorg_check_cuts_each_call_at_duty_fetch(10, &expected).await;
+}
+
+/// Gloas+: attester, proposer and PTC for the epoch and the next.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon_when_gloas_active() {
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use bn_manager::MockMethod::{GetAttesterDuties, GetProposerDuties, PostPtcDuties};
 
-    let mock_server = MockServer::start().await;
-
-    let slow_response = serde_json::json!({
-        "data": [],
-        "dependent_root": "0xslow_root",
-        "execution_optimistic": false
-    });
-
-    let timeouts = fast_timeouts();
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/ptc/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
-        .with_timeout(Duration::from_secs(30))
-        .with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
-
-    let gloas_epoch = 70u64;
-    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
-    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-    clock.set_slot(slot);
-
-    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let signer =
-        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-    let submitter = Arc::new(MockSubmitter::new());
-    let propagator = Arc::new(Propagator::new(submitter));
-    let config = create_test_config().with_timeouts(timeouts.clone());
-    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-
-    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
-        clock,
-        duty_tracker,
-        signer,
-        propagator,
-        beacon,
-        create_mock_block_beacon(),
-        None,
-        create_mock_validator_store(),
-        config,
-        pubkey_map,
-    ));
-
-    let start = std::time::Instant::now();
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
-    let elapsed = start.elapsed();
-
-    // Gloas+: 6 calls (attester+proposer+ptc × current/next), each bounded by
-    // duty_fetch (200ms). With timeouts: 6 * 200ms = 1.2s + margin.
-    assert!(
-        elapsed < timeouts.duty_fetch * 7,
-        "Gloas reorg check took {:?}, expected < {:?} (6 timeouts + margin)",
-        elapsed,
-        timeouts.duty_fetch * 7
-    );
+    // create_test_config schedules Gloas at epoch 70.
+    let expected = [
+        GetAttesterDuties,
+        GetProposerDuties,
+        PostPtcDuties,
+        GetAttesterDuties,
+        GetProposerDuties,
+        PostPtcDuties,
+    ];
+    assert_reorg_check_cuts_each_call_at_duty_fetch(70, &expected).await;
 }
 
 #[tokio::test]
@@ -1683,6 +1590,7 @@ async fn shutdown_startup_fee_run(started: StartupFeeRun) {
 
 #[tokio::test]
 async fn test_prepare_and_register_payloads_at_startup() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
     clock.advance_time(9);
@@ -1716,6 +1624,7 @@ async fn test_prepare_and_register_payloads_at_startup() {
 
 #[tokio::test]
 async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
+    let _metrics = m2_metric_lock().await;
     use beacon::BeaconError;
 
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -1751,6 +1660,7 @@ async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
 
 #[tokio::test]
 async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     let genesis_ms = TEST_GENESIS_TIME.saturating_mul(1000);
     clock.set_current_time_ms(genesis_ms - 50);
@@ -1784,6 +1694,7 @@ async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
 
 #[tokio::test]
 async fn test_startup_preparation_does_not_block_the_proposer_duty() {
+    let _metrics = m2_metric_lock().await;
     use bn_manager::MockMethod;
 
     let mock = retirement_beacon_base()
@@ -1834,6 +1745,7 @@ async fn test_startup_preparation_does_not_block_the_proposer_duty() {
 /// on this move.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn startup_preparation_ends_when_run_returns() {
+    let _metrics = m2_metric_lock().await;
     use bn_manager::MockMethod;
 
     let mock = retirement_beacon_base()
@@ -1905,6 +1817,7 @@ async fn startup_preparation_ends_when_run_returns() {
 /// afterwards. A completed future must not be polled again.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn startup_preparation_finishes_while_the_slot_loop_continues() {
+    let _metrics = m2_metric_lock().await;
     let mut timeouts = fast_timeouts();
     timeouts.preparation = Duration::from_secs(7200);
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));

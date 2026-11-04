@@ -78,6 +78,7 @@ fn find_parent_name(spans: &SpanMap<u64, SpanEntry>, child_name: &str) -> Option
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_slot_processing_creates_root_and_phase_spans() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(65); // slot 65 = epoch 2, not at epoch boundary
                         // Advance past 2/3 of slot so all phases run without waiting
@@ -153,6 +154,7 @@ async fn test_slot_processing_creates_root_and_phase_spans() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_epoch_boundary_creates_epoch_span() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(32); // slot 32 = epoch 1, IS at epoch boundary (32 % 32 == 0)
     clock.advance_time(9);
@@ -373,6 +375,7 @@ async fn test_aggregation_non_aggregator_creates_produce_span_without_submit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_phase_spans_are_children_of_slot_process() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(65); // non-boundary slot
     clock.advance_time(9);
@@ -446,6 +449,7 @@ async fn test_phase_spans_are_children_of_slot_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_epoch_boundary_span_is_child_of_slot_process() {
+    let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(32); // epoch boundary
     clock.advance_time(9);
@@ -769,6 +773,7 @@ fn assert_fire_stamp(stamp: &PhaseStamp, expected_ms: u64) {
 /// (`current_time_secs` truncated) cannot satisfy it. PTC does not fire.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_t15_time_into_slot_matches_bps_when_phase_fires() {
+    let _metrics = m2_metric_lock().await;
     let slot_ms = 12_000u64;
     let pre = DeadlineBps::default();
     let expected_att = due_ms(pre.attestation, slot_ms);
@@ -809,6 +814,7 @@ async fn test_t15_time_into_slot_matches_bps_when_phase_fires() {
 /// by 100 ms, so a 1-second clock cannot tell them apart.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_t15_ptc_time_into_slot_when_gloas_active() {
+    let _metrics = m2_metric_lock().await;
     let slot_ms = 12_000u64;
     // Attestation 3333 → 3999 and aggregate 3416 → 4099 differ by 100 ms.
     // Sync and contribution use different bps so those duties take the split
@@ -860,6 +866,7 @@ async fn test_t15_ptc_time_into_slot_when_gloas_active() {
 /// `time_into_slot`. Measuring from the wake instant drops that offset.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn attestation_span_time_into_slot_includes_a_late_wake() {
+    let _metrics = m2_metric_lock().await;
     const OFFSET_MS: u64 = 600;
     let slot_ms = 12_000u64;
     let pre = DeadlineBps::default();

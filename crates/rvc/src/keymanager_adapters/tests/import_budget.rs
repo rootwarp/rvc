@@ -150,7 +150,7 @@ fn app_state(adapter: Arc<KeystoreManagerAdapter>) -> Arc<AppState> {
 /// Receiving every park on the current-thread runtime shows the worker is
 /// not occupied by the blocking import body. All `N` keystores still land.
 #[tokio::test(flavor = "current_thread")]
-async fn async_heartbeat_has_no_gap_over_50ms_while_100_keystores_import() {
+async fn imports_park_off_the_runtime_while_100_keystores_import() {
     const N: usize = 100;
     let dir = TempDir::new().unwrap();
     let (adapter, _, _) =
