@@ -2,10 +2,13 @@ use std::fs;
 use std::path::Path;
 
 use aes::cipher::{KeyIvInit, StreamCipher};
+use observability::logging::TruncatedPubkey;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tracing::warn;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use zeroize::Zeroizing;
@@ -87,6 +90,11 @@ const MAX_SCRYPT_DKLEN: u32 = 32;
 /// [`kdf_working_set_bytes`] reports the uploaded cost even past this ceiling;
 /// parameter rejection stays inside `decrypt`.
 pub const MAX_KDF_WORKING_SET_BYTES: u64 = 128 * (MAX_SCRYPT_R as u64) * (MAX_SCRYPT_N as u64);
+
+#[cfg(test)]
+thread_local! {
+    static KDF_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum EncryptionKdf {
@@ -224,6 +232,29 @@ pub fn kdf_working_set_bytes(keystore: &Keystore) -> u64 {
     }
 }
 
+/// EIP-2335 password processing: NFKD normalisation, then removal of the C0
+/// (U+0000–U+001F), DEL (U+007F) and C1 (U+0080–U+009F) control codes.
+///
+/// [`Keystore::encrypt`] and [`Keystore::decrypt`] apply it themselves, so
+/// callers pass the password as typed.
+///
+/// # Examples
+///
+/// ```
+/// use rvc_crypto::process_password;
+///
+/// assert_eq!(process_password("pass\r\n").as_str(), "pass");
+/// assert_eq!(process_password("caf\u{e9}").as_str(), "cafe\u{301}");
+/// ```
+pub fn process_password(password: &str) -> Zeroizing<String> {
+    let kept =
+        || password.nfkd().filter(|c| !matches!(c, '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}'));
+    // Sized up front so the buffer never reallocates and leaves an unzeroized copy.
+    let mut processed = Zeroizing::new(String::with_capacity(kept().map(char::len_utf8).sum()));
+    processed.extend(kept());
+    processed
+}
+
 impl Keystore {
     pub fn from_json(json: &str) -> Result<Self, KeystoreError> {
         let keystore: Keystore = serde_json::from_str(json)?;
@@ -261,7 +292,38 @@ impl Keystore {
         Ok(())
     }
 
+    /// Decrypts the secret key.
+    ///
+    /// A UTF-8 `password` goes through [`process_password`] before the KDF. If
+    /// that fails the checksum and the processed bytes differ from `password`,
+    /// the raw bytes are tried once, so a keystore rvc wrote before it processed
+    /// passwords still opens; that success logs a warning to re-encrypt the
+    /// keystore. A non-UTF-8 `password` is used as raw bytes only. A wrong
+    /// password is [`KeystoreError::ChecksumMismatch`].
     pub fn decrypt(&self, password: &[u8]) -> Result<SecretKey, KeystoreError> {
+        let Ok(text) = std::str::from_utf8(password) else {
+            return self.decrypt_with(password);
+        };
+        let processed = process_password(text);
+        match self.decrypt_with(processed.as_bytes()) {
+            Err(KeystoreError::ChecksumMismatch) if processed.as_bytes() != password => {
+                let secret_key = self.decrypt_with(password)?;
+                let keystore = match &self.pubkey {
+                    Some(pubkey) => TruncatedPubkey::new(pubkey).to_string(),
+                    None => self.uuid.to_string(),
+                };
+                warn!(
+                    keystore = %keystore,
+                    "Keystore opened with its unprocessed password bytes, not the EIP-2335 \
+                     processed password; re-encrypt this keystore with the same password"
+                );
+                Ok(secret_key)
+            }
+            result => result,
+        }
+    }
+
+    fn decrypt_with(&self, password: &[u8]) -> Result<SecretKey, KeystoreError> {
         let derived_key = Zeroizing::new(self.derive_key(password)?);
         let ciphertext = hex::decode(&self.crypto.cipher.message)?;
         self.verify_checksum(&derived_key, &ciphertext)?;
@@ -270,6 +332,8 @@ impl Keystore {
     }
 
     fn derive_key(&self, password: &[u8]) -> Result<[u8; DERIVED_KEY_LEN], KeystoreError> {
+        #[cfg(test)]
+        KDF_RUNS.with(|runs| runs.set(runs.get() + 1));
         match self.crypto.kdf.function.as_str() {
             KDF_SCRYPT => self.derive_key_scrypt(password),
             KDF_PBKDF2 => self.derive_key_pbkdf2(password),
@@ -421,12 +485,23 @@ impl Keystore {
         }
     }
 
+    /// Encrypts `secret_key` under the [`process_password`] form of `password`.
+    ///
+    /// A `password` that is not UTF-8, or is empty after processing, is
+    /// refused with [`KeystoreError::InvalidPassword`].
     pub fn encrypt(
         secret_key: &SecretKey,
         password: &[u8],
         path: &str,
         kdf: EncryptionKdf,
     ) -> Result<Self, KeystoreError> {
+        let password = std::str::from_utf8(password)
+            .map_err(|_| KeystoreError::InvalidPassword("not UTF-8"))?;
+        let password = process_password(password);
+        if password.is_empty() {
+            return Err(KeystoreError::InvalidPassword("empty after EIP-2335 processing"));
+        }
+
         let mut salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
 
@@ -495,7 +570,7 @@ impl Keystore {
             version: KEYSTORE_VERSION,
         };
 
-        let derived_key = Zeroizing::new(keystore.derive_key(password)?);
+        let derived_key = Zeroizing::new(keystore.derive_key(password.as_bytes())?);
 
         // Gate 1: keystore encryption needs the raw SK bytes (kept in Zeroizing, never logged).
         #[allow(clippy::disallowed_methods)]
@@ -562,6 +637,85 @@ mod tests {
     ];
     const EIP2335_SECRET_HEX: &str =
         "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+    /// The spec vectors' password as EIP-2335 writes it: Mathematical Fraktur
+    /// "testpassword" plus U+1F511. [`EIP2335_PASSWORD`] is its processed form.
+    const EIP2335_RAW_PASSWORD: &str = "\u{1D531}\u{1D522}\u{1D530}\u{1D531}\u{1D52D}\u{1D51E}\
+        \u{1D530}\u{1D530}\u{1D534}\u{1D52C}\u{1D52F}\u{1D521}\u{1F511}";
+    const EIP2335_PUBKEY_TRUNCATED: &str = "0x9612d7a727...2b420d07";
+
+    const RAW_BYTES_PASSWORD: &str = "p\u{e4}ssword\n";
+    const RAW_BYTES_PASSWORD_NFKD: &str = "pa\u{308}ssword";
+    const RAW_BYTES_PASSWORD_UUID: &str = "019132b2-8373-4501-a8a4-d952da4934e2";
+    const NON_UTF8_PASSWORD: &[u8] = b"\xffpass\xfe";
+    const REENCRYPT_WARN: &str = "Keystore opened with its unprocessed password bytes, not the \
+        EIP-2335 processed password; re-encrypt this keystore with the same password";
+
+    // Old-format keystores: real output of the unprocessed `Keystore::encrypt`
+    // at 9eb6f27c (cheap scrypt, secret `EIP2335_SECRET_HEX`), over the raw
+    // bytes of `RAW_BYTES_PASSWORD` and `NON_UTF8_PASSWORD`. Never regenerate.
+    const RAW_BYTES_PASSWORD_KEYSTORE: &str = r#"{
+  "crypto": {
+    "kdf": {
+      "function": "scrypt",
+      "params": {
+        "dklen": 32,
+        "n": 2,
+        "p": 1,
+        "r": 1,
+        "salt": "06424e90db5ce54244f130e13500ca74bdc1f067e2cecabd8dc331654d547ce7"
+      },
+      "message": ""
+    },
+    "checksum": {
+      "function": "sha256",
+      "params": {},
+      "message": "871a15a72b760c91c4ee27d1f99fb0d909f929a78059bd6b4f78486a80233d37"
+    },
+    "cipher": {
+      "function": "aes-128-ctr",
+      "params": {
+        "iv": "a4d4d87814581a6354e26177ede5e180"
+      },
+      "message": "ca20c32f3fd386b05c1dc9c82df03c4973c63876af164535578958440af7bfe4"
+    }
+  },
+  "pubkey": "9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07",
+  "path": "m/12381/3600/0/0/0",
+  "uuid": "019132b2-8373-4501-a8a4-d952da4934e2",
+  "version": 4
+}"#;
+
+    const NON_UTF8_PASSWORD_KEYSTORE: &str = r#"{
+  "crypto": {
+    "kdf": {
+      "function": "scrypt",
+      "params": {
+        "dklen": 32,
+        "n": 2,
+        "p": 1,
+        "r": 1,
+        "salt": "02d583b56ad343f026df8286287c95691dce34d2df3c1eede3b49e37c9f89099"
+      },
+      "message": ""
+    },
+    "checksum": {
+      "function": "sha256",
+      "params": {},
+      "message": "70c5cfbc078459cacf0d7fabb516e13aad17fca54e03e905d7e17ea0117c811c"
+    },
+    "cipher": {
+      "function": "aes-128-ctr",
+      "params": {
+        "iv": "b2b915732004d5f6e826da51a91f4baa"
+      },
+      "message": "cd7a94c895b61e0fa04e9cd0cade6a0ac8e5a7a8d22a783868dae3be38b435c7"
+    }
+  },
+  "pubkey": "9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07",
+  "path": "m/12381/3600/0/0/0",
+  "uuid": "0c157eff-1e72-466e-8032-67982204ac6d",
+  "version": 4
+}"#;
 
     const EIP2335_SCRYPT_TEST_VECTOR: &str = r#"
     {
@@ -1930,5 +2084,241 @@ mod tests {
         let iv = hex::decode(&encrypted.crypto.cipher.params.iv).expect("hex");
         assert_eq!(iv.len(), IV_LEN);
         encrypted.decrypt(b"pw").expect("encrypt-side IV must decrypt cleanly");
+    }
+
+    // ========== EIP-2335 password processing ==========
+
+    fn eip2335_secret() -> SecretKey {
+        SecretKey::from_bytes(&hex::decode(EIP2335_SECRET_HEX).expect("hex")).expect("secret")
+    }
+
+    fn cheap_keystore(secret: &SecretKey, password: &[u8]) -> Keystore {
+        Keystore::encrypt(
+            secret,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt")
+    }
+
+    fn reencrypt_warns<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        lines.iter().copied().filter(|line| line.contains("re-encrypt")).collect()
+    }
+
+    // Failure messages carry counts only, never log lines, so a leaking
+    // mutant cannot print a password into the test output.
+    fn no_reencrypt_warn(lines: &[&str]) -> Result<(), String> {
+        match reencrypt_warns(lines).len() {
+            0 => Ok(()),
+            n => Err(format!("expected no re-encrypt warn, got {n}")),
+        }
+    }
+
+    fn one_reencrypt_warn_naming(lines: &[&str], keystore: &str) -> Result<(), String> {
+        let field = format!("keystore={keystore}");
+        let warns = reencrypt_warns(lines);
+        let exact = warns
+            .iter()
+            .filter(|line| {
+                line.contains(" WARN ") && line.contains(REENCRYPT_WARN) && line.contains(&field)
+            })
+            .count();
+        match (warns.len(), exact) {
+            (1, 1) => Ok(()),
+            (n, exact) => Err(format!("{n} re-encrypt lines, {exact} exact WARN with {field}")),
+        }
+    }
+
+    fn no_raw_bytes_password_in(lines: &[&str]) -> Result<(), String> {
+        let raw_hex = hex::encode(RAW_BYTES_PASSWORD);
+        let nfkd_hex = hex::encode(RAW_BYTES_PASSWORD_NFKD);
+        let decimal = format!("{:?}", RAW_BYTES_PASSWORD.as_bytes());
+        let nfkd_decimal = format!("{:?}", RAW_BYTES_PASSWORD_NFKD.as_bytes());
+        let nfkd_debug = format!("{RAW_BYTES_PASSWORD_NFKD:?}");
+        let forms = [
+            RAW_BYTES_PASSWORD.trim_end(),
+            RAW_BYTES_PASSWORD_NFKD,
+            raw_hex.as_str(),
+            nfkd_hex.as_str(),
+            decimal.trim_start_matches('[').trim_end_matches(']'),
+            nfkd_decimal.trim_start_matches('[').trim_end_matches(']'),
+            nfkd_debug.trim_matches('"'),
+        ];
+        match lines
+            .iter()
+            .filter(|line| forms.iter().any(|form| line.to_lowercase().contains(form)))
+            .count()
+        {
+            0 => Ok(()),
+            n => Err(format!("{n} log lines carry the password, its NFKD form or their hex")),
+        }
+    }
+
+    #[test]
+    fn process_password_applies_nfkd_and_strips_c0_c1_del() {
+        let processed = process_password(EIP2335_RAW_PASSWORD);
+        assert_eq!(hex::encode(processed.as_bytes()), "7465737470617373776f7264f09f9491");
+        assert_eq!(processed.as_bytes(), EIP2335_PASSWORD);
+        for (label, variant) in
+            [("CR LF", "pass\r\n"), ("NEL", "pa\u{85}ss"), ("DEL", "pa\u{7f}ss")]
+        {
+            assert_eq!(process_password(variant).as_str(), "pass", "{label}");
+        }
+        assert_eq!(process_password("\u{e9}").as_bytes(), b"e\xcc\x81");
+        assert_eq!(process_password("e\u{301}").as_bytes(), b"e\xcc\x81");
+        assert_eq!(process_password(RAW_BYTES_PASSWORD).as_str(), RAW_BYTES_PASSWORD_NFKD);
+        assert_eq!(process_password("a\u{315}\n\u{300}").as_str(), "a\u{315}\u{300}");
+        assert_eq!(process_password("pass\r\n").capacity(), 4);
+
+        let printable_ascii: String = (' '..='~').collect();
+        assert_eq!(process_password(&printable_ascii).as_str(), printable_ascii);
+
+        for code_point in 0u32..=0xFF {
+            let c = char::from_u32(code_point).expect("U+0000..=U+00FF are scalar values");
+            let control = matches!(code_point, 0x00..=0x1F | 0x7F..=0x9F);
+            for (at, input) in [
+                ("start", format!("{c}ab")),
+                ("middle", format!("a{c}b")),
+                ("end", format!("ab{c}")),
+            ] {
+                let stripped = process_password(&input).as_str() == "ab";
+                assert_eq!(stripped, control, "U+{code_point:04X} at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_password_is_its_own_variant() {
+        let secret = eip2335_secret();
+        let encrypt = |password: &[u8]| {
+            Keystore::encrypt(
+                &secret,
+                password,
+                "m/12381/3600/0/0/0",
+                EncryptionKdf::scrypt_cheap_for_tests(),
+            )
+        };
+        assert!(matches!(encrypt(b"\xff"), Err(KeystoreError::InvalidPassword("not UTF-8"))));
+        assert!(matches!(
+            encrypt(b"\n\t"),
+            Err(KeystoreError::InvalidPassword("empty after EIP-2335 processing"))
+        ));
+    }
+
+    #[test]
+    fn eip2335_official_vectors_decrypt_with_the_raw_unicode_password() {
+        for vector in [EIP2335_SCRYPT_TEST_VECTOR, EIP2335_PBKDF2_TEST_VECTOR] {
+            let keystore = Keystore::from_json(vector).expect("should parse");
+            let secret = keystore.decrypt(EIP2335_RAW_PASSWORD.as_bytes()).expect("decrypt");
+            assert_eq!(hex::encode(secret.to_bytes()), EIP2335_SECRET_HEX);
+        }
+    }
+
+    #[test]
+    fn a_pass_keystore_opens_with_control_and_normalisation_variants() {
+        let secret = eip2335_secret();
+        let pass = cheap_keystore(&secret, b"pass");
+        for (label, variant) in [("CR LF", "pass\r\n"), ("NEL", "pa\u{85}ss")] {
+            let opened = pass.decrypt(variant.as_bytes()).expect(label);
+            assert_eq!(opened.to_bytes(), secret.to_bytes(), "{label}");
+        }
+
+        let precomposed = cheap_keystore(&secret, "caf\u{e9}".as_bytes());
+        let opened = precomposed.decrypt("cafe\u{301}".as_bytes()).expect("decomposed opens");
+        assert_eq!(opened.to_bytes(), secret.to_bytes());
+        let decomposed = cheap_keystore(&secret, "cafe\u{301}".as_bytes());
+        let opened = decomposed.decrypt("caf\u{e9}".as_bytes()).expect("precomposed opens");
+        assert_eq!(opened.to_bytes(), secret.to_bytes());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_raw_bytes_keystore_opens_through_the_fallback_with_one_warn() {
+        let keystore = Keystore::from_json(RAW_BYTES_PASSWORD_KEYSTORE).expect("fixture");
+        let secret = keystore.decrypt(RAW_BYTES_PASSWORD.as_bytes()).expect("fallback opens");
+        assert_eq!(hex::encode(secret.to_bytes()), EIP2335_SECRET_HEX);
+        logs_assert(no_raw_bytes_password_in);
+        logs_assert(|lines| one_reencrypt_warn_naming(lines, EIP2335_PUBKEY_TRUNCATED));
+        assert!(!logs_contain(keystore.pubkey.as_deref().expect("fixture pubkey")));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_raw_bytes_keystore_without_pubkey_names_its_uuid_in_the_warn() {
+        let mut keystore = Keystore::from_json(RAW_BYTES_PASSWORD_KEYSTORE).expect("fixture");
+        keystore.pubkey = None;
+        keystore.decrypt(RAW_BYTES_PASSWORD.as_bytes()).expect("fallback opens");
+        logs_assert(no_raw_bytes_password_in);
+        logs_assert(|lines| one_reencrypt_warn_naming(lines, RAW_BYTES_PASSWORD_UUID));
+    }
+
+    #[test]
+    fn encrypt_rejects_non_utf8_and_empty_after_processing() {
+        let secret = eip2335_secret();
+        for (label, password, reason) in [
+            ("0xff", &b"\xff"[..], "not UTF-8"),
+            ("LF TAB", b"\n\t", "empty after EIP-2335 processing"),
+            ("empty", b"", "empty after EIP-2335 processing"),
+        ] {
+            let err = Keystore::encrypt(
+                &secret,
+                password,
+                "m/12381/3600/0/0/0",
+                EncryptionKdf::scrypt_cheap_for_tests(),
+            )
+            .expect_err(label);
+            assert_eq!(err.to_string(), format!("Invalid password: {reason}"), "{label}");
+        }
+
+        let pass = cheap_keystore(&secret, b"pass");
+        assert!(matches!(pass.decrypt(b"wrong"), Err(KeystoreError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn encrypt_derives_from_the_processed_password() {
+        let secret = eip2335_secret();
+        let keystore = cheap_keystore(&secret, EIP2335_RAW_PASSWORD.as_bytes());
+        let opened = keystore.decrypt(EIP2335_PASSWORD).expect("processed bytes open");
+        assert_eq!(opened.to_bytes(), secret.to_bytes());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn wrong_non_ascii_password_is_a_checksum_mismatch_without_warn() {
+        let pass = cheap_keystore(&eip2335_secret(), b"pass");
+        let result = pass.decrypt("p\u{e4}ssword".as_bytes());
+        assert!(matches!(result, Err(KeystoreError::ChecksumMismatch)), "{result:?}");
+        logs_assert(no_reencrypt_warn);
+    }
+
+    #[test]
+    fn decrypt_runs_a_second_kdf_only_after_a_checksum_mismatch_that_processing_changed() {
+        let pass = cheap_keystore(&eip2335_secret(), b"pass");
+        let mut bad_ciphertext = pass.clone();
+        bad_ciphertext.crypto.cipher.message = "zz".to_string();
+        let cases: [(&str, &Keystore, &[u8], usize); 5] = [
+            ("wrong, processing changes nothing", &pass, b"wrong", 1),
+            ("wrong, processing changes it", &pass, "p\u{e4}ssword".as_bytes(), 2),
+            ("wrong, not UTF-8", &pass, b"\xffwrong", 1),
+            ("right after processing", &pass, b"pass\r\n", 1),
+            ("bad ciphertext hex", &bad_ciphertext, "p\u{e4}ssword".as_bytes(), 1),
+        ];
+        for (label, keystore, password, expected) in cases {
+            KDF_RUNS.with(|runs| runs.set(0));
+            let _ = keystore.decrypt(password);
+            assert_eq!(KDF_RUNS.with(std::cell::Cell::get), expected, "{label}");
+        }
+        let bad_hex = bad_ciphertext.decrypt("p\u{e4}ssword".as_bytes());
+        assert!(matches!(bad_hex, Err(KeystoreError::InvalidHex(_))), "{bad_hex:?}");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn non_utf8_password_decrypts_with_raw_bytes() {
+        let keystore = Keystore::from_json(NON_UTF8_PASSWORD_KEYSTORE).expect("fixture");
+        let secret = keystore.decrypt(NON_UTF8_PASSWORD).expect("raw bytes open");
+        assert_eq!(hex::encode(secret.to_bytes()), EIP2335_SECRET_HEX);
+        logs_assert(no_reencrypt_warn);
     }
 }

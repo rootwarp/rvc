@@ -132,6 +132,7 @@ subtle = "2.6"
 hkdf = "0.12"
 num-bigint = "0.4"
 bip39 = { version = "2.2", features = ["zeroize", "rand"] }
+unicode-normalization = "0.1"
 rpassword = "5"
 tiny-keccak = { version = "2", features = ["keccak"] }
 rayon = "1"
