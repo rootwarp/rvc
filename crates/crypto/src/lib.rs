@@ -57,8 +57,8 @@ pub use key_manager::{
     decode_password_map_key, password_map_key, KeyManager, KeystoreLoadReport, WILDCARD_KEY,
 };
 pub use keystore::{
-    kdf_working_set_bytes, EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams,
-    MAX_KDF_WORKING_SET_BYTES,
+    kdf_working_set_bytes, process_password, EncryptionKdf, KdfParams, Keystore, Pbkdf2Params,
+    ScryptParams, MAX_KDF_WORKING_SET_BYTES,
 };
 pub use signer_trait::{LocalSigner, Signer};
 pub use signing::{compute_domain, compute_fork_data_root, compute_signing_root};

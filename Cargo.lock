@@ -4435,6 +4435,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "tree_hash",
+ "unicode-normalization",
  "uuid",
  "zeroize",
 ]

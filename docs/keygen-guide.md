@@ -22,7 +22,7 @@ rvc-keygen new-mnemonic \
   --withdrawal-address 0xYOUR_EXECUTION_ADDRESS
 ```
 
-You will be prompted to create a keystore password (minimum 8 characters, entered twice for confirmation). The tool then:
+You will be prompted to create a keystore password (minimum 8 characters after EIP-2335 processing, see [Keystore passwords](#keystore-passwords); entered twice for confirmation). The tool then:
 
 1. Generates a 24-word BIP-39 mnemonic and displays it
 2. Derives the signing key at path `m/12381/3600/0/0/0`
@@ -96,6 +96,12 @@ rvc-keygen new-mnemonic \
   --password-file /tmp/pw.txt
 rm /tmp/pw.txt
 ```
+
+### Keystore passwords
+
+rvc processes every keystore password as EIP-2335 requires before key derivation: NFKD normalisation, then removal of the C0 (U+0000–U+001F), DEL (U+007F) and C1 (U+0080–U+009F) control characters. So `pass` and `pass\r\n` open the same keystore, as do a precomposed and a decomposed `é`, and keystores from other EIP-2335 tools open with the password as typed. The 8-character minimum applies to the processed password and counts UTF-8 bytes. A password that is empty after processing, or is not valid UTF-8, cannot encrypt a keystore.
+
+A keystore that an earlier rvc wrote with a password that processing changes (a non-ASCII or control character) still opens: when the processed password fails, rvc tries the unprocessed bytes once and, if they open it, logs a warning naming the keystore (truncated pubkey, or uuid) and asking you to re-encrypt it with the same password. A wrong password that processing changes costs two key derivations before it is reported.
 
 ### PBKDF2 encryption
 
@@ -245,7 +251,7 @@ curl -X POST http://localhost:7500/eth/v1/keystores \
 - All keystore files are written with `0600` permissions (owner read/write only)
 - Mnemonic input uses `rpassword` (no terminal echo)
 - Secret keys and seeds are wrapped in `Zeroizing<>` and cleared from memory on drop
-- Keystore password must be at least 8 characters
+- Keystore password must be at least 8 characters after EIP-2335 processing (NFKD, control characters removed; counted in UTF-8 bytes)
 - Scrypt (default) uses n=262144, r=8, p=1 for strong brute-force resistance
 - The mnemonic is displayed **once** -- store it offline in a secure location
 
