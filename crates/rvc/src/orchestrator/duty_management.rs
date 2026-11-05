@@ -559,22 +559,6 @@ impl DutyManagementService {
         }
     }
 
-    /// Epoch-boundary work: reorg checks, proposer preparation, committee
-    /// subscriptions for the current and next epoch, then a duty summary.
-    ///
-    /// Extracted from the coordinator slot loop so the run path stays a pure
-    /// phase dispatcher. Circuit-breaker reset stays in the coordinator (it
-    /// owns that state).
-    #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) -> bool {
-        let proposer_root_changed = self.check_reorg_at_epoch_boundary(current_epoch).await;
-        self.prepare_proposers(current_epoch).await;
-        self.submit_committee_subscriptions(current_epoch).await;
-        self.submit_committee_subscriptions(current_epoch + 1).await;
-        self.log_epoch_boundary_summary(current_epoch, current_slot).await;
-        proposer_root_changed
-    }
-
     /// Count attester/proposer/sync duties for the epoch and emit the
     /// `Epoch boundary summary` info line.
     ///

@@ -38,6 +38,7 @@ use metrics::definitions::{
     RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL, RVC_BUILDER_CONSECUTIVE_MISSES,
     RVC_BUILDER_EPOCH_MISSES,
 };
+use signer::CircuitBreakerState;
 use timing::SlotClock;
 
 use super::coordinator::DutyOrchestrator;
@@ -87,17 +88,18 @@ mod proposal_counter_lock {
     }
 }
 
+/// Sets the builder miss gauges from `breaker`.
+pub(crate) fn publish_circuit_breaker_metrics(breaker: &CircuitBreakerState) {
+    RVC_BUILDER_CONSECUTIVE_MISSES.set(breaker.consecutive_misses() as i64);
+    RVC_BUILDER_EPOCH_MISSES.set(breaker.epoch_misses() as i64);
+}
+
 impl<C, S, B> DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
     B: BeaconBlockClient + 'static,
 {
-    pub(crate) fn update_circuit_breaker_metrics(&self) {
-        RVC_BUILDER_CONSECUTIVE_MISSES.set(self.circuit_breaker.consecutive_misses() as i64);
-        RVC_BUILDER_EPOCH_MISSES.set(self.circuit_breaker.epoch_misses() as i64);
-    }
-
     #[tracing::instrument(name = "orchestrator.maybe_propose_block", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
     pub(crate) async fn maybe_propose_block(
         &self,
@@ -188,7 +190,7 @@ where
                 if result.builder_path {
                     let was_tripped = self.circuit_breaker.is_tripped();
                     self.circuit_breaker.record_success();
-                    self.update_circuit_breaker_metrics();
+                    publish_circuit_breaker_metrics(&self.circuit_breaker);
                     if was_tripped && !self.circuit_breaker.is_tripped() {
                         info!(slot, "Builder circuit breaker reset after successful proposal");
                     }
@@ -214,7 +216,7 @@ where
                 if is_builder_failure {
                     let was_tripped = self.circuit_breaker.is_tripped();
                     self.circuit_breaker.record_miss();
-                    self.update_circuit_breaker_metrics();
+                    publish_circuit_breaker_metrics(&self.circuit_breaker);
                     if !was_tripped && self.circuit_breaker.is_tripped() {
                         RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
                         warn!(slot, "Builder circuit breaker tripped");

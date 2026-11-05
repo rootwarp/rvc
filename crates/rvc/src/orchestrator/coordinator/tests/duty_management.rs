@@ -1042,6 +1042,43 @@ async fn drive_prepare_and_register(
     extra_locals: Vec<(SecretKey, bool)>,
     foreign_keys: Vec<SecretKey>,
 ) -> RetirementDrive {
+    let (orchestrator, _handle, mock) =
+        retirement_orchestrator(epoch, schedule, mock, local, extra_locals, foreign_keys).await;
+    orchestrator.epoch_boundary.run_pending(epoch * ::timing::SLOTS_PER_EPOCH).await;
+    orchestrator.run_builder_epoch_boundary(epoch).await;
+    RetirementDrive { mock }
+}
+
+/// Builder-attached orchestrator at slot 0 of `epoch`; `local` has index 42.
+async fn retirement_orchestrator(
+    epoch: u64,
+    schedule: Arc<ForkSchedule>,
+    mock: bn_manager::MockBeaconNodeClient,
+    local: (SecretKey, bool),
+    extra_locals: Vec<(SecretKey, bool)>,
+    foreign_keys: Vec<SecretKey>,
+) -> (
+    DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    Arc<bn_manager::MockBeaconNodeClient>,
+) {
+    let (deps, mock) = retirement_deps(epoch, schedule, mock, local, extra_locals, foreign_keys);
+    let (orchestrator, handle) = DutyOrchestrator::new(deps);
+    (orchestrator, handle, mock)
+}
+
+/// Deps of [`retirement_orchestrator`].
+fn retirement_deps(
+    epoch: u64,
+    schedule: Arc<ForkSchedule>,
+    mock: bn_manager::MockBeaconNodeClient,
+    local: (SecretKey, bool),
+    extra_locals: Vec<(SecretKey, bool)>,
+    foreign_keys: Vec<SecretKey>,
+) -> (
+    OrchestratorDeps<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    Arc<bn_manager::MockBeaconNodeClient>,
+) {
     use signer::ValidatorSigner;
     use validator_store::ValidatorConfig;
 
@@ -1114,11 +1151,7 @@ async fn drive_prepare_and_register(
         pubkey_map,
     );
     deps.pubkey_index.write().insert(local_pk, "42".to_string());
-    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
-
-    orchestrator.duty_management.on_epoch_boundary(epoch, slot).await;
-    orchestrator.run_builder_epoch_boundary(epoch).await;
-    RetirementDrive { mock }
+    (deps, mock)
 }
 
 #[tokio::test]
@@ -1352,6 +1385,163 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
             eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
         );
     }
+}
+
+/// Span names from each new span up through its ancestors, read at creation.
+#[derive(Clone, Default)]
+struct SpanChains(Arc<parking_lot::Mutex<Vec<Vec<&'static str>>>>);
+
+impl<S> tracing_subscriber::Layer<S> for SpanChains
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        _attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = ctx.span(id) {
+            self.0.lock().push(span.scope().map(|s| s.name()).collect());
+        }
+    }
+}
+
+impl SpanChains {
+    fn ancestors_of(&self, name: &str) -> Vec<Vec<&'static str>> {
+        self.0.lock().iter().filter(|chain| chain[0] == name).map(|c| c[1..].to_vec()).collect()
+    }
+}
+
+/// The slot-0 post-duty tail runs the boundary steps under `epoch.boundary`,
+/// and a proposer `dependent_root` change seen by the reorg check
+/// re-broadcasts preferences from that tail.
+///
+/// `register_validators` is held in the mock, so the jitter block never
+/// reaches its own broadcast: the only preferences POST is the root-change one.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_change() {
+    let _metrics = m2_metric_lock().await;
+    use bn_manager::MockMethod;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let gloas_epoch = 100u64;
+    let epoch = gloas_epoch - 1;
+    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon_base()
+        .with_get_proposer_duties(move |e| {
+            let data = if e == gloas_epoch {
+                vec![proposer_duty(&local_hex, "42", proposal_slot)]
+            } else {
+                Vec::new()
+            };
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ROOT_B.to_string(),
+                execution_optimistic: false,
+                data,
+            })
+        })
+        .with_method_delay(MockMethod::RegisterValidators, Duration::from_secs(3600));
+    let (mut orchestrator, handle, mock) = retirement_orchestrator(
+        epoch,
+        near_gloas_schedule(gloas_epoch),
+        mock,
+        (local, true),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert!(!orchestrator.duty_tracker.cache_proposer_duties(epoch, ROOT_A.into(), &[]).await);
+    orchestrator.clock.advance_time(9);
+
+    let chains = SpanChains::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(chains.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let mut waited_ms = 0u64;
+    while mock.submit_proposer_preferences_calls().is_empty() && waited_ms < 2_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+
+    let prefs = mock.submit_proposer_preferences_calls();
+    assert_eq!(prefs.len(), 1, "the root change must re-broadcast once; virtual ms {waited_ms}");
+    assert_eq!(prefs[0].len(), 1);
+    assert_eq!(prefs[0][0].message.proposal_slot, proposal_slot);
+    assert_eq!(
+        prefs[0][0].message.dependent_root,
+        eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
+    );
+
+    for step in ["orchestrator.check_reorg", "orchestrator.submit_committee_subscriptions"] {
+        let ancestors = chains.ancestors_of(step);
+        assert!(!ancestors.is_empty(), "{step} span must be created");
+        for chain in ancestors {
+            assert!(
+                chain.ends_with(&["epoch.boundary", "slot.process"]),
+                "{step} must run under epoch.boundary: {chain:?}"
+            );
+        }
+    }
+}
+
+/// The slot-0 tail resets the circuit breaker passed in `OrchestratorDeps`,
+/// the same `Arc` the proposal path records misses on.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_slot_zero_boundary_resets_the_deps_circuit_breaker() {
+    use crate::orchestrator::block_proposal::publish_circuit_breaker_metrics;
+    use ::metrics::definitions::{RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES};
+
+    let _metrics = m2_metric_lock().await;
+    let gloas_epoch = 100u64;
+    let (deps, _mock) = retirement_deps(
+        gloas_epoch - 1,
+        near_gloas_schedule(gloas_epoch),
+        retirement_beacon(),
+        (SecretKey::generate(), true),
+        vec![],
+        vec![],
+    );
+    let breaker = Arc::new(CircuitBreakerState::new(3, 5));
+    for _ in 0..5 {
+        breaker.record_miss();
+    }
+    publish_circuit_breaker_metrics(&breaker);
+    assert!(breaker.is_tripped());
+    assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 5);
+    assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 5);
+
+    let (mut orchestrator, handle) =
+        DutyOrchestrator::new(OrchestratorDeps { circuit_breaker: Arc::clone(&breaker), ..deps });
+    orchestrator.clock.advance_time(9);
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let mut waited_ms = 0u64;
+    while breaker.epoch_misses() != 0 && waited_ms < 2_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+
+    assert!(
+        !breaker.is_tripped(),
+        "the boundary must reset the deps breaker; virtual ms {waited_ms}"
+    );
+    assert_eq!(breaker.epoch_misses(), 0);
+    assert_eq!(breaker.consecutive_misses(), 0);
+    assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 0);
+    assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 0);
 }
 
 /// Records `produce` so a startup test can see the first proposer duty.
