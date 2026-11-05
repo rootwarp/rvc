@@ -1278,11 +1278,13 @@ impl ServiceBuilder {
         // Bridge full trait objects onto the narrow builder seams
         // (`RegistrationSigner` / `BuilderBeaconClient`).
         let signer: Arc<dyn ValidatorSigner> = signer;
-        let service = BuilderService::new(
+        let service = BuilderService::with_batching(
             Arc::new(signer),
             Arc::new(beacon),
             validator_store,
             genesis_fork_version,
+            self.config.validator_registration_batch_size,
+            self.config.validator_registration_batch_delay,
             fork_schedule,
         );
         info!("Created builder service");
@@ -2880,6 +2882,113 @@ mod tests {
             [0, 0, 0, 0],
             Arc::new(eth_types::ForkSchedule::unscheduled_gloas()),
         );
+    }
+
+    /// Production builder service over `keys` signable builder keys and the two batch knobs.
+    fn builder_service_with_knobs(
+        keys: usize,
+        batch_size: usize,
+        batch_delay_ms: u64,
+    ) -> (Arc<BuilderService>, Arc<bn_manager::MockBeaconNodeClient>) {
+        let builder = ServiceBuilder::new(Config {
+            validator_registration_batch_size: batch_size,
+            validator_registration_batch_delay: batch_delay_ms,
+            ..create_minimal_config()
+        });
+        let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
+        let mut key_manager = KeyManager::new();
+        for _ in 0..keys {
+            let sk = crypto::SecretKey::generate();
+            let mut config = validator_store::ValidatorConfig::new(sk.public_key().to_bytes());
+            config.builder_proposals = true;
+            store.add_validator(config).unwrap();
+            key_manager.insert(sk);
+        }
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
+        let bn =
+            Arc::new(bn_manager::MockBeaconNodeClient::new().with_register_validators(|_| Ok(())));
+        let service = builder.build_builder_service(
+            signer,
+            bn.clone(),
+            store,
+            [0, 0, 0, 0],
+            Arc::new(ForkSchedule::unscheduled_gloas()),
+        );
+        (service, bn)
+    }
+
+    fn register_validators_offsets(bn: &bn_manager::MockBeaconNodeClient) -> Vec<Duration> {
+        let stamps: Vec<tokio::time::Instant> = bn
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == bn_manager::MockMethod::RegisterValidators)
+            .map(|stamp| stamp.at)
+            .collect();
+        stamps.iter().map(|at| *at - stamps[0]).collect()
+    }
+
+    /// 654-AC4: `validator_registration_batch_size` / `_delay` reach the production path.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_build_builder_service_applies_batch_knobs() {
+        let (service, bn) = builder_service_with_knobs(5, 2, 10);
+
+        service.register_validators(0).await.unwrap();
+
+        let sizes: Vec<usize> = bn.register_validators_calls().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 2, 1], "5 keys in batches of 2");
+        assert_eq!(
+            register_validators_offsets(&bn),
+            vec![Duration::ZERO, Duration::from_millis(10), Duration::from_millis(20)],
+            "10 ms between batches"
+        );
+    }
+
+    /// 654-AC5 pair: 3 batches 6 s apart land under `registration_step_timeout()`
+    /// (22 s); a fixed 10 s cuts the third.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_batched_send_fits_inside_the_step_timeout() {
+        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
+        assert_eq!(service.registration_step_timeout(), Duration::from_secs(22));
+
+        let sent = tokio::time::timeout(
+            service.registration_step_timeout(),
+            service.submit_epoch_registrations(0),
+        )
+        .await;
+
+        assert!(matches!(sent, Ok(Ok(()))), "{sent:?}");
+        assert_eq!(bn.register_validators_calls().len(), 3);
+
+        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
+        let cut =
+            tokio::time::timeout(Duration::from_secs(10), service.submit_epoch_registrations(0))
+                .await;
+
+        assert!(cut.is_err(), "a fixed 10 s cuts the round: {cut:?}");
+        assert_eq!(bn.register_validators_calls().len(), 2);
+    }
+
+    /// Old path under its 10 s cut: the batches already sent stay cached, so the
+    /// next round sends only the keys the cut left out.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_cut_registration_round_keeps_the_batches_it_sent() {
+        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
+        let cut =
+            tokio::time::timeout(Duration::from_secs(10), service.register_validators(0)).await;
+        assert!(cut.is_err(), "the round is cut after 2 of 3 batches: {cut:?}");
+        let sent: HashSet<[u8; 48]> =
+            bn.register_validators_calls().iter().flatten().map(|r| r.message.pubkey).collect();
+        assert_eq!(sent.len(), 2);
+
+        service.register_validators(0).await.unwrap();
+
+        let calls = bn.register_validators_calls();
+        assert_eq!(calls.len(), 3, "the next round sends one batch");
+        assert_eq!(calls[2].len(), 1);
+        assert!(!sent.contains(&calls[2][0].message.pubkey), "only the key the cut left out");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -18,6 +18,9 @@ use signer::SignerError;
 use validator_store::ValidatorStore;
 
 use crate::traits::{BuilderBeaconClient, RegistrationSigner};
+
+/// Fixed part of [`BuilderService::registration_step_timeout`].
+const REGISTRATION_STEP_BASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether Gloas retired `prepare_beacon_proposer` / `register_validator`.
 ///
@@ -43,13 +46,45 @@ pub enum BuilderServiceError {
 
     #[error("signer error: {0}")]
     SignerError(#[from] SignerError),
+
+    #[error("{failed} of {total} builder registration batches failed")]
+    RegistrationBatchesFailed { failed: usize, total: usize },
+
+    #[error("{failed} of {total} builder registrations could not be signed")]
+    RegistrationSigningFailed { failed: usize, total: usize },
+
+    #[error("system clock is before the unix epoch")]
+    ClockBeforeUnixEpoch,
 }
 
-/// Cached registration data for change detection.
+/// A signed registration and the fee recipient and gas limit it was signed for.
+///
+/// Built only by [`Self::new`], so both fields equal `signed.message`'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedRegistration {
     fee_recipient: [u8; 20],
     gas_limit: u64,
+    signed: SignedValidatorRegistration,
+}
+
+impl CachedRegistration {
+    fn new(signed: SignedValidatorRegistration) -> Self {
+        Self {
+            fee_recipient: signed.message.fee_recipient,
+            gas_limit: signed.message.gas_limit,
+            signed,
+        }
+    }
+
+    fn signed_for(&self, fee_recipient: [u8; 20], gas_limit: u64) -> bool {
+        self.fee_recipient == fee_recipient && self.gas_limit == gas_limit
+    }
+}
+
+/// Failed and total batch counts of one [`BuilderService::send_batches`] call.
+struct BatchReport {
+    failed: usize,
+    total: usize,
 }
 
 /// Last broadcast proposer preferences for a `(pubkey, slot)`.
@@ -144,6 +179,10 @@ impl BuilderService {
         self.cache.write().await.clear();
     }
 
+    /// Old path: signs and sends only new or changed keys; a cached key is never re-sent.
+    ///
+    /// Kept for the startup future and the slot-0 boundary until W4-E6a moves
+    /// them to [`Self::submit_epoch_registrations`] and deletes this method.
     #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size, epoch = epoch))]
     pub async fn register_validators(&self, epoch: u64) -> Result<(), BuilderServiceError> {
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
@@ -151,11 +190,7 @@ impl BuilderService {
             info!(epoch, fork = fork.as_ref(), "Skipping register_validators at Gloas");
             return Ok(());
         }
-        let enabled_pubkeys = self.validator_store.list_enabled_pubkeys();
-        let builder_pubkeys: Vec<[u8; 48]> = enabled_pubkeys
-            .into_iter()
-            .filter(|pk| self.validator_store.is_builder_enabled(pk))
-            .collect();
+        let builder_pubkeys = self.builder_keys();
 
         if builder_pubkeys.is_empty() {
             debug!("no builder-enabled validators to register");
@@ -177,8 +212,7 @@ impl BuilderService {
                 .filter_map(|pubkey| {
                     let fee_recipient = self.validator_store.effective_fee_recipient(pubkey);
                     let gas_limit = self.validator_store.effective_gas_limit(pubkey);
-                    let new_cached = CachedRegistration { fee_recipient, gas_limit };
-                    if cache.get(pubkey) == Some(&new_cached) {
+                    if cache.get(pubkey).is_some_and(|c| c.signed_for(fee_recipient, gas_limit)) {
                         None
                     } else {
                         Some((*pubkey, fee_recipient, gas_limit))
@@ -188,51 +222,11 @@ impl BuilderService {
         };
 
         let mut registrations = Vec::new();
-
-        for (pubkey, fee_recipient, gas_limit) in &candidates {
-            let registration = ValidatorRegistrationV1 {
-                fee_recipient: *fee_recipient,
-                gas_limit: *gas_limit,
-                timestamp,
-                pubkey: *pubkey,
-            };
-
-            let pk = match crypto::PublicKey::from_bytes(pubkey) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    warn!(pubkey = hex::encode(pubkey), error = %e, "skipping invalid pubkey");
-                    continue;
-                }
-            };
-
-            // Fee recipient, gas limit, timestamp, and pubkey are local
-            // config under the configured genesis fork version, not a
-            // beacon-node body. The scope is `BeaconAdmission::unbound`.
-            // A missing scope still fails closed.
-            match signer::with_beacon_admission(
-                signer::BeaconAdmission::unbound(),
-                self.signer.sign_builder_registration(
-                    &registration,
-                    &pk,
-                    self.genesis_fork_version,
-                ),
-            )
-            .await
-            {
-                Ok(signature) => {
-                    // Wire boundary: eth_types::Signature is Vec<u8> for JSON serde.
-                    registrations.push(SignedValidatorRegistration {
-                        message: registration,
-                        signature: signature.to_bytes().to_vec(),
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        pubkey = hex::encode(pubkey),
-                        error = %e,
-                        "failed to sign builder registration"
-                    );
-                }
+        for &(pubkey, fee_recipient, gas_limit) in &candidates {
+            let registration =
+                ValidatorRegistrationV1 { fee_recipient, gas_limit, timestamp, pubkey };
+            if let Some(signed) = self.sign_registration(registration).await {
+                registrations.push(signed);
             }
         }
 
@@ -241,6 +235,173 @@ impl BuilderService {
             return Ok(());
         }
 
+        self.send_batches(&registrations).await;
+        Ok(())
+    }
+
+    /// Re-send every builder key's registration; sign only keys that are new or changed.
+    ///
+    /// Entries for keys that left the builder set (enabled and
+    /// `builder_proposals`) are evicted first. A key is signed when it has no
+    /// entry or its fee recipient or gas limit changed, so a re-send keeps its
+    /// signed timestamp. Each signature is cached before any send; a changed
+    /// key whose re-sign fails loses its old entry. Every cached builder key is
+    /// then sent in the configured batches, and every batch is tried. From
+    /// Gloas on this is a no-op. W4-E6a's epoch-boundary step calls it.
+    ///
+    /// # Errors
+    ///
+    /// - [`BuilderServiceError::RegistrationBatchesFailed`] when any batch failed.
+    /// - Otherwise [`BuilderServiceError::RegistrationSigningFailed`] when any
+    ///   key was not signed; the signed keys are still sent.
+    /// - [`BuilderServiceError::ClockBeforeUnixEpoch`] when a key needs signing
+    ///   and the system clock reads before 1970.
+    #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size, epoch = epoch))]
+    pub async fn submit_epoch_registrations(&self, epoch: u64) -> Result<(), BuilderServiceError> {
+        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
+        if legacy_proposer_ops_retired(fork) {
+            info!(epoch, fork = fork.as_ref(), "Skipping builder registrations at Gloas");
+            return Ok(());
+        }
+        let builder_keys = self.builder_keys();
+
+        let to_sign: Vec<([u8; 48], [u8; 20], u64)> = {
+            let keep: HashSet<&[u8; 48]> = builder_keys.iter().collect();
+            let mut cache = self.cache.write().await;
+            cache.retain(|pubkey, _| keep.contains(pubkey));
+            builder_keys
+                .iter()
+                .filter_map(|pubkey| {
+                    let fee_recipient = self.validator_store.effective_fee_recipient(pubkey);
+                    let gas_limit = self.validator_store.effective_gas_limit(pubkey);
+                    let unchanged =
+                        cache.get(pubkey).is_some_and(|c| c.signed_for(fee_recipient, gas_limit));
+                    (!unchanged).then_some((*pubkey, fee_recipient, gas_limit))
+                })
+                .collect()
+        };
+
+        let mut signing_failures = 0;
+        if !to_sign.is_empty() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| BuilderServiceError::ClockBeforeUnixEpoch)?
+                .as_secs();
+            for &(pubkey, fee_recipient, gas_limit) in &to_sign {
+                let registration =
+                    ValidatorRegistrationV1 { fee_recipient, gas_limit, timestamp, pubkey };
+                let signed = self.sign_registration(registration).await;
+                let mut cache = self.cache.write().await;
+                match signed {
+                    Some(signed) => {
+                        cache.insert(pubkey, CachedRegistration::new(signed));
+                    }
+                    None => {
+                        cache.remove(&pubkey);
+                        signing_failures += 1;
+                    }
+                }
+            }
+        }
+
+        let registrations: Vec<SignedValidatorRegistration> = {
+            let cache = self.cache.read().await;
+            builder_keys
+                .iter()
+                .filter_map(|pubkey| cache.get(pubkey))
+                .map(|c| c.signed.clone())
+                .collect()
+        };
+        let report = self.send_batches(&registrations).await;
+
+        if report.failed > 0 {
+            return Err(BuilderServiceError::RegistrationBatchesFailed {
+                failed: report.failed,
+                total: report.total,
+            });
+        }
+        if signing_failures > 0 {
+            return Err(BuilderServiceError::RegistrationSigningFailed {
+                failed: signing_failures,
+                total: to_sign.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Time budget for one [`Self::submit_epoch_registrations`] round.
+    ///
+    /// 10 s plus one batch delay for each batch after the first, where
+    /// `batches = ceil(builder keys / batch size)`. A batch size of 0 and an
+    /// empty builder set each count as one batch. Saturates instead of overflowing.
+    pub fn registration_step_timeout(&self) -> Duration {
+        let batches = match self.registration_batch_size {
+            0 => 1,
+            size => self.builder_keys().len().div_ceil(size).max(1),
+        };
+        let extra_delays = u64::try_from(batches - 1).unwrap_or(u64::MAX);
+        REGISTRATION_STEP_BASE_TIMEOUT.saturating_add(Duration::from_millis(
+            self.registration_batch_delay_ms.saturating_mul(extra_delays),
+        ))
+    }
+
+    /// Enabled keys with `builder_proposals`.
+    fn builder_keys(&self) -> Vec<[u8; 48]> {
+        self.validator_store
+            .list_enabled_pubkeys()
+            .into_iter()
+            .filter(|pk| self.validator_store.is_builder_enabled(pk))
+            .collect()
+    }
+
+    /// Sign `registration`; `None` (an invalid pubkey or a signer error) is logged.
+    async fn sign_registration(
+        &self,
+        registration: ValidatorRegistrationV1,
+    ) -> Option<SignedValidatorRegistration> {
+        let pubkey = registration.pubkey;
+        let pk = match crypto::PublicKey::from_bytes(&pubkey) {
+            Ok(pk) => pk,
+            Err(e) => {
+                warn!(pubkey = hex::encode(pubkey), error = %e, "skipping invalid pubkey");
+                return None;
+            }
+        };
+
+        // Fee recipient, gas limit, timestamp, and pubkey are local
+        // config under the configured genesis fork version, not a
+        // beacon-node body. The scope is `BeaconAdmission::unbound`.
+        // A missing scope still fails closed.
+        match signer::with_beacon_admission(
+            signer::BeaconAdmission::unbound(),
+            self.signer.sign_builder_registration(&registration, &pk, self.genesis_fork_version),
+        )
+        .await
+        {
+            // Wire boundary: eth_types::Signature is Vec<u8> for JSON serde.
+            Ok(signature) => Some(SignedValidatorRegistration {
+                message: registration,
+                signature: signature.to_bytes().to_vec(),
+            }),
+            Err(e) => {
+                error!(
+                    pubkey = hex::encode(pubkey),
+                    error = %e,
+                    "failed to sign builder registration"
+                );
+                None
+            }
+        }
+    }
+
+    /// POST `registrations` in the configured batches, trying every batch.
+    ///
+    /// Each accepted batch is cached as soon as it lands, so a round cut by a
+    /// caller's timeout keeps the batches it sent.
+    async fn send_batches(&self, registrations: &[SignedValidatorRegistration]) -> BatchReport {
+        if registrations.is_empty() {
+            return BatchReport { failed: 0, total: 0 };
+        }
         let total_count = registrations.len();
         tracing::Span::current().record("builder.batch_size", total_count);
 
@@ -251,8 +412,8 @@ impl BuilderService {
             self.registration_batch_size
         };
 
-        let mut successful_registrations = Vec::new();
-        let mut batch_failures = 0u64;
+        let mut successful = 0;
+        let mut batch_failures = 0;
         let chunks: Vec<&[SignedValidatorRegistration]> =
             registrations.chunks(effective_batch_size).collect();
         let num_batches = chunks.len();
@@ -264,12 +425,9 @@ impl BuilderService {
             "submitting builder registrations in batches"
         );
 
-        for (i, chunk) in chunks.iter().enumerate() {
+        for (i, chunk) in chunks.into_iter().enumerate() {
             if i > 0 && self.registration_batch_delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    self.registration_batch_delay_ms,
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(self.registration_batch_delay_ms)).await;
             }
 
             let start = Instant::now();
@@ -283,7 +441,11 @@ impl BuilderService {
                         duration_ms = duration_ms,
                         "registration batch sent"
                     );
-                    successful_registrations.extend_from_slice(chunk);
+                    successful += chunk.len();
+                    let mut cache = self.cache.write().await;
+                    for reg in chunk {
+                        cache.insert(reg.message.pubkey, CachedRegistration::new(reg.clone()));
+                    }
                 }
                 Err(e) => {
                     batch_failures += 1;
@@ -301,26 +463,12 @@ impl BuilderService {
 
         info!(
             total = total_count,
-            successful = successful_registrations.len(),
+            successful = successful,
             batch_failures = batch_failures,
             "registration batching complete"
         );
 
-        // Update cache for successfully submitted registrations
-        {
-            let mut cache = self.cache.write().await;
-            for reg in &successful_registrations {
-                cache.insert(
-                    reg.message.pubkey,
-                    CachedRegistration {
-                        fee_recipient: reg.message.fee_recipient,
-                        gas_limit: reg.message.gas_limit,
-                    },
-                );
-            }
-        }
-
-        Ok(())
+        BatchReport { failed: batch_failures, total: num_batches }
     }
 
     #[tracing::instrument(name = "builder.prepare_proposers", skip_all, fields(epoch = epoch))]
@@ -886,6 +1034,8 @@ mod tests {
 
     struct MockSigner {
         fail_sign: bool,
+        /// Builder registrations for these keys fail until [`Self::heal`].
+        fail_for: Mutex<HashSet<[u8; 48]>>,
         sign_calls: Mutex<Vec<[u8; 48]>>,
         /// Fixed valid BLS signature for wire-boundary assertions.
         sig: crypto::Signature,
@@ -896,6 +1046,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 fail_sign: false,
+                fail_for: Mutex::new(HashSet::new()),
                 sign_calls: Mutex::new(Vec::new()),
                 sig: crypto::SecretKey::generate().sign(b"mock-builder-reg"),
                 auth_sk: None,
@@ -905,6 +1056,15 @@ mod tests {
         fn with_sign_error(mut self) -> Self {
             self.fail_sign = true;
             self
+        }
+
+        fn with_sign_error_for(self, pubkey: [u8; 48]) -> Self {
+            self.fail_for.lock().insert(pubkey);
+            self
+        }
+
+        fn heal(&self) {
+            self.fail_for.lock().clear();
         }
 
         fn with_auth_key(mut self, sk: crypto::SecretKey) -> Self {
@@ -925,7 +1085,7 @@ mod tests {
             pubkey: &PublicKey,
             _fork_version: [u8; 4],
         ) -> Result<crypto::Signature, SignerError> {
-            if self.fail_sign {
+            if self.fail_sign || self.fail_for.lock().contains(&pubkey.to_bytes()) {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
@@ -1161,6 +1321,7 @@ mod tests {
         assert!(!pubkeys.contains(&pk3));
     }
 
+    /// Old-path guard until W4-E6a: a failed batch still returns `Ok` and caches nothing.
     #[tokio::test]
     async fn test_register_validators_beacon_error_continues() {
         let pk = gen_pubkey_bytes();
@@ -1179,6 +1340,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    /// Old-path guard until W4-E6a: every signature failing still returns `Ok`, no POST.
     #[tokio::test]
     async fn test_register_validators_sign_error_skips_validator() {
         let pk1 = gen_pubkey_bytes();
@@ -1199,6 +1361,7 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    /// Old-path guard until W4-E6a: an unchanged cached key is not re-sent.
     #[tokio::test]
     async fn test_register_validators_caches_and_skips_unchanged() {
         let pk = gen_pubkey_bytes();
@@ -1516,6 +1679,7 @@ mod tests {
         assert_eq!(calls[0].len(), 5);
     }
 
+    /// Old-path guard until W4-E6a: a failed batch still returns `Ok`; only accepted batches are cached.
     #[tokio::test]
     async fn test_batching_partial_failure_continues_remaining() {
         // Fail batch index 1 (second batch). Batches 0 and 2 should succeed.
@@ -1594,6 +1758,451 @@ mod tests {
         );
         assert_eq!(service.registration_batch_size, 0);
         assert_eq!(service.registration_batch_delay_ms, 0);
+    }
+
+    // --- submit_epoch_registrations (W4-E5) ---
+
+    fn builder_keys_store(n: usize) -> (Vec<[u8; 48]>, Arc<ValidatorStore>) {
+        let pks: Vec<[u8; 48]> = (0..n).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> = pks
+            .iter()
+            .map(|pk| (*pk, true, Some(test_fee_recipient(0xab)), Some(30_000_000)))
+            .collect();
+        (pks, Arc::new(test_store_with_builder_validators(&validators)))
+    }
+
+    fn by_key(
+        call: &[SignedValidatorRegistration],
+    ) -> HashMap<[u8; 48], SignedValidatorRegistration> {
+        call.iter().map(|r| (r.message.pubkey, r.clone())).collect()
+    }
+
+    fn sent_keys(call: &[SignedValidatorRegistration]) -> HashSet<[u8; 48]> {
+        call.iter().map(|r| r.message.pubkey).collect()
+    }
+
+    fn key_set(pks: &[[u8; 48]]) -> HashSet<[u8; 48]> {
+        pks.iter().copied().collect()
+    }
+
+    fn signatures_for(signer: &MockSigner, pk: &[u8; 48]) -> usize {
+        signer.sign_calls.lock().iter().filter(|signed| *signed == pk).count()
+    }
+
+    async fn cached_keys(service: &BuilderService) -> HashSet<[u8; 48]> {
+        service.cache.read().await.keys().copied().collect()
+    }
+
+    fn update(
+        store: &ValidatorStore,
+        pk: &[u8; 48],
+        update: validator_store::ValidatorConfigUpdate,
+    ) {
+        store.update_config(pk, update).unwrap();
+    }
+
+    fn builder_flag(on: bool) -> validator_store::ValidatorConfigUpdate {
+        validator_store::ValidatorConfigUpdate { builder_proposals: Some(on), ..Default::default() }
+    }
+
+    /// 654-AC2: no re-sign on an unchanged key; a fee or gas change re-signs only that key.
+    #[tokio::test]
+    async fn test_register_validators_resends_cached_without_resigning() {
+        let (pks, store) = builder_keys_store(3);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store.clone(), 0, 0);
+
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        {
+            let calls = bn.register_calls.lock();
+            assert_eq!(calls.len(), 2, "one POST per call");
+            assert_eq!(sent_keys(&calls[0]), key_set(&pks));
+            assert_eq!(by_key(&calls[1]), by_key(&calls[0]), "the second POST re-sends the first");
+        }
+        for pk in &pks {
+            assert_eq!(signatures_for(&signer, pk), 1, "exactly one signature per key");
+        }
+
+        let new_fee = test_fee_recipient(0xcd);
+        update(
+            &store,
+            &pks[0],
+            validator_store::ValidatorConfigUpdate {
+                fee_recipient: Some(Some(new_fee)),
+                ..Default::default()
+            },
+        );
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert_eq!(
+            pks.iter().map(|pk| signatures_for(&signer, pk)).collect::<Vec<_>>(),
+            vec![2, 1, 1],
+            "a fee change re-signs only that key"
+        );
+        {
+            let calls = bn.register_calls.lock();
+            assert_eq!(calls.len(), 3);
+            let third = by_key(&calls[2]);
+            assert_eq!(sent_keys(&calls[2]), key_set(&pks), "the third POST carries every key");
+            assert_eq!(third[&pks[0]].message.fee_recipient, new_fee);
+            assert_eq!(third[&pks[1]], by_key(&calls[0])[&pks[1]]);
+        }
+
+        update(
+            &store,
+            &pks[1],
+            validator_store::ValidatorConfigUpdate {
+                gas_limit: Some(Some(45_000_000)),
+                ..Default::default()
+            },
+        );
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert_eq!(
+            pks.iter().map(|pk| signatures_for(&signer, pk)).collect::<Vec<_>>(),
+            vec![2, 2, 1],
+            "a gas change re-signs only that key"
+        );
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(sent_keys(&calls[3]), key_set(&pks));
+        assert_eq!(by_key(&calls[3])[&pks[1]].message.gas_limit, 45_000_000);
+    }
+
+    /// 654-AC3 (unit): a failed batch is reported; the next call re-sends its cached signature.
+    #[tokio::test]
+    async fn test_registration_503_then_200_sends_at_next_call() {
+        let (pks, store) = builder_keys_store(1);
+        let bn = Arc::new(MockBn::new().with_register_error_on_calls(vec![0]));
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store, 0, 0);
+
+        let first = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+        assert!(
+            matches!(
+                first,
+                Err(BuilderServiceError::RegistrationBatchesFailed { failed: 1, total: 1 })
+            ),
+            "{first:?}"
+        );
+        assert_eq!(cached_keys(&service).await, key_set(&pks), "the failed batch stays cached");
+
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert_eq!(signer.sign_calls.lock().len(), 1, "0 new signatures at the second call");
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], calls[0], "the second POST carries the cached signature");
+    }
+
+    /// 654-AC9: every signature fails → `RegistrationSigningFailed`, no POST.
+    #[tokio::test]
+    async fn test_register_validators_errs_when_every_signature_fails() {
+        let (_pks, store) = builder_keys_store(2);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new().with_sign_error());
+        let service = build_service_with_batching(signer, bn.clone(), store, 0, 0);
+
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BuilderServiceError::RegistrationSigningFailed { failed: 2, total: 2 })
+            ),
+            "{result:?}"
+        );
+        assert!(bn.register_calls.lock().is_empty(), "nothing signed, nothing sent");
+        assert!(cached_keys(&service).await.is_empty());
+    }
+
+    /// 682-4: every batch is tried, the failed one is reported, and every key stays cached.
+    #[tokio::test]
+    async fn test_register_validators_errs_when_a_batch_fails() {
+        let (pks, store) = builder_keys_store(5);
+        let bn = Arc::new(MockBn::new().with_register_error_on_calls(vec![1]));
+        let service =
+            build_service_with_batching(Arc::new(MockSigner::new()), bn.clone(), store, 2, 0);
+
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BuilderServiceError::RegistrationBatchesFailed { failed: 1, total: 3 })
+            ),
+            "{result:?}"
+        );
+        let sizes: Vec<usize> = bn.register_calls.lock().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 2, 1], "all 3 batches attempted");
+        assert_eq!(cached_keys(&service).await, key_set(&pks), "all 5 keys cached");
+    }
+
+    /// 1 of 3 signatures fails: 2 sent, `RegistrationSigningFailed { 1, 3 }`; next call re-signs only that key.
+    #[tokio::test]
+    async fn test_partial_signing_failure_sends_the_rest_and_errs() {
+        let (pks, store) = builder_keys_store(3);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new().with_sign_error_for(pks[1]));
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store, 0, 0);
+
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+        assert!(
+            matches!(
+                result,
+                Err(BuilderServiceError::RegistrationSigningFailed { failed: 1, total: 3 })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sent_keys(&bn.register_calls.lock()[0]), key_set(&[pks[0], pks[2]]));
+
+        signer.heal();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert_eq!(
+            pks.iter().map(|pk| signatures_for(&signer, pk)).collect::<Vec<_>>(),
+            vec![1, 1, 1],
+            "only the failed key is signed at the next call"
+        );
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(sent_keys(&calls[1]), key_set(&pks));
+    }
+
+    /// 654-AC10 / 696-5: flag off → not in the next POST, not cached, not re-signed.
+    #[tokio::test]
+    async fn test_register_validators_evicts_key_whose_builder_flag_turned_off() {
+        let (pks, store) = builder_keys_store(2);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store.clone(), 0, 0);
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        update(&store, &pks[0], builder_flag(false));
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        assert_eq!(sent_keys(&bn.register_calls.lock()[1]), key_set(&[pks[1]]));
+        assert_eq!(cached_keys(&service).await, key_set(&[pks[1]]));
+        assert_eq!(signer.sign_calls.lock().len(), 2, "no key re-signed");
+    }
+
+    /// 654-AC11 / 696-5: flag back on with the same fee and gas → 1 new signature, key sent.
+    #[tokio::test]
+    async fn test_register_validators_reregisters_when_flag_turned_back_on() {
+        let (pks, store) = builder_keys_store(2);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store.clone(), 0, 0);
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        update(&store, &pks[0], builder_flag(false));
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        update(&store, &pks[0], builder_flag(true));
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        assert_eq!(signatures_for(&signer, &pks[0]), 2, "re-signed once after re-enable");
+        assert_eq!(signatures_for(&signer, &pks[1]), 1);
+        assert_eq!(cached_keys(&service).await, key_set(&pks));
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(sent_keys(&calls[2]), key_set(&pks));
+    }
+
+    /// A key disabled or deleted (not in `list_enabled_pubkeys`) is evicted and not sent.
+    #[tokio::test]
+    async fn test_disabled_key_is_evicted() {
+        let (pks, store) = builder_keys_store(3);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store.clone(), 0, 0);
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        store.set_enabled(&pks[0], false);
+        store.remove_validator(&pks[1]);
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        assert_eq!(sent_keys(&bn.register_calls.lock()[1]), key_set(&[pks[2]]));
+        assert_eq!(cached_keys(&service).await, key_set(&[pks[2]]));
+        assert_eq!(signer.sign_calls.lock().len(), 3, "no key re-signed");
+    }
+
+    /// No builder keys → `Ok`, no POST, and the cache is emptied.
+    #[tokio::test]
+    async fn test_no_builder_keys_is_ok_and_empties_the_cache() {
+        let bn = Arc::new(MockBn::new());
+        let empty = build_service_with_batching(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(ValidatorStore::new(test_fee_recipient(0xff), 30_000_000)),
+            0,
+            0,
+        );
+        empty.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert!(bn.register_calls.lock().is_empty());
+
+        let (pks, store) = builder_keys_store(1);
+        let bn = Arc::new(MockBn::new());
+        let service = build_service_with_batching(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            store.clone(),
+            0,
+            0,
+        );
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        assert_eq!(cached_keys(&service).await, key_set(&pks));
+
+        update(&store, &pks[0], builder_flag(false));
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        assert_eq!(bn.register_calls.lock().len(), 1, "no POST without builder keys");
+        assert!(cached_keys(&service).await.is_empty());
+    }
+
+    /// Gloas: `Ok`, no sign, no POST, also for a key cached before Gloas.
+    #[tokio::test]
+    async fn test_submit_epoch_registrations_skipped_at_gloas() {
+        let (_pks, store) = builder_keys_store(1);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::with_batching(
+            signer.clone(),
+            bn.clone(),
+            store,
+            GENESIS_FORK,
+            0,
+            0,
+            gloas_at(gloas_epoch),
+        );
+
+        service.submit_epoch_registrations(gloas_epoch).await.unwrap();
+        assert_eq!((signer.sign_calls.lock().len(), bn.register_calls.lock().len()), (0, 0));
+
+        service.submit_epoch_registrations(gloas_epoch - 1).await.unwrap();
+        assert_eq!((signer.sign_calls.lock().len(), bn.register_calls.lock().len()), (1, 1));
+
+        service.submit_epoch_registrations(gloas_epoch + 1).await.unwrap();
+        assert_eq!(
+            (signer.sign_calls.lock().len(), bn.register_calls.lock().len()),
+            (1, 1),
+            "a key cached before Gloas is not re-sent"
+        );
+    }
+
+    /// 654-AC5: 10 s plus one batch delay per batch after the first.
+    #[test]
+    fn test_registration_step_timeout_scales_with_batches() {
+        fn timeout_for(builder_keys: usize, batch_size: usize, delay_ms: u64) -> Duration {
+            let store = Arc::new(ValidatorStore::new(test_fee_recipient(0xff), 30_000_000));
+            // 400 enabled non-builder keys and 400 disabled builder keys are not counted.
+            for i in 0..builder_keys + 800 {
+                let mut pk = [0u8; 48];
+                pk[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                let mut config = ValidatorConfig::new(pk);
+                config.builder_proposals = i < builder_keys || i >= builder_keys + 400;
+                config.enabled = i < builder_keys + 400;
+                store.add_validator(config).unwrap();
+            }
+            build_service_with_batching(
+                Arc::new(MockSigner::new()),
+                Arc::new(MockBn::new()),
+                store,
+                batch_size,
+                delay_ms,
+            )
+            .registration_step_timeout()
+        }
+
+        assert_eq!(timeout_for(1_200, 500, 500), Duration::from_secs(11), "3 batches");
+        assert_eq!(timeout_for(1_000, 500, 500), Duration::from_millis(10_500), "2 batches");
+        assert_eq!(timeout_for(1_200, 0, 500), Duration::from_secs(10), "batch 0 is one batch");
+        assert_eq!(timeout_for(0, 500, 500), Duration::from_secs(10), "zero keys is one batch");
+        assert_eq!(
+            timeout_for(1_200, 500, u64::MAX),
+            Duration::from_secs(10) + Duration::from_millis(u64::MAX),
+            "saturates"
+        );
+    }
+
+    /// The second POST carries the first POST's signed timestamp; nothing is re-signed.
+    #[tokio::test]
+    async fn test_resend_keeps_the_original_signed_timestamp() {
+        let (pks, store) = builder_keys_store(1);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store, 0, 0);
+
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        let first = bn.register_calls.lock()[0][0].message.timestamp;
+        assert_eq!(bn.register_calls.lock()[1][0].message.timestamp, first);
+
+        // A re-sign inside the same wall-clock second repeats the timestamp, so age the
+        // cached registration by one epoch: a re-sign now could not carry that value.
+        let signed_earlier = first - 384;
+        service.cache.write().await.get_mut(&pks[0]).unwrap().signed.message.timestamp =
+            signed_earlier;
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        assert_eq!(bn.register_calls.lock()[2][0].message.timestamp, signed_earlier);
+        assert_eq!(signer.sign_calls.lock().len(), 1, "signed once across three calls");
+    }
+
+    /// A failed batch is reported ahead of a failed signature.
+    #[tokio::test]
+    async fn test_batch_failure_wins_over_signing_failure() {
+        let (pks, store) = builder_keys_store(2);
+        let bn = Arc::new(MockBn::new().with_register_error());
+        let signer = Arc::new(MockSigner::new().with_sign_error_for(pks[0]));
+        let service = build_service_with_batching(signer, bn.clone(), store, 0, 0);
+
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BuilderServiceError::RegistrationBatchesFailed { failed: 1, total: 1 })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sent_keys(&bn.register_calls.lock()[0]), key_set(&[pks[1]]));
+    }
+
+    /// A changed key whose re-sign fails is not re-sent with its old fee recipient.
+    #[tokio::test]
+    async fn test_failed_resign_does_not_resend_the_stale_registration() {
+        let (pks, store) = builder_keys_store(2);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer.clone(), bn.clone(), store.clone(), 0, 0);
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+
+        let new_fee = test_fee_recipient(0xcd);
+        update(
+            &store,
+            &pks[0],
+            validator_store::ValidatorConfigUpdate {
+                fee_recipient: Some(Some(new_fee)),
+                ..Default::default()
+            },
+        );
+        signer.fail_for.lock().insert(pks[0]);
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BuilderServiceError::RegistrationSigningFailed { failed: 1, total: 1 })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sent_keys(&bn.register_calls.lock()[1]), key_set(&[pks[1]]));
+        assert_eq!(cached_keys(&service).await, key_set(&[pks[1]]));
+
+        signer.heal();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
+        let calls = bn.register_calls.lock();
+        assert_eq!(by_key(&calls[2])[&pks[0]].message.fee_recipient, new_fee);
+        assert_eq!(sent_keys(&calls[2]), key_set(&pks));
     }
 
     // --- Gloas retirement + preferences broadcast ---
