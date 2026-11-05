@@ -14,7 +14,7 @@ use doppelganger::MonotonicEpochClock;
 use eth_types::SLOTS_PER_EPOCH;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::liveness_loop::merge_validator_indices;
@@ -37,7 +37,7 @@ pub struct IndexResolverDeps {
     pub key_gen_tx: watch::Sender<u64>,
     /// Wake signal for admission and for our own post-insert re-send.
     pub key_gen_rx: watch::Receiver<u64>,
-    /// Epoch source for the per-epoch tick and per-pubkey backoff.
+    /// Slot length for the wakes, and the epoch for the per-pubkey backoff.
     pub epoch_clock: Arc<MonotonicEpochClock>,
 }
 
@@ -55,15 +55,39 @@ pub struct ResolvePass {
     pub key_gen_after_write: u64,
     /// `key_gen` after the pass (incremented only when the set grew).
     pub key_gen_after: u64,
+    /// `get_validators` returned `Err`; [`IndexResolver::run`] retries at the next slot.
+    pub bn_error: bool,
+}
+
+/// Why a [`IndexResolver::run`] wake makes a BN pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassTrigger {
+    /// The pass before the first wait.
+    First,
+    /// The last `get_validators` returned `Err`.
+    Failed,
+    /// The map has keys and the registry holds none of them.
+    Empty,
+    /// One epoch has passed since the last pass.
+    EpochDue,
+}
+
+/// When the last pass started, and whether its `get_validators` failed.
+#[derive(Debug, Clone, Copy)]
+struct LastPass {
+    at: tokio::time::Instant,
+    bn_error: bool,
 }
 
 /// The single index writer (ADR-R05).
 ///
 /// Owns the shared registry, the live [`PubkeyMap`](crate::orchestrator::PubkeyMap),
 /// a beacon client, both ends of the `key_gen` watch, and the epoch clock.
-/// Wakes on `key_gen` and once per epoch, resolves pubkeys that are not yet in
-/// the registry, and merges them through [`merge_validator_indices`](crate::liveness_loop::merge_validator_indices).
-/// A pubkey that does not resolve is not queried again until the next epoch.
+/// Passes once at start, on every `key_gen` change, and on a slot wake that has
+/// a [`PassTrigger`]. A pass resolves pubkeys that are not yet in the registry
+/// and merges them through [`merge_validator_indices`](crate::liveness_loop::merge_validator_indices).
+/// A pubkey missing from an `Ok` answer is not queried again until the next
+/// epoch. A failed `get_validators` sets no backoff.
 /// When the merge grows the set, `key_gen` is re-sent **after** the registry
 /// write so duty-cache invalidation observes the new index.
 pub struct IndexResolver {
@@ -74,7 +98,7 @@ pub struct IndexResolver {
     key_gen_rx: watch::Receiver<u64>,
     epoch_clock: Arc<MonotonicEpochClock>,
     cancel: CancellationToken,
-    /// First epoch at which a missed pubkey may be queried again.
+    /// First epoch at which a pubkey missing from an `Ok` answer may be queried again.
     retry_at: HashMap<[u8; 48], u64>,
 }
 
@@ -104,55 +128,87 @@ impl IndexResolver {
     }
 
     /// Run until the process token is cancelled or `key_gen` senders are dropped.
+    ///
+    /// The first pass runs before the first wait. Each pass is one
+    /// `index.resolve.tick` span. A slot wake without a [`PassTrigger`] opens
+    /// no span and makes no BN call.
     pub async fn run(mut self) {
         info!("index resolver started");
         self.publish_gauge();
-        let interval = self.tick_interval();
-        let mut next_tick = tokio::time::Instant::now() + interval;
+        let epoch = self.tick_interval();
+        let slot = self.retry_interval();
+        let mut next_wake = tokio::time::Instant::now() + slot;
         // detached: process-lifetime loop root; the tick is the exported span.
         let loop_span = tracing::info_span!(parent: None, "index.resolve");
+        let mut last = self.traced_pass(&loop_span, Some(PassTrigger::First)).await;
         loop {
-            let tick = tracing::info_span!(parent: None, "index.resolve.tick");
-            tick.follows_from(&loop_span);
-            let stop = async {
-                let sleep_for = next_tick.saturating_duration_since(tokio::time::Instant::now());
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => {
-                        info!("index resolver cancelled");
-                        return true;
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    info!("index resolver cancelled");
+                    break;
+                }
+                changed = self.key_gen_rx.changed() => {
+                    if changed.is_err() {
+                        info!("index resolver stopping: key_gen sender dropped");
+                        break;
                     }
-                    changed = self.key_gen_rx.changed() => {
-                        if changed.is_err() {
-                            info!("index resolver stopping: key_gen sender dropped");
-                            return true;
-                        }
-                        self.finish_wake(self.epoch_clock.current_epoch()).await;
-                    }
-                    _ = tokio::time::sleep(sleep_for) => {
-                        next_tick = tokio::time::Instant::now() + interval;
-                        self.finish_wake(self.epoch_clock.current_epoch()).await;
+                    last = self.traced_pass(&loop_span, None).await;
+                }
+                _ = tokio::time::sleep_until(next_wake) => {
+                    next_wake = tokio::time::Instant::now() + slot;
+                    if let Some(trigger) = self.slot_trigger(last, epoch) {
+                        last = self.traced_pass(&loop_span, Some(trigger)).await;
                     }
                 }
-                false
-            }
-            .instrument(tick)
-            .await;
-            if stop {
-                break;
             }
         }
     }
 
     /// Per-epoch wake interval from the clock's slot duration.
     pub fn tick_interval(&self) -> Duration {
-        epoch_tick_interval(self.epoch_clock.slot_duration_ms())
+        slots_interval(self.epoch_clock.slot_duration_ms(), SLOTS_PER_EPOCH)
+    }
+
+    /// Per-slot wake interval, with the same bounds and cap as [`Self::tick_interval`].
+    pub fn retry_interval(&self) -> Duration {
+        slots_interval(self.epoch_clock.slot_duration_ms(), 1)
+    }
+
+    /// Why a slot wake makes a BN pass; `None` keeps the wake silent.
+    fn slot_trigger(&self, last: LastPass, epoch: Duration) -> Option<PassTrigger> {
+        if last.bn_error {
+            return Some(PassTrigger::Failed);
+        }
+        if last.at.elapsed() >= epoch {
+            return Some(PassTrigger::EpochDue);
+        }
+        let map = self.pubkey_map.read();
+        let registry = self.registry.read();
+        let empty = !map.is_empty() && map.keys().all(|pk| registry.index_of(pk).is_none());
+        empty.then_some(PassTrigger::Empty)
+    }
+
+    /// One pass under a fresh `index.resolve.tick` root that follows `loop_span`.
+    ///
+    /// `trigger` is `None` for a `key_gen` wake, which always passes.
+    async fn traced_pass(
+        &mut self,
+        loop_span: &tracing::Span,
+        trigger: Option<PassTrigger>,
+    ) -> LastPass {
+        let tick = tracing::info_span!(parent: None, "index.resolve.tick");
+        tick.follows_from(loop_span);
+        debug!(parent: &tick, ?trigger, "index resolver pass due");
+        let at = tokio::time::Instant::now();
+        let pass = self.finish_wake(self.epoch_clock.current_epoch()).instrument(tick).await;
+        LastPass { at, bn_error: pass.bn_error }
     }
 
     /// One resolve pass at `epoch`.
     ///
     /// Tests call this instead of sleeping for an epoch. Production [`Self::run`]
-    /// calls [`Self::finish_wake`] on each `key_gen` wake and on the per-epoch tick.
+    /// calls [`Self::finish_wake`] for every pass.
     ///
     /// Compiled only for this crate's tests or when the `test-utils` feature
     /// is enabled. Integration tests see it through the self dev-dependency.
@@ -166,8 +222,8 @@ impl IndexResolver {
     /// A growth re-send whose generation is still the value just written is marked
     /// seen so the next `select` does not call this again for that echo. A newer
     /// generation, or a pubkey that appeared during the in-flight `get_validators`,
-    /// is resolved in this same turn.
-    async fn finish_wake(&mut self, epoch: u64) {
+    /// is resolved in this same turn. Returns the last resolve.
+    async fn finish_wake(&mut self, epoch: u64) -> ResolvePass {
         loop {
             let map_before: HashSet<[u8; 48]> = self.pubkey_map.read().keys().copied().collect();
             let pass = self.resolve_at(epoch).await;
@@ -187,7 +243,7 @@ impl IndexResolver {
             let late =
                 self.unresolved_pubkeys(epoch).into_iter().any(|pk| !map_before.contains(&pk));
             if !newer && !late {
-                break;
+                return pass;
             }
         }
     }
@@ -203,6 +259,7 @@ impl IndexResolver {
                 len_after_write: len,
                 key_gen_after_write: key_gen,
                 key_gen_after: key_gen,
+                bn_error: false,
             };
         }
 
@@ -242,19 +299,21 @@ impl IndexResolver {
                     debug!(total = len_after_write, "index resolver pass added no indices");
                 }
                 let key_gen_after = *self.key_gen_tx.borrow();
-                ResolvePass { len_before, len_after_write, key_gen_after_write, key_gen_after }
+                ResolvePass {
+                    len_before,
+                    len_after_write,
+                    key_gen_after_write,
+                    key_gen_after,
+                    bn_error: false,
+                }
             }
             Err(e) => {
-                debug!(
+                warn!(
                     error = %e,
                     epoch,
                     count = unresolved.len(),
-                    "index resolver get_validators failed; backing off one epoch"
+                    "index resolver get_validators failed; retrying at the next slot"
                 );
-                let next_epoch = epoch.saturating_add(1);
-                for pk in &unresolved {
-                    self.retry_at.insert(*pk, next_epoch);
-                }
                 let len = self.registry.read().len();
                 self.publish_gauge();
                 let key_gen = *self.key_gen_tx.borrow();
@@ -263,6 +322,7 @@ impl IndexResolver {
                     len_after_write: len,
                     key_gen_after_write: key_gen,
                     key_gen_after: key_gen,
+                    bn_error: true,
                 }
             }
         }
@@ -286,11 +346,11 @@ impl IndexResolver {
     }
 }
 
-/// One epoch at the beacon-node slot length.
+/// `slots` slots at the beacon-node slot length.
 ///
 /// Zero is not a slot. A zero tick would spin the resolver, and assuming 12 s
 /// would be wrong on a longer slot. A zero duration waits indefinitely.
-fn epoch_tick_interval(slot_duration_ms: u64) -> Duration {
+fn slots_interval(slot_duration_ms: u64, slots: u64) -> Duration {
     // `Instant + Duration::MAX` panics. A zero or huge duration waits a day
     // instead of spinning or aborting the resolver.
     const CAP: Duration = Duration::from_secs(24 * 60 * 60);
@@ -299,7 +359,7 @@ fn epoch_tick_interval(slot_duration_ms: u64) -> Duration {
     {
         return CAP;
     }
-    let ms = SLOTS_PER_EPOCH.saturating_mul(slot_duration_ms);
+    let ms = slots.saturating_mul(slot_duration_ms);
     Duration::from_millis(ms).min(CAP)
 }
 
@@ -312,7 +372,7 @@ mod tests {
     use crate::config::{Config, ServiceBuilder};
     use crate::pubkey_index::PubkeyIndexRegistry;
     use beacon::{BeaconClient, BeaconError, ValidatorData, ValidatorInfo, ValidatorsResponse};
-    use bn_manager::{BnManager, MockBeaconNodeClient, OperationTimeouts};
+    use bn_manager::{BnManager, MockBeaconNodeClient, MockMethod, OperationTimeouts};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use slashing::SlashingDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -320,6 +380,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const GVR: eth_types::Root = [0x11u8; 32];
+    const SLOT: Duration = Duration::from_secs(12);
+    const EPOCH: Duration = Duration::from_secs(12 * SLOTS_PER_EPOCH);
 
     fn loaded_keys_with_pubkey(pk: crypto::PublicKey) -> crate::bootstrap::LoadedKeys {
         let mut map = HashMap::new();
@@ -418,11 +480,98 @@ mod tests {
                 beacon,
                 key_gen_tx: key_gen_tx.clone(),
                 key_gen_rx: key_gen_rx.clone(),
-                epoch_clock: Arc::new(MonotonicEpochClock::new(0, 12_000)),
+                epoch_clock: fixed_clock(),
             },
             CancellationToken::new(),
         );
         (resolver, registry, key_gen_tx, key_gen_rx)
+    }
+
+    /// Epoch 0 for 384 s of wall time, so a paused-clock test never crosses an epoch.
+    fn fixed_clock() -> Arc<MonotonicEpochClock> {
+        Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000))
+    }
+
+    fn unavailable() -> BeaconError {
+        BeaconError::ApiError { status: 503, message: "Service Unavailable".into() }
+    }
+
+    /// `run` on its own task. Cancel the token, then await the handle.
+    fn spawn_run(resolver: IndexResolver) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        (resolver.cancel.clone(), tokio::spawn(resolver.run()))
+    }
+
+    /// Offsets from `start` of the mock's `get_validators` calls (paused clock).
+    fn bn_calls(mock: &MockBeaconNodeClient, start: tokio::time::Instant) -> Vec<Duration> {
+        let stamps = mock.call_stamps().into_iter();
+        stamps
+            .filter(|stamp| stamp.method == MockMethod::GetValidators)
+            .map(|s| s.at - start)
+            .collect()
+    }
+
+    /// Passes spaced exactly one epoch apart: slot wakes in between stayed silent.
+    fn assert_one_pass_per_epoch(ticks: &[Duration]) {
+        assert!(ticks.len() >= 2, "two epochs need two passes: {ticks:?}");
+        assert!(
+            ticks.windows(2).all(|pair| pair[1] - pair[0] == EPOCH),
+            "one index.resolve.tick per epoch, none on a silent slot wake: {ticks:?}"
+        );
+    }
+
+    /// WARN events (prefixed with their span) and `index.resolve.tick` close instants.
+    #[derive(Clone, Default)]
+    struct ResolverLog {
+        warns: Arc<Mutex<Vec<String>>>,
+        ticks: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    impl ResolverLog {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn warns(&self) -> Vec<String> {
+            self.warns.lock().expect("warn log").clone()
+        }
+
+        fn ticks(&self, start: tokio::time::Instant) -> Vec<Duration> {
+            self.ticks.lock().expect("tick log").iter().map(|at| *at - start).collect()
+        }
+    }
+
+    struct FieldText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldText<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ResolverLog
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let span = ctx.event_span(event);
+                let mut line = span.map_or("<none>", |span| span.name()).to_string();
+                event.record(&mut FieldText(&mut line));
+                self.warns.lock().expect("warn log").push(line);
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if ctx.span(&id).is_some_and(|span| span.name() == "index.resolve.tick") {
+                self.ticks.lock().expect("tick log").push(tokio::time::Instant::now());
+            }
+        }
     }
 
     fn resolve_at_body() -> &'static str {
@@ -535,30 +684,230 @@ mod tests {
                 .await;
     }
 
-    #[tokio::test]
+    /// A key an `Ok` answer omits (pending activation) is asked once per epoch.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn unresolved_pubkey_is_retried_no_faster_than_one_epoch() {
         let (pk, _bytes, _hex) = fresh_key();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_c = Arc::clone(&calls);
-        let beacon = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |_pks| {
-            calls_c.fetch_add(1, Ordering::SeqCst);
-            Err(BeaconError::ApiError { status: 404, message: "not found".into() })
-        }));
+        let omits = |_| Ok(ValidatorsResponse { data: Vec::new() });
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(omits));
         let (mut resolver, _registry, key_gen_tx, _key_gen_rx) =
-            resolver_for(beacon, map_with(&pk));
+            resolver_for(mock.clone(), map_with(&pk));
+        let start = tokio::time::Instant::now();
 
-        resolver.drive_once_for_test(5).await;
+        assert!(!resolver.drive_once_for_test(5).await.bn_error, "an Ok answer is no failure");
         key_gen_tx.send_modify(|gen| *gen += 1);
         resolver.drive_once_for_test(5).await;
         resolver.drive_once_for_test(5).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            bn_calls(&mock, start).len(),
             1,
-            "a 404 pubkey is queried at most once per epoch, including extra key_gen wakes"
+            "an omitted pubkey is queried at most once per epoch, including extra key_gen wakes"
+        );
+        resolver.drive_once_for_test(6).await;
+        assert_eq!(bn_calls(&mock, start).len(), 2, "the same pubkey is retried next epoch");
+
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(omits));
+        let (resolver, _registry, key_gen_tx, _key_gen_rx) =
+            resolver_for(mock.clone(), map_with(&pk));
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+        tokio::time::sleep(SLOT + SLOT / 2).await;
+        key_gen_tx.send_modify(|gen| *gen += 1);
+        tokio::time::sleep_until(start + EPOCH + SLOT / 2).await;
+        assert_eq!(
+            bn_calls(&mock, start).len(),
+            1,
+            "run: the key_gen wake, the slot wakes and the epoch pass of one clock epoch \
+             ask no second time"
+        );
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// `run` passes the live clock epoch: an omitted key is asked again once the
+    /// clock enters the next epoch, and not before.
+    ///
+    /// The epoch clock reads std time, which paused tokio time does not move. So
+    /// the clock starts `MARGIN` before the epoch-1 boundary, the test runs the
+    /// epoch-0 slots under paused time, then blocks the thread past the boundary.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_asks_an_omitted_pubkey_again_when_the_clock_epoch_advances() {
+        const MARGIN: Duration = Duration::from_secs(2);
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let (pk, _bytes, _hex) = fresh_key();
+        let omits = |_| Ok(ValidatorsResponse { data: Vec::new() });
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(omits));
+        let (mut resolver, _registry, _tx, _rx) = resolver_for(mock.clone(), map_with(&pk));
+        let before_boundary_ms = u64::try_from((EPOCH - MARGIN).as_millis()).expect("ms");
+        let clock = Arc::new(MonotonicEpochClock::with_start_time_ms(
+            0,
+            std::time::Instant::now(),
+            before_boundary_ms,
+            12_000,
+        ));
+        resolver.epoch_clock = Arc::clone(&clock);
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        tokio::time::sleep_until(start + 2 * SLOT + SLOT / 2).await;
+        assert_eq!(clock.current_epoch(), 0, "precondition: epoch-0 slots ran within {MARGIN:?}");
+        assert_eq!(
+            bn_calls(&mock, start),
+            [Duration::ZERO],
+            "the Empty slot passes of epoch 0 ask no second time"
         );
 
-        resolver.drive_once_for_test(6).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "the same pubkey is retried on the next epoch");
+        std::thread::sleep(MARGIN);
+        assert_eq!(clock.current_epoch(), 1);
+        tokio::time::sleep_until(start + 4 * SLOT + SLOT / 2).await;
+        assert_eq!(
+            bn_calls(&mock, start),
+            [Duration::ZERO, 3 * SLOT],
+            "the first slot pass in clock epoch 1 asks again, then backs off to epoch 2"
+        );
+        assert_eq!(log.ticks(start), [0, 1, 2, 3, 4].map(|slot| slot * SLOT));
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// #655 AC2: a 503 at boot, then data. The index is in the registry within two slots.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_boot_503_resolves_indices_within_two_slots() {
+        let (pk, bytes, hex) = fresh_key();
+        let attempts = AtomicUsize::new(0);
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(unavailable());
+            }
+            let data = pks.iter().filter(|p| *p == &hex).map(|p| validator(p, "21")).collect();
+            Ok(ValidatorsResponse { data })
+        }));
+        let registry = PubkeyIndexRegistry::shared();
+        let (key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let start = tokio::time::Instant::now();
+        spawn_index_resolver(
+            IndexResolverDeps {
+                registry: Arc::clone(&registry),
+                pubkey_map: map_with(&pk),
+                beacon: mock.clone(),
+                key_gen_tx,
+                key_gen_rx,
+                epoch_clock: fixed_clock(),
+            },
+            &executor,
+        );
+
+        tokio::time::sleep(2 * SLOT).await;
+        let calls = bn_calls(&mock, start);
+        assert_eq!(registry.read().index_of(&bytes), Some("21"), "BN calls at {calls:?}");
+        assert_eq!(calls, [Duration::ZERO, SLOT], "the boot 503, then one retry a slot later");
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), executor.shutdown(TierBudget::default()))
+                .await;
+    }
+
+    /// #655 AC5: a failed pass warns once, with its epoch and key count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_pass_logs_a_warn() {
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let (pk, _, _) = fresh_key();
+        let mock = MockBeaconNodeClient::new().with_get_validators(|_| Err(unavailable()));
+        let (mut resolver, _registry, _tx, _rx) = resolver_for(Arc::new(mock), map_with(&pk));
+
+        let pass = resolver.drive_once_for_test(7).await;
+        assert!(pass.bn_error, "an Err answer marks the pass failed");
+        let warns = log.warns();
+        assert_eq!(warns.len(), 1, "one WARN per failed pass: {warns:?}");
+        for field in ["get_validators failed", "epoch=7", "count=1", "503"] {
+            assert!(warns[0].contains(field), "WARN lacks `{field}`: {warns:?}");
+        }
+    }
+
+    /// 503 forever: one BN call and one WARN per slot, with no per-key backoff.
+    ///
+    /// The registry already holds key A, so only a failure (not `Empty`) retries
+    /// key B, which arrives with a `key_gen` bump while the BN is down.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn persistent_error_retries_each_slot() {
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let (pk_a, bytes_a, _) = fresh_key();
+        let (pk_b, bytes_b, hex_b) = fresh_key();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let asked_c = Arc::clone(&asked);
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            asked_c.lock().expect("asked").push(pks);
+            Err(unavailable())
+        }));
+        let pubkey_map = map_with(&pk_a);
+        let (resolver, registry, key_gen_tx, _rx) =
+            resolver_for(mock.clone(), Arc::clone(&pubkey_map));
+        registry.write().insert(bytes_a, "1".to_string());
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        tokio::time::sleep(SLOT / 2).await;
+        pubkey_map.write().insert(bytes_b, pk_b);
+        key_gen_tx.send_modify(|gen| *gen += 1);
+        tokio::time::sleep_until(start + 3 * SLOT + SLOT / 2).await;
+        assert_eq!(bn_calls(&mock, start), [SLOT / 2, SLOT, 2 * SLOT, 3 * SLOT]);
+        assert!(asked.lock().expect("asked").iter().all(|pks| *pks == [hex_b.clone()]));
+        let warns = log.warns();
+        assert_eq!(warns.len(), 4, "one WARN per failed pass: {warns:?}");
+        assert!(
+            warns.iter().all(|line| line.starts_with("index.resolve.tick")
+                && line.contains("get_validators failed")),
+            "each failed pass warns inside its tick span: {warns:?}"
+        );
+        assert_eq!(registry.read().index_of(&bytes_b), None);
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// All keys resolved: one BN call, then one pass per epoch; slot wakes are silent.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn healthy_registry_keeps_the_epoch_tick() {
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let (pk, bytes, hex) = fresh_key();
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            let data = pks.iter().filter(|p| *p == &hex).map(|p| validator(p, "8")).collect();
+            Ok(ValidatorsResponse { data })
+        }));
+        let (resolver, registry, _tx, _rx) = resolver_for(mock.clone(), map_with(&pk));
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        tokio::time::sleep(2 * EPOCH + SLOT / 2).await;
+        let calls = bn_calls(&mock, start);
+        let ticks = log.ticks(start);
+        assert_eq!(registry.read().index_of(&bytes), Some("8"));
+        assert_eq!(calls.len(), 1, "later passes have nothing to ask: {calls:?}");
+        assert_eq!(ticks.first(), calls.first(), "the BN call is the first pass: {ticks:?}");
+        assert_one_pass_per_epoch(&ticks);
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// No keys: no BN call, and an empty map does not count as an empty registry.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn empty_map_makes_no_bn_call() {
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let omits = |_| Ok(ValidatorsResponse { data: Vec::new() });
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(omits));
+        let (resolver, _registry, _tx, _rx) = resolver_for(mock.clone(), empty_map());
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        tokio::time::sleep(2 * EPOCH + SLOT / 2).await;
+        assert_eq!(bn_calls(&mock, start), Vec::<Duration>::new());
+        assert_one_pass_per_epoch(&log.ticks(start));
+        cancel.cancel();
+        task.await.expect("resolver task");
     }
 
     #[tokio::test]
@@ -682,7 +1031,7 @@ mod tests {
     }
 
     /// Shape B on `IndexResolver::run`: each tick is a fresh root with exactly one
-    /// `follows_from` link, and N iterations close N tick spans.
+    /// `follows_from` link, and N passes close N tick spans.
     #[tokio::test(flavor = "current_thread")]
     async fn test_shape_b_tick_has_one_link_and_each_iteration_closes() {
         use opentelemetry::trace::TracerProvider as _;
@@ -740,12 +1089,14 @@ mod tests {
         let cancel = resolver.cancel.clone();
         let task = tokio::spawn(resolver.run());
 
-        for i in 1..N {
+        // The first pass closes tick 1 before any wake; each key_gen wake closes one more.
+        wait_for_completed_ticks(&spans, 1).await;
+        for i in 2..=N {
             key_gen_tx.send_modify(|gen| *gen += 1);
             wait_for_completed_ticks(&spans, i).await;
         }
+        // The cancel wake runs no pass, so it closes no tick.
         cancel.cancel();
-        wait_for_completed_ticks(&spans, N).await;
         task.await.expect("index resolver task");
 
         let recorded = spans.lock().expect("span log");
@@ -753,7 +1104,7 @@ mod tests {
         assert_eq!(
             ticks.len(),
             N,
-            "each iteration closes its span: {N} iterations must produce {N} completed \
+            "each pass closes its span: {N} passes must produce {N} completed \
              index.resolve.tick spans, not one span for the process; saw {:?}",
             recorded.iter().map(|span| span.name.as_ref()).collect::<Vec<_>>()
         );
@@ -831,6 +1182,49 @@ mod tests {
             },
             CancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn retry_interval_is_one_slot() {
+        use eth_types::{MAX_SLOT_DURATION_MS, MIN_SLOT_DURATION_MS};
+        assert_eq!(resolver_at(12_000).retry_interval(), SLOT);
+        assert_eq!(resolver_at(6_000).retry_interval(), Duration::from_secs(6));
+        assert_eq!(resolver_at(MIN_SLOT_DURATION_MS).retry_interval(), Duration::from_secs(1));
+        assert_eq!(resolver_at(MAX_SLOT_DURATION_MS).retry_interval(), Duration::from_secs(60));
+        let capped = Duration::from_secs(24 * 60 * 60);
+        for out_of_range in [0, MIN_SLOT_DURATION_MS - 1, MAX_SLOT_DURATION_MS + 1, u64::MAX] {
+            assert_eq!(resolver_at(out_of_range).retry_interval(), capped, "{out_of_range} ms");
+        }
+    }
+
+    /// A slot wake passes only after a failure, while the registry holds none of the
+    /// map's keys, or once an epoch has passed since the last pass.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slot_wake_passes_only_when_failed_empty_or_epoch_due() {
+        let (pk_a, bytes_a, _) = fresh_key();
+        let (pk_b, bytes_b, _) = fresh_key();
+        let pubkey_map = map_with(&pk_a);
+        pubkey_map.write().insert(bytes_b, pk_b);
+        let mock = Arc::new(MockBeaconNodeClient::new());
+        let (resolver, registry, _tx, _rx) = resolver_for(mock.clone(), pubkey_map);
+        let now = |bn_error| LastPass { at: tokio::time::Instant::now(), bn_error };
+        assert_eq!(resolver.slot_trigger(now(false), EPOCH), Some(PassTrigger::Empty));
+
+        registry.write().insert(bytes_a, "3".to_string());
+        assert_eq!(resolver.slot_trigger(now(false), EPOCH), None, "one of two keys resolved");
+        assert_eq!(resolver.slot_trigger(now(true), EPOCH), Some(PassTrigger::Failed));
+        let last = now(false);
+        tokio::time::advance(EPOCH - Duration::from_millis(1)).await;
+        assert_eq!(resolver.slot_trigger(last, EPOCH), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(resolver.slot_trigger(last, EPOCH), Some(PassTrigger::EpochDue));
+
+        let (no_keys, _registry, _tx, _rx) = resolver_for(mock, empty_map());
+        assert_eq!(
+            no_keys.slot_trigger(now(false), EPOCH),
+            None,
+            "no keys is not an empty registry"
+        );
     }
 
     #[test]

@@ -129,9 +129,16 @@ pub async fn wire_signing_enablement(
                 return Err(BootstrapError::IndexResolution(e.to_string()));
             }
         }
-    } else if let Ok(reg) = &resolve_result {
-        // Duty-tracker indices: keep successful resolution even when doppelganger is off.
-        pubkey_index.write().extend_from(reg);
+    } else {
+        match &resolve_result {
+            // Duty-tracker indices: keep successful resolution even when doppelganger is off.
+            Ok(reg) => pubkey_index.write().extend_from(reg),
+            Err(e) => warn!(
+                error = %e,
+                "validator index resolution failed at boot; \
+                 duties stay empty until the index resolver succeeds"
+            ),
+        }
     }
 
     if epoch0_bypass && doppelganger_enabled {
@@ -835,6 +842,134 @@ mod tests {
             ForwardWindowStatus::Safe,
             "register_for_import reaches Safe after 3 closed not-live epochs"
         );
+    }
+
+    /// WARN events as `target field=value…`, for one test.
+    struct Warns(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct WarnText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for WarnText<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut line = event.metadata().target().to_string();
+                event.record(&mut WarnText(&mut line));
+                self.0.lock().expect("warn log").push(line);
+            }
+        }
+    }
+
+    /// `mock_beacon` whose `validators` route answers 503.
+    async fn mock_beacon_validators_503() -> (MockServer, BeaconHandles) {
+        let (server, beacon) = mock_beacon(0).await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        (server, beacon)
+    }
+
+    /// #655 AC5: a boot `get_validators` error with doppelganger off warns, and boot goes on.
+    #[tokio::test]
+    async fn boot_get_validators_err_with_doppelganger_off_warns() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (_server, beacon) = mock_beacon_validators_503().await;
+        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let warns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = tracing_subscriber::registry().with(Warns(Arc::clone(&warns)));
+        let guard = tracing::subscriber::set_default(capture);
+
+        let handles = wire_signing_enablement(
+            &base_config(false),
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        )
+        .await
+        .expect("a boot get_validators error with doppelganger off does not stop boot");
+        drop(guard);
+
+        assert!(handles.pubkey_index.read().is_empty());
+        let warns = warns.lock().expect("warn log").clone();
+        let named: Vec<_> = warns
+            .iter()
+            .filter(|line| line.starts_with("rvc::") && line.contains("index resolver"))
+            .collect();
+        assert_eq!(named.len(), 1, "one rvc WARN naming the resolver: {warns:?}");
+        assert!(
+            named[0].contains(
+                "validator index resolution failed at boot; \
+                 duties stay empty until the index resolver succeeds"
+            ) && named[0].contains(" error="),
+            "{named:?}"
+        );
+        executor.token().cancel();
+    }
+
+    /// With doppelganger off, a boot `Ok` answer still fills the registry.
+    #[tokio::test]
+    async fn boot_indices_with_doppelganger_off_reach_the_registry() {
+        let (server, beacon) = mock_beacon(0).await;
+        let pk = SecretKey::generate().public_key();
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "index": "5",
+                    "status": "active_ongoing",
+                    "validator": { "pubkey": pubkey_bytes_to_0x(&pk.to_bytes()) }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let handles = wire_signing_enablement(
+            &base_config(false),
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        )
+        .await
+        .expect("doppelganger-off boot");
+        assert_eq!(handles.pubkey_index.read().index_of(&pk.to_bytes()), Some("5"));
+        executor.token().cancel();
+    }
+
+    /// The same boot error with doppelganger on and keys present still fails closed.
+    #[tokio::test]
+    async fn boot_get_validators_err_with_doppelganger_on_fails_closed() {
+        let (_server, beacon) = mock_beacon_validators_503().await;
+        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let result = wire_signing_enablement(
+            &base_config(true),
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        )
+        .await;
+        assert!(matches!(result, Err(BootstrapError::IndexResolution(_))));
+        executor.token().cancel();
     }
 
     /// BN `SLOT_DURATION_MS=6000` and genesis 10 epochs ago at 6 s slots.
