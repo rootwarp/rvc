@@ -351,7 +351,7 @@ sequenceDiagram
     Orch->>Sync: produce_contributions(slot, duties, head_root)
     Sync->>BNM: submit_contribution_and_proofs(proofs)
 
-    Note over Clock,Builder: Post-duty (epoch boundary only)
+    Note over Clock,Builder: Post-duty (epoch boundary only)<br/>EpochBoundaryRunner::run_pending: BreakerReset → ReorgCheck → PrepareProposers → CommitteeSubscriptions (E, then E+1)
     Orch->>Builder: register_validators (with jitter)
 ```
 

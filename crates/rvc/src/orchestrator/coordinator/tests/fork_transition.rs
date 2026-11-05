@@ -2745,7 +2745,7 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
 
     orchestrator.duty_tracker.fetch_proposer_duties(gloas_epoch).await.unwrap();
 
-    orchestrator.duty_management.on_epoch_boundary(fulu_epoch, fulu_slot).await;
+    orchestrator.epoch_boundary.run_pending(fulu_slot).await;
     orchestrator.run_builder_epoch_boundary(fulu_epoch).await;
 
     let after_69 = mock_server.received_requests().await.unwrap();
@@ -2801,7 +2801,7 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         .await;
 
     orchestrator.clock.set_slot(gloas_slot);
-    orchestrator.duty_management.on_epoch_boundary(gloas_epoch, gloas_slot).await;
+    orchestrator.epoch_boundary.run_pending(gloas_slot).await;
     orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
 
     let after_70 = mock_server.received_requests().await.unwrap();

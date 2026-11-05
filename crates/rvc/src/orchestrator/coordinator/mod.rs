@@ -35,6 +35,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
+use super::epoch_boundary::EpochBoundaryRunner;
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
@@ -459,6 +460,8 @@ where
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
     pub(crate) duty_management: Arc<DutyManagementService>,
+    /// Boundary steps run from the slot-0 post-duty tail.
+    pub(crate) epoch_boundary: EpochBoundaryRunner,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -624,7 +627,7 @@ where
             validator_store.clone(),
         );
 
-        let duty_management = DutyManagementService::new(
+        let duty_management = Arc::new(DutyManagementService::new(
             signer,
             beacon.clone(),
             duty_tracker.clone(),
@@ -632,7 +635,9 @@ where
             pubkey_map.clone(),
             pubkey_index.clone(),
             config.clone(),
-        );
+        ));
+        let epoch_boundary =
+            EpochBoundaryRunner::new(Arc::clone(&duty_management), circuit_breaker.clone());
 
         let sync_enabled = Arc::new(AtomicBool::new(true));
 
@@ -650,7 +655,8 @@ where
             aggregation_service,
             sync_committee_service,
             payload_attestation_service,
-            duty_management: Arc::new(duty_management),
+            duty_management,
+            epoch_boundary,
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
@@ -904,18 +910,11 @@ where
                     .await;
 
                 if should_register {
-                    self.circuit_breaker.reset_epoch(current_epoch);
-                    self.update_circuit_breaker_metrics();
-                    info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
-
                     let epoch_span =
                         info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                    let proposer_root_changed = self
-                        .duty_management
-                        .on_epoch_boundary(current_epoch, current_slot)
-                        .instrument(epoch_span)
-                        .await;
-                    if proposer_root_changed {
+                    let pass =
+                        self.epoch_boundary.run_pending(current_slot).instrument(epoch_span).await;
+                    if pass.proposer_root_changed {
                         self.on_proposer_dependent_root_changed(current_epoch).await;
                     }
 
