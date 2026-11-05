@@ -87,12 +87,15 @@ proposer node is admitted. When a proposer pool is configured, the block
 fence watches both revocation generations, including when that pool has no
 admitted node. Produce still asks whichever pool is admitted when the block
 is requested, so a proposer node granted after that fence can be asked. If
-either watched generation moves before the header is signed, the candidate
-is dropped and the header is not signed. A parent-capture fence that no
-longer holds signs no RANDAO. With no proposer pool, the fence watches only
-the main generation. The proposer sync monitor publishes health tiers for
-admitted proposer endpoints on the same one-epoch interval. An empty list
-builds no proposer pool.
+either watched generation moves before the signer's last check before BLS
+(for the header, after the slashing-protection reservation), the header is
+not signed. A BLS call already started is not stopped. For Gloas, a move
+before the signer's entry check for the envelope drops the envelope; a move
+after that check, or after it is signed, does not stop its publish. A
+parent-capture fence that no longer holds signs no RANDAO. With no proposer
+pool, the fence watches only the main generation. The proposer sync monitor
+publishes health tiers for admitted proposer endpoints on the same one-epoch
+interval. An empty list builds no proposer pool.
 
 #### Server Options
 
@@ -246,7 +249,8 @@ log_level = "info"
 # pool. Empty builds no pool. No admitted proposer node uses beacon_nodes.
 # The block fence watches that pool's revocation generation even when it is
 # empty. Produce may still ask a node granted later. If either watched
-# generation moves before the header is signed, the candidate is dropped.
+# generation moves before the signer's last check before BLS, the block is
+# not signed; a BLS call already started is not stopped.
 # proposer_nodes = ["http://proposer:5052"]
 
 # Keymanager API
@@ -375,6 +379,8 @@ The password for each keystore is resolved in this order:
 A secret that is unreadable, has the wrong mode, or does not decrypt its
 keystore aborts startup. The error names the file and does not print the
 password. A secret with no keystore is a warning.
+
+If a keystore for a key with an import secret changes while rvc is starting (for example, a copy into `keystore_path` is still running), startup aborts with `keystore directory changed during boot` and names the secret file. Let the copy finish, then restart.
 
 Existing password files that use only `pubkey=password` lines keep working
 unchanged — the wildcard is purely additive.
@@ -605,6 +611,7 @@ clearing. The command also resets `.rvc.doppelganger_record` in place to
 restart-skip. That forced window stays in force until every key loaded on
 that boot has finished one. The first key to finish does not clear it for
 the others.
+A key deleted mid-window through the keymanager API keeps `.rvc.doppelganger_force_window` until a forward window completes.
 
 ```bash
 rvc doppelganger clear-detection --datadir /var/lib/rvc/keystores --confirm

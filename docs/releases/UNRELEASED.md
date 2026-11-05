@@ -170,7 +170,7 @@ Import writes a keystore as `0x` plus the lowercase pubkey hex plus `.json`. Sta
 
 A `*.json` file with any other name is a keystore only when it validates, or when it has a pubkey and a `crypto` field and validation fails. A file that only carries the pubkey and a `version` does not block startup. That secret is a warning, the same as a secret with no keystore file. A valid keystore under another name, such as `keystore-<hex>.json`, still loads. If that file loads the key, an empty `0x<pk>.json` for the same pubkey does not fail startup. An unreadable canonical file is recorded with the same invalid mark, and a valid file for that pubkey is kept. A canonical file whose body validates as a different pubkey is corrupt for the name in the filename.
 
-DELETE writes the deletion denylist after it tries to remove the import secret, including when that removal fails. A loaded key stays in the signing registry until secret removal and the denylist write both succeed, so the DELETE can be retried. A restart skips a key that is on the denylist. A failure to remove the keystore JSON returns before the denylist write. The keystore directory is not fsynced on DELETE.
+DELETE writes the deletion denylist after it tries to remove the import secret, including when that removal fails. A loaded key stays in the signing registry until secret removal and the denylist write both succeed, so the DELETE can be retried. A restart skips a key that is on the denylist. A failure to remove the keystore JSON returns before the denylist write. DELETE now also fsyncs the keystore directory: see "Keystore: fsync the denylist dir on first create and the keystore dir on DELETE, plus the #798 leftovers" below.
 
 After an import-secret file or a staged partial is removed, boot and DELETE fsync that secret directory. A later directory-entry error or a failed unlink does not skip that fsync when something was already removed. If the fsync also fails, the error keeps the first removal error and includes the fsync failure. A partial-cleanup error is attached to an earlier final-secret unlink error.
 
@@ -705,8 +705,19 @@ the main pool's revocation generation and the proposer pool's revocation
 generation, including when the proposer pool has no admitted node. Produce
 still asks whichever pool is admitted when the block is requested, so a
 proposer node granted after that fence can be asked. If either watched
-generation moves before the header is signed, the candidate is dropped and
-the header is not signed. Combining fences keeps every generation.
+generation moves before the signer's last check before BLS, the header is
+not signed. For a block header that check runs after the slashing-protection
+reservation, and the row reserved for the header is deleted (it is kept if
+that delete fails). A BLS call that has already started is not stopped. For
+Gloas, a move before the signer's entry check for the execution payload
+envelope drops the envelope; a move after that check, or after it is signed,
+does not stop its publish. A key that doppelganger detection has already
+closed when a check runs reports `signing blocked by doppelganger gate`,
+even when its beacon-node admission also moved. In the `rvc-signer` library,
+the signing gate (`SigningGate`) reports an admission refusal as its own error,
+`beacon node admission revoked`, not as a doppelganger block. The `rvc-signer`
+server installs an admission that always holds, so its responses do not
+change. Combining fences keeps every generation.
 `rvc_bn_admitted` and `rvc_bn_health_tier` carry a `pool` label (`main` or
 `proposer`), so one URL configured in both pools does not share a series.
 The proposer sync monitor publishes health tiers for admitted proposer
@@ -1044,3 +1055,48 @@ These changes can stop a start, refuse a command, or change a response or a file
 6. **A secret id is treated as immutable.** Section: "Secret-provider refresh: cache secret id → pubkey per provider, so a known opaque id is not fetched and decrypted every cycle". A key rotated under the same secret id is picked up at the next restart, so restart rvc after such a rotation.
 
 The slashing changes need no operator action. An interchange that holds a slot or epoch above `i64::MAX` is rejected with HTTP 400, and values that already wrapped are not migrated. The off-runtime decrypts and the `reload_config` changes need no operator action either.
+
+## Slashing: one EIP-3076 evaluator for stage and group commit, and the staged sign path test-only
+
+Slashing protection now refuses an attestation whose source epoch is above its target epoch on every signing path, including the signer-server reserve and stage paths (`SourceExceedsTarget`, the same check as Lighthouse). Before, the VC filtered this case before signing, but the signer-server HTTP, gRPC and DVT peer paths accepted a request with a source epoch above its target and recorded it. Such a request now fails with `412 Precondition Failed` on HTTP (`slashing protection violation: attestation slashable: source epoch S is above target epoch T`) and `FAILED_PRECONDITION` on the signer-server gRPC sign path and the DVT peer path, and no history row is written. Importing an EIP-3076 interchange that contains such a record is unchanged. Release builds of `rvc-signer` no longer compile the retired `stage_then_sign` / `StagedRow` path. It exists only for tests (`test-utils`), which changes no runtime behaviour.
+
+## Keystore: fsync the denylist dir on first create and the keystore dir on DELETE, plus the #798 leftovers
+
+DELETE `/eth/v1/keystores` now fsyncs the keystore directory on every call, after it removes the key's files and the import password and before it writes the deletion denylist. The DELETE that creates `.rvc.deleted_keys` (the first one) also fsyncs that file's directory. Before this, a power loss right after the first DELETE could leave the keystore file on disk without the denylist file, and the key loaded again at the next start. If either fsync fails, DELETE reports `error`, the denylist entry is still written, and a loaded key stays loaded so the DELETE can be retried; the retry fsyncs again.
+
+Startup now aborts with `keystore directory changed during boot` when, for a key with an import password in `.rvc.keymanager-secrets`, the keystore directory changed while startup was loading keys (or the secrets directory appeared during startup). The error names the secret file. This can happen when keystores are still being copied into the keystore directory while rvc starts: let the copy finish and restart. Startup also checks import passwords when the keystore loader itself fails, so a corrupt or unloaded imported keystore aborts startup instead of starting without validators.
+
+## Key backends: reject a pubkey loaded in another backend; remote add/delete take the shared tracked-keys lock
+
+Keymanager API: `POST /eth/v1/remotekeys` and `POST /eth/v1/keystores` now return `duplicate` for a pubkey that is already loaded in another key backend (a local key, an HTTP remote signer or a gRPC remote signer). Before this, a locally loaded key could also be imported as a remote key. Deleting that remote entry then dropped the local key's doppelganger forward-window state (and could delete the force-window file that `clear-detection` writes) and removed the key from the duty set until restart. Remote key import and delete now take the same lock as keystore import and delete.
+
+## Signer: a syn-based signing-duty source pin, and the attester selection proof gets its own rejection label
+
+**Metrics: attester selection-proof rejections have their own label.** On the validator client, a classified backend rejection of an attester selection proof (aggregation slot) is now counted in `rvc_signer_rejections_total` with `sign_type="aggregation_slot"`. A classified rejection is an unsupported signing type or an unsupported version. Before this change it was counted under `sign_type="sync_aggregator_selection_data"`, together with sync-committee selection proofs, so the two duties could not be told apart. Sync-committee selection proofs keep `sync_aggregator_selection_data`. The set of `sign_type` values is unchanged. A query or alert that relied on `sync_aggregator_selection_data` to see attester selection-proof rejections must also select `sign_type="aggregation_slot"`. The signer-server's signing gate applies the same labels, but it records them in a process-global registry that `rvc-signer`'s `:9101` endpoint does not export (this is not changed here), so `:9101` shows no change. The `:9101` `rvc_signer_rejections_total`, fed by the HTTP decode path, already used `aggregation_slot` for `AGGREGATION_SLOT` requests.
+
+## Doppelganger: deleting a forced key mid-window keeps the force-window file until a window completes
+
+**Doppelganger: deleting a key no longer releases the doppelganger force window.** After `rvc doppelganger clear-detection`, `.rvc.doppelganger_force_window` was removed as soon as the last key loaded under it was deleted through the keymanager API (local keystore or remote key), even though no forward window had completed. The next start could then restart-skip. The file is now removed only when a forward window completes, no key loaded on that boot is still in its window, and no detection latch is set. If the only such key is deleted and no other key completes a window before the next start, that start runs one more full forward window.
+
+## Signer: test the production missing-scope rule for every duty, and state the real admission boundary in the docs
+
+This change's operator text replaces the fence sentence in the proposer-pool admission paragraph of "Slot duration comes from the beacon node" above, so the admission boundary is stated once: the last check before BLS, the reserved header row, the Gloas envelope, the doppelganger report when admission also moved, and the separate `SigningGate` admission error.
+
+## Keystore passwords: EIP-2335 NFKD and control-character processing in encrypt/decrypt, raw-bytes fallback
+
+**Keystore passwords follow EIP-2335 (NFKD).** rvc, `rvc-keygen` and `rvc-signer` now normalise every keystore password to NFKD and remove the C0 (U+0000–U+001F), DEL (U+007F) and C1 (U+0080–U+009F) control characters before key derivation, as EIP-2335 requires. Keystores made by other EIP-2335 tools with a non-ASCII or control-character password now load, and keystores rvc writes with such a password load elsewhere. ASCII passwords without control characters are unaffected.
+
+Keystores that an earlier rvc wrote with such a password still open: when the processed password does not match, rvc tries the unprocessed bytes once and, on success, logs one warning per load that names the keystore (truncated pubkey, or uuid) and says "re-encrypt this keystore with the same password". A wrong password that processing changes now costs two key derivations before it is reported, which makes boot and import slower only in that failure case.
+
+Encrypting a keystore now refuses a password that is not valid UTF-8 or is empty after processing (`Invalid password: not UTF-8`, `Invalid password: empty after EIP-2335 processing`). This applies to `rvc-signer split-key --output-password`. `rvc-keygen`'s 8-character minimum for a new keystore now counts the processed password, in UTF-8 bytes. `rvc-keygen exit` no longer applies a minimum length to the keystore's password, and asks for it once instead of twice.
+
+## W4.2 migration: behaviour changes and operator actions
+
+These changes can stop a start, refuse a command, or change a response or a metric label that a script reads. Each item names the section above that describes it.
+
+1. **Keystore passwords are processed as EIP-2335 requires.** Section: "Keystore passwords: EIP-2335 NFKD and control-character processing in encrypt/decrypt, raw-bytes fallback". When rvc logs "re-encrypt this keystore with the same password", re-encrypt the keystore it names with the same password. Encrypting a keystore, including `rvc-signer split-key --output-password`, refuses a password that is not valid UTF-8 or is empty after processing. `rvc-keygen`'s 8-character minimum for a new keystore counts the processed password, in UTF-8 bytes.
+2. **Startup aborts when the keystore directory changes while it loads a key with an import password.** Section: "Keystore: fsync the denylist dir on first create and the keystore dir on DELETE, plus the #798 leftovers". When startup aborts with `keystore directory changed during boot`, let the copy into the keystore directory finish, then restart. A corrupt or unloaded imported keystore now aborts startup instead of starting without validators.
+3. **Keymanager import returns `duplicate` for a pubkey already loaded in another key backend.** Section: "Key backends: reject a pubkey loaded in another backend; remote add/delete take the shared tracked-keys lock". `POST /eth/v1/remotekeys` and `POST /eth/v1/keystores` return `duplicate` for a pubkey that is already loaded in another key backend (a local key, an HTTP remote signer or a gRPC remote signer), so a script that imports one pubkey into a second backend gets `duplicate`.
+4. **Attester selection-proof rejections have their own metric label.** Section: "Signer: a syn-based signing-duty source pin, and the attester selection proof gets its own rejection label". A query or alert that relied on `sync_aggregator_selection_data` to see attester selection-proof rejections must also select `sign_type="aggregation_slot"`.
+
+These need no operator action. The signer-server refuses an attestation whose source epoch is above its target epoch (HTTP 412, gRPC and DVT peer `FAILED_PRECONDITION`); the validator client never sends one, and importing an interchange that holds such a record is unchanged. A key deleted mid-window keeps the doppelganger force window, so the next start can run one more full forward window. The admission boundary text and the `SigningGate` admission error change no setting or `rvc-signer` server response.
