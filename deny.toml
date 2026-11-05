@@ -60,6 +60,12 @@ ignore = [
     # and combines them.
     # Review by 2027-01-26.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing variability. The fix is >=0.7.6, and elliptic-curve 0.13 and vsss-rs 5.3 do not depend on it. bls12_381_plus uses it only to convert and encode, and blst signs." },
+
+    # pin-utils: unmaintained (RUSTSEC-2026-0441). Transitive through hyper 1.8
+    # (axum, reqwest, tonic, hyper-util). Reachable in production builds.
+    # Do not bump hyper/axum only for this advisory.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained. hyper 1.x depends on it. Transitive only, no direct use." },
 ]
 
 [sources]

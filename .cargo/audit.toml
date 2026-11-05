@@ -45,4 +45,11 @@ ignore = [
     # and combines them.
     # Review by 2027-01-26.
     "RUSTSEC-2026-0387",
+
+    # pin-utils: unmaintained (RUSTSEC-2026-0441). Transitive through hyper 1.8
+    # (axum, reqwest, tonic, hyper-util). Reachable in production builds.
+    # Do not bump hyper/axum only for this advisory. pin-utils is unmaintained.
+    # hyper 1.x depends on it. Transitive only, no direct use.
+    # Review by 2027-01-26.
+    "RUSTSEC-2026-0441",
 ]
