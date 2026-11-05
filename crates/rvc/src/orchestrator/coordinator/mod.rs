@@ -14,7 +14,7 @@ use tracing::{debug, error, field, info, info_span, warn, Instrument};
 use async_trait::async_trait;
 use block_service::{BeaconBlockClient, BlockService, BuilderConfig, BuilderConfigProvider};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator};
-use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
+use builder::{legacy_proposer_ops_retired, BuilderService};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
@@ -35,14 +35,14 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
-use super::epoch_boundary::EpochBoundaryRunner;
+use super::epoch_boundary::{EpochBoundaryRunner, PreferenceBroadcaster};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
 use super::slot_anchor::SlotAnchor;
 use super::slot_context::{fetch_head_root, SlotContext};
 use super::sync_committee::SyncCommitteeService;
-use super::utils::{self, TimedOutcome};
+use super::utils::TimedOutcome;
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
 
 /// Shared, dynamically-updatable public key map.
@@ -462,6 +462,8 @@ where
     pub(crate) duty_management: Arc<DutyManagementService>,
     /// Boundary steps run from the slot-0 post-duty tail.
     pub(crate) epoch_boundary: EpochBoundaryRunner,
+    /// Shared with [`Self::epoch_boundary`] for the slot-0 builder block.
+    preferences: Arc<PreferenceBroadcaster>,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -636,8 +638,18 @@ where
             pubkey_index.clone(),
             config.clone(),
         ));
-        let epoch_boundary =
-            EpochBoundaryRunner::new(Arc::clone(&duty_management), circuit_breaker.clone());
+        let preferences = Arc::new(PreferenceBroadcaster::new(
+            builder_service.clone(),
+            duty_tracker.clone(),
+            pubkey_map.clone(),
+            validator_store.clone(),
+            config.genesis_validators_root,
+        ));
+        let epoch_boundary = EpochBoundaryRunner::new(
+            Arc::clone(&duty_management),
+            circuit_breaker.clone(),
+            Arc::clone(&preferences),
+        );
 
         let sync_enabled = Arc::new(AtomicBool::new(true));
 
@@ -657,6 +669,7 @@ where
             payload_attestation_service,
             duty_management,
             epoch_boundary,
+            preferences,
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
@@ -912,11 +925,7 @@ where
                 if should_register {
                     let epoch_span =
                         info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                    let pass =
-                        self.epoch_boundary.run_pending(current_slot).instrument(epoch_span).await;
-                    if pass.proposer_root_changed {
-                        self.on_proposer_dependent_root_changed(current_epoch).await;
-                    }
+                    self.epoch_boundary.run_pending(current_slot).instrument(epoch_span).await;
 
                     if self.builder_service.is_some() {
                         let jitter = Duration::from_secs(BuilderService::jitter_seconds());
@@ -982,85 +991,13 @@ where
                 Err(e) => warn!(error = %e, "Builder registration failed (non-fatal)"),
             }
         }
-        self.broadcast_preferences(current_epoch).await;
+        self.preferences.broadcast_preferences(current_epoch).await;
     }
 
     /// Re-broadcast preferences after a proposer `dependent_root` change.
-    ///
-    /// Call when [`DutyTracker::cache_proposer_duties`] returns `true`.
+    #[cfg(test)]
     pub(crate) async fn on_proposer_dependent_root_changed(&self, current_epoch: u64) {
-        self.broadcast_preferences(current_epoch).await;
-    }
-
-    async fn broadcast_preferences(&self, current_epoch: u64) {
-        let Some(bs) = &self.builder_service else {
-            return;
-        };
-        let proposals = self.upcoming_proposals(current_epoch).await;
-        match bs
-            .broadcast_proposer_preferences(
-                current_epoch,
-                &proposals,
-                &self.config.genesis_validators_root,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Proposer preferences broadcast failed (non-fatal)"),
-        }
-        match bs.broadcast_builder_preferences(current_epoch, &proposals).await {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Builder preferences broadcast failed (non-fatal)"),
-        }
-    }
-
-    /// Local signing-enabled proposer duties for the current and next epoch.
-    async fn upcoming_proposals(&self, current_epoch: u64) -> Vec<UpcomingProposal> {
-        let mut out = Vec::new();
-        for epoch in [current_epoch, current_epoch.saturating_add(1)] {
-            out.extend(self.proposals_for_epoch(epoch).await);
-        }
-        out
-    }
-
-    async fn proposals_for_epoch(&self, epoch: u64) -> Vec<UpcomingProposal> {
-        let dependent_root = match self.duty_tracker.get_cached_proposer_dependent_root(epoch).await
-        {
-            Some(hex) => match eth_types::canonical::gvr_hex::parse_gvr_hex(&hex) {
-                Ok(root) => root,
-                Err(e) => {
-                    warn!(
-                        epoch,
-                        error = %e,
-                        "Invalid proposer dependent_root; skipping preferences"
-                    );
-                    return Vec::new();
-                }
-            },
-            None => {
-                debug!(epoch, "No cached proposer dependent_root for preferences");
-                return Vec::new();
-            }
-        };
-
-        let mut out = Vec::new();
-        for offset in 0..SLOTS_PER_EPOCH {
-            let slot = epoch.saturating_mul(SLOTS_PER_EPOCH).saturating_add(offset);
-            let Some(duty) = self.duty_tracker.get_proposer_duty(slot).await else {
-                continue;
-            };
-            let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) else {
-                continue;
-            };
-            let pubkey = pk.to_bytes();
-            if !self.validator_store.is_signing_enabled(&pubkey) {
-                continue;
-            }
-            let validator_index = duty.validator_index;
-            let proposal_slot = duty.slot;
-            out.push(UpcomingProposal { pubkey, validator_index, proposal_slot, dependent_root });
-        }
-        out
+        self.preferences.on_proposer_dependent_root_changed(current_epoch).await;
     }
 
     /// Bounded proposer-only fetch when the current epoch cache is empty.
