@@ -3,8 +3,9 @@
 //! [`EpochBoundaryRunner::run_pending`] runs every step of the slot's epoch
 //! that has not run yet, in [`BoundaryStep`] order, and marks each step done
 //! after one attempt. The epoch summary is logged once per epoch, after the
-//! last step. The slot loop calls it from the post-duty tail of slot 0 of
-//! each epoch, under the `epoch.boundary` span.
+//! last step. [`EpochBoundaryTask::run`] calls it on its own task
+//! ([`TASK_NAME`]) after each slot the slot loop processed, while that
+//! slot's epoch has a step pending. Each pass is a root `epoch.boundary` span.
 //!
 //! # Step order
 //!
@@ -24,7 +25,9 @@
 //!
 //! The progress mutex is taken only between steps and is never held across
 //! an `.await`, so `run_pending(&self)` can run inside a future that borrows
-//! the runner shared.
+//! the runner shared. Outside tests, only [`EpochBoundaryTask::run`] calls
+//! `run_pending`, and it awaits each pass before the next wake, so one pass
+//! runs at a time.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -34,13 +37,69 @@ use duty_tracker::DutyTracker;
 use eth_types::{Root, Slot};
 use signer::CircuitBreakerState;
 use timing::SLOTS_PER_EPOCH;
-use tracing::{debug, info, warn};
+use tokio::sync::watch;
+use tracing::{debug, info, info_span, warn, Instrument};
 use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
 use super::duty_management::DutyManagementService;
 use super::utils;
+
+/// Executor task name. The runner's loop span has the same name.
+pub const TASK_NAME: &str = "epoch.boundary.runner";
+
+/// The runner on its own task, woken by each slot the slot loop processed.
+pub struct EpochBoundaryTask {
+    runner: Arc<EpochBoundaryRunner>,
+    slots: watch::Receiver<Option<Slot>>,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl EpochBoundaryTask {
+    pub(crate) fn new(
+        runner: Arc<EpochBoundaryRunner>,
+        slots: watch::Receiver<Option<Slot>>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        Self { runner, slots, shutdown }
+    }
+
+    /// Runs the pending steps at each processed slot until shutdown.
+    ///
+    /// Returns when the shutdown watch reads `true` or loses its sender, or
+    /// when the processed-slot sender is dropped (the slot loop is gone). A
+    /// wake reads the latest slot, so wakes during a pass coalesce. A pass in
+    /// flight is not raced against shutdown.
+    pub async fn run(mut self) {
+        let loop_span = info_span!(parent: None, "epoch.boundary.runner");
+        loop {
+            tokio::select! {
+                biased;
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() || *self.shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
+                changed = self.slots.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let Some(slot) = *self.slots.borrow_and_update() else {
+                        continue;
+                    };
+                    if !self.runner.has_pending(slot) {
+                        continue;
+                    }
+                    let epoch = slot / SLOTS_PER_EPOCH;
+                    let pass = info_span!(parent: None, "epoch.boundary", epoch, slot);
+                    pass.follows_from(&loop_span);
+                    self.runner.run_pending(slot).instrument(pass).await;
+                }
+            }
+        }
+    }
+}
 
 /// One boundary step. Declaration order is run order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,6 +172,20 @@ impl EpochBoundaryRunner {
         }
     }
 
+    /// Whether a step of `slot`'s epoch has not run yet.
+    ///
+    /// An epoch before the progress epoch has nothing pending.
+    pub(crate) fn has_pending(&self, slot: Slot) -> bool {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        match self.progress.lock().as_ref() {
+            Some(current) if current.epoch > epoch => false,
+            Some(current) if current.epoch == epoch => {
+                BoundaryStep::ALL.iter().any(|step| !current.done.contains(step))
+            }
+            _ => true,
+        }
+    }
+
     fn is_pending(&self, epoch: u64, step: BoundaryStep) -> bool {
         let mut progress = self.progress.lock();
         let current =
@@ -154,7 +227,9 @@ impl EpochBoundaryRunner {
 /// Picks local proposals and broadcasts proposer and builder preferences for them.
 ///
 /// One instance is shared by the runner's ReorgCheck and the slot-0 builder
-/// block.
+/// block. They run on different tasks, so two broadcasts can overlap. The
+/// broadcaster holds no mutable state; two overlapping broadcasts may each
+/// sign the same `(pubkey, slot)` once, and a duplicate POST is harmless.
 pub(crate) struct PreferenceBroadcaster {
     builder_service: Option<Arc<BuilderService>>,
     duty_tracker: Arc<DutyTracker>,
@@ -257,20 +332,26 @@ impl PreferenceBroadcaster {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, MockMethod};
+    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, MockMethod, Propagator};
     use builder::BuilderService;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use metrics::definitions::{RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES};
     use signer::{always_enabled, SignerService, ValidatorSigner};
     use slashing::SlashingDb;
+    use timing::MockSlotClock;
+    use tokio::task::JoinHandle;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
     use super::*;
     use crate::orchestrator::coordinator::tests::{
-        create_test_config, create_test_fork_schedule, m2_metric_lock,
+        create_mock_block_beacon, create_mock_validator_store, create_test_config,
+        create_test_fork_schedule, m2_metric_lock, MockBlockBeacon, MockSubmitter,
+        TEST_GENESIS_TIME,
     };
+    use crate::orchestrator::{DutyOrchestrator, OrchestratorDeps, OrchestratorHandle};
     use crate::pubkey_index::PubkeyIndexRegistry;
 
     const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -614,5 +695,110 @@ mod tests {
                 "seed, ReorgCheck E and E+1, re-broadcast, then subscriptions"
             );
         }
+    }
+
+    type TestOrchestrator = DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>;
+
+    /// An orchestrator with no validators over `beacon`.
+    fn orchestrator_over(beacon: MockBeaconNodeClient) -> (TestOrchestrator, OrchestratorHandle) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        let beacon = Arc::new(beacon);
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+        DutyOrchestrator::new(OrchestratorDeps::for_test(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            create_test_config(),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        ))
+    }
+
+    /// Spawns the runner of a fresh orchestrator whose slot loop never runs,
+    /// and checks that the runner waits.
+    async fn spawn_idle_runner() -> (TestOrchestrator, OrchestratorHandle, JoinHandle<()>) {
+        let (mut orchestrator, handle) = orchestrator_over(MockBeaconNodeClient::new());
+        let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+        assert!(orchestrator.take_epoch_boundary_runner().is_none(), "the runner is taken once");
+        tokio::time::advance(Duration::from_secs(12)).await;
+        assert!(!runner.is_finished(), "an idle runner keeps waiting");
+        (orchestrator, handle, runner)
+    }
+
+    async fn assert_ends(runner: JoinHandle<()>, arm: &str) {
+        tokio::time::timeout(Duration::from_secs(1), runner)
+            .await
+            .unwrap_or_else(|_| panic!("{arm}: the runner task must end"))
+            .expect("runner task");
+    }
+
+    /// The runner task cannot outlive `run`: it ends when the orchestrator
+    /// (the processed-slot sender) is dropped, and when the shutdown watch
+    /// flips or loses its sender while the runner is idle.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn runner_exits_when_run_returns() {
+        let (orchestrator, handle, runner) = spawn_idle_runner().await;
+        drop(orchestrator);
+        assert_ends(runner, "processed-slot sender dropped").await;
+        drop(handle);
+
+        let (orchestrator, handle, runner) = spawn_idle_runner().await;
+        handle.shutdown();
+        assert_ends(runner, "shutdown requested").await;
+        drop(orchestrator);
+
+        let (orchestrator, handle, runner) = spawn_idle_runner().await;
+        drop(handle);
+        assert_ends(runner, "shutdown sender dropped").await;
+        drop(orchestrator);
+    }
+
+    /// A pass parked in a slow step runs on the runner task, not in the slot
+    /// loop: shutdown still ends `run` at once, from its post-duty window.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_held_pass_does_not_hold_the_slot_loop() {
+        let _metrics = m2_metric_lock().await;
+        let held = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetProposerDuties, Duration::from_secs(3600));
+        let (mut orchestrator, handle) = orchestrator_over(held);
+        orchestrator.clock.set_slot(64);
+        orchestrator.clock.advance_time(9);
+        let runner_state = Arc::clone(&orchestrator.epoch_boundary);
+        let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+        let mut run = tokio::spawn(async move { orchestrator.run().await });
+
+        let parked_in_reorg_check = || {
+            runner_state.progress.lock().as_ref().is_some_and(|progress| {
+                progress.epoch == 2
+                    && progress.done.contains(&BoundaryStep::BreakerReset)
+                    && !progress.done.contains(&BoundaryStep::ReorgCheck)
+            })
+        };
+        let mut waited_ms = 0u64;
+        while !parked_in_reorg_check() && waited_ms < 2_000 {
+            waited_ms += 1;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(
+            parked_in_reorg_check(),
+            "the pass must be held in ReorgCheck; virtual ms {waited_ms}"
+        );
+
+        handle.shutdown();
+        let result = tokio::time::timeout(Duration::from_millis(1), &mut run)
+            .await
+            .expect("shutdown must end run while the runner's pass is held")
+            .expect("run task");
+        assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+        runner.await.expect("runner task");
     }
 }

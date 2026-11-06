@@ -387,6 +387,13 @@ pub async fn run(
         broadcast_drains.wait_for_broadcast_drains(block_publication).await;
     });
 
+    // Its own task, so the slot loop's post-duty window cannot drop a pass.
+    // Shape B: `EpochBoundaryTask::run` roots each pass span.
+    let Some(boundary) = orchestrator.take_epoch_boundary_runner() else {
+        return Err(BootstrapError::EpochBoundaryRunnerMissing);
+    };
+    executor.spawn("epoch.boundary.runner", ShutdownTier::Orchestrator, boundary.run());
+
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
     // detached: already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B.
     executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async move {
@@ -1376,6 +1383,44 @@ mod tests {
         assert!(connect_at < bind_at, "bind_required_listeners must follow connect_beacon");
         assert!(bind_at < keys_at, "bind_required_listeners must precede load_signing_keys");
         assert!(keys_at < orch_at, "load_signing_keys must precede the duty_orchestrator spawn");
+    }
+
+    /// W4-E2b: the epoch boundary runner is its own Orchestrator-tier executor
+    /// task, spawned before the slot loop. A missing runner fails boot with
+    /// [`BootstrapError::EpochBoundaryRunnerMissing`].
+    ///
+    /// The spawn passes the task name as a literal: the census scan rejects a
+    /// path argument such as `epoch_boundary::TASK_NAME`.
+    #[test]
+    fn runner_is_spawned_on_the_orchestrator_tier() {
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production body before tests");
+        let start = prod.find("pub async fn run(").expect("fn run");
+        let rest = &prod[start..];
+        let end = rest.find("pub(crate) struct ShutdownInputs").expect("end of run");
+        let run_fn = squash(&rest[..end]);
+
+        let take = squash(
+            "let Some(boundary) = orchestrator.take_epoch_boundary_runner() else {
+                return Err(BootstrapError::EpochBoundaryRunnerMissing);
+            };",
+        );
+        let spawn = format!(
+            "executor.spawn(\"{}\", ShutdownTier::Orchestrator, boundary.run());",
+            crate::orchestrator::epoch_boundary::TASK_NAME
+        );
+        let orchestrator =
+            "executor.spawn_result(\"duty_orchestrator\", ShutdownTier::Orchestrator,";
+
+        let take_at =
+            run_fn.find(&take).expect("a missing runner returns EpochBoundaryRunnerMissing");
+        let spawn_at = run_fn.find(&spawn).expect("the runner is spawned on the Orchestrator tier");
+        let orch_at = run_fn.find(orchestrator).expect("duty_orchestrator spawn");
+        assert_eq!(run_fn.matches("take_epoch_boundary_runner").count(), 1, "one take");
+        assert_eq!(run_fn.matches("boundary.run()").count(), 1, "one runner spawn");
+        assert!(take_at < spawn_at, "take the runner before spawning it");
+        assert!(spawn_at < orch_at, "spawn the runner before the duty_orchestrator task");
     }
 
     /// ARCH-2i: production body of run.rs must not hard-exit the process.

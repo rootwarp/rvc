@@ -333,20 +333,118 @@ fn first_index(log: &[&'static str], name: &str) -> Option<usize> {
     log.iter().position(|n| *n == name)
 }
 
-/// Span names in creation order.
-struct SpanNames {
-    names: Arc<ParkingMutex<Vec<String>>>,
+/// One span, in creation order.
+#[derive(Clone, Debug)]
+struct SpanRecord {
+    id: u64,
+    name: &'static str,
+    /// Parent span name. `None` for a root span.
+    parent: Option<&'static str>,
+    epoch: Option<u64>,
+    /// Virtual time from the layer's start to the span's creation.
+    created: Duration,
+    closed: bool,
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanNames {
+struct EpochField(Option<u64>);
+
+impl tracing::field::Visit for EpochField {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "epoch" {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// Spans in creation order, with parent, `epoch`, creation time and close.
+struct SpanNames {
+    spans: Arc<ParkingMutex<Vec<SpanRecord>>>,
+    start: tokio::time::Instant,
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanNames
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
-        _id: &Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
+        id: &Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        self.names.lock().push(attrs.metadata().name().to_string());
+        let parent = if attrs.is_root() {
+            None
+        } else if let Some(parent) = attrs.parent() {
+            ctx.span(parent).map(|span| span.name())
+        } else {
+            ctx.lookup_current().map(|span| span.name())
+        };
+        let mut epoch = EpochField(None);
+        attrs.record(&mut epoch);
+        self.spans.lock().push(SpanRecord {
+            id: id.into_u64(),
+            name: attrs.metadata().name(),
+            parent,
+            epoch: epoch.0,
+            created: self.start.elapsed(),
+            closed: false,
+        });
     }
+
+    fn on_close(&self, id: Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let id = id.into_u64();
+        if let Some(record) = self.spans.lock().iter_mut().rev().find(|r| r.id == id && !r.closed) {
+            record.closed = true;
+        }
+    }
+}
+
+const EPOCH_BOUNDARY: &str = "epoch.boundary";
+
+/// Boots at the start of `slot` with the runner task spawned beside `run`,
+/// and stops once a runner pass has closed, or after one slot of virtual time.
+///
+/// Also returns the aggregate deadline: the last phase of a pre-Gloas slot.
+async fn drive_boundary(slot: Slot) -> (Vec<SpanRecord>, Duration) {
+    let parts = build_proposal_first(ProposalFirstOpts {
+        slot,
+        seed_proposer: true,
+        seed_attester: false,
+        seed_sync: true,
+    })
+    .await;
+    let handle = parts.handle;
+    let mut orchestrator = parts.orchestrator;
+    // From the slot start the phases wait, so a pass that started before
+    // them would be created before the aggregate deadline.
+    orchestrator.clock.set_slot(slot);
+    let slot_ms = orchestrator.clock.slot_duration().as_millis() as u64;
+    let fork = ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &orchestrator.config.fork_schedule);
+    let aggregate_bps = orchestrator.config.deadline_schedule.for_fork(fork).aggregate;
+    let aggregate_due = Duration::from_millis(timing::due_ms(aggregate_bps, slot_ms));
+
+    let spans = Arc::new(ParkingMutex::new(Vec::new()));
+    let layer = SpanNames { spans: spans.clone(), start: tokio::time::Instant::now() };
+    let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    let pass_closed =
+        |spans: &[SpanRecord]| spans.iter().any(|s| s.name == EPOCH_BOUNDARY && s.closed);
+    let mut waited_ms = 0u64;
+    while !pass_closed(&spans.lock()) && waited_ms < slot_ms {
+        waited_ms += 10;
+        tokio::time::advance(Duration::from_millis(10)).await;
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+    let recorded = spans.lock().clone();
+    (recorded, aggregate_due)
 }
 
 /// `produceBlock` must be entered before the first `get_attester_duties`.
@@ -510,57 +608,33 @@ async fn test_proposal_still_happens_when_duty_fetches_stall() {
     );
 }
 
-/// Epoch-boundary prep runs after phase 3, only on boundary slots.
+/// Epoch-boundary prep runs on the runner task once the boot slot's phases
+/// are done, at any first slot of the epoch.
 ///
-/// RED at HEAD: `on_epoch_boundary` (span `epoch.boundary`) is entered before
-/// `slot.phase.block` / `slot.phase.aggregation`.
-#[tokio::test(flavor = "current_thread")]
+/// A boot at slot 65 (slot 64 was never processed) and a boot at slot 64 each
+/// record one root `epoch.boundary` pass for epoch 2. No `epoch.boundary` span
+/// is under `slot.process`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_epoch_boundary_prep_runs_in_the_post_duty_window() {
     let _metrics = m2_metric_lock().await;
-    async fn drive(slot: Slot) -> Vec<String> {
-        let parts = build_proposal_first(ProposalFirstOpts {
-            slot,
-            seed_proposer: true,
-            seed_attester: false,
-            seed_sync: true,
-        })
-        .await;
-        let handle = parts.handle;
-        let mut orchestrator = parts.orchestrator;
-
-        let captured = Arc::new(ParkingMutex::new(Vec::new()));
-        let layer = SpanNames { names: captured.clone() };
-        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            handle.shutdown();
-        });
-        let _ = orchestrator.run().await;
-        let names = captured.lock().clone();
-        names
+    for slot in [65, 64] {
+        let (spans, aggregate_due) = drive_boundary(slot).await;
+        let passes: Vec<&SpanRecord> = spans.iter().filter(|s| s.name == EPOCH_BOUNDARY).collect();
+        assert!(
+            passes.iter().all(|pass| pass.parent != Some("slot.process")),
+            "boot at {slot}: no epoch.boundary under slot.process; passes={passes:?}"
+        );
+        assert_eq!(passes.len(), 1, "boot at {slot}: one runner pass; spans={spans:?}");
+        let pass = passes[0];
+        assert_eq!(pass.parent, None, "boot at {slot}: the pass is a root span: {pass:?}");
+        assert_eq!(pass.epoch, Some(2), "boot at {slot}: the pass is for epoch 2: {pass:?}");
+        assert!(
+            pass.created >= aggregate_due,
+            "boot at {slot}: the pass starts after the slot's phases \
+             (created {:?}, aggregate due {aggregate_due:?})",
+            pass.created
+        );
     }
-
-    let boundary = drive(64).await;
-    let aggregation_at = boundary
-        .iter()
-        .position(|n| n == "slot.phase.aggregation")
-        .expect("phase 3 span must exist");
-    let epoch_at = boundary
-        .iter()
-        .position(|n| n == "epoch.boundary")
-        .expect("epoch-boundary prep must still run on a boundary slot");
-    assert!(
-        epoch_at > aggregation_at,
-        "on_epoch_boundary must run after phase 3; spans={boundary:?}"
-    );
-
-    let mid_epoch = drive(65).await;
-    assert!(
-        !mid_epoch.iter().any(|n| n == "epoch.boundary"),
-        "epoch-boundary prep must not run on a non-boundary slot; spans={mid_epoch:?}"
-    );
 }
 
 /// Which duties run is unchanged by the reorder — only when they run.

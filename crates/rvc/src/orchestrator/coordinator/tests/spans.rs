@@ -25,11 +25,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanCapture {
     }
 }
 
-/// Recorded span entry with name and optional parent span ID.
+/// Recorded span entry with name, optional parent span ID, and the spans it
+/// `follows_from`.
 #[derive(Debug, Clone)]
 struct SpanEntry {
     name: String,
     parent_id: Option<Id>,
+    follows_from: Vec<u64>,
 }
 
 /// A tracing layer that captures span names and parent-child relationships.
@@ -47,11 +49,30 @@ where
         id: &Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let parent_id = attrs.parent().cloned().or_else(|| ctx.current_span().id().cloned());
+        let parent_id = if attrs.is_root() {
+            None
+        } else {
+            attrs.parent().cloned().or_else(|| ctx.current_span().id().cloned())
+        };
         self.spans.lock().insert(
             id.into_u64(),
-            SpanEntry { name: attrs.metadata().name().to_string(), parent_id },
+            SpanEntry {
+                name: attrs.metadata().name().to_string(),
+                parent_id,
+                follows_from: Vec::new(),
+            },
         );
+    }
+
+    fn on_follows_from(
+        &self,
+        span: &Id,
+        follows: &Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(entry) = self.spans.lock().get_mut(&span.into_u64()) {
+            entry.follows_from.push(follows.into_u64());
+        }
     }
 }
 
@@ -197,6 +218,7 @@ async fn test_epoch_boundary_creates_epoch_span() {
         handle.shutdown();
     });
 
+    tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
     let _ = orchestrator.run().await;
 
     let span_names = captured.lock();
@@ -447,15 +469,19 @@ async fn test_phase_spans_are_children_of_slot_process() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_epoch_boundary_span_is_child_of_slot_process() {
+/// Each runner pass is a root `epoch.boundary` span with a `follows_from`
+/// link to the runner's `epoch.boundary.runner` loop span (shape B).
+///
+/// The runner is polled inside a caller span here, so a pass or loop span
+/// that inherited the current span would not be a root.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_epoch_boundary_span_is_a_root_span() {
     let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(32); // epoch boundary
     clock.advance_time(9);
 
-    let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
 
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
@@ -486,20 +512,48 @@ async fn test_epoch_boundary_span_is_child_of_slot_process() {
     let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        handle.shutdown();
-    });
+    let caller = tracing::info_span!("test.caller");
+    let runner = tokio::spawn(
+        orchestrator.take_epoch_boundary_runner().expect("runner").run().instrument(caller),
+    );
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    // Snapshot when the pass appears: tracing may reuse a closed span's id.
+    let mut waited_ms = 0u64;
+    let span_map = loop {
+        {
+            let map = spans.lock();
+            if map.values().any(|entry| entry.name == "epoch.boundary") || waited_ms >= 2_000 {
+                break map.clone();
+            }
+        }
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    };
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
 
-    let _ = orchestrator.run().await;
+    let named = |name: &str| -> Vec<(u64, SpanEntry)> {
+        span_map
+            .iter()
+            .filter(|(_, entry)| entry.name == name)
+            .map(|(id, entry)| (*id, entry.clone()))
+            .collect()
+    };
+    let loops = named("epoch.boundary.runner");
+    assert_eq!(loops.len(), 1, "one runner loop span; virtual ms {waited_ms}: {span_map:?}");
+    let (loop_id, loop_span) = &loops[0];
+    assert!(loop_span.parent_id.is_none(), "the loop span is a root span: {loop_span:?}");
 
-    let span_map = spans.lock();
-
-    let epoch_parent = find_parent_name(&span_map, "epoch.boundary");
+    let passes = named("epoch.boundary");
+    assert_eq!(passes.len(), 1, "one pass at the boundary slot: {span_map:?}");
+    let (_, pass) = &passes[0];
+    assert!(pass.parent_id.is_none(), "epoch.boundary must be a root span: {pass:?}");
     assert_eq!(
-        epoch_parent.as_deref(),
-        Some("slot.process"),
-        "epoch.boundary should be child of slot.process"
+        pass.follows_from,
+        vec![*loop_id],
+        "epoch.boundary must follow_from the epoch.boundary.runner loop span"
     );
 }
 

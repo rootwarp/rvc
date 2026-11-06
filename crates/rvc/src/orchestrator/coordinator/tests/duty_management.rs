@@ -1413,9 +1413,9 @@ impl SpanChains {
     }
 }
 
-/// The slot-0 post-duty tail runs the boundary steps under `epoch.boundary`,
-/// and a proposer `dependent_root` change seen by the reorg check
-/// re-broadcasts preferences from that tail.
+/// The runner task's pass at slot 0 runs the boundary steps under a root
+/// `epoch.boundary` span, and a proposer `dependent_root` change seen by the
+/// reorg check re-broadcasts preferences from that pass.
 ///
 /// `register_validators` is held in the mock, so the jitter block never
 /// reaches its own broadcast: the only preferences POST is the root-change one.
@@ -1462,6 +1462,7 @@ async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_
     let chains = SpanChains::default();
     let subscriber = tracing_subscriber::registry::Registry::default().with(chains.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
     let run = tokio::spawn(async move { orchestrator.run().await });
 
     let mut waited_ms = 0u64;
@@ -1472,6 +1473,7 @@ async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_
     handle.shutdown();
     let result = run.await.expect("run task");
     assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
 
     let prefs = mock.submit_proposer_preferences_calls();
     assert_eq!(prefs.len(), 1, "the root change must re-broadcast once; virtual ms {waited_ms}");
@@ -1487,15 +1489,15 @@ async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_
         assert!(!ancestors.is_empty(), "{step} span must be created");
         for chain in ancestors {
             assert!(
-                chain.ends_with(&["epoch.boundary", "slot.process"]),
-                "{step} must run under epoch.boundary: {chain:?}"
+                chain.ends_with(&["epoch.boundary"]),
+                "{step} must run under the root epoch.boundary span: {chain:?}"
             );
         }
     }
 }
 
-/// The slot-0 tail resets the circuit breaker passed in `OrchestratorDeps`,
-/// the same `Arc` the proposal path records misses on.
+/// The runner task's slot-0 pass resets the circuit breaker passed in
+/// `OrchestratorDeps`, the same `Arc` the proposal path records misses on.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_slot_zero_boundary_resets_the_deps_circuit_breaker() {
     use crate::orchestrator::block_proposal::publish_circuit_breaker_metrics;
@@ -1523,6 +1525,7 @@ async fn test_slot_zero_boundary_resets_the_deps_circuit_breaker() {
     let (mut orchestrator, handle) =
         DutyOrchestrator::new(OrchestratorDeps { circuit_breaker: Arc::clone(&breaker), ..deps });
     orchestrator.clock.advance_time(9);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
     let run = tokio::spawn(async move { orchestrator.run().await });
 
     let mut waited_ms = 0u64;
@@ -1533,6 +1536,7 @@ async fn test_slot_zero_boundary_resets_the_deps_circuit_breaker() {
     handle.shutdown();
     let result = run.await.expect("run task");
     assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
 
     assert!(
         !breaker.is_tripped(),

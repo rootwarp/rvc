@@ -8,7 +8,9 @@
 //! `submit_aggregate_and_proofs_completions`, taken when that future returns.
 //!
 //! Slots 33 through 64 stay pre-Electra (Electra is epoch 50 in the fixture).
-//! Slot 64 is the only epoch boundary, so committee subscriptions run once.
+//! The epoch boundary runner runs on its own task beside the slot loop. It
+//! sends committee subscriptions for the boot epoch at slot 33 and for epoch 2
+//! at slot 64, the only epoch boundary.
 
 mod common;
 
@@ -116,6 +118,8 @@ async fn aggregations_are_dispatched_concurrently() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let handle = &fixture.handle;
+    let runner =
+        tokio::spawn(fixture.orchestrator.take_epoch_boundary_runner().expect("runner").run());
     let run_fut = fixture.orchestrator.run();
     tokio::pin!(run_fut);
 
@@ -156,6 +160,7 @@ async fn aggregations_are_dispatched_concurrently() {
         }
     }
     assert!(shutdown_sent, "run returned before {SLOT_COUNT} aggregate slots were published");
+    runner.await.expect("runner task");
 
     let calls = client.submit_aggregate_and_proofs_calls();
     assert_eq!(
