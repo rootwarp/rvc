@@ -103,11 +103,13 @@ impl EpochDutyCache {
 struct ProposerEpochDutyCache {
     duties: HashMap<u64, TypedProposerDuty>,
     dependent_root: String,
+    /// Revocation generation captured before the request that produced `duties`.
+    fetched_gen: Option<u64>,
 }
 
 impl ProposerEpochDutyCache {
     fn new(dependent_root: String) -> Self {
-        Self { duties: HashMap::new(), dependent_root }
+        Self { duties: HashMap::new(), dependent_root, fetched_gen: None }
     }
 
     /// Parse proposer duties from a BN response into a slot-keyed epoch cache.
@@ -231,18 +233,50 @@ fn visible(stamp: Option<u64>, now: Option<u64>) -> bool {
     stamp == now
 }
 
-/// `epoch`'s attester entry when it is visible under `now`.
+/// A cache entry that carries the generation captured before its request.
+trait Stamped {
+    fn fetched_gen(&self) -> Option<u64>;
+}
+
+impl Stamped for EpochDutyCache {
+    fn fetched_gen(&self) -> Option<u64> {
+        self.fetched_gen
+    }
+}
+
+impl Stamped for ProposerEpochDutyCache {
+    fn fetched_gen(&self) -> Option<u64> {
+        self.fetched_gen
+    }
+}
+
+/// `epoch`'s entry when it is visible under `now`.
 ///
 /// A stale entry reads as absent.
-fn servable(
-    cache: &HashMap<u64, EpochDutyCache>,
-    epoch: u64,
-    now: Option<u64>,
-) -> Option<&EpochDutyCache> {
-    let entry = cache.get(&epoch).filter(|entry| visible(entry.fetched_gen, now));
+fn servable<E: Stamped>(cache: &HashMap<u64, E>, epoch: u64, now: Option<u64>) -> Option<&E> {
+    let entry = cache.get(&epoch).filter(|entry| visible(entry.fetched_gen(), now));
     #[cfg(test)]
     hooks::fire(&hooks::AFTER_STAMP_CHECK);
     entry
+}
+
+/// Insert `epoch`'s proposer duties stamped with `stamp`, under the write guard.
+///
+/// Returns `true` when a visible entry for `epoch` had another
+/// `dependent_root`: the signal to re-broadcast preferences.
+fn insert_proposer(
+    cache: &mut RwLockWriteGuard<'_, HashMap<u64, ProposerEpochDutyCache>>,
+    epoch: u64,
+    dependent_root: String,
+    duties: &[ProposerDuty],
+    stamp: FetchStamp,
+) -> bool {
+    let root_changed =
+        servable(cache, epoch, stamp.0).is_some_and(|c| c.dependent_root != dependent_root);
+    let (mut entry, _rejected) = ProposerEpochDutyCache::from_response(dependent_root, duties);
+    entry.fetched_gen = stamp.0;
+    cache.insert(epoch, entry);
+    root_changed
 }
 
 /// Test-only ordering hooks: each runs a closure at one interleaving point.
@@ -251,15 +285,17 @@ mod hooks {
     use std::cell::RefCell;
     use std::thread::LocalKey;
 
-    type Slot = RefCell<Option<Box<dyn FnMut()>>>;
+    pub(super) type Slot = RefCell<Option<Box<dyn FnMut()>>>;
 
     thread_local! {
         /// After a reader takes its guard, before it loads the generation.
         pub(super) static AFTER_READ_LOCK: Slot = const { RefCell::new(None) };
         /// After a reader's stamp check, still inside its guard.
         pub(super) static AFTER_STAMP_CHECK: Slot = const { RefCell::new(None) };
-        /// In `admit_attester`, after the re-check and before the insert.
+        /// In `admit_attester` and `admit_proposer`, after the re-check and before the insert.
         pub(super) static BEFORE_INSERT: Slot = const { RefCell::new(None) };
+        /// In `admit_proposer`, after it takes the write guard, before the re-check.
+        pub(super) static AFTER_WRITE_LOCK: Slot = const { RefCell::new(None) };
     }
 
     pub(super) fn fire(point: &'static LocalKey<Slot>) {
@@ -320,8 +356,8 @@ impl DutyTracker {
     /// static set.
     ///
     /// When `beacon` has a [`DutiesProvider::revocation_generation`], a
-    /// cached attester entry is served only while that generation equals the
-    /// one captured before the request that produced it.
+    /// cached attester or proposer entry is served only while that generation
+    /// equals the one captured before the request that produced it.
     pub fn new_with_source(
         beacon: Arc<dyn DutiesProvider>,
         index_source: Arc<dyn ValidatorIndexSource>,
@@ -360,6 +396,15 @@ impl DutyTracker {
         guard
     }
 
+    /// Read guard on the proposer cache. Every proposer reader starts here,
+    /// then checks the stamp while it holds the guard.
+    async fn proposer_read(&self) -> RwLockReadGuard<'_, HashMap<u64, ProposerEpochDutyCache>> {
+        let guard = self.proposer_cache.read().await;
+        #[cfg(test)]
+        hooks::fire(&hooks::AFTER_READ_LOCK);
+        guard
+    }
+
     fn generation_now(&self) -> Option<u64> {
         self.revocation.as_ref().map(|generation| generation.load(Ordering::Acquire))
     }
@@ -389,6 +434,30 @@ impl DutyTracker {
         entry.fetched_gen = stamp.0;
         cache.insert(epoch, entry);
         Ok(())
+    }
+
+    /// Insert proposer duties stamped with `stamp`, the only production
+    /// proposer insert path.
+    ///
+    /// The generation is re-loaded under the write guard. If it moved since
+    /// `stamp` was captured, nothing is inserted and the caller must not use
+    /// the answer. Otherwise returns [`insert_proposer`]'s root-change flag.
+    async fn admit_proposer(
+        &self,
+        epoch: u64,
+        dependent_root: String,
+        duties: &[ProposerDuty],
+        stamp: FetchStamp,
+    ) -> Result<bool, DutyTrackerError> {
+        let mut cache = self.proposer_cache.write().await;
+        #[cfg(test)]
+        hooks::fire(&hooks::AFTER_WRITE_LOCK);
+        if !visible(stamp.0, self.generation_now()) {
+            return Err(DutyTrackerError::RevokedDuringFetch { epoch });
+        }
+        #[cfg(test)]
+        hooks::fire(&hooks::BEFORE_INSERT);
+        Ok(insert_proposer(&mut cache, epoch, dependent_root, duties, stamp))
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Attestation.as_str()))]
@@ -615,10 +684,15 @@ impl DutyTracker {
         servable(&cache, epoch, now).map(|c| c.dependent_root.clone())
     }
 
-    /// Write proposer duties into the in-process cache.
+    /// Test-only: write proposer duties with no beacon node request.
     ///
-    /// Returns `true` when this epoch was already cached under a different
+    /// It stamps with the generation loaded inside its write guard, so the
+    /// entry is always current. Production writers capture the stamp before
+    /// their request and insert through `admit_proposer`.
+    ///
+    /// Returns `true` when a visible entry for this epoch had a different
     /// `dependent_root` — the signal to re-broadcast preferences.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn cache_proposer_duties(
         &self,
         epoch: u64,
@@ -626,11 +700,8 @@ impl DutyTracker {
         duties: &[ProposerDuty],
     ) -> bool {
         let mut cache = self.proposer_cache.write().await;
-        let root_changed = cache.get(&epoch).is_some_and(|c| c.dependent_root != dependent_root);
-        let (epoch_cache, _rejected) =
-            ProposerEpochDutyCache::from_response(dependent_root, duties);
-        cache.insert(epoch, epoch_cache);
-        root_changed
+        let stamp = self.fetch_stamp();
+        insert_proposer(&mut cache, epoch, dependent_root, duties, stamp)
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Block.as_str()))]
@@ -640,15 +711,14 @@ impl DutyTracker {
     ) -> Result<Vec<ProposerDuty>, DutyTrackerError> {
         debug!(epoch = epoch, "Fetching proposer duties for epoch");
 
+        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .get_proposer_duties(epoch, &self.fork_schedule)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        let _ = self
-            .cache_proposer_duties(epoch, response.dependent_root.clone(), &response.data)
-            .await;
+        self.admit_proposer(epoch, response.dependent_root.clone(), &response.data, stamp).await?;
 
         info!(epoch = epoch, count = response.data.len(), "Cached proposer duties for epoch");
 
@@ -663,8 +733,9 @@ impl DutyTracker {
     )]
     pub async fn get_proposer_duty(&self, slot: u64) -> Option<TypedProposerDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
-        let cache = self.proposer_cache.read().await;
-        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).cloned();
+        let cache = self.proposer_read().await;
+        let now = self.generation_now();
+        let result = servable(&cache, epoch, now).and_then(|c| c.get(&slot)).cloned();
         if result.is_some() {
             debug!(slot, epoch, cache_type = "proposer", "Cache hit");
         } else {
@@ -674,8 +745,9 @@ impl DutyTracker {
     }
 
     pub async fn get_cached_proposer_dependent_root(&self, epoch: u64) -> Option<String> {
-        let cache = self.proposer_cache.read().await;
-        cache.get(&epoch).map(|c| c.dependent_root.clone())
+        let cache = self.proposer_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).map(|c| c.dependent_root.clone())
     }
 
     #[tracing::instrument(name = "duty_tracker.check_proposer_reorg", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Block.as_str()))]
@@ -683,9 +755,12 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
+        let stamp = self.fetch_stamp();
+        // A stale entry counts as uncached.
         let cached_root = {
-            let cache = self.proposer_cache.read().await;
-            cache.get(&epoch).map(|c| c.dependent_root.clone())
+            let cache = self.proposer_read().await;
+            let now = self.generation_now();
+            servable(&cache, epoch, now).map(|c| c.dependent_root.clone())
         };
 
         if cached_root.is_none() {
@@ -707,17 +782,18 @@ impl DutyTracker {
                 "Proposer dependent root changed, refetching duties"
             );
 
-            let _ =
-                self.cache_proposer_duties(epoch, response.dependent_root, &response.data).await;
-            return Ok(true);
+            return self
+                .admit_proposer(epoch, response.dependent_root, &response.data, stamp)
+                .await;
         }
 
         Ok(false)
     }
 
     pub async fn is_proposer_epoch_cached(&self, epoch: u64) -> bool {
-        let cache = self.proposer_cache.read().await;
-        cache.contains_key(&epoch)
+        let cache = self.proposer_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).is_some()
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_ptc_duties", level = "debug", skip_all, fields(epoch =epoch))]
@@ -911,8 +987,11 @@ impl DutyTracker {
             let now = self.generation_now();
             servable(&cache, epoch, now).map_or(0, |c| c.duties.len())
         };
-        let proposer_count =
-            self.proposer_cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
+        let proposer_count = {
+            let cache = self.proposer_read().await;
+            let now = self.generation_now();
+            servable(&cache, epoch, now).map_or(0, |c| c.duties.len())
+        };
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         let sync_count =
             self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.duties.len());
@@ -3225,6 +3304,367 @@ mod tests {
         for reader in Reader::ALL {
             assert!(reader.hits(&tracker).await, "{reader:?} serves the entry after the refresh");
         }
+    }
+
+    // -- Revocation-stamped proposer cache (W4-E7c1) --
+
+    fn proposer_stamp_response(dependent_root: &str) -> ProposerDutiesResponse {
+        proposer_response(vec![(STAMP_SLOT, "1234", "0xpubkey_1234")], dependent_root)
+    }
+
+    /// The stored proposer entry for `STAMP_EPOCH`, stale or not: root and stamp.
+    async fn proposer_entry(tracker: &DutyTracker) -> Option<(String, Option<u64>)> {
+        let cache = tracker.proposer_cache.read().await;
+        cache.get(&STAMP_EPOCH).map(|entry| (entry.dependent_root.clone(), entry.fetched_gen))
+    }
+
+    fn entry(root: &str, generation: u64) -> Option<(String, Option<u64>)> {
+        Some((root.to_string(), Some(generation)))
+    }
+
+    /// A hook that bumps `generation` on its `nth` run (1-based).
+    fn bump_on_run(generation: &Arc<AtomicU64>, nth: usize) -> impl FnMut() + 'static {
+        let generation = Arc::clone(generation);
+        let mut runs = 0;
+        move || {
+            runs += 1;
+            if runs == nth {
+                bump(&generation);
+            }
+        }
+    }
+
+    /// The proposer readers that take the proposer cache's read guard.
+    #[derive(Debug, Clone, Copy)]
+    enum ProposerReader {
+        Duty,
+        DependentRoot,
+        IsEpochCached,
+        DutyCounts,
+    }
+
+    impl ProposerReader {
+        const ALL: [Self; 4] =
+            [Self::Duty, Self::DependentRoot, Self::IsEpochCached, Self::DutyCounts];
+
+        /// Which run of a read-path hook is this reader's proposer guard.
+        /// `cached_duty_counts` takes the attester guard first.
+        fn proposer_run(self) -> usize {
+            match self {
+                Self::DutyCounts => 2,
+                _ => 1,
+            }
+        }
+
+        /// Whether this reader serves the proposer entry cached for `STAMP_EPOCH`.
+        async fn hits(self, tracker: &DutyTracker) -> bool {
+            match self {
+                Self::Duty => tracker.get_proposer_duty(STAMP_SLOT).await.is_some(),
+                Self::DependentRoot => {
+                    tracker.get_cached_proposer_dependent_root(STAMP_EPOCH).await.is_some()
+                }
+                Self::IsEpochCached => tracker.is_proposer_epoch_cached(STAMP_EPOCH).await,
+                Self::DutyCounts => tracker.cached_duty_counts(STAMP_EPOCH).await.1 > 0,
+            }
+        }
+    }
+
+    async fn assert_no_proposer_reader_hits(tracker: &DutyTracker, context: &str) {
+        for reader in ProposerReader::ALL {
+            assert!(!reader.hits(tracker).await, "{context}: {reader:?} served the entry");
+        }
+    }
+
+    fn is_revoked_during_fetch<T>(result: &Result<T, DutyTrackerError>) -> bool {
+        matches!(result, Err(DutyTrackerError::RevokedDuringFetch { epoch: STAMP_EPOCH }))
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_proposer_reorg_refresh_revoked_before_release_is_discarded() {
+        let mock = mock_proposer_queue(vec![
+            proposer_stamp_response("0xroot_a"),
+            proposer_stamp_response("0xroot_b"),
+        ])
+        .with_method_delay(MockMethod::GetProposerDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed root A");
+        assert_eq!(
+            tracker.get_cached_proposer_dependent_root(STAMP_EPOCH).await.as_deref(),
+            Some("0xroot_a")
+        );
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::GetProposerDuties, 2).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = refresh.await.expect("refresh task");
+        assert!(
+            is_revoked_during_fetch(&result),
+            "a refresh answer fetched across a bump must be discarded, got {result:?}"
+        );
+        assert_eq!(proposer_entry(&tracker).await, entry("0xroot_a", 0), "root B is not stored");
+        assert_eq!(tracker.get_cached_proposer_dependent_root(STAMP_EPOCH).await, None);
+        assert!(tracker.get_proposer_duty(STAMP_SLOT).await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_proposer_fetch_revoked_before_release_is_discarded() {
+        let mock = mock_proposer(proposer_stamp_response("0xroot_a"))
+            .with_method_delay(MockMethod::GetProposerDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+
+        // The refresh of an uncached epoch takes its cold path.
+        for (arrivals, writer) in [(1, "fetch"), (2, "cold-path refresh")] {
+            let held = tokio::spawn({
+                let tracker = Arc::clone(&tracker);
+                async move {
+                    if arrivals == 1 {
+                        tracker.fetch_proposer_duties(STAMP_EPOCH).await.map(|_| ())
+                    } else {
+                        tracker
+                            .check_and_refetch_proposer_if_root_changed(STAMP_EPOCH)
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            });
+            wait_for_arrivals(&mock, MockMethod::GetProposerDuties, arrivals).await;
+            bump(&generation);
+            tokio::time::advance(HOLD).await;
+
+            let result = held.await.expect("writer task");
+            assert!(
+                is_revoked_during_fetch(&result),
+                "{writer}: an answer fetched across a bump must be discarded, got {result:?}"
+            );
+            assert_eq!(proposer_entry(&tracker).await, None, "{writer}: nothing is stored");
+            assert_no_proposer_reader_hits(&tracker, writer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_proposer_entry_sends_the_refresh_down_the_cold_path() {
+        let (_mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed");
+        bump(&generation);
+        assert!(
+            !tracker.is_proposer_epoch_cached(STAMP_EPOCH).await,
+            "the entry is stale after a bump"
+        );
+
+        let changed =
+            tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+
+        assert!(changed, "a stale entry counts as uncached, so the cold path reports Ok(true)");
+        assert_eq!(proposer_entry(&tracker).await, entry("0xroot_a", 1), "re-stamped");
+        for reader in ProposerReader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the re-stamped entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_proposer_reader_misses_after_a_bump() {
+        let (_mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("fetch");
+        for reader in ProposerReader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+        }
+        let changed =
+            tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(!changed, "the refresh read sees the fresh entry");
+
+        bump(&generation);
+
+        assert_no_proposer_reader_hits(&tracker, "after a bump").await;
+        let changed =
+            tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(changed, "the refresh read treats the stale entry as uncached");
+    }
+
+    /// Holds a proposer fetch, runs `clear_cache()`, bumps if asked, then
+    /// releases the answer.
+    async fn clear_during_a_held_proposer_fetch(
+        bump_after_clear: bool,
+    ) -> (Result<Vec<ProposerDuty>, DutyTrackerError>, Arc<DutyTracker>) {
+        let mock = mock_proposer(proposer_stamp_response("0xroot_a"))
+            .with_method_delay(MockMethod::GetProposerDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        let fetch = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.fetch_proposer_duties(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::GetProposerDuties, 1).await;
+        tracker.clear_cache().await;
+        if bump_after_clear {
+            bump(&generation);
+        }
+        tokio::time::advance(HOLD).await;
+        (fetch.await.expect("fetch task"), tracker)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn clear_during_a_held_proposer_fetch_then_bump_does_not_reinsert() {
+        let (result, tracker) = clear_during_a_held_proposer_fetch(true).await;
+
+        assert!(is_revoked_during_fetch(&result), "got {result:?}");
+        assert_eq!(proposer_entry(&tracker).await, None);
+        assert_no_proposer_reader_hits(&tracker, "clear then bump").await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn clear_without_a_bump_lets_the_held_fetch_insert() {
+        let (result, tracker) = clear_during_a_held_proposer_fetch(false).await;
+
+        assert_eq!(result.expect("clearing is not a revocation").len(), 1);
+        let root = proposer_entry(&tracker).await.map(|(root, _)| root);
+        assert_eq!(root.as_deref(), Some("0xroot_a"));
+        for reader in ProposerReader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the inserted entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_between_proposer_read_lock_and_stamp_check_is_a_miss() {
+        let (_mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        for reader in ProposerReader::ALL {
+            tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("fetch");
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+            let before = generation.load(Ordering::Acquire);
+
+            let hit = {
+                let hook = bump_on_run(&generation, reader.proposer_run());
+                let _armed = hooks::arm(&hooks::AFTER_READ_LOCK, hook);
+                reader.hits(&tracker).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{reader:?}: hook ran");
+            assert!(!hit, "{reader:?} must load the generation inside its guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_after_the_proposer_stamp_check_is_seen_by_the_next_read() {
+        let (_mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        for reader in ProposerReader::ALL {
+            tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("fetch");
+            let before = generation.load(Ordering::Acquire);
+
+            let hit = {
+                let hook = bump_on_run(&generation, reader.proposer_run());
+                let _armed = hooks::arm(&hooks::AFTER_STAMP_CHECK, hook);
+                reader.hits(&tracker).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{reader:?}: hook ran");
+            assert!(hit, "{reader:?}: this read is linearised before the bump");
+            assert!(!reader.hits(&tracker).await, "{reader:?}: the next read misses");
+        }
+    }
+
+    /// Seeds root A, then runs `writer` with `hook` armed. The warm refresh
+    /// answers root B over the visible root A.
+    async fn proposer_write_with_hook(
+        point: &'static std::thread::LocalKey<hooks::Slot>,
+        refresh: bool,
+    ) -> (Result<(), DutyTrackerError>, Arc<DutyTracker>, u64) {
+        let mock = mock_proposer_queue(vec![
+            proposer_stamp_response("0xroot_a"),
+            proposer_stamp_response("0xroot_b"),
+        ]);
+        let (_mock, tracker, generation) = stamped(mock);
+        if refresh {
+            tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed root A");
+        }
+        let before = generation.load(Ordering::Acquire);
+        let written = {
+            let _armed = hooks::arm(point, bump_on_run(&generation, 1));
+            if refresh {
+                tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await.map(|_| ())
+            } else {
+                tracker.fetch_proposer_duties(STAMP_EPOCH).await.map(|_| ())
+            }
+        };
+        assert_eq!(generation.load(Ordering::Acquire), before + 1, "hook ran");
+        (written, tracker, before)
+    }
+
+    #[tokio::test]
+    async fn bump_between_proposer_write_lock_and_recheck_is_discarded() {
+        for (writer, refresh) in [("fetch", false), ("warm refresh", true)] {
+            let (written, tracker, before) =
+                proposer_write_with_hook(&hooks::AFTER_WRITE_LOCK, refresh).await;
+
+            assert!(
+                is_revoked_during_fetch(&written),
+                "{writer}: the re-check runs under the write guard, got {written:?}"
+            );
+            let kept = refresh.then(|| ("0xroot_a".to_string(), Some(before)));
+            assert_eq!(proposer_entry(&tracker).await, kept, "{writer}: nothing is inserted");
+            assert_no_proposer_reader_hits(&tracker, writer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_between_proposer_recheck_and_insert_leaves_nothing_servable() {
+        for (writer, refresh, root) in
+            [("fetch", false, "0xroot_a"), ("warm refresh", true, "0xroot_b")]
+        {
+            let (written, tracker, before) =
+                proposer_write_with_hook(&hooks::BEFORE_INSERT, refresh).await;
+
+            written.unwrap_or_else(|err| panic!("{writer}: the re-check passed, got {err}"));
+            assert_eq!(
+                proposer_entry(&tracker).await,
+                entry(root, before),
+                "{writer}: the entry carries the generation captured before the request"
+            );
+            assert_no_proposer_reader_hits(&tracker, writer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_only_cache_proposer_duties_stamps_the_current_generation() {
+        let (_mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        let duties = proposer_stamp_response("0xroot_b").data;
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed root A");
+        bump(&generation);
+
+        let changed = tracker.cache_proposer_duties(STAMP_EPOCH, "0xroot_b".into(), &duties).await;
+
+        assert!(!changed, "the stale root A counts as absent, not as a root change");
+        assert_eq!(proposer_entry(&tracker).await, entry("0xroot_b", 1));
+        for reader in ProposerReader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_between_proposer_refresh_read_lock_and_stamp_check_takes_the_cold_path() {
+        let (mock, tracker, generation) =
+            stamped(mock_proposer(proposer_stamp_response("0xroot_a")));
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed");
+
+        let changed = {
+            let _armed = hooks::arm(&hooks::AFTER_READ_LOCK, bump_on_run(&generation, 1));
+            tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await
+        };
+
+        assert_eq!(generation.load(Ordering::Acquire), 1, "hook ran");
+        assert!(
+            changed.expect("refresh"),
+            "the refresh read loads the generation inside its guard, so it sees a stale entry"
+        );
+        assert_eq!(mock.get_proposer_duties_calls().len(), 2, "seed, then the cold-path fetch");
+        assert_eq!(proposer_entry(&tracker).await, entry("0xroot_a", 1), "re-stamped");
     }
 
     fn key_set(keys: &[&str]) -> BTreeSet<String> {
