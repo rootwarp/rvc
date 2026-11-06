@@ -36,13 +36,13 @@
 //! A site passes only when:
 //!
 //! 1. the immediately preceding non-empty line is a `// detached:` comment, or
-//! 2. it is one of the five shape-B spawns in
+//! 2. it is one of the six shape-B spawns in
 //!    `plan/tracing-2026-08-06/spawn-census.md`, and the loop **file** named there
 //!    contains `parent: None` and `follows_from` for that task.
 //!
 //! A window around the spawn line is not classification (2). `monitoring_push` and
 //! `proposer_config_refresh` are spawned in `bootstrap/tasks.rs`; their loops live
-//! in other files. The allow-list is empty. The pin is 16 (5 shape B, 11 detached,
+//! in other files. The allow-list is empty. The pin is 17 (6 shape B, 11 detached,
 //! shape A = 0).
 //!
 //! Census rows are content anchors. A production site is `(file, enclosing
@@ -74,9 +74,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Production-site pin. 5 shape B + 11 detached + shape A = 0.
-const PIN: usize = 16;
-const SHAPE_B_PIN: usize = 5;
+/// Production-site pin. 6 shape B + 11 detached + shape A = 0.
+const PIN: usize = 17;
+const SHAPE_B_PIN: usize = 6;
 const DETACHED_PIN: usize = 11;
 const SHAPE_A_PIN: usize = 0;
 
@@ -756,7 +756,7 @@ fn pin_failure(found: usize, detail: &str) -> String {
          `#[cfg(test)]`); a `///` or `//!` line is a comment, not a call; \
          `register_opt(..., None)` is not a site; drop paths containing `/tests/`.\n\
          A site passes only when (1) the immediately preceding non-empty line is a \
-         `// detached:` comment, or (2) it is one of the five census shape-B spawns \
+         `// detached:` comment, or (2) it is one of the six census shape-B spawns \
          and the loop file named in {CENSUS} contains `parent: None` and \
          `follows_from` for that task. A same-file window is not enough.\n\
          This pin is tracing ADR-009.\n\
@@ -825,7 +825,7 @@ fn loop_ok_for<'a>(root: &'a Path) -> impl Fn(&ShapeBRow) -> Result<bool, String
 // ---------------------------------------------------------------------------
 
 #[test]
-fn production_executor_sites_pin_sixteen() {
+fn production_executor_sites_pin_seventeen() {
     assert!(
         ALLOW_LIST.is_empty(),
         "allow-list stays empty; classify with a // detached: comment or a census shape-B row"

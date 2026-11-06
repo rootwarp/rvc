@@ -35,7 +35,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
-use super::epoch_boundary::{EpochBoundaryRunner, PreferenceBroadcaster};
+use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
@@ -460,10 +460,15 @@ where
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
     pub(crate) duty_management: Arc<DutyManagementService>,
-    /// Boundary steps run from the slot-0 post-duty tail.
-    pub(crate) epoch_boundary: EpochBoundaryRunner,
-    /// Shared with [`Self::epoch_boundary`] for the slot-0 builder block.
+    /// The runner [`EpochBoundaryTask`] owns, for tests that drive one pass.
+    #[cfg(test)]
+    pub(crate) epoch_boundary: Arc<EpochBoundaryRunner>,
+    /// Shared with the runner's ReorgCheck, for the slot-0 builder block.
     preferences: Arc<PreferenceBroadcaster>,
+    /// Each processed slot, for [`EpochBoundaryTask`].
+    processed_slot_tx: watch::Sender<Option<Slot>>,
+    /// Until [`Self::take_epoch_boundary_runner`].
+    epoch_boundary_task: Option<EpochBoundaryTask>,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -645,10 +650,16 @@ where
             validator_store.clone(),
             config.genesis_validators_root,
         ));
-        let epoch_boundary = EpochBoundaryRunner::new(
+        let epoch_boundary = Arc::new(EpochBoundaryRunner::new(
             Arc::clone(&duty_management),
             circuit_breaker.clone(),
             Arc::clone(&preferences),
+        ));
+        let (processed_slot_tx, processed_slots) = watch::channel(None);
+        let epoch_boundary_task = EpochBoundaryTask::new(
+            Arc::clone(&epoch_boundary),
+            processed_slots,
+            shutdown_rx.clone(),
         );
 
         let sync_enabled = Arc::new(AtomicBool::new(true));
@@ -668,8 +679,11 @@ where
             sync_committee_service,
             payload_attestation_service,
             duty_management,
+            #[cfg(test)]
             epoch_boundary,
             preferences,
+            processed_slot_tx,
+            epoch_boundary_task: Some(epoch_boundary_task),
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
@@ -695,7 +709,10 @@ where
     /// - aggregate due: aggregation starts then. Contributions wait for the
     ///   in-flight phase-2 head, bounded by the contribution signing deadline.
     /// - payload attestation due (Gloas+): payload attestations
-    /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
+    /// - post-duty: epoch duty fetches, builder registration
+    ///
+    /// Each processed slot is then sent to the epoch boundary runner, which
+    /// runs on its own task (see [`Self::take_epoch_boundary_runner`]).
     ///
     /// Startup proposer preparation is polled beside the slot loop and dropped
     /// when this function returns, including on shutdown.
@@ -722,6 +739,16 @@ where
                 _ = &mut startup => {}
             }
         }
+    }
+
+    /// The epoch boundary runner task, `Some` on the first call only.
+    ///
+    /// Spawn it beside [`Self::run`] on the Orchestrator shutdown tier. It
+    /// runs the boundary steps at the first processed slot of every epoch,
+    /// the boot epoch included, and ends when shutdown is requested or this
+    /// orchestrator is dropped.
+    pub fn take_epoch_boundary_runner(&mut self) -> Option<EpochBoundaryTask> {
+        self.epoch_boundary_task.take()
     }
 
     async fn run_slot_loop(&mut self) -> Result<(), OrchestratorError> {
@@ -901,6 +928,8 @@ where
             }
 
             last_processed_slot = Some(current_slot);
+            // After the phases: boundary work never competes with this slot's duties.
+            self.processed_slot_tx.send_replace(Some(current_slot));
 
             // === Post-duty: host work in the next-slot wait ===
             // Occupants race the wait via `run_post_duty_window`. Incomplete
@@ -922,30 +951,24 @@ where
                     .instrument(slot_span.clone())
                     .await;
 
-                if should_register {
-                    let epoch_span =
-                        info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                    self.epoch_boundary.run_pending(current_slot).instrument(epoch_span).await;
-
-                    if self.builder_service.is_some() {
-                        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-                        debug!(
-                            jitter_secs = jitter.as_secs(),
-                            "Delaying builder epoch-boundary work with jitter"
-                        );
-                        tokio::time::sleep(jitter).await;
-                        match tokio::time::timeout(
-                            BUILDER_REGISTRATION_TIMEOUT,
-                            self.run_builder_epoch_boundary(current_epoch),
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(_) => warn!(
-                                "Builder epoch-boundary work timed out after {}s (non-fatal)",
-                                BUILDER_REGISTRATION_TIMEOUT.as_secs()
-                            ),
-                        }
+                if should_register && self.builder_service.is_some() {
+                    let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+                    debug!(
+                        jitter_secs = jitter.as_secs(),
+                        "Delaying builder epoch-boundary work with jitter"
+                    );
+                    tokio::time::sleep(jitter).await;
+                    match tokio::time::timeout(
+                        BUILDER_REGISTRATION_TIMEOUT,
+                        self.run_builder_epoch_boundary(current_epoch),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn!(
+                            "Builder epoch-boundary work timed out after {}s (non-fatal)",
+                            BUILDER_REGISTRATION_TIMEOUT.as_secs()
+                        ),
                     }
                 }
 

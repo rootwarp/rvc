@@ -1,8 +1,8 @@
 # TRC-6a — executor spawn census
 
-Production executor sites. Shape A = 0. Shape B = 5. Detached = 11. Total = 16.
+Production executor sites. Shape A = 0. Shape B = 6. Detached = 11. Total = 17.
 
-`register_opt(..., None)` is not a site. A `// detached:` comment sits on the line immediately above each detached call. The five shape B calls have no such comment.
+`register_opt(..., None)` is not a site. A `// detached:` comment sits on the line immediately above each detached call. The six shape B calls have no such comment.
 
 Rows are content anchors. A line number is not a key. `census_anchors_match_sources` checks them.
 
@@ -10,11 +10,12 @@ Rows are content anchors. A line number is not a key. `census_anchors_match_sour
 
 Production sites are `(file, enclosing item, task, call)`. Shape B loops are `(loop file, item containing the loop)`. Not-sites are `(file, enclosing item, task)`. The task is the whole first argument: a plain string literal, or the only `const` of that name in the production prefix whose initializer is a plain string followed by `;`. The next token is a comma. The scan reads lexer tokens. `enclosing_item` resolves the item on the production prefix, the source above the first `#[cfg(test)]` followed by `mod`. A hit inside an item whose name is declared twice, an untrusted token stream, or a hit outside every fn and `macro_rules!` fails the file. A path cell is repo-relative.
 
-## Production sites (16)
+## Production sites (17)
 
 | File | Item | Task | Call | Bucket | Reason |
 |---|---|---|---|---|---|
 | `bin/rvc/src/logging.rs` | `spawn_log_reload_handler` | `log_reload` | spawn | detached | SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit. |
+| `crates/rvc/src/bootstrap/run.rs` | `run` | `epoch.boundary.runner` | spawn | B | Iteration loop in `EpochBoundaryTask::run`. Each pass is a root `epoch.boundary` span that follows from the loop span. |
 | `crates/rvc/src/bootstrap/run.rs` | `run` | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. The call is `executor.spawn_result`; this column is the pin kind `spawn`. |
 | `crates/rvc/src/bootstrap/run.rs` | `spawn_secret_provider_refresh` | `secret_provider_refresh` | spawn | detached | `RefreshService::run` in `crates/secret-provider`; loop body is out of scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | `spawn_background_tasks` | `metrics_server` | spawn | detached | Metrics server; serve loop is `serve_metrics_with_health` in `crates/metrics`, out of P1-1 scope. |
@@ -31,7 +32,7 @@ Production sites are `(file, enclosing item, task, call)`. Shape B loops are `(l
 | `crates/rvc/src/liveness_loop.rs` | `spawn_liveness_loop` | `liveness_loop` | spawn | B | Iteration loop in `LivenessObservationLoop::run`. TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/slashing_monitor.rs` | `spawn_with_interval` | `slashing_monitor` | spawn | B | Iteration loop in `spawn_with_interval`. TRC-6b owns the per-iteration root. |
 
-Shape A = 0. None of the 16 inherit a caller trace as a shape A root.
+Shape A = 0. None of the 17 inherit a caller trace as a shape A root.
 
 ## Shape B loop sites
 
@@ -42,6 +43,7 @@ Shape A = 0. None of the 16 inherit a caller trace as a shape A root.
 | `liveness_loop` | `crates/rvc/src/liveness_loop.rs` | `spawn_liveness_loop` | `crates/rvc/src/liveness_loop.rs` | `LivenessObservationLoop::run` |
 | `slashing_monitor` | `crates/rvc/src/slashing_monitor.rs` | `spawn_with_interval` | `crates/rvc/src/slashing_monitor.rs` | `spawn_with_interval` |
 | `index.resolve` | `crates/rvc/src/index_resolver.rs` | `spawn_index_resolver` | `crates/rvc/src/index_resolver.rs` | `IndexResolver::run` |
+| `epoch.boundary.runner` | `crates/rvc/src/bootstrap/run.rs` | `run` | `crates/rvc/src/orchestrator/epoch_boundary.rs` | `EpochBoundaryTask::run` |
 
 ## Not sites — `register_opt(..., None)`
 
@@ -62,7 +64,7 @@ The first bare `#[cfg(test)]` in `crates/rvc/src/liveness_loop.rs` sits on a fun
 
 Truncating the file at the first bare `#[cfg(test)]` hides that spawn. The gate ends the production region at the first token `#[cfg(test)]` followed by `mod`, not at the first bare attribute.
 
-`crates/architecture-tests/tests/spawn_span_continuity.rs` pins this census at 16 under tracing ADR-009. The gate treats `///` and `//!` as comments, and does not count `register_opt(..., None)`. A site passes only when the preceding non-empty line is a `// detached:` comment, or it is one of the five shape-B rows and the loop file contains `parent: None` and `follows_from` for that task. The allow-list is empty.
+`crates/architecture-tests/tests/spawn_span_continuity.rs` pins this census at 17 under tracing ADR-009. The gate treats `///` and `//!` as comments, and does not count `register_opt(..., None)`. A site passes only when the preceding non-empty line is a `// detached:` comment, or it is one of the six shape-B rows and the loop file contains `parent: None` and `follows_from` for that task. The allow-list is empty.
 
 ## A-12 pin
 

@@ -125,6 +125,13 @@ pub enum BootstrapError {
     /// Doppelganger detection requested a drain. Exit 12.
     #[error("doppelganger detected; process exiting")]
     DoppelgangerDetected,
+
+    /// The orchestrator had no epoch boundary runner task to spawn.
+    #[error(
+        "duty orchestrator has no `{}` task to spawn",
+        crate::orchestrator::epoch_boundary::TASK_NAME
+    )]
+    EpochBoundaryRunnerMissing,
 }
 
 impl BootstrapError {

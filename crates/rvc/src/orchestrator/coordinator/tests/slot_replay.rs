@@ -322,8 +322,9 @@ async fn skipped_slot_reenters_wait_without_spinning() {
     );
 }
 
-/// Thirty-two forward slots leave the counter at zero. Slot 96 is the one
-/// epoch boundary in the run, and its prep runs once.
+/// Thirty-two forward slots leave the counter at zero. The runner makes two
+/// passes: the boot epoch at slot 65 and the epoch boundary at slot 96. A wake
+/// in an epoch whose steps are done opens no pass.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn forward_32_slots_leave_slot_replay_skipped_at_zero() {
     let _guard = m2_metric_lock().await;
@@ -336,6 +337,7 @@ async fn forward_32_slots_leave_slot_replay_skipped_at_zero() {
     let layer = ReplayCapture { spans: spans.clone(), warns };
     let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
     let _guard_sub = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
 
     let before = replay_skipped();
     let clock_fwd = clock.clone();
@@ -354,15 +356,14 @@ async fn forward_32_slots_leave_slot_replay_skipped_at_zero() {
                     1,
                     "slot {slot} must be processed once before the clock moves forward"
                 );
+                let passes = if slot.is_multiple_of(::timing::SLOTS_PER_EPOCH) { 2 } else { 1 };
+                assert_eq!(
+                    epoch_boundary_count(&spans_fwd.lock()),
+                    passes,
+                    "after slot {slot}: one pass for the boot epoch at slot {FORWARD_START}, \
+                     one more at the epoch boundary"
+                );
                 if i + 1 == FORWARD_SLOTS {
-                    assert_eq!(
-                        epoch_boundary_count(&spans_fwd.lock()),
-                        1,
-                        "slot {} is the only epoch boundary in {}..={}",
-                        FORWARD_START + FORWARD_SLOTS - 1,
-                        FORWARD_START,
-                        FORWARD_START + FORWARD_SLOTS - 1
-                    );
                     handle.shutdown();
                     std::future::pending::<()>().await;
                 }
@@ -379,8 +380,9 @@ async fn forward_32_slots_leave_slot_replay_skipped_at_zero() {
         for slot in FORWARD_START..FORWARD_START + FORWARD_SLOTS {
             phase0_slots += phase0_for_slot(&spans, slot);
         }
-        assert_eq!(epoch_boundary_count(&spans), 1);
+        assert_eq!(epoch_boundary_count(&spans), 2, "the boot epoch and the epoch boundary");
     }
     assert_eq!(phase0_slots, FORWARD_SLOTS as usize, "each forward slot runs phase 0 once");
     assert_eq!(replay_skipped() - before, 0, "forward progress must not skip a replay");
+    runner.await.expect("runner task");
 }
