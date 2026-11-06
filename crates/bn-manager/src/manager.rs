@@ -4404,6 +4404,10 @@ impl DutiesProvider for BnManager {
         )
         .await
     }
+
+    fn revocation_generation(&self) -> Option<Arc<AtomicU64>> {
+        Some(Arc::clone(&self.revocation_generation))
+    }
 }
 
 #[async_trait]

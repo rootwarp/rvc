@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, info, trace, warn};
 
 use crate::metrics::{
@@ -46,11 +46,13 @@ struct EpochDutyCache {
     dependent_root: String,
     /// Index list posted to produce `duties`. `dependent_root` does not cover it.
     indices: Vec<String>,
+    /// Revocation generation captured before the request that produced `duties`.
+    fetched_gen: Option<u64>,
 }
 
 impl EpochDutyCache {
     fn new(dependent_root: String) -> Self {
-        Self { duties: HashMap::new(), dependent_root, indices: Vec::new() }
+        Self { duties: HashMap::new(), dependent_root, indices: Vec::new(), fetched_gen: None }
     }
 
     /// Parse attester duties from a BN response into a keyed epoch cache.
@@ -217,6 +219,73 @@ impl ValidatorIndexSource for StaticIndexSource {
     }
 }
 
+/// Revocation generation captured before a duty request is sent.
+///
+/// Only [`DutyTracker::fetch_stamp`] creates one, so an entry can only carry
+/// a generation sampled before its request.
+#[derive(Debug, Clone, Copy)]
+struct FetchStamp(Option<u64>);
+
+/// An entry is served only under the generation it was stamped with.
+fn visible(stamp: Option<u64>, now: Option<u64>) -> bool {
+    stamp == now
+}
+
+/// `epoch`'s attester entry when it is visible under `now`.
+///
+/// A stale entry reads as absent.
+fn servable(
+    cache: &HashMap<u64, EpochDutyCache>,
+    epoch: u64,
+    now: Option<u64>,
+) -> Option<&EpochDutyCache> {
+    let entry = cache.get(&epoch).filter(|entry| visible(entry.fetched_gen, now));
+    #[cfg(test)]
+    hooks::fire(&hooks::AFTER_STAMP_CHECK);
+    entry
+}
+
+/// Test-only ordering hooks: each runs a closure at one interleaving point.
+#[cfg(test)]
+mod hooks {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    type Slot = RefCell<Option<Box<dyn FnMut()>>>;
+
+    thread_local! {
+        /// After a reader takes its guard, before it loads the generation.
+        pub(super) static AFTER_READ_LOCK: Slot = const { RefCell::new(None) };
+        /// After a reader's stamp check, still inside its guard.
+        pub(super) static AFTER_STAMP_CHECK: Slot = const { RefCell::new(None) };
+        /// In `admit_attester`, after the re-check and before the insert.
+        pub(super) static BEFORE_INSERT: Slot = const { RefCell::new(None) };
+    }
+
+    pub(super) fn fire(point: &'static LocalKey<Slot>) {
+        point.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Clears its hook on drop.
+    #[must_use]
+    pub(super) struct Armed(&'static LocalKey<Slot>);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.0.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn arm(point: &'static LocalKey<Slot>, hook: impl FnMut() + 'static) -> Armed {
+        point.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Armed(point)
+    }
+}
+
 pub struct DutyTracker {
     beacon: Arc<dyn DutiesProvider>,
     index_source: Arc<dyn ValidatorIndexSource>,
@@ -231,6 +300,8 @@ pub struct DutyTracker {
     slot_duty_lookups: AtomicU64,
     /// Reconciled fork schedule used to route proposer-duties v1/v2.
     fork_schedule: ForkSchedule,
+    /// [`DutiesProvider::revocation_generation`], read once at construction.
+    revocation: Option<Arc<AtomicU64>>,
 }
 
 impl DutyTracker {
@@ -247,10 +318,15 @@ impl DutyTracker {
     /// Each fetch calls [`ValidatorIndexSource::indices`] once and uses that
     /// snapshot for every beacon request the call makes. [`Self::new`] wraps a
     /// static set.
+    ///
+    /// When `beacon` has a [`DutiesProvider::revocation_generation`], a
+    /// cached attester entry is served only while that generation equals the
+    /// one captured before the request that produced it.
     pub fn new_with_source(
         beacon: Arc<dyn DutiesProvider>,
         index_source: Arc<dyn ValidatorIndexSource>,
     ) -> Self {
+        let revocation = beacon.revocation_generation();
         Self {
             beacon,
             index_source,
@@ -260,6 +336,7 @@ impl DutyTracker {
             sync_committee_cache: RwLock::new(HashMap::new()),
             slot_duty_lookups: AtomicU64::new(0),
             fork_schedule: ForkSchedule::unscheduled_gloas(),
+            revocation,
         }
     }
 
@@ -274,6 +351,46 @@ impl DutyTracker {
         self.slot_duty_lookups.load(Ordering::Relaxed)
     }
 
+    /// Read guard on the attester cache. Every attester reader starts here,
+    /// then calls [`Self::generation_now`] while it holds the guard.
+    async fn attester_read(&self) -> RwLockReadGuard<'_, HashMap<u64, EpochDutyCache>> {
+        let guard = self.cache.read().await;
+        #[cfg(test)]
+        hooks::fire(&hooks::AFTER_READ_LOCK);
+        guard
+    }
+
+    fn generation_now(&self) -> Option<u64> {
+        self.revocation.as_ref().map(|generation| generation.load(Ordering::Acquire))
+    }
+
+    /// Capture the generation. A writer calls this before its BN request.
+    fn fetch_stamp(&self) -> FetchStamp {
+        FetchStamp(self.generation_now())
+    }
+
+    /// Insert `entry` stamped with `stamp`, the only attester insert path.
+    ///
+    /// The generation is re-loaded under the write guard. If it moved since
+    /// `stamp` was captured, nothing is inserted and the caller must not use
+    /// the answer.
+    fn admit_attester(
+        &self,
+        cache: &mut RwLockWriteGuard<'_, HashMap<u64, EpochDutyCache>>,
+        epoch: u64,
+        mut entry: EpochDutyCache,
+        stamp: FetchStamp,
+    ) -> Result<(), DutyTrackerError> {
+        if !visible(stamp.0, self.generation_now()) {
+            return Err(DutyTrackerError::RevokedDuringFetch { epoch });
+        }
+        #[cfg(test)]
+        hooks::fire(&hooks::BEFORE_INSERT);
+        entry.fetched_gen = stamp.0;
+        cache.insert(epoch, entry);
+        Ok(())
+    }
+
     #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Attestation.as_str()))]
     pub async fn fetch_duties_for_epoch(
         &self,
@@ -282,6 +399,7 @@ impl DutyTracker {
         let indices = self.index_source.indices();
         debug!(epoch = epoch, "Fetching duties for epoch");
 
+        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .get_attester_duties(epoch, &indices)
@@ -307,14 +425,14 @@ impl DutyTracker {
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
         epoch_cache.indices = indices;
 
+        self.admit_attester(&mut cache, epoch, epoch_cache, stamp)?;
+
         info!(
             epoch = epoch,
             duties_count = response.data.len(),
             dependent_root = %response.dependent_root,
             "Cached duties for epoch"
         );
-
-        cache.insert(epoch, epoch_cache);
 
         Ok(response.data)
     }
@@ -337,11 +455,12 @@ impl DutyTracker {
         validator_index: u64,
     ) -> Result<TypedAttesterDuty, DutyTrackerError> {
         let epoch = slot / SLOTS_PER_EPOCH;
-        let cache = self.cache.read().await;
+        let cache = self.attester_read().await;
+        let now = self.generation_now();
 
         let key = DutyCacheKey { slot, committee_index, validator_index };
 
-        if let Some(epoch_cache) = cache.get(&epoch) {
+        if let Some(epoch_cache) = servable(&cache, epoch, now) {
             if let Some(duty) = epoch_cache.get(&key) {
                 debug!(slot, epoch, cache_type = "attester", "Cache hit");
                 return Ok(duty.clone());
@@ -358,6 +477,7 @@ impl DutyTracker {
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
         let indices = self.index_source.indices();
+        let stamp = self.fetch_stamp();
         // Fetch from BN first (no lock held) to avoid TOCTOU race
         let response = self
             .beacon
@@ -365,9 +485,10 @@ impl DutyTracker {
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        // Acquire write lock and compare-and-swap atomically
+        // Acquire write lock and compare-and-swap atomically. An entry that is
+        // stale under the stamp counts as absent.
         let mut cache = self.cache.write().await;
-        let cached = cache.get(&epoch);
+        let cached = servable(&cache, epoch, stamp.0);
         let same_snapshot = cached
             .is_some_and(|c| c.dependent_root == response.dependent_root && c.indices == indices);
         if same_snapshot {
@@ -391,7 +512,7 @@ impl DutyTracker {
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
         epoch_cache.indices = indices;
 
-        cache.insert(epoch, epoch_cache);
+        self.admit_attester(&mut cache, epoch, epoch_cache, stamp)?;
         Ok(root_changed)
     }
 
@@ -448,9 +569,10 @@ impl DutyTracker {
     pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<TypedAttesterDuty> {
         self.slot_duty_lookups.fetch_add(1, Ordering::Relaxed);
         let epoch = slot / SLOTS_PER_EPOCH;
-        let cache = self.cache.read().await;
+        let cache = self.attester_read().await;
+        let now = self.generation_now();
 
-        let Some(epoch_cache) = cache.get(&epoch) else {
+        let Some(epoch_cache) = servable(&cache, epoch, now) else {
             debug!(slot, epoch, cache_type = "attester", "Cache miss for slot");
             return Vec::new();
         };
@@ -482,13 +604,15 @@ impl DutyTracker {
 
     pub async fn is_epoch_cached(&self, epoch: u64) -> bool {
         let indices = self.index_source.indices();
-        let cache = self.cache.read().await;
-        cache.get(&epoch).is_some_and(|entry| entry.indices == indices)
+        let cache = self.attester_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).is_some_and(|entry| entry.indices == indices)
     }
 
     pub async fn get_cached_dependent_root(&self, epoch: u64) -> Option<String> {
-        let cache = self.cache.read().await;
-        cache.get(&epoch).map(|c| c.dependent_root.clone())
+        let cache = self.attester_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).map(|c| c.dependent_root.clone())
     }
 
     /// Write proposer duties into the in-process cache.
@@ -782,7 +906,11 @@ impl DutyTracker {
     }
 
     pub async fn cached_duty_counts(&self, epoch: u64) -> (usize, usize, usize, usize) {
-        let attester_count = self.cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
+        let attester_count = {
+            let cache = self.attester_read().await;
+            let now = self.generation_now();
+            servable(&cache, epoch, now).map_or(0, |c| c.duties.len())
+        };
         let proposer_count =
             self.proposer_cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
@@ -1056,7 +1184,7 @@ mod tests {
 
     use bn_manager::{
         AttesterDutiesResponse, AttesterDuty, BeaconError, DutiesProvider, MockBeaconNodeClient,
-        ProposerDutiesResponse, ProposerDuty, PtcDutiesResponse, PtcDuty,
+        MockMethod, ProposerDutiesResponse, ProposerDuty, PtcDutiesResponse, PtcDuty,
         SyncCommitteeDutiesResponse,
     };
     use eth_types::SyncCommitteeDuty;
@@ -2837,6 +2965,266 @@ mod tests {
         assert!(tracker.is_ptc_epoch_cached(10).await);
         assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
         assert!(!tracker.get_ptc_duties_for_slot(320).await.is_empty());
+    }
+
+    // -- Revocation-stamped attester cache (W4-E7b) --
+
+    /// Hold on a mock duty answer. Longer than every other timer in these tests.
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(3_600);
+    const STAMP_EPOCH: u64 = 10;
+    const STAMP_SLOT: u64 = 320;
+
+    fn stamp_response(committee_index: u64, dependent_root: &str) -> AttesterDutiesResponse {
+        attester_response(vec![(STAMP_SLOT, committee_index, "1234")], dependent_root)
+    }
+
+    /// `track_admission()` runs before the tracker is built: the tracker reads
+    /// the generation once, at construction.
+    fn stamped(
+        mock: MockBeaconNodeClient,
+    ) -> (Arc<MockBeaconNodeClient>, Arc<DutyTracker>, Arc<AtomicU64>) {
+        let generation = mock.track_admission();
+        let mock = Arc::new(mock);
+        let tracker = Arc::new(DutyTracker::new(mock.clone(), vec!["1234".to_string()]));
+        (mock, tracker, generation)
+    }
+
+    fn bump(generation: &AtomicU64) {
+        generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// A hook that bumps `generation` the first time it runs.
+    fn bump_once(generation: &Arc<AtomicU64>) -> impl FnMut() + 'static {
+        let generation = Arc::clone(generation);
+        let mut fired = false;
+        move || {
+            if !fired {
+                fired = true;
+                bump(&generation);
+            }
+        }
+    }
+
+    /// Yields until `count` calls of `method` have arrived. It never parks, so
+    /// a paused clock cannot auto-advance past a held answer.
+    async fn wait_for_arrivals(mock: &MockBeaconNodeClient, method: MockMethod, count: usize) {
+        for _ in 0..10_000 {
+            if mock.call_stamps().iter().filter(|stamp| stamp.method == method).count() >= count {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{count} {method:?} calls never arrived");
+    }
+
+    /// The attester readers that take the cache's read guard.
+    #[derive(Debug, Clone, Copy)]
+    enum Reader {
+        GetDuty,
+        DutiesForSlot,
+        IsEpochCached,
+        DependentRoot,
+        DutyCounts,
+    }
+
+    impl Reader {
+        const ALL: [Self; 5] = [
+            Self::GetDuty,
+            Self::DutiesForSlot,
+            Self::IsEpochCached,
+            Self::DependentRoot,
+            Self::DutyCounts,
+        ];
+
+        /// Whether this reader serves the entry cached for `STAMP_EPOCH`.
+        async fn hits(self, tracker: &DutyTracker) -> bool {
+            match self {
+                Self::GetDuty => tracker.get_duty(STAMP_SLOT, 1, 1234).await.is_ok(),
+                Self::DutiesForSlot => !tracker.get_duties_for_slot(STAMP_SLOT).await.is_empty(),
+                Self::IsEpochCached => tracker.is_epoch_cached(STAMP_EPOCH).await,
+                Self::DependentRoot => {
+                    tracker.get_cached_dependent_root(STAMP_EPOCH).await.is_some()
+                }
+                Self::DutyCounts => tracker.cached_duty_counts(STAMP_EPOCH).await.0 > 0,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_attester_fetch_revoked_before_release_is_discarded() {
+        let mock = mock_attester(stamp_response(1, "0xroot_a"))
+            .with_method_delay(MockMethod::GetAttesterDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+
+        let fetch = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.fetch_duties_for_epoch(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::GetAttesterDuties, 1).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = fetch.await.expect("fetch task");
+        assert!(
+            matches!(result, Err(DutyTrackerError::RevokedDuringFetch { epoch: STAMP_EPOCH })),
+            "an answer fetched across a bump must be discarded, got {result:?}"
+        );
+        assert!(!tracker.is_epoch_cached(STAMP_EPOCH).await);
+        assert!(tracker.get_duties_for_slot(STAMP_SLOT).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_attester_reorg_refresh_revoked_before_release_is_discarded() {
+        let mock =
+            mock_attester_queue(vec![stamp_response(1, "0xroot_a"), stamp_response(2, "0xroot_b")])
+                .with_method_delay(MockMethod::GetAttesterDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+        assert_eq!(
+            tracker.get_cached_dependent_root(STAMP_EPOCH).await.as_deref(),
+            Some("0xroot_a")
+        );
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::GetAttesterDuties, 2).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = refresh.await.expect("refresh task");
+        assert!(
+            matches!(result, Err(DutyTrackerError::RevokedDuringFetch { epoch: STAMP_EPOCH })),
+            "a refresh answer fetched across a bump must be discarded, got {result:?}"
+        );
+        assert_eq!(tracker.get_cached_dependent_root(STAMP_EPOCH).await, None);
+        assert!(tracker.get_duties_for_slot(STAMP_SLOT).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reorg_refresh_replaces_a_stale_entry_with_an_unchanged_root() {
+        // kat_exempt: cache freshness only; the root is an opaque BN dependent_root string
+        let (_mock, tracker, generation) = stamped(mock_attester(stamp_response(1, "0xroot_a")));
+        tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("seed");
+        bump(&generation);
+        assert!(!tracker.is_epoch_cached(STAMP_EPOCH).await, "the entry is stale after a bump");
+
+        let changed =
+            tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+
+        assert!(changed, "a stale entry counts as absent, so the refresh reports a change");
+        assert!(tracker.is_epoch_cached(STAMP_EPOCH).await, "the entry is re-stamped");
+        assert_eq!(
+            tracker.get_cached_dependent_root(STAMP_EPOCH).await.as_deref(),
+            Some("0xroot_a")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_attester_reader_misses_after_a_bump() {
+        let (_mock, tracker, generation) = stamped(mock_attester(stamp_response(1, "0xroot_a")));
+        tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("fetch");
+        for reader in Reader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+        }
+        let changed =
+            tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(!changed, "the refresh compare sees the fresh entry");
+
+        bump(&generation);
+
+        for reader in Reader::ALL {
+            assert!(!reader.hits(&tracker).await, "{reader:?} served a stale entry");
+        }
+        let changed =
+            tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(changed, "the refresh compare treats the stale entry as absent");
+    }
+
+    #[tokio::test]
+    async fn bump_between_read_lock_and_stamp_check_is_a_miss() {
+        let (_mock, tracker, generation) = stamped(mock_attester(stamp_response(1, "0xroot_a")));
+        for reader in Reader::ALL {
+            tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("fetch");
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+            let before = generation.load(Ordering::Acquire);
+
+            let hit = {
+                let _armed = hooks::arm(&hooks::AFTER_READ_LOCK, bump_once(&generation));
+                reader.hits(&tracker).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{reader:?}: hook ran");
+            assert!(!hit, "{reader:?} must load the generation inside its guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_after_the_stamp_check_is_seen_by_the_next_read() {
+        let (_mock, tracker, generation) = stamped(mock_attester(stamp_response(1, "0xroot_a")));
+        for reader in Reader::ALL {
+            tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("fetch");
+            let before = generation.load(Ordering::Acquire);
+
+            let hit = {
+                let _armed = hooks::arm(&hooks::AFTER_STAMP_CHECK, bump_once(&generation));
+                reader.hits(&tracker).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{reader:?}: hook ran");
+            assert!(hit, "{reader:?}: this read is linearised before the bump");
+            assert!(!reader.hits(&tracker).await, "{reader:?}: the next read misses");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_between_generation_check_and_insert_leaves_nothing_servable() {
+        let (_mock, tracker, generation) = stamped(mock_attester(stamp_response(1, "0xroot_a")));
+
+        // The refresh runs second, over the entry the bump made stale.
+        for (writer, refresh) in [("fetch", false), ("reorg refresh", true)] {
+            let before = generation.load(Ordering::Acquire);
+            let written = {
+                let _armed = hooks::arm(&hooks::BEFORE_INSERT, bump_once(&generation));
+                if refresh {
+                    tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await.map(|_| ())
+                } else {
+                    tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.map(|_| ())
+                }
+            };
+
+            written.unwrap_or_else(|err| panic!("{writer}: the re-check passed, got {err}"));
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{writer}: hook ran");
+            let stamp = tracker.cache.read().await.get(&STAMP_EPOCH).map(|entry| entry.fetched_gen);
+            assert_eq!(
+                stamp,
+                Some(Some(before)),
+                "{writer}: the entry carries the generation captured before the request"
+            );
+            for reader in Reader::ALL {
+                assert!(!reader.hits(&tracker).await, "{writer}: {reader:?} served the entry");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_generation_caches_are_never_dropped() {
+        let mock = Arc::new(mock_attester(stamp_response(1, "0xroot_a")));
+        let tracker = DutyTracker::new(mock, vec!["1234".to_string()]);
+        tracker.fetch_duties_for_epoch(STAMP_EPOCH).await.expect("fetch");
+
+        for round in 0..2 {
+            for reader in Reader::ALL {
+                assert!(reader.hits(&tracker).await, "round {round}: {reader:?} serves the entry");
+            }
+        }
+        let changed =
+            tracker.check_and_refetch_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(!changed, "an unchanged root is not a change without a generation");
+        for reader in Reader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the entry after the refresh");
+        }
     }
 
     fn key_set(keys: &[&str]) -> BTreeSet<String> {
