@@ -9,6 +9,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test seams: `DutyTracker::cache_proposer_duties`. Not a production feature.
+test-utils = []
+
 [dependencies]
 bn-manager.workspace = true
 eth-types.workspace = true
