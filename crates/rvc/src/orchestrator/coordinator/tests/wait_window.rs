@@ -2,6 +2,7 @@
 
 use super::*;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use timing::{DeadlineBps, DeadlineSchedule};
 use tracing::span::Id;
 use tracing_subscriber::layer::SubscriberExt;
@@ -410,4 +411,248 @@ async fn test_pre_gloas_epoch_does_not_call_ptc_endpoint() {
         "pre-Gloas must not call get_payload_attestation_data"
     );
     assert!(mock.get_payload_attestation_data_calls().is_empty());
+}
+
+// ── W4-E2c: zero post-duty window over a cold duty cache ──────────────
+
+const SLOT_MS: u64 = 12_000;
+const LOCAL_INDEX: &str = "7";
+const DUTY_ROOT: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FETCH_EPOCH_DUTIES: &str = "orchestrator.fetch_epoch_duties";
+
+/// `now` is genesis, plus `start_slot` slots, plus the paused tokio time
+/// since construction, so the inter-slot wait and the phase deadlines move
+/// together.
+struct PausedSlotClock {
+    origin: tokio::time::Instant,
+    start_slot: Slot,
+}
+
+impl SlotClock for PausedSlotClock {
+    fn genesis_time(&self) -> u64 {
+        TEST_GENESIS_TIME
+    }
+
+    fn slot_duration(&self) -> Duration {
+        Duration::from_millis(SLOT_MS)
+    }
+
+    fn slots_per_epoch(&self) -> u64 {
+        SLOTS_PER_EPOCH
+    }
+
+    fn now_since_epoch(&self) -> Duration {
+        Duration::from_secs(TEST_GENESIS_TIME)
+            + Duration::from_millis(self.start_slot * SLOT_MS)
+            + self.origin.elapsed()
+    }
+
+    fn current_slot(&self) -> Result<Slot, TimingError> {
+        let since_genesis =
+            self.now_since_epoch().saturating_sub(Duration::from_secs(TEST_GENESIS_TIME));
+        Ok(u64::try_from(since_genesis.as_millis()).unwrap_or(u64::MAX) / SLOT_MS)
+    }
+}
+
+/// Aggregate and contribution at 10,000 bps: the last phase ends at the next
+/// slot start, so every post-duty window is zero.
+fn zero_window_config() -> OrchestratorConfig {
+    create_test_config().with_deadline_schedule(DeadlineSchedule::uniform(DeadlineBps {
+        aggregate: 10_000,
+        contribution: 10_000,
+        ..DeadlineBps::default()
+    }))
+}
+
+/// Answers 503 to the first attester-duties request for each epoch, then one
+/// duty for index 7 at slot 1 of that epoch.
+fn first_request_503_attester_duties(pubkey_hex: String) -> bn_manager::MockBeaconNodeClient {
+    let answered = Mutex::new(HashSet::new());
+    bn_manager::MockBeaconNodeClient::new().with_get_attester_duties(move |epoch, _indices| {
+        if answered.lock().insert(epoch) {
+            return Err(beacon::BeaconError::ApiError {
+                status: 503,
+                message: "first request".to_string(),
+            });
+        }
+        Ok(beacon::DependentRootResponse {
+            dependent_root: DUTY_ROOT.to_string(),
+            execution_optimistic: false,
+            data: vec![AttesterDuty {
+                pubkey: pubkey_hex.clone(),
+                validator_index: LOCAL_INDEX.to_string(),
+                committee_index: "1".to_string(),
+                committee_length: "8".to_string(),
+                committees_at_slot: "4".to_string(),
+                validator_committee_index: "0".to_string(),
+                slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
+            }],
+        })
+    })
+}
+
+/// Offset from `start_slot`'s start to `slot`'s start.
+fn slot_offset(start_slot: Slot, slot: Slot) -> Duration {
+    Duration::from_millis((slot - start_slot) * SLOT_MS)
+}
+
+fn duty_slots<const N: usize>(slots: [&str; N]) -> Vec<String> {
+    slots.iter().map(|slot| slot.to_string()).collect()
+}
+
+struct ZeroWindowRun {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+    /// Offset from boot and duty slots of each subscription POST.
+    subscriptions: Vec<(Duration, Vec<String>)>,
+    spans: Vec<(String, u64)>,
+    boot: tokio::time::Instant,
+}
+
+impl ZeroWindowRun {
+    /// Offset from boot of each prepare POST; every POST is for index 7 only.
+    fn prepares(&self) -> Vec<Duration> {
+        for posted in self.mock.prepare_beacon_proposer_calls() {
+            let indices: Vec<&str> = posted.iter().map(|p| p.validator_index.as_str()).collect();
+            assert_eq!(indices, [LOCAL_INDEX], "prepare for index 7");
+        }
+        self.mock
+            .call_stamps()
+            .iter()
+            .filter(|stamp| stamp.method == bn_manager::MockMethod::PrepareBeaconProposer)
+            .map(|stamp| stamp.at.duration_since(self.boot))
+            .collect()
+    }
+
+    fn assert_no_warm_up(&self) {
+        let warm_ups: Vec<u64> =
+            self.spans.iter().filter(|(name, _)| name == FETCH_EPOCH_DUTIES).map(|s| s.1).collect();
+        assert!(warm_ups.is_empty(), "a post-duty window was not zero: warm-up at {warm_ups:?} ms");
+    }
+}
+
+/// Boots at the start of `start_slot` with an empty duty cache, index 7 in
+/// the registry and every post-duty window zero. Runs `run()` and the runner
+/// task side by side for `run_for` of virtual time, then shuts down.
+async fn run_zero_window(start_slot: Slot, run_for: Duration) -> ZeroWindowRun {
+    let boot = tokio::time::Instant::now();
+    let secret = SecretKey::generate();
+    let pubkey = secret.public_key();
+    let pk_bytes = pubkey.to_bytes();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let subscriptions = Arc::clone(&recorded);
+    let mock = Arc::new(
+        first_request_503_attester_duties(format!("0x{}", hex::encode(pk_bytes)))
+            .with_get_proposer_duties(|_epoch| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: DUTY_ROOT.to_string(),
+                    execution_optimistic: false,
+                    data: Vec::new(),
+                })
+            })
+            .with_prepare_beacon_proposer(|_preparations| Ok(()))
+            .with_submit_beacon_committee_subscriptions(move |posted| {
+                let slots = posted.into_iter().map(|s| s.slot).collect();
+                subscriptions.lock().push((boot.elapsed(), slots));
+                Ok(())
+            }),
+    );
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(secret);
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+            Arc::new(SlashingDb::open_in_memory().expect("slashing db")),
+        )
+        .with_enablement(always_enabled()),
+    );
+    let validator_store = create_mock_validator_store();
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
+        .expect("add validator");
+    let pubkey_index = crate::pubkey_index::PubkeyIndexRegistry::shared();
+    pubkey_index.write().insert(pk_bytes, LOCAL_INDEX.to_string());
+    let deps = OrchestratorDeps::for_test(
+        Arc::new(PausedSlotClock { origin: boot, start_slot }),
+        Arc::new(DutyTracker::new(mock.clone(), vec![LOCAL_INDEX.to_string()])),
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        mock.clone(),
+        create_mock_block_beacon(),
+        None,
+        validator_store,
+        zero_window_config(),
+        Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)]))),
+    );
+    let (mut orchestrator, handle) =
+        DutyOrchestrator::new(OrchestratorDeps { pubkey_index, ..deps });
+
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let layer = TimedSpans { start: boot, times: times.clone() };
+    let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    tokio::time::sleep_until(boot + run_for).await;
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+
+    let subscriptions = recorded.lock().clone();
+    let spans = times.lock().clone();
+    ZeroWindowRun { mock, subscriptions, spans, boot }
+}
+
+/// W4-E2c cold start: boot at slot 10 with an empty cache, every post-duty
+/// window zero (the warm-up never runs) and the first attester request for
+/// each epoch failing. The runner's epoch-0 pass, woken by processed slot
+/// 10 at the end of slot 10, fetches epoch 1 itself and subscribes for both
+/// epochs before slot 32.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_cold_start_with_zero_post_duty_window_subscribes_for_the_boot_epoch() {
+    let _metrics = m2_metric_lock().await;
+    let end_of_slot_31 = slot_offset(10, 32) - Duration::from_millis(1);
+    let run = run_zero_window(10, end_of_slot_31).await;
+
+    let end_of_slot_10 = slot_offset(10, 11);
+    assert_eq!(
+        run.subscriptions,
+        [(end_of_slot_10, duty_slots(["1"])), (end_of_slot_10, duty_slots(["33"]))],
+        "the epoch-0 and epoch-1 duties are subscribed in epoch 0"
+    );
+    assert_eq!(
+        run.prepares(),
+        [Duration::ZERO, end_of_slot_10],
+        "startup preparation at boot, then the runner's epoch-0 pass"
+    );
+    run.assert_no_warm_up();
+}
+
+/// 652-AC2: boot at slot 31, then slot 32 with a zero window. The epoch-1
+/// pass is woken by processed slot 32 when its last phase ends, at the end
+/// of slot 32, before slot 33's first phase: it prepares and subscribes for
+/// epochs 1 and 2 there although the warm-up never runs.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_zero_post_duty_window_at_slot_0_still_runs_boundary_steps() {
+    let _metrics = m2_metric_lock().await;
+    let run = run_zero_window(31, slot_offset(31, 33) + Duration::from_secs(1)).await;
+
+    let end_of_slot_31 = slot_offset(31, 32);
+    let end_of_slot_32 = slot_offset(31, 33);
+    assert_eq!(
+        run.subscriptions,
+        [
+            (end_of_slot_31, duty_slots(["1"])),
+            (end_of_slot_31, duty_slots(["33"])),
+            (end_of_slot_32, duty_slots(["33"])),
+            (end_of_slot_32, duty_slots(["65"])),
+        ],
+        "epoch 0's pass subscribes for epochs 0 and 1, epoch 1's for epochs 1 and 2"
+    );
+    assert_eq!(
+        run.prepares(),
+        [Duration::ZERO, end_of_slot_31, end_of_slot_32],
+        "startup preparation at boot, then the epoch-0 and epoch-1 passes"
+    );
+    run.assert_no_warm_up();
 }
