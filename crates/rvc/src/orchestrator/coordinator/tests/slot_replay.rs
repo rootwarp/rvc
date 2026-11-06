@@ -43,10 +43,29 @@ fn replay_config() -> OrchestratorConfig {
         .with_timeouts(fast_timeouts())
 }
 
+const DUTY_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Answers empty duties, so each epoch's boundary steps can finish.
 fn replay_orchestrator(
     clock: Arc<MockSlotClock>,
 ) -> (DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>, OrchestratorHandle) {
-    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let beacon = Arc::new(
+        bn_manager::MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, _indices| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: DUTY_ROOT.to_string(),
+                    execution_optimistic: false,
+                    data: Vec::new(),
+                })
+            })
+            .with_get_proposer_duties(|_epoch| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: DUTY_ROOT.to_string(),
+                    execution_optimistic: false,
+                    data: Vec::new(),
+                })
+            }),
+    );
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());

@@ -654,6 +654,8 @@ where
             Arc::clone(&duty_management),
             circuit_breaker.clone(),
             Arc::clone(&preferences),
+            duty_tracker.clone(),
+            config.timeouts.clone(),
         ));
         let (processed_slot_tx, processed_slots) = watch::channel(None);
         let epoch_boundary_task = EpochBoundaryTask::new(
@@ -712,7 +714,9 @@ where
     /// - post-duty: epoch duty fetches, builder registration
     ///
     /// Each processed slot is then sent to the epoch boundary runner, which
-    /// runs on its own task (see [`Self::take_epoch_boundary_runner`]).
+    /// runs on its own task (see [`Self::take_epoch_boundary_runner`]) and
+    /// fetches the duties its steps need itself, so it never waits on the
+    /// post-duty window.
     ///
     /// Startup proposer preparation is polled beside the slot loop and dropped
     /// when this function returns, including on shutdown.
