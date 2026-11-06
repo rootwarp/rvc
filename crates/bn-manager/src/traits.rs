@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -56,6 +58,14 @@ pub trait DutiesProvider: Send + Sync {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<PtcDutiesResponse, BeaconError>;
+
+    /// Revocation generation that duty caches stamp their entries with.
+    ///
+    /// It moves when an admitted node is revoked. `None` (the default) means
+    /// no generation: cached duties are never dropped on revocation.
+    fn revocation_generation(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
 }
 
 /// Duty fields applied before a produced block is ranked or returned.

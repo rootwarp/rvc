@@ -1,0 +1,94 @@
+//! Cached duties from a revoked beacon node are not served.
+//!
+//! The tracker is built as `bootstrap/services.rs` builds it: on the real
+//! `BnManager`, through `DutyTracker::new_with_source` and the production
+//! index source.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use bn_manager::{BnManager, BnManagerConfig, DutiesProvider};
+use crypto::SecretKey;
+use duty_tracker::DutyTracker;
+use parking_lot::RwLock;
+use rvc::orchestrator::PubkeyMap;
+use rvc::pubkey_index::{pubkey_bytes_to_0x, PubkeyIndexRegistry, PubkeyIndexSource};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+const EPOCH: u64 = 10;
+const SLOT: u64 = EPOCH * 32 + 3;
+const VALIDATOR_INDEX: &str = "7";
+const FIRST_ROOT: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const SECOND_ROOT: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+fn attester_path() -> String {
+    format!("/eth/v1/validator/duties/attester/{EPOCH}")
+}
+
+async fn attester_bn(dependent_root: &str, pubkey_hex: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(attester_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": dependent_root,
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": VALIDATOR_INDEX,
+                "committee_index": "0",
+                "committee_length": "4",
+                "committees_at_slot": "1",
+                "validator_committee_index": "0",
+                "slot": SLOT.to_string()
+            }]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn attester_hits(server: &MockServer) -> usize {
+    let requests: Vec<Request> = server.received_requests().await.expect("requests");
+    requests.iter().filter(|request| request.url.path() == attester_path()).count()
+}
+
+#[tokio::test]
+async fn attester_duties_cached_from_before_a_revocation_are_not_served() {
+    let pubkey = SecretKey::generate().public_key();
+    let pubkey_bytes = pubkey.to_bytes();
+    let pubkey_hex = pubkey_bytes_to_0x(&pubkey_bytes);
+    let first = attester_bn(FIRST_ROOT, &pubkey_hex).await;
+    let second = attester_bn(SECOND_ROOT, &pubkey_hex).await;
+    let bn_manager = Arc::new(
+        BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager"),
+    );
+
+    let mut registry = PubkeyIndexRegistry::new();
+    registry.insert(pubkey_bytes, VALIDATOR_INDEX.to_string());
+    let pubkey_map: PubkeyMap = Arc::new(RwLock::new(HashMap::from([(pubkey_bytes, pubkey)])));
+    let index_source =
+        Arc::new(PubkeyIndexSource { registry: Arc::new(RwLock::new(registry)), pubkey_map });
+    let tracker = DutyTracker::new_with_source(
+        Arc::clone(&bn_manager) as Arc<dyn DutiesProvider>,
+        index_source,
+    );
+
+    tracker.fetch_duties_for_epoch(EPOCH).await.expect("fetch from the first node");
+    assert_eq!(tracker.get_duties_for_slot(SLOT).await.len(), 1);
+    assert!(tracker.is_epoch_cached(EPOCH).await);
+    assert_eq!((attester_hits(&first).await, attester_hits(&second).await), (1, 0));
+
+    bn_manager.testing_revoke_admission(0);
+
+    assert!(
+        tracker.get_duties_for_slot(SLOT).await.is_empty(),
+        "duties cached from the revoked node must not be served"
+    );
+    assert!(!tracker.is_epoch_cached(EPOCH).await, "the revoked node's epoch reads as uncached");
+
+    tracker.fetch_duties_for_epoch(EPOCH).await.expect("refetch from the admitted node");
+    assert_eq!((attester_hits(&first).await, attester_hits(&second).await), (1, 1));
+    assert_eq!(tracker.get_duties_for_slot(SLOT).await.len(), 1);
+    assert_eq!(tracker.get_cached_dependent_root(EPOCH).await.as_deref(), Some(SECOND_ROOT));
+}

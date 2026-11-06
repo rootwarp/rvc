@@ -334,7 +334,11 @@ impl MockBeaconNodeClient {
         Self::default()
     }
 
-    /// `duty_fence` and `admission_duty_fence` follow this generation.
+    /// `duty_fence`, `admission_duty_fence` and `revocation_generation`
+    /// follow this generation.
+    ///
+    /// A `DutyTracker` reads `revocation_generation` once, when it is built.
+    /// Call this first to get stamped duty caches.
     pub fn track_admission(&self) -> Arc<AtomicU64> {
         let mut slot = self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner());
         slot.get_or_insert_with(|| Arc::new(AtomicU64::new(0))).clone()
@@ -1087,6 +1091,10 @@ impl DutiesProvider for MockBeaconNodeClient {
     ) -> Result<PtcDutiesResponse, BeaconError> {
         self.charge(MockMethod::PostPtcDuties).await;
         self.post_ptc_duties.invoke("post_ptc_duties", (epoch, validator_indices.to_vec()))
+    }
+
+    fn revocation_generation(&self) -> Option<Arc<AtomicU64>> {
+        self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner()).clone()
     }
 }
 

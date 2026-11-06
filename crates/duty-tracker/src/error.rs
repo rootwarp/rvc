@@ -12,4 +12,11 @@ pub enum DutyTrackerError {
 
     #[error("Invalid epoch: {0}")]
     InvalidEpoch(u64),
+
+    /// The revocation generation moved while the request was in flight.
+    ///
+    /// The answering node may have been revoked during the fetch, so the
+    /// answer is neither cached nor returned.
+    #[error("Duties for epoch {epoch} were discarded: a beacon node was revoked during the fetch")]
+    RevokedDuringFetch { epoch: u64 },
 }
