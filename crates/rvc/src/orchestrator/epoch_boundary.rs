@@ -435,10 +435,14 @@ impl PreferenceBroadcaster {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, MockMethod, Propagator};
+    use bn_manager::{
+        BeaconNodeClient, MockBeaconNodeClient, MockCallStamp, MockMethod, Propagator,
+    };
     use builder::BuilderService;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
@@ -1462,5 +1466,102 @@ mod tests {
         assert!(!spans.0.lock().contains(&"epoch.boundary"), "shutdown wins: no pass span");
         assert_eq!(f.mock.call_stamps().len(), calls, "shutdown wins: no step ran");
         assert!(f.runner.progress.lock().is_none(), "shutdown wins: no epoch started");
+    }
+
+    /// The fixture's runner as a local future over test-held senders, so the
+    /// test decides when it is polled.
+    struct LocalRunner {
+        slots: watch::Sender<Option<Slot>>,
+        shutdown: watch::Sender<bool>,
+        run: Pin<Box<dyn Future<Output = ()>>>,
+    }
+
+    impl LocalRunner {
+        fn new(f: &Fixture) -> Self {
+            let (slots, slots_rx) = watch::channel(None);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = EpochBoundaryTask::new(Arc::clone(&f.runner), slots_rx, shutdown_rx);
+            Self { slots, shutdown, run: Box::pin(task.run()) }
+        }
+
+        /// Polls `run`, 1 ms apart, until the `nth` held prepare arrives, and
+        /// returns its stamp. Nothing polls `run` again until the test does.
+        async fn poll_until_prepare(
+            &mut self,
+            mock: &MockBeaconNodeClient,
+            nth: usize,
+        ) -> MockCallStamp {
+            for _ in 0..5_000 {
+                assert!(futures::poll!(self.run.as_mut()).is_pending(), "only shutdown ends it");
+                let mut prepares = mock
+                    .call_stamps()
+                    .into_iter()
+                    .filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer);
+                if let Some(held) = prepares.nth(nth - 1) {
+                    return held;
+                }
+                tokio::time::advance(Duration::from_millis(1)).await;
+            }
+            panic!("PrepareBeaconProposer: arrival {nth} did not come within 5,000 virtual ms");
+        }
+    }
+
+    fn prepare_done(runner: &EpochBoundaryRunner) -> bool {
+        runner
+            .progress
+            .lock()
+            .as_ref()
+            .is_some_and(|p| p.done.contains(&BoundaryStep::PrepareProposers))
+    }
+
+    /// Shutdown and a ready pass on the same poll of the in-flight select:
+    /// shutdown wins, and the ready prepare never completes. The test stops
+    /// polling `run` once the held prepare arrives, flips shutdown and lets
+    /// the hold elapse, then polls once with both arms ready. Repeated: an
+    /// unbiased select picks a random first arm. Without shutdown, the same
+    /// poll completes the prepare and the steps after it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_wins_an_in_flight_tie_with_a_ready_pass() {
+        let f = held_fixture(MockMethod::PrepareBeaconProposer, &[1, 2]).await;
+        for round in 1..=32 {
+            let mut runner = LocalRunner::new(&f);
+            runner.slots.send_replace(Some(32));
+            let held = runner.poll_until_prepare(&f.mock, round).await;
+            let mut hold_end = std::pin::pin!(tokio::time::sleep_until(held.at + HOLD));
+            assert!(futures::poll!(hold_end.as_mut()).is_pending(), "round {round}: still held");
+            runner.shutdown.send_replace(true);
+            tokio::time::advance(HOLD).await;
+            assert!(futures::poll!(hold_end.as_mut()).is_ready(), "round {round}: hold elapsed");
+            let tie = futures::poll!(runner.run.as_mut());
+            assert!(
+                f.mock.prepare_beacon_proposer_calls().is_empty(),
+                "round {round}: shutdown wins: the ready prepare did not complete"
+            );
+            assert!(
+                !prepare_done(&f.runner),
+                "round {round}: shutdown wins: no PrepareProposers done mark"
+            );
+            assert_eq!(
+                arrivals(&f.mock, MockMethod::SubmitBeaconCommitteeSubscriptions),
+                0,
+                "round {round}: shutdown wins: no subscription request"
+            );
+            assert!(tie.is_ready(), "round {round}: shutdown wins: the tie poll ends the runner");
+        }
+
+        let mut runner = LocalRunner::new(&f);
+        runner.slots.send_replace(Some(32));
+        runner.poll_until_prepare(&f.mock, 33).await;
+        tokio::time::advance(HOLD).await;
+        assert!(futures::poll!(runner.run.as_mut()).is_pending(), "no shutdown: still running");
+        assert_eq!(
+            f.mock.prepare_beacon_proposer_calls().len(),
+            1,
+            "no shutdown: the same poll completes the held prepare"
+        );
+        assert!(prepare_done(&f.runner), "no shutdown: PrepareProposers is marked done");
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        runner.shutdown.send_replace(true);
+        assert!(futures::poll!(runner.run.as_mut()).is_ready(), "shutdown ends the idle runner");
     }
 }
