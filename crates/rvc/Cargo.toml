@@ -66,6 +66,9 @@ axum.workspace = true
 block-service = { workspace = true, features = ["test-utils"] }
 # test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
 bn-manager = { workspace = true, features = ["test-utils"] }
+# test-utils: `DutyTracker::cache_proposer_duties` for the preference re-broadcast
+# tests. The production dependency line above does not enable this feature.
+duty-tracker = { workspace = true, features = ["test-utils"] }
 crypto = { workspace = true, features = ["test-utils"] }
 # ARCH-7b: valid Deneb body fixtures for proposal success path in M1 harness.
 eth-types = { workspace = true, features = ["test-fixtures"] }

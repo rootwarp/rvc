@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bn_manager::{BnManager, BnManagerConfig, DutiesProvider};
+use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig, DutiesProvider};
 use crypto::SecretKey;
 use duty_tracker::DutyTracker;
+use eth_types::ForkSchedule;
 use parking_lot::RwLock;
 use rvc::orchestrator::PubkeyMap;
 use rvc::pubkey_index::{pubkey_bytes_to_0x, PubkeyIndexRegistry, PubkeyIndexSource};
@@ -91,4 +92,127 @@ async fn attester_duties_cached_from_before_a_revocation_are_not_served() {
     assert_eq!((attester_hits(&first).await, attester_hits(&second).await), (1, 1));
     assert_eq!(tracker.get_duties_for_slot(SLOT).await.len(), 1);
     assert_eq!(tracker.get_cached_dependent_root(EPOCH).await.as_deref(), Some(SECOND_ROOT));
+}
+
+fn proposer_path() -> String {
+    format!("/eth/v1/validator/duties/proposer/{EPOCH}")
+}
+
+async fn proposer_bn(dependent_root: &str, pubkey_hex: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(proposer_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": dependent_root,
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": VALIDATOR_INDEX,
+                "slot": SLOT.to_string()
+            }]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Two proposer BNs behind one `BnManager`, and a tracker built on it as
+/// `bootstrap/services.rs` builds it (fork schedule included: it routes
+/// proposer duties v1/v2).
+struct ProposerBns {
+    first: MockServer,
+    second: MockServer,
+    bn_manager: Arc<BnManager>,
+    tracker: DutyTracker,
+}
+
+impl ProposerBns {
+    async fn start() -> Self {
+        let pubkey = SecretKey::generate().public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = pubkey_bytes_to_0x(&pubkey_bytes);
+        let first = proposer_bn(FIRST_ROOT, &pubkey_hex).await;
+        let second = proposer_bn(SECOND_ROOT, &pubkey_hex).await;
+        let bn_manager = Arc::new(
+            BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager"),
+        );
+
+        let mut registry = PubkeyIndexRegistry::new();
+        registry.insert(pubkey_bytes, VALIDATOR_INDEX.to_string());
+        let pubkey_map: PubkeyMap = Arc::new(RwLock::new(HashMap::from([(pubkey_bytes, pubkey)])));
+        let index_source =
+            Arc::new(PubkeyIndexSource { registry: Arc::new(RwLock::new(registry)), pubkey_map });
+        let tracker = DutyTracker::new_with_source(
+            Arc::clone(&bn_manager) as Arc<dyn DutiesProvider>,
+            index_source,
+        )
+        .with_fork_schedule(ForkSchedule::unscheduled_gloas());
+        Self { first, second, bn_manager, tracker }
+    }
+
+    /// Proposer-duty requests received by (first, second).
+    async fn hits(&self) -> (usize, usize) {
+        let count = |requests: Vec<Request>| {
+            requests.iter().filter(|request| request.url.path() == proposer_path()).count()
+        };
+        (
+            count(self.first.received_requests().await.expect("requests")),
+            count(self.second.received_requests().await.expect("requests")),
+        )
+    }
+}
+
+#[tokio::test]
+async fn proposer_duty_cached_before_a_revocation_is_not_served() {
+    let bns = ProposerBns::start().await;
+    let tracker = &bns.tracker;
+
+    tracker.fetch_proposer_duties(EPOCH).await.expect("fetch from the first node");
+    assert!(tracker.get_proposer_duty(SLOT).await.is_some());
+    assert!(tracker.is_proposer_epoch_cached(EPOCH).await);
+    assert_eq!(bns.hits().await, (1, 0));
+
+    bns.bn_manager.testing_revoke_admission(0);
+
+    assert!(
+        tracker.get_proposer_duty(SLOT).await.is_none(),
+        "a proposer duty cached from the revoked node must not be served"
+    );
+    assert!(
+        !tracker.is_proposer_epoch_cached(EPOCH).await,
+        "the revoked node's epoch reads as uncached"
+    );
+
+    tracker.fetch_proposer_duties(EPOCH).await.expect("refetch from the admitted node");
+    assert_eq!(bns.hits().await, (1, 1));
+    assert!(tracker.get_proposer_duty(SLOT).await.is_some());
+    assert_eq!(
+        tracker.get_cached_proposer_dependent_root(EPOCH).await.as_deref(),
+        Some(SECOND_ROOT)
+    );
+}
+
+#[tokio::test]
+async fn a_fence_captured_after_a_revocation_never_sees_older_duties() {
+    let bns = ProposerBns::start().await;
+    let tracker = &bns.tracker;
+    tracker.fetch_proposer_duties(EPOCH).await.expect("cache under G");
+    let seen_at_fetch = bns.bn_manager.revocation_watch().seen();
+
+    bns.bn_manager.testing_revoke_admission(0);
+    let fence = bns.bn_manager.revocation_watch();
+    assert_eq!(fence.seen(), seen_at_fetch + 1, "the fence is captured after the revocation");
+
+    assert!(
+        tracker.get_proposer_duty(SLOT).await.is_none(),
+        "a fence holder is never handed a duty fetched before its fence, though nothing cleared the cache"
+    );
+
+    tracker.fetch_proposer_duties(EPOCH).await.expect("refetch under G+1");
+    assert!(tracker.get_proposer_duty(SLOT).await.is_some(), "the refetched duty is served");
+    assert!(fence.holds(), "and it was served while the fence holds");
+
+    bns.bn_manager.testing_revoke_admission(1);
+    assert!(!fence.holds());
+    assert!(tracker.get_proposer_duty(SLOT).await.is_none(), "a second revocation drops it again");
 }
