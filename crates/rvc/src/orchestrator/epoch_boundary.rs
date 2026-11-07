@@ -451,7 +451,7 @@ mod tests {
     use crate::orchestrator::{
         DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle,
     };
-    use crate::pubkey_index::PubkeyIndexRegistry;
+    use crate::pubkey_index::{PubkeyIndexRegistry, PubkeyIndexSource};
 
     const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -466,6 +466,21 @@ mod tests {
         subscription_slots: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
         /// Attester-duties requests still to answer 503, per epoch.
         failing_attester: FailPlan,
+        /// The tracker's index source: the production one, over the fixture's
+        /// pubkey map and index registry.
+        index_source: Arc<PubkeyIndexSource>,
+    }
+
+    impl Fixture {
+        /// Resolves a new local key to `index` with no cache clear, as the
+        /// index resolver does mid-epoch. Every cached attester epoch stays
+        /// present, under an index snapshot that is now stale.
+        fn resolve_new_key(&self, index: &str) {
+            let pubkey = SecretKey::generate().public_key();
+            let pk_bytes = pubkey.to_bytes();
+            self.index_source.pubkey_map.write().insert(pk_bytes, pubkey);
+            self.index_source.registry.write().insert(pk_bytes, index.to_string());
+        }
     }
 
     /// Requests still to answer 503, per epoch.
@@ -605,16 +620,21 @@ mod tests {
         mock.track_admission();
         let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
 
-        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["42".to_string()]));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)])));
+        let pubkey_index = PubkeyIndexRegistry::shared();
+        pubkey_index.write().insert(pk_bytes, "42".to_string());
+        let index_source = Arc::new(PubkeyIndexSource {
+            registry: Arc::clone(&pubkey_index),
+            pubkey_map: Arc::clone(&pubkey_map),
+        });
+        let duty_tracker =
+            Arc::new(DutyTracker::new_with_source(beacon.clone(), index_source.clone()));
         for &epoch in seed {
             duty_tracker.fetch_duties_for_epoch(epoch).await.expect("seed attester duties");
         }
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         validator_store.add_validator(ValidatorConfig::new(pk_bytes)).expect("add validator");
-        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)])));
-        let pubkey_index = PubkeyIndexRegistry::shared();
-        pubkey_index.write().insert(pk_bytes, "42".to_string());
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(local);
@@ -660,7 +680,15 @@ mod tests {
             Arc::clone(&duty_tracker),
             timeouts,
         );
-        Fixture { mock, duty_tracker, breaker, runner, subscription_slots, failing_attester }
+        Fixture {
+            mock,
+            duty_tracker,
+            breaker,
+            runner,
+            subscription_slots,
+            failing_attester,
+            index_source,
+        }
     }
 
     fn expect_summaries(lines: &[&str], want: usize) -> Result<(), String> {
@@ -929,6 +957,68 @@ mod tests {
         assert!(f.subscription_slots.lock().is_empty(), "E is still uncached");
     }
 
+    /// A failed proposer fetch does not stop the next fetch either. ReorgCheck's
+    /// proposer E and E+1 and attester E+1 requests fail, so DutyFetch
+    /// requests all three; its proposer E request fails too, and the E+1
+    /// requests still follow it in the same pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn duty_fetch_continues_after_a_failed_proposer_fetch() {
+        let [att, prop] = [MockMethod::GetAttesterDuties, MockMethod::GetProposerDuties];
+        let [prep, subs] =
+            [MockMethod::PrepareBeaconProposer, MockMethod::SubmitBeaconCommitteeSubscriptions];
+        let failing_proposer = FailPlan::default();
+        let f = fixture(proposer_duties_failing(Arc::clone(&failing_proposer))).await;
+        f.duty_tracker.clear_epoch_cache(2).await;
+        f.failing_attester.lock().insert(2, 1);
+        failing_proposer.lock().extend([(1, 2), (2, 1)]);
+        let seeded = f.mock.call_stamps().len();
+        let attester_seeded = f.mock.get_attester_duties_calls().len();
+        let proposer_seeded = f.mock.get_proposer_duties_calls().len();
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            methods_since(&f.mock, seeded),
+            [att, prop, att, prop, prop, att, prop, prep, subs, subs],
+            "ReorgCheck E and E+1, then DutyFetch: proposer E fails, E+1 still follows"
+        );
+        assert_eq!(f.mock.get_proposer_duties_calls()[proposer_seeded..], [1, 2, 1, 2]);
+        assert_eq!(attester_epochs_since(&f.mock, attester_seeded), [1, 2, 2]);
+        assert!(!f.duty_tracker.is_proposer_epoch_cached(1).await, "both E requests failed");
+        assert!(f.duty_tracker.is_proposer_epoch_cached(2).await);
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+    }
+
+    /// DutyFetch keys on `is_epoch_cached`, the index-snapshot rule, not on
+    /// presence. E+1 fails for the whole first pass, so the subscription
+    /// step stays pending. A key resolved before the next wake leaves E
+    /// present under the old index set, and that wake's DutyFetch requests E
+    /// again with the new set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn duty_fetch_refetches_an_epoch_cached_under_an_older_index_set() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.duty_tracker.clear_epoch_cache(2).await;
+        f.failing_attester.lock().insert(2, 2);
+        f.runner.run_pending(32).await;
+        assert!(f.subscription_slots.lock().is_empty(), "E+1's requests failed: no POST");
+        assert!(f.runner.has_pending(33), "the subscription step stays pending");
+
+        f.resolve_new_key("43");
+        assert!(f.duty_tracker.get_cached_dependent_root(1).await.is_some(), "E is present");
+        assert!(!f.duty_tracker.is_epoch_cached(1).await, "under the old index set");
+        let attester_seeded = f.mock.get_attester_duties_calls().len();
+
+        f.runner.run_pending(33).await;
+
+        let grown = vec!["42".to_string(), "43".to_string()];
+        assert_eq!(
+            f.mock.get_attester_duties_calls()[attester_seeded..],
+            [(1, grown.clone()), (2, grown)],
+            "DutyFetch requests the stale E again with the new index set, then E+1"
+        );
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+    }
+
     /// Held on the prepare POST, so a cache entry can turn into a miss after
     /// DutyFetch and before the subscription step.
     const PREPARE_HOLD: Duration = Duration::from_secs(1);
@@ -983,6 +1073,44 @@ mod tests {
         logs_assert(|lines| expect_summaries(lines, 2));
     }
 
+    /// The subscription step reads the same index-snapshot rule, not
+    /// presence. A key resolved after DutyFetch, while the prepare POST is
+    /// held, leaves E and E+1 present under the old index set: no POST, and
+    /// the step stays pending. The next wake's DutyFetch requests both with
+    /// the new set, then the step POSTs.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscriptions_wait_when_a_key_resolves_after_duty_fetch() {
+        let held = proposer_duties_at(ROOT_A)
+            .with_method_delay(MockMethod::PrepareBeaconProposer, PREPARE_HOLD);
+        let f = fixture(held).await;
+        let resolve_during_prepare = async {
+            tokio::time::sleep(PREPARE_HOLD / 2).await;
+            f.resolve_new_key("43");
+        };
+
+        tokio::join!(f.runner.run_pending(32), resolve_during_prepare);
+
+        assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1, "the pass reached prepare");
+        assert!(f.subscription_slots.lock().is_empty(), "stale E and E+1 at the step: no POST");
+        for epoch in [1, 2] {
+            assert!(f.duty_tracker.get_cached_dependent_root(epoch).await.is_some(), "{epoch}");
+            assert!(!f.duty_tracker.is_epoch_cached(epoch).await, "{epoch}: old index set");
+        }
+        assert!(f.runner.has_pending(33), "the subscription step stays pending");
+        let attester_seeded = f.mock.get_attester_duties_calls().len();
+
+        f.runner.run_pending(33).await;
+
+        let grown = vec!["42".to_string(), "43".to_string()];
+        assert_eq!(
+            f.mock.get_attester_duties_calls()[attester_seeded..],
+            [(1, grown.clone()), (2, grown)],
+            "the next wake's DutyFetch requests E and E+1 with the new index set"
+        );
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert!(!f.runner.has_pending(34), "nothing is pending once both epochs are subscribed");
+    }
+
     /// A hung beacon node does not hold the runner: the pass returns when
     /// DutyFetch's `timeouts.duty_fetch` bound fires, with the subscription
     /// step pending, and the next wake retries under the same bound.
@@ -1014,6 +1142,31 @@ mod tests {
         assert_eq!(attester_stamps().len(), 4);
         assert!(f.subscription_slots.lock().is_empty());
         assert!(f.runner.has_pending(34));
+    }
+
+    /// The one `timeouts.duty_fetch` bound covers the proposer fetches too.
+    /// With the attester duties cached and every proposer request hung, the
+    /// step ends at the bound after its first proposer request, and the
+    /// steps after it still run in the same pass.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duty_fetch_bound_covers_a_hung_proposer_fetch() {
+        let held = proposer_duties_at(ROOT_A)
+            .with_method_delay(MockMethod::GetProposerDuties, Duration::from_secs(3_600));
+        let f = fixture(held).await;
+        let duty_fetch = create_test_config().timeouts.duty_fetch;
+        let seeded = f.mock.call_stamps().len();
+
+        f.runner.run_pending(32).await;
+
+        let proposer_stamps: Vec<tokio::time::Instant> = f.mock.call_stamps()[seeded..]
+            .iter()
+            .filter(|stamp| stamp.method == MockMethod::GetProposerDuties)
+            .map(|stamp| stamp.at)
+            .collect();
+        assert_eq!(proposer_stamps.len(), 3, "ReorgCheck E and E+1, then DutyFetch's E");
+        assert_eq!(proposer_stamps[2].elapsed(), duty_fetch, "the pass ends at DutyFetch's bound");
+        assert!(!f.duty_tracker.is_proposer_epoch_cached(1).await);
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]), "the steps after ran");
     }
 
     /// DutyFetch calls the tracker directly. Eviction, PTC duties and the
