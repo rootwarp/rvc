@@ -29,9 +29,10 @@
 //!
 //! The progress mutex is taken only between steps and is never held across
 //! an `.await`, so `run_pending(&self)` can run inside a future that borrows
-//! the runner shared. Outside tests, only [`EpochBoundaryTask::run`] calls
-//! `run_pending`, and it awaits each pass before the next wake, so one pass
-//! runs at a time.
+//! the runner shared, and a pass dropped mid-step leaves it unlocked. A step
+//! is marked done only after it returns. Outside tests, only
+//! [`EpochBoundaryTask::run`] calls `run_pending`, and it awaits or drops
+//! each pass before the next wake, so one pass runs at a time.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -75,17 +76,14 @@ impl EpochBoundaryTask {
     /// Returns when the shutdown watch reads `true` or loses its sender, or
     /// when the processed-slot sender is dropped (the slot loop is gone). A
     /// wake reads the latest slot, so wakes during a pass coalesce. A pass in
-    /// flight is not raced against shutdown.
+    /// flight is raced against shutdown and dropped when shutdown wins; the
+    /// step it was in stays pending. Shutdown wins ties in both waits.
     pub async fn run(mut self) {
         let loop_span = info_span!(parent: None, "epoch.boundary.runner");
         loop {
             tokio::select! {
                 biased;
-                changed = self.shutdown.changed() => {
-                    if changed.is_err() || *self.shutdown.borrow_and_update() {
-                        return;
-                    }
-                }
+                () = shutdown_requested(&mut self.shutdown) => return,
                 changed = self.slots.changed() => {
                     if changed.is_err() {
                         return;
@@ -99,11 +97,20 @@ impl EpochBoundaryTask {
                     let epoch = slot / SLOTS_PER_EPOCH;
                     let pass = info_span!(parent: None, "epoch.boundary", epoch, slot);
                     pass.follows_from(&loop_span);
-                    self.runner.run_pending(slot).instrument(pass).await;
+                    tokio::select! {
+                        biased;
+                        () = shutdown_requested(&mut self.shutdown) => return,
+                        () = self.runner.run_pending(slot).instrument(pass) => {}
+                    }
                 }
             }
         }
     }
+}
+
+/// Resolves once `shutdown` reads `true` or loses its sender.
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
 /// One boundary step. Declaration order is run order.
@@ -440,9 +447,11 @@ mod tests {
     use slashing::SlashingDb;
     use timing::MockSlotClock;
     use tokio::task::JoinHandle;
+    use tracing_subscriber::layer::SubscriberExt;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
     use super::*;
+    use crate::bootstrap::executor::{ShutdownTier, TierBudget};
     use crate::orchestrator::coordinator::tests::{
         create_mock_block_beacon, create_mock_validator_store, create_test_config,
         create_test_fork_schedule, fast_timeouts, m2_metric_lock, MockBlockBeacon, MockSubmitter,
@@ -461,7 +470,7 @@ mod tests {
         mock: Arc<MockBeaconNodeClient>,
         duty_tracker: Arc<DutyTracker>,
         breaker: Arc<CircuitBreakerState>,
-        runner: EpochBoundaryRunner,
+        runner: Arc<EpochBoundaryRunner>,
         /// Duty slots of each subscription POST, in POST order.
         subscription_slots: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
         /// Attester-duties requests still to answer 503, per epoch.
@@ -585,6 +594,17 @@ mod tests {
         with_builder: bool,
         seed: &[u64],
     ) -> Fixture {
+        fixture_config(mock, local, with_builder, seed, create_test_config()).await
+    }
+
+    /// [`fixture_seeded`] under `config`'s timeouts.
+    async fn fixture_config(
+        mock: MockBeaconNodeClient,
+        local: SecretKey,
+        with_builder: bool,
+        seed: &[u64],
+        config: OrchestratorConfig,
+    ) -> Fixture {
         let pubkey = local.public_key();
         let pk_bytes = pubkey.to_bytes();
         let pk_hex = format!("0x{}", hex::encode(pk_bytes));
@@ -654,7 +674,6 @@ mod tests {
                 schedule,
             ))
         });
-        let config = create_test_config();
         let timeouts = config.timeouts.clone();
         let preferences = Arc::new(PreferenceBroadcaster::new(
             builder_service,
@@ -673,13 +692,13 @@ mod tests {
             config,
         ));
         let breaker = Arc::new(CircuitBreakerState::new(BREAKER_CONSECUTIVE_LIMIT, 5));
-        let runner = EpochBoundaryRunner::new(
+        let runner = Arc::new(EpochBoundaryRunner::new(
             duty_management,
             Arc::clone(&breaker),
             preferences,
             Arc::clone(&duty_tracker),
             timeouts,
-        );
+        ));
         Fixture {
             mock,
             duty_tracker,
@@ -1315,5 +1334,133 @@ mod tests {
             .expect("run task");
         assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
         runner.await.expect("runner task");
+    }
+
+    /// Longer than the tier budget, so only shutdown can end a held step in it.
+    const HOLD: Duration = Duration::from_secs(3_600);
+
+    /// The fixture's runner on its own task, over test-held senders.
+    struct RunnerTask {
+        slots: watch::Sender<Option<Slot>>,
+        shutdown: watch::Sender<bool>,
+        task: JoinHandle<()>,
+    }
+
+    fn spawn_runner(f: &Fixture) -> RunnerTask {
+        let (slots, slots_rx) = watch::channel(None);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = EpochBoundaryTask::new(Arc::clone(&f.runner), slots_rx, shutdown_rx);
+        RunnerTask { slots, shutdown, task: tokio::spawn(task.run()) }
+    }
+
+    fn arrivals(mock: &MockBeaconNodeClient, method: MockMethod) -> usize {
+        mock.call_stamps().iter().filter(|stamp| stamp.method == method).count()
+    }
+
+    /// Bounded 1 ms steps, far below `HOLD`, until `method` has `count` arrivals.
+    async fn await_arrivals(mock: &MockBeaconNodeClient, method: MockMethod, count: usize) {
+        for _ in 0..5_000 {
+            if arrivals(mock, method) >= count {
+                return;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        panic!("{method:?}: {count} arrivals did not come within 5,000 virtual ms");
+    }
+
+    /// Flips shutdown; the task must end inside the Orchestrator tier budget.
+    async fn shut_down_within_budget(runner: RunnerTask, arm: &str) {
+        let RunnerTask { slots: _slots, shutdown, task } = runner;
+        let budget = TierBudget::default().for_tier(ShutdownTier::Orchestrator);
+        shutdown.send_replace(true);
+        tokio::time::timeout(budget, task)
+            .await
+            .unwrap_or_else(|_| panic!("{arm}: the runner must end within the {budget:?} budget"))
+            .expect("runner task");
+    }
+
+    /// `method` held for `HOLD`. `preparation` and `duty_fetch` outlast it,
+    /// so no inner bound ends a held pass first.
+    async fn held_fixture(method: MockMethod, seed: &[u64]) -> Fixture {
+        let timeouts = OperationTimeouts {
+            preparation: 2 * HOLD,
+            duty_fetch: 2 * HOLD,
+            ..OperationTimeouts::default()
+        };
+        let mock = proposer_duties_at(ROOT_A).with_method_delay(method, HOLD);
+        let config = create_test_config().with_timeouts(timeouts);
+        fixture_config(mock, SecretKey::generate(), false, seed, config).await
+    }
+
+    /// Records the name of every span opened.
+    #[derive(Clone, Default)]
+    struct OpenedSpans(Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OpenedSpans {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.lock().push(attrs.metadata().name());
+        }
+    }
+
+    /// Shutdown with a pass in flight drops the pass, so the task ends inside
+    /// the Orchestrator tier budget, with the cancelled step still pending:
+    /// held in PrepareProposers, then in DutyFetch on the epoch's second
+    /// pass. A slot wake and shutdown ready together: shutdown wins, and no
+    /// pass starts.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn runner_exits_on_shutdown_within_tier_budget() {
+        let f = held_fixture(MockMethod::PrepareBeaconProposer, &[1, 2]).await;
+        let runner = spawn_runner(&f);
+        runner.slots.send_replace(Some(32));
+        await_arrivals(&f.mock, MockMethod::PrepareBeaconProposer, 1).await;
+        shut_down_within_budget(runner, "prepare in flight").await;
+        assert!(f.mock.prepare_beacon_proposer_calls().is_empty(), "dropped, not finished");
+        assert!(f.subscription_slots.lock().is_empty(), "no step after the cancelled one ran");
+        f.runner.run_pending(32).await;
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::PrepareBeaconProposer),
+            2,
+            "the cancelled step is still pending: a fresh pass prepares again"
+        );
+        assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1);
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+
+        // The first pass ends with E+1 uncached: ReorgCheck's and DutyFetch's
+        // E+1 requests fail. The second pass starts at DutyFetch.
+        let f = held_fixture(MockMethod::GetAttesterDuties, &[1]).await;
+        f.failing_attester.lock().insert(2, 2);
+        f.runner.run_pending(32).await;
+        assert!(f.subscription_slots.lock().is_empty(), "the subscription step is pending");
+        let fetches = arrivals(&f.mock, MockMethod::GetAttesterDuties);
+        let runner = spawn_runner(&f);
+        runner.slots.send_replace(Some(33));
+        await_arrivals(&f.mock, MockMethod::GetAttesterDuties, fetches + 1).await;
+        shut_down_within_budget(runner, "DutyFetch in flight").await;
+        assert!(!f.duty_tracker.is_epoch_cached(2).await, "dropped, not finished");
+        assert!(f.runner.has_pending(33), "the cancelled step is still pending");
+        f.runner.run_pending(33).await;
+        assert_eq!(arrivals(&f.mock, MockMethod::GetAttesterDuties), fetches + 2);
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+
+        // A slot wake and shutdown ready at the task's first poll. Repeated:
+        // an unbiased select picks a random first arm.
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let calls = f.mock.call_stamps().len();
+        let spans = OpenedSpans::default();
+        let subscriber = tracing_subscriber::registry().with(spans.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+        for _ in 0..16 {
+            let runner = spawn_runner(&f);
+            runner.slots.send_replace(Some(32));
+            shut_down_within_budget(runner, "slot wake and shutdown together").await;
+        }
+        assert!(!spans.0.lock().contains(&"epoch.boundary"), "shutdown wins: no pass span");
+        assert_eq!(f.mock.call_stamps().len(), calls, "shutdown wins: no step ran");
+        assert!(f.runner.progress.lock().is_none(), "shutdown wins: no epoch started");
     }
 }
