@@ -1564,4 +1564,89 @@ mod tests {
         runner.shutdown.send_replace(true);
         assert!(futures::poll!(runner.run.as_mut()).is_ready(), "shutdown ends the idle runner");
     }
+
+    /// The in-flight select is `biased;` with the shutdown arm first, so a
+    /// same-poll tie never takes `select!`'s random first arm. The tie test
+    /// above catches an unbiased select only when the random draw picks the
+    /// pass.
+    #[test]
+    fn the_in_flight_select_is_biased_with_the_shutdown_arm_first() {
+        use std::ops::Range;
+
+        fn block(code: &str, open: usize) -> Range<usize> {
+            assert_eq!(code.as_bytes().get(open), Some(&b'{'), "a block opens at byte {open}");
+            let mut depth = 0_usize;
+            for (at, byte) in code.bytes().enumerate().skip(open) {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return open + 1..at;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the block at byte {open} never closes");
+        }
+        fn blocks(code: &str, within: Range<usize>, head: &str) -> Vec<Range<usize>> {
+            let base = within.start;
+            code[within]
+                .match_indices(head)
+                .map(|(at, _)| block(code, base + at + head.len() - 1))
+                .collect()
+        }
+
+        let source = include_str!("epoch_boundary.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production part");
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .flat_map(str::split_whitespace)
+            .collect();
+        let tasks = blocks(&code, 0..code.len(), "implEpochBoundaryTask{");
+        assert_eq!(tasks.len(), 1, "one `impl EpochBoundaryTask` block");
+        let runs = blocks(&code, tasks[0].clone(), "pubasyncfnrun(mutself){");
+        assert_eq!(runs.len(), 1, "one `EpochBoundaryTask::run`");
+        let run = &code[runs[0].clone()];
+        assert_eq!(
+            run.matches("select!").count(),
+            2,
+            "`run` has the idle and the in-flight select"
+        );
+        let selects = blocks(&code, runs[0].clone(), "tokio::select!{");
+        let [idle, in_flight] = selects.as_slice() else {
+            panic!("both selects in `run` are `tokio::select!`: {run}");
+        };
+        assert!(
+            idle.start < in_flight.start && in_flight.end < idle.end,
+            "the in-flight select is nested in the idle select: {run}"
+        );
+        assert!(
+            code[idle.clone()].contains("self.slots.changed()"),
+            "the outer select waits for a slot"
+        );
+
+        let inner = &code[in_flight.clone()];
+        assert_eq!(inner.matches("=>").count(), 2, "the in-flight select has two arms: {inner}");
+        let arm = |head: &str| {
+            assert_eq!(
+                inner.matches(head).count(),
+                1,
+                "the in-flight select has one `{head}` arm: {inner}"
+            );
+            inner.find(head).expect("counted above")
+        };
+        let shutdown = arm("()=shutdown_requested(&mutself.shutdown)=>");
+        let pass = arm("()=self.runner.run_pending(slot)");
+        assert!(
+            inner.starts_with("biased;"),
+            "the in-flight select opens with `biased;`, so a tie never takes a random first arm: {inner}"
+        );
+        assert!(
+            shutdown < pass,
+            "the in-flight select lists the shutdown arm before the pass arm: {inner}"
+        );
+    }
 }
