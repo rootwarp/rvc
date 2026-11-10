@@ -2739,6 +2739,95 @@ mod tests {
         );
     }
 
+    /// Hands the pass to a lock holder when the first proposer reorg check
+    /// returns, after it cached the beacon node's root and before the caller
+    /// reads that root back, and waits until the holder has the proposer
+    /// cache's write lock.
+    #[derive(Clone)]
+    struct CachedRootGate(Arc<parking_lot::Mutex<Option<Handoff>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for CachedRootGate
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let check = "duty_tracker.check_proposer_reorg";
+            if !ctx.span(&id).is_some_and(|span| span.name() == check) {
+                return;
+            }
+            let handoff = self.0.lock().take();
+            if let Some((returned, locked)) = handoff {
+                returned.send(()).expect("the holder waits for the check");
+                locked.recv().expect("the holder took the write lock");
+            }
+        }
+    }
+
+    /// RSA B1 / Harper B1 (fix2): a root change the reorg check cached is
+    /// broadcast on retry when the step bound cuts the check at its read of
+    /// the new root, the first await after the cache write. Root A is cached
+    /// for E and the beacon node answers B. When E's proposer check returns,
+    /// a thread takes the proposer cache's write lock, so that read waits
+    /// until the 2 s step bound drops the check. The retry broadcasts B once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_root_change_cut_at_its_cached_root_read_is_broadcast_on_retry() {
+        let epoch = create_test_fork_schedule().gloas_fork_epoch;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let mock = proposer_duties_then(local_hex, epoch, ROOT_A, ROOT_B);
+        let f = fixture_config(mock, local, true, &[epoch, epoch + 1], short_duty_fetch()).await;
+        f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
+        let (returned, returned_rx) = std::sync::mpsc::sync_channel(0);
+        let (locked, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let gate = CachedRootGate(Arc::new(parking_lot::Mutex::new(Some((returned, locked_rx)))));
+        let tracker = Arc::clone(&f.duty_tracker);
+        let holder = std::thread::spawn(move || {
+            if returned_rx.recv().is_ok() {
+                tracker.with_proposer_cache_locked(|| {
+                    locked.send(()).expect("the check waits for the lock");
+                    release_rx.recv().expect("the test releases the lock");
+                });
+            }
+        });
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone()).with(gate.clone());
+        let default = tracing::subscriber::set_default(subscriber);
+        let start = tokio::time::Instant::now();
+
+        let (step, bound) = (BoundaryStep::ReorgCheck, f.runner.timeouts.duty_fetch);
+        let cut = bounded(epoch, step, bound, f.runner.reorg_check(epoch)).await;
+
+        let elapsed = start.elapsed();
+        release.send(()).expect("the holder takes the release");
+        drop(default);
+        drop(gate.0.lock().take());
+        holder.join().expect("lock holder");
+        assert_eq!(cut, StepOutcome::Failed, "the step bound cut the check");
+        assert_eq!(elapsed, bound, "at the 2 s step bound");
+        assert_eq!(
+            warns.lines(),
+            [format!("Epoch boundary step timed out epoch={epoch} step=ReorgCheck timeout=2s")],
+            "cut at the read, before the reorg warn"
+        );
+        let root = f.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
+        assert_eq!(root.as_deref(), Some(ROOT_B), "B cached before the cut");
+        assert!(f.mock.submit_proposer_preferences_calls().is_empty(), "cut before the broadcast");
+
+        f.runner.run_pending(epoch * SLOTS_PER_EPOCH).await;
+
+        let prefs = f.mock.submit_proposer_preferences_calls();
+        assert_eq!(prefs.len(), 1, "the retry broadcasts B once");
+        assert_eq!(
+            prefs[0][0].message.dependent_root,
+            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).expect("root B")
+        );
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::ReorgCheck),
+            (Some(StepOutcome::Done), true)
+        );
+    }
+
     /// Hands the pass to a lock holder when it enters
     /// `orchestrator.prepare_proposers`, after the step bound started and
     /// before the step reads the pubkey map, and waits until the holder has

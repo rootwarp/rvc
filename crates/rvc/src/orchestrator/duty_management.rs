@@ -262,8 +262,9 @@ impl DutyManagementService {
     }
 
     /// Sets `proposer_root_changed` as soon as a previously cached proposer
-    /// `dependent_root` changes, so a caller that drops the check part way
-    /// still sees a change it cached.
+    /// `dependent_root` changes, before the next await after the cache
+    /// write, so a caller that drops the check part way still sees a change
+    /// it cached.
     #[tracing::instrument(name = "orchestrator.check_reorg", level = "debug", skip_all, fields(epoch = current_epoch))]
     pub(crate) async fn check_reorg_at_epoch_boundary(
         &self,
@@ -317,6 +318,7 @@ impl DutyManagementService {
             .await
             {
                 TimedOutcome::Ok(true) if proposer_cached => {
+                    proposer_root_changed.store(true, Ordering::Release);
                     let new_root =
                         self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
                     warn!(
@@ -326,7 +328,6 @@ impl DutyManagementService {
                         "Reorg detected: proposer duties refetched"
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
-                    proposer_root_changed.store(true, Ordering::Release);
                 }
                 TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");

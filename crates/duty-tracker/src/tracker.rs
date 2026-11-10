@@ -784,6 +784,17 @@ impl DutyTracker {
         insert_proposer(&mut cache, epoch, dependent_root, duties, stamp)
     }
 
+    /// Test-only: runs `hold` while this thread holds the proposer cache's
+    /// write lock, so a test can park proposer readers at a chosen point.
+    ///
+    /// Blocks the calling thread. Call it from a plain thread, never from
+    /// async code.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_proposer_cache_locked<R>(&self, hold: impl FnOnce() -> R) -> R {
+        let _cache = self.proposer_cache.blocking_write();
+        hold()
+    }
+
     #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Block.as_str()))]
     pub async fn fetch_proposer_duties(
         &self,
