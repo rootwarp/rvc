@@ -303,6 +303,8 @@ pub struct MockBeaconNodeClient {
     request_delay: Duration,
     /// Per-method override. A present key wins over `request_delay`, including zero.
     method_delays: HashMap<MockMethod, Duration>,
+    /// Per-call override: call `n` of a method waits entry `n`, when listed.
+    call_delays: HashMap<MockMethod, Vec<Duration>>,
     /// One stamp per role-trait entry, taken before [`Self::charge`] sleeps.
     arrivals: Mutex<Vec<MockCallStamp>>,
     /// `submit_sync_committee_messages` futures that returned, after the delay
@@ -389,8 +391,21 @@ impl MockBeaconNodeClient {
         self
     }
 
-    fn effective_delay(&self, method: MockMethod) -> Duration {
-        self.method_delays.get(&method).copied().unwrap_or(self.request_delay)
+    /// Override both delays for the first calls of `method`: call `n` (from 0)
+    /// waits `delays[n]`. A call past the list waits the delay it would without it.
+    pub fn with_call_delays(
+        mut self,
+        method: MockMethod,
+        delays: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        self.call_delays.insert(method, delays.into_iter().collect());
+        self
+    }
+
+    fn effective_delay(&self, method: MockMethod, call: usize) -> Duration {
+        let listed = self.call_delays.get(&method).and_then(|delays| delays.get(call));
+        let fallback = || self.method_delays.get(&method).copied().unwrap_or(self.request_delay);
+        listed.copied().unwrap_or_else(fallback)
     }
 
     /// Stamps recorded since the client was built, in arrival order.
@@ -434,11 +449,13 @@ impl MockBeaconNodeClient {
     }
 
     async fn charge(&self, method: MockMethod) {
-        self.arrivals
-            .lock()
-            .expect("mock arrival log poisoned")
-            .push(MockCallStamp { method, at: tokio::time::Instant::now() });
-        let delay = self.effective_delay(method);
+        let call = {
+            let mut arrivals = self.arrivals.lock().expect("mock arrival log poisoned");
+            let call = arrivals.iter().filter(|stamp| stamp.method == method).count();
+            arrivals.push(MockCallStamp { method, at: tokio::time::Instant::now() });
+            call
+        };
+        let delay = self.effective_delay(method, call);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -1744,6 +1761,26 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_millis(20));
         let _ = mock.get_fork("head").await;
         assert_eq!(start.elapsed(), Duration::from_millis(70));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_call_delays_hold_the_listed_calls_then_fall_back() {
+        use std::time::Duration;
+
+        let mock = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetAttestationData, Duration::from_millis(5))
+            .with_call_delays(
+                MockMethod::GetAttestationData,
+                [Duration::from_millis(40), Duration::ZERO],
+            );
+        let start = tokio::time::Instant::now();
+        let _ = mock.get_attestation_data(1, 0).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(40), "call 0 waits its listed delay");
+        let _ = mock.get_genesis().await;
+        let _ = mock.get_attestation_data(1, 1).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(40), "call 1 waits its listed zero");
+        let _ = mock.get_attestation_data(1, 2).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(45), "call 2 falls back");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

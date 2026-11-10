@@ -38,16 +38,18 @@
 //!
 //! # Lock rule
 //!
-//! The progress and processed-slot mutexes are taken only between steps and
-//! are never held across an `.await`, so `run_pending(&self)` can run inside
-//! a future that borrows the runner shared, and a pass dropped mid-step
-//! leaves them unlocked. A step's outcome is recorded only after it returns.
+//! The progress and processed-slot mutexes are taken only between steps, or
+//! between the subscription step's sends, and no runner mutex is held across
+//! an `.await`, so `run_pending(&self)` can run inside a future that borrows
+//! the runner shared, and a pass dropped mid-step leaves them unlocked. A
+//! step's outcome is recorded only after it returns.
 //! Outside tests, only [`EpochBoundaryTask::run`] calls `run_pending`, and it
 //! awaits or drops each pass before the next wake, so one pass runs at a
 //! time.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,7 +65,7 @@ use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
-use super::duty_management::DutyManagementService;
+use super::duty_management::{DutyManagementService, SelectionProofs};
 use super::utils;
 
 /// Executor task name. The runner's loop span has the same name.
@@ -171,11 +173,18 @@ pub(crate) struct EpochProgress {
     done: BTreeSet<BoundaryStep>,
     /// Read by the warn for the steps the epoch did not finish.
     last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
+    /// The duty epochs whose committee subscriptions went out.
+    subscribed: BTreeSet<u64>,
 }
 
 impl EpochProgress {
     fn new(epoch: u64) -> Self {
-        Self { epoch, done: BTreeSet::new(), last_outcome: BTreeMap::new() }
+        Self {
+            epoch,
+            done: BTreeSet::new(),
+            last_outcome: BTreeMap::new(),
+            subscribed: BTreeSet::new(),
+        }
     }
 
     /// DutyFetch is never marked done: it is pending while a step that needs
@@ -229,7 +238,15 @@ pub(crate) struct EpochBoundaryRunner {
     preferences: Arc<PreferenceBroadcaster>,
     duty_tracker: Arc<DutyTracker>,
     timeouts: OperationTimeouts,
+    /// A proposer root change whose preferences are not broadcast yet. The
+    /// reorg check sets it when it caches the change, and it is cleared once
+    /// the broadcast returns, so an attempt cut in between leaves it to the
+    /// next one, in this epoch or a later one.
+    preferences_owed: AtomicBool,
     progress: parking_lot::Mutex<Option<EpochProgress>>,
+    /// The selection proofs the subscription step signed in the progress
+    /// epoch, kept across its attempts.
+    selection_proofs: SelectionProofs,
     /// The processed slots of the task that runs the passes.
     processed: parking_lot::Mutex<Option<watch::Receiver<Option<Slot>>>>,
 }
@@ -248,7 +265,9 @@ impl EpochBoundaryRunner {
             preferences,
             duty_tracker,
             timeouts,
+            preferences_owed: AtomicBool::new(false),
             progress: parking_lot::Mutex::new(None),
+            selection_proofs: SelectionProofs::default(),
             processed: parking_lot::Mutex::new(None),
         }
     }
@@ -338,6 +357,7 @@ impl EpochBoundaryRunner {
         }
         let old = progress.replace(EpochProgress::new(epoch));
         drop(progress);
+        self.selection_proofs.lock().clear();
         if let Some(old) = old {
             old.warn_unfinished();
         }
@@ -367,13 +387,24 @@ impl EpochBoundaryRunner {
         StepOutcome::Done
     }
 
-    /// `Done` after one attempt. Its fetch errors are logged; whether the
-    /// duties are cached is DutyFetch's concern.
+    /// Re-broadcasts preferences after a proposer root change. One that an
+    /// earlier attempt cached before its bound cut it goes first, before
+    /// this check's requests. `Done` once it returns. Its fetch errors are
+    /// logged; whether the duties are cached is DutyFetch's concern.
     async fn reorg_check(&self, epoch: u64) -> StepOutcome {
-        if self.duty_management.check_reorg_at_epoch_boundary(epoch).await {
-            self.preferences.on_proposer_dependent_root_changed(epoch).await;
-        }
+        self.broadcast_owed_preferences(epoch).await;
+        let owed = &self.preferences_owed;
+        self.duty_management.check_reorg_at_epoch_boundary(epoch, owed).await;
+        self.broadcast_owed_preferences(epoch).await;
         StepOutcome::Done
+    }
+
+    /// Broadcasts the preferences a root change owes, if any.
+    async fn broadcast_owed_preferences(&self, epoch: u64) {
+        if self.preferences_owed.load(Ordering::Acquire) {
+            self.preferences.on_proposer_dependent_root_changed(epoch).await;
+            self.preferences_owed.store(false, Ordering::Release);
+        }
     }
 
     /// Fetches the E and E+1 attester and proposer duties that are not
@@ -430,7 +461,9 @@ impl EpochBoundaryRunner {
     }
 
     /// `NotReady` until the attester duties of E and E+1 are cached; then
-    /// sends both epochs' subscriptions and is `Done`.
+    /// sends the subscriptions of E, then E+1, that did not go out yet in
+    /// this epoch. `Failed` while one of them did not: a failed or timed-out
+    /// POST.
     async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
         for duty_epoch in [epoch, epoch + 1] {
             if !self.duty_tracker.is_epoch_cached(duty_epoch).await {
@@ -438,9 +471,31 @@ impl EpochBoundaryRunner {
                 return StepOutcome::NotReady;
             }
         }
-        self.duty_management.submit_committee_subscriptions(epoch).await;
-        self.duty_management.submit_committee_subscriptions(epoch + 1).await;
-        StepOutcome::Done
+        let mut outcome = StepOutcome::Done;
+        for duty_epoch in [epoch, epoch + 1] {
+            if self.subscribed(epoch, duty_epoch) {
+                continue;
+            }
+            let proofs = &self.selection_proofs;
+            if self.duty_management.submit_committee_subscriptions_with(duty_epoch, proofs).await {
+                self.mark_subscribed(epoch, duty_epoch);
+            } else {
+                outcome = StepOutcome::Failed;
+            }
+        }
+        outcome
+    }
+
+    /// Whether `duty_epoch`'s subscriptions went out in `epoch`.
+    fn subscribed(&self, epoch: u64, duty_epoch: u64) -> bool {
+        let progress = self.progress.lock();
+        progress.as_ref().is_some_and(|p| p.epoch == epoch && p.subscribed.contains(&duty_epoch))
+    }
+
+    fn mark_subscribed(&self, epoch: u64, duty_epoch: u64) {
+        if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
+            current.subscribed.insert(duty_epoch);
+        }
     }
 }
 
@@ -610,6 +665,8 @@ mod tests {
         failing_attester: FailPlan,
         /// Prepare POSTs still to answer 503.
         failing_prepare: Arc<parking_lot::Mutex<usize>>,
+        /// Subscription POSTs still to answer 503.
+        failing_subscriptions: Arc<parking_lot::Mutex<usize>>,
         /// The tracker's index source: the production one, over the fixture's
         /// pubkey map and index registry.
         index_source: Arc<PubkeyIndexSource>,
@@ -749,6 +806,8 @@ mod tests {
         let failing = Arc::clone(&failing_attester);
         let failing_prepare = Arc::new(parking_lot::Mutex::new(0_usize));
         let prepare_failures = Arc::clone(&failing_prepare);
+        let failing_subscriptions = Arc::new(parking_lot::Mutex::new(0_usize));
+        let subscription_failures = Arc::clone(&failing_subscriptions);
         let mock = Arc::new(
             mock.with_get_attester_duties(move |epoch, _indices| {
                 if take_failure(&failing, epoch) {
@@ -777,6 +836,11 @@ mod tests {
                 Ok(())
             })
             .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+                let mut left = subscription_failures.lock();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(unavailable());
+                }
                 recorded.lock().push(subscriptions.into_iter().map(|s| s.slot).collect());
                 Ok(())
             }),
@@ -851,6 +915,7 @@ mod tests {
             subscription_slots,
             failing_attester,
             failing_prepare,
+            failing_subscriptions,
             index_source,
         }
     }
@@ -2288,8 +2353,8 @@ mod tests {
     /// The step bounds, as source: `duty_fetch` for ReorgCheck and
     /// CommitteeSubscriptions, `preparation` for PrepareProposers, DutyFetch's
     /// inside the step, and none for BreakerReset (no I/O). PrepareProposers'
-    /// bound has the length of its POST's own `preparation` bound, which runs
-    /// inside it and fires first, so no behavioural test can see it today.
+    /// bound has the length of its POST's own `preparation` bound but starts
+    /// earlier: `the_prepare_step_bound_starts_before_the_map_read` sees it.
     #[test]
     fn each_step_with_beacon_node_work_has_its_own_bound() {
         let source = include_str!("epoch_boundary.rs");
@@ -2320,10 +2385,10 @@ mod tests {
         }
     }
 
-    /// With the default timeouts, the prepare POST's own 3 s `preparation`
-    /// bound fires at the same instant as the step's, and first: the step is
-    /// `Failed`, the held POST is dropped unanswered, and the next slot's pass
-    /// retries it.
+    /// With the default timeouts and no time passing before the POST, the
+    /// prepare POST's own 3 s `preparation` bound fires at the same instant
+    /// as the step's, and first: the step is `Failed`, the held POST is
+    /// dropped unanswered, and the next slot's pass retries it.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn inner_preparation_timeout_is_a_failed_step() {
         use BoundaryStep::PrepareProposers;
@@ -2477,6 +2542,277 @@ mod tests {
             ["epoch=2 abandoned_steps=[ReorgCheck, PrepareProposers, CommitteeSubscriptions] \
                  last_outcomes={}"],
             "epoch 2's unattempted steps, with no outcome from epoch 1"
+        );
+    }
+
+    // --- PR #982 R1: cancellation-safe retries ---
+
+    /// RSA B2: a retry does not redo an epoch whose subscriptions went out,
+    /// nor a selection proof already signed. E's POST is answered and E+1's
+    /// is held past the 2 s step bound, so the step is `Failed` with E sent.
+    /// The slot-33 pass sends E+1 only, with the proof signed at slot 32,
+    /// and the step is done. Epoch 2 keeps only its own proofs.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_subscription_retry_sends_only_the_epochs_not_sent() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let subs = MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let mock = proposer_duties_at(ROOT_A).with_call_delays(subs, [Duration::ZERO, HOLD]);
+        let f =
+            fixture_config(mock, SecretKey::generate(), false, &[1, 2], short_duty_fetch()).await;
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"]]), "E sent, E+1 held");
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Failed), false)
+        );
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"], &["65"]]),
+            "the retry sends E+1 only"
+        );
+        assert_eq!(arrivals(&f.mock, subs), 3, "E, E+1 held, then E+1");
+        assert_eq!(step_state(&f.runner, CommitteeSubscriptions), (Some(StepOutcome::Done), true));
+        let signed = spans.0.lock().iter().filter(|name| **name == "sign.selection_proof").count();
+        assert_eq!(signed, 2, "one selection proof each for E and E+1, signed once");
+
+        f.runner.run_pending(64).await;
+
+        let kept: BTreeSet<Slot> =
+            f.runner.selection_proofs.lock().keys().map(|(slot, _)| *slot).collect();
+        assert_eq!(kept, BTreeSet::from([65, 97]), "epoch 2 keeps the proofs of epochs 2 and 3");
+    }
+
+    /// Harper B4 (#855 Decisions): a subscription POST cut by its own 3 s
+    /// `preparation` bound, as by the step's, makes the step `Failed`, and
+    /// so does a POST error. With the default timeouts, E's first POST is
+    /// held 5 s, or answers 503. E+1's POST still goes out in that pass. The
+    /// slot-33 pass sends E only, and the step is done.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_or_timed_out_subscription_post_is_a_failed_step() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let subs = MockMethod::SubmitBeaconCommitteeSubscriptions;
+        for (arm, hold, failures, warn) in [
+            (
+                "inner timeout",
+                Duration::from_secs(5),
+                0,
+                "Committee subscription timed out after 3s epoch=1",
+            ),
+            (
+                "503",
+                Duration::ZERO,
+                1,
+                "Failed to send committee subscriptions epoch=1 \
+                 error=Beacon node returned error: 503 - unavailable",
+            ),
+        ] {
+            let f = fixture(proposer_duties_at(ROOT_A).with_call_delays(subs, [hold])).await;
+            *f.failing_subscriptions.lock() = failures;
+            let warns = Warns::default();
+            let _default = warns.install();
+
+            f.runner.run_pending(32).await;
+
+            assert_eq!(
+                step_state(&f.runner, CommitteeSubscriptions),
+                (Some(StepOutcome::Failed), false),
+                "{arm}: E's POST failed, so the step is failed, and not done"
+            );
+            assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"]]), "{arm}: E+1 went out");
+            assert_eq!(warns.lines(), [warn], "{arm}: the POST's own warn, no step-bound warn");
+
+            f.runner.run_pending(33).await;
+
+            assert_eq!(
+                *f.subscription_slots.lock(),
+                slots(&[&["65"], &["33"]]),
+                "{arm}: the slot-33 pass sends E only"
+            );
+            assert_eq!(
+                step_state(&f.runner, CommitteeSubscriptions),
+                (Some(StepOutcome::Done), true),
+                "{arm}"
+            );
+        }
+    }
+
+    /// RSA B1 / Harper B1: a proposer root change that ReorgCheck commits to
+    /// the cache is broadcast even when the step bound cuts the check before
+    /// it gets there. Root A is cached for E and the beacon node answers B,
+    /// under the 2 s step bound. Passes run until ReorgCheck is done; the
+    /// list is the preferences POSTs answered after each pass.
+    /// - Cut after the change: E's request takes 1 s and E+1's is held, so
+    ///   the bound cuts the check after it cached B. The retry broadcasts.
+    /// - Retry cut too: the retry is cut the same way, and broadcasts before
+    ///   its own check. The pass after it broadcasts nothing more.
+    /// - Cut in the broadcast: the first preferences POST is held. The retry
+    ///   broadcasts again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_root_change_cut_before_its_broadcast_is_broadcast_on_retry() {
+        use BoundaryStep::ReorgCheck;
+        let epoch = create_test_fork_schedule().gloas_fork_epoch;
+        let first = epoch * SLOTS_PER_EPOCH;
+        let (zero, slow) = (Duration::ZERO, Duration::from_secs(1));
+        // Proposer requests: the seed, ReorgCheck's E and E+1, DutyFetch's
+        // E+1, then the retry's E and E+1.
+        let arms = [
+            ("cut after the change", vec![zero, slow, HOLD], vec![], vec![0, 1]),
+            ("retry cut too", vec![zero, slow, HOLD, zero, slow, HOLD], vec![], vec![0, 1, 1]),
+            ("cut in the broadcast", vec![], vec![HOLD], vec![0, 1]),
+        ];
+        for (arm, duties, preferences, want) in arms {
+            let local = SecretKey::generate();
+            let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+            let mock = proposer_duties_then(local_hex, epoch, ROOT_A, ROOT_B)
+                .with_call_delays(MockMethod::GetProposerDuties, duties)
+                .with_call_delays(MockMethod::SubmitProposerPreferences, preferences);
+            let seed = [epoch, epoch + 1];
+            let f = fixture_config(mock, local, true, &seed, short_duty_fetch()).await;
+            f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
+
+            let mut posts = Vec::new();
+            for slot in first..first + 3 {
+                f.runner.run_pending(slot).await;
+                posts.push(f.mock.submit_proposer_preferences_calls().len());
+                if slot == first {
+                    let root = f.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
+                    assert_eq!(root.as_deref(), Some(ROOT_B), "{arm}: B cached before the cut");
+                    assert_eq!(
+                        step_state(&f.runner, ReorgCheck),
+                        (Some(StepOutcome::Failed), false),
+                        "{arm}: cut at the step bound"
+                    );
+                }
+                if step_state(&f.runner, ReorgCheck).1 {
+                    break;
+                }
+            }
+            assert_eq!(posts, want, "{arm}: B's preferences are POSTed once");
+            assert_eq!(step_state(&f.runner, ReorgCheck), (Some(StepOutcome::Done), true), "{arm}");
+        }
+    }
+
+    /// A root change the last pass of an epoch cached, cut before its
+    /// broadcast, is broadcast by the next epoch's ReorgCheck. Root A is
+    /// cached for E+1, where the local proposal is. At slot 31 of E the
+    /// check caches B for E+1 after 1 s, and its E+1 PTC request is held, so
+    /// the 2 s step bound cuts it. Epoch E+1's first pass broadcasts B.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_root_change_owed_at_the_epoch_end_is_broadcast_in_the_next_epoch() {
+        let epoch = create_test_fork_schedule().gloas_fork_epoch;
+        let next = epoch + 1;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        // Proposer requests: the seed of E+1, then ReorgCheck's E and E+1.
+        let slow = [Duration::ZERO, Duration::ZERO, Duration::from_secs(1)];
+        let mock = proposer_duties_then(local_hex, next, ROOT_A, ROOT_B)
+            .with_call_delays(MockMethod::GetProposerDuties, slow)
+            .with_call_delays(MockMethod::PostPtcDuties, [Duration::ZERO, HOLD]);
+        let f = fixture_config(mock, local, true, &[epoch, next], short_duty_fetch()).await;
+        f.duty_tracker.fetch_proposer_duties(next).await.expect("seed root A");
+
+        f.runner.run_pending(next * SLOTS_PER_EPOCH - 1).await;
+
+        let root = f.duty_tracker.get_cached_proposer_dependent_root(next).await;
+        assert_eq!(root.as_deref(), Some(ROOT_B), "B cached for E+1 before the cut");
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::ReorgCheck),
+            (Some(StepOutcome::Failed), false)
+        );
+        assert!(f.mock.submit_proposer_preferences_calls().is_empty(), "cut before the broadcast");
+
+        f.runner.run_pending(next * SLOTS_PER_EPOCH).await;
+
+        let prefs = f.mock.submit_proposer_preferences_calls();
+        assert_eq!(prefs.len(), 1, "epoch E+1's first pass broadcasts B once");
+        assert_eq!(
+            prefs[0][0].message.dependent_root,
+            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).expect("root B")
+        );
+    }
+
+    /// Hands the pass to a lock holder when it enters
+    /// `orchestrator.prepare_proposers`, after the step bound started and
+    /// before the step reads the pubkey map, and waits until the holder has
+    /// the map's write lock.
+    #[derive(Clone)]
+    struct PrepareGate(Arc<parking_lot::Mutex<Option<Handoff>>>);
+
+    /// Signals that the step started; then waits for the lock holder.
+    type Handoff = (std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PrepareGate {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "orchestrator.prepare_proposers" {
+                return;
+            }
+            let handoff = self.0.lock().take();
+            if let Some((entered, locked)) = handoff {
+                entered.send(()).expect("the holder waits for the step");
+                locked.recv().expect("the holder took the write lock");
+            }
+        }
+    }
+
+    /// Harper B2 (T3): PrepareProposers' step bound starts before the step
+    /// reads the pubkey map; the POST's own `preparation` bound starts after
+    /// that read. A thread takes the map's write lock as the step starts and
+    /// holds it while 250 virtual ms pass. The POST answers 2.9 s after it
+    /// is sent, 3.15 s after the step started: past the step's 3 s bound,
+    /// inside the POST's own. The step bound cuts it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_prepare_step_bound_starts_before_the_map_read() {
+        let prep = MockMethod::PrepareBeaconProposer;
+        let mock = proposer_duties_at(ROOT_A).with_method_delay(prep, Duration::from_millis(2_900));
+        let f = fixture(mock).await;
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (locked, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let gate = PrepareGate(Arc::new(parking_lot::Mutex::new(Some((entered, locked_rx)))));
+        let map = Arc::clone(&f.index_source.pubkey_map);
+        let runtime = tokio::runtime::Handle::current();
+        let holder = std::thread::spawn(move || {
+            if entered_rx.recv().is_ok() {
+                let write = map.write();
+                locked.send(()).expect("the step waits for the lock");
+                runtime.block_on(tokio::time::advance(Duration::from_millis(250)));
+                drop(write);
+            }
+        });
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone()).with(gate.clone());
+        let default = tracing::subscriber::set_default(subscriber);
+        let start = tokio::time::Instant::now();
+
+        f.runner.run_pending(32).await;
+
+        let elapsed = start.elapsed();
+        drop(default);
+        drop(gate.0.lock().take());
+        holder.join().expect("lock holder");
+        assert_eq!(elapsed, f.runner.timeouts.preparation, "the step bound ends the pass at 3 s");
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::PrepareProposers),
+            (Some(StepOutcome::Failed), false),
+            "the step bound cut the POST"
+        );
+        assert!(f.mock.prepare_beacon_proposer_calls().is_empty(), "dropped, not answered");
+        assert_eq!(
+            warns.lines(),
+            ["Epoch boundary step timed out epoch=1 step=PrepareProposers timeout=3s"],
+            "the step's bound fired, not the POST's"
         );
     }
 }

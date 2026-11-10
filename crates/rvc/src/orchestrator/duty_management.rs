@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use builder::legacy_proposer_ops_retired;
+use crypto::Signature;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
 use observability::logging::TruncatedPubkey;
@@ -37,6 +39,9 @@ pub(crate) struct DutyManagementService {
     /// Tracks which sync committee periods have been prefetched to ensure idempotency.
     prefetched_periods: RwLock<HashSet<u64>>,
 }
+
+/// Selection proofs already signed, by duty slot and validator pubkey.
+pub(crate) type SelectionProofs = parking_lot::Mutex<HashMap<(Slot, [u8; 48]), Signature>>;
 
 impl DutyManagementService {
     pub(crate) fn new(
@@ -256,10 +261,15 @@ impl DutyManagementService {
         }
     }
 
-    /// Returns `true` when a previously cached proposer `dependent_root` changed.
+    /// Sets `proposer_root_changed` as soon as a previously cached proposer
+    /// `dependent_root` changes, so a caller that drops the check part way
+    /// still sees a change it cached.
     #[tracing::instrument(name = "orchestrator.check_reorg", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) -> bool {
-        let mut proposer_root_changed = false;
+    pub(crate) async fn check_reorg_at_epoch_boundary(
+        &self,
+        current_epoch: u64,
+        proposer_root_changed: &AtomicBool,
+    ) {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
@@ -316,7 +326,7 @@ impl DutyManagementService {
                         "Reorg detected: proposer duties refetched"
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
-                    proposer_root_changed = true;
+                    proposer_root_changed.store(true, Ordering::Release);
                 }
                 TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
@@ -373,7 +383,6 @@ impl DutyManagementService {
                 }
             }
         }
-        proposer_root_changed
     }
 
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
@@ -449,8 +458,22 @@ impl DutyManagementService {
         }
     }
 
-    #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
+    /// [`Self::submit_committee_subscriptions_with`], keeping no proof.
     pub(crate) async fn submit_committee_subscriptions(&self, epoch: u64) {
+        self.submit_committee_subscriptions_with(epoch, &SelectionProofs::default()).await;
+    }
+
+    /// Signs a selection proof for each local attester duty of `epoch` that
+    /// `proofs` does not hold yet, keeping it there, and POSTs the epoch's
+    /// committee subscriptions. `true` when the epoch needs no further send:
+    /// the POST went out, or there is nothing to send. A failed or timed-out
+    /// POST is `false`.
+    #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
+    pub(crate) async fn submit_committee_subscriptions_with(
+        &self,
+        epoch: u64,
+        proofs: &SelectionProofs,
+    ) -> bool {
         let mut subscriptions = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
@@ -500,17 +523,23 @@ impl DutyManagementService {
                         continue;
                     }
                 };
-                let selection_proof = match super::slot_context::under_admission(
-                    &fence,
-                    self.signer.sign_selection_proof(
-                        slot,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    ),
-                )
-                .await
-                {
+                let kept = proofs.lock().get(&(slot, duty_bytes)).cloned();
+                let signed = match kept {
+                    Some(proof) => Ok(proof),
+                    None => {
+                        super::slot_context::under_admission(
+                            &fence,
+                            self.signer.sign_selection_proof(
+                                slot,
+                                &pubkey,
+                                &self.config.fork_schedule,
+                                &self.config.genesis_validators_root,
+                            ),
+                        )
+                        .await
+                    }
+                };
+                let selection_proof = match signed {
                     Ok(sig) => sig,
                     Err(e) => {
                         warn!(
@@ -524,6 +553,7 @@ impl DutyManagementService {
                 };
 
                 let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
+                proofs.lock().insert((slot, duty_bytes), selection_proof);
 
                 subscriptions.push(BeaconCommitteeSubscription {
                     validator_index: wire.validator_index.clone(),
@@ -536,7 +566,7 @@ impl DutyManagementService {
         }
 
         if subscriptions.is_empty() {
-            return;
+            return true;
         }
 
         let count = subscriptions.len();
@@ -547,15 +577,22 @@ impl DutyManagementService {
         )
         .await
         {
-            TimedOutcome::Ok(_) => info!(count, epoch, "Sent committee subscriptions"),
-            TimedOutcome::Err(e) => {
-                warn!(epoch, error = %e, "Failed to send committee subscriptions")
+            TimedOutcome::Ok(_) => {
+                info!(count, epoch, "Sent committee subscriptions");
+                true
             }
-            TimedOutcome::Timeout => warn!(
-                epoch,
-                "Committee subscription timed out after {}s",
-                self.config.timeouts.preparation.as_secs()
-            ),
+            TimedOutcome::Err(e) => {
+                warn!(epoch, error = %e, "Failed to send committee subscriptions");
+                false
+            }
+            TimedOutcome::Timeout => {
+                warn!(
+                    epoch,
+                    "Committee subscription timed out after {}s",
+                    self.config.timeouts.preparation.as_secs()
+                );
+                false
+            }
         }
     }
 
@@ -1189,7 +1226,7 @@ mod tests {
         let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
 
         // Epoch boundary at gloas-2 checks epochs gloas-2 and gloas-1 (both pre-Gloas).
-        service.check_reorg_at_epoch_boundary(gloas_epoch - 2).await;
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 2, &AtomicBool::default()).await;
 
         assert!(
             mock.post_ptc_duties_calls().is_empty(),
@@ -1198,7 +1235,7 @@ mod tests {
         );
 
         // Boundary into Gloas: current pre-Gloas skipped, next (Gloas) fetched.
-        service.check_reorg_at_epoch_boundary(gloas_epoch - 1).await;
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 1, &AtomicBool::default()).await;
         let ptc_epochs: Vec<u64> =
             mock.post_ptc_duties_calls().into_iter().map(|(epoch, _)| epoch).collect();
         assert_eq!(
@@ -1243,8 +1280,8 @@ mod tests {
         let service = build_service_with_mock(mock.clone(), make_config_with_gloas(u64::MAX));
         assert_eq!(service.config.fork_schedule.gloas_fork_epoch, u64::MAX);
 
-        service.check_reorg_at_epoch_boundary(10).await;
-        service.check_reorg_at_epoch_boundary(1_000_000).await;
+        service.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
+        service.check_reorg_at_epoch_boundary(1_000_000, &AtomicBool::default()).await;
 
         assert!(
             mock.post_ptc_duties_calls().is_empty(),

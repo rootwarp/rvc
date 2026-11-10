@@ -514,7 +514,7 @@ async fn test_check_reorg_at_epoch_boundary_no_change() {
     ));
 
     // Should not panic, should complete successfully
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 }
 
 #[tokio::test]
@@ -586,7 +586,7 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
     ));
 
     // No caches populated — should fetch and not panic
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 
     // Attester/proposer caches populated; PTC skipped (epochs 10/11 are pre-Gloas).
     assert!(duty_tracker.is_epoch_cached(10).await);
@@ -668,7 +668,10 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches_ptc_when_gloas_acti
         pubkey_map,
     ));
 
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+    orchestrator
+        .duty_management
+        .check_reorg_at_epoch_boundary(gloas_epoch, &AtomicBool::default())
+        .await;
 
     assert!(duty_tracker.is_epoch_cached(gloas_epoch).await);
     assert!(duty_tracker.is_epoch_cached(gloas_epoch + 1).await);
@@ -721,7 +724,7 @@ async fn assert_reorg_check_cuts_each_call_at_duty_fetch(
     ));
 
     let start = tokio::time::Instant::now();
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(epoch).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(epoch, &AtomicBool::default()).await;
     let elapsed = start.elapsed();
 
     let calls: Vec<_> =
@@ -795,7 +798,7 @@ async fn test_check_reorg_at_epoch_boundary_survives_error() {
     ));
 
     // Should not panic even with broken beacon (pre-Gloas: PTC path not entered)
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 }
 
 #[tokio::test]
@@ -834,7 +837,10 @@ async fn test_check_reorg_at_epoch_boundary_survives_error_when_gloas_active() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+    orchestrator
+        .duty_management
+        .check_reorg_at_epoch_boundary(gloas_epoch, &AtomicBool::default())
+        .await;
 }
 
 // --- RF6-31: prepare_proposers complexity (count-based, not wall-clock) ---
@@ -2396,6 +2402,48 @@ async fn test_step_timeout_leaves_step_pending() {
         run.pass_slots("orchestrator.prepare_proposers"),
         [None, Some(32)],
         "startup preparation at boot, then the slot-32 pass: the 3 s POST is inside its bound"
+    );
+}
+
+/// 653-AC2, recovery: only the first subscription POST is held past the
+/// 2 s step bound; later POSTs answer at once. The slot-32 pass is cut in
+/// E's POST. The slot-33 pass sends E and E+1 and finishes the step, so no
+/// pass runs at slot 34.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_step_timeout_retry_succeeds_then_stops() {
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&sent);
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(last_slot_attester_duty(&local_hex, epoch))
+        })
+        .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+            recorded.lock().extend(subscriptions.into_iter().map(|s| s.slot));
+            Ok(())
+        })
+        .with_call_delays(subs, [DRIVE_HOLD]);
+    let timeouts = OperationTimeouts {
+        duty_fetch: Duration::from_secs(2),
+        preparation: Duration::from_secs(60),
+        ..OperationTimeouts::default()
+    };
+
+    let run = drive_boundary_with(mock, local, timeouts, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(32), Some(33), Some(33)],
+        "E cut at slot 32, then E and E+1 at slot 33"
+    );
+    assert_eq!(*sent.lock(), ["63", "95"], "E and E+1 answered at slot 33");
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33)],
+        "the step is done at slot 33: no pass at slot 34"
     );
 }
 
