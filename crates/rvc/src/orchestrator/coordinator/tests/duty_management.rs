@@ -2039,3 +2039,263 @@ async fn startup_preparation_finishes_while_the_slot_loop_continues() {
 fn local_pk_public(bytes: &[u8; 48]) -> PublicKey {
     PublicKey::from_bytes(bytes).expect("pubkey bytes")
 }
+
+// --- W4-E3a: a failed boundary step retries at the next processed slot ---
+
+const BOUNDARY_INDEX: &str = "42";
+const BOUNDARY_SLOT: Duration = Duration::from_secs(12);
+
+/// Slot of an `epoch.boundary` pass, kept in that span's extensions.
+struct PassSlot(Slot);
+
+/// Reads the `slot` field of an `epoch.boundary` span.
+struct SlotField(Option<Slot>);
+
+impl tracing::field::Visit for SlotField {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "slot" {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// One WARN event as `message key=value ...`.
+#[derive(Default)]
+struct WarnText {
+    message: String,
+    fields: String,
+}
+
+impl tracing::field::Visit for WarnText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+/// Each span opened and each WARN event, with the slot of the
+/// `epoch.boundary` pass it runs in (`None` outside a pass).
+#[derive(Clone, Default)]
+struct BoundaryCapture {
+    spans: Captured<(&'static str, Option<Slot>)>,
+    warns: Captured<(Option<Slot>, String)>,
+}
+
+type Captured<T> = Arc<parking_lot::Mutex<Vec<T>>>;
+
+/// The slot of the innermost `epoch.boundary` pass in `scope`.
+fn pass_slot<'a, R: tracing_subscriber::registry::LookupSpan<'a>>(
+    mut scope: tracing_subscriber::registry::Scope<'a, R>,
+) -> Option<Slot> {
+    scope.find_map(|span| span.extensions().get::<PassSlot>().map(|pass| pass.0))
+}
+
+impl<S> tracing_subscriber::Layer<S> for BoundaryCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        if span.name() == "epoch.boundary" {
+            let mut slot = SlotField(None);
+            attrs.record(&mut slot);
+            if let Some(slot) = slot.0 {
+                span.extensions_mut().insert(PassSlot(slot));
+            }
+        }
+        self.spans.lock().push((span.name(), pass_slot(span.scope())));
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut text = WarnText::default();
+            event.record(&mut text);
+            let pass = ctx.event_scope(event).and_then(pass_slot);
+            self.warns.lock().push((pass, format!("{}{}", text.message, text.fields)));
+        }
+    }
+}
+
+/// What [`drive_boundary`] saw.
+struct BoundaryRun {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+    /// Each span opened, with its pass slot, in opening order.
+    spans: Vec<(&'static str, Option<Slot>)>,
+    /// Each WARN event, with its pass slot, in order. The slot loop's own
+    /// warns (no block header or root in the mock; every phase due at slot
+    /// start) are outside any pass.
+    warns: Vec<(Option<Slot>, String)>,
+    /// Epochs of the `get_proposer_duties` requests made after the seed.
+    proposer_requests: Vec<u64>,
+}
+
+impl BoundaryRun {
+    /// The pass slot of each `name` span, in opening order.
+    fn pass_slots(&self, name: &str) -> Vec<Option<Slot>> {
+        self.spans.iter().filter(|(opened, _)| *opened == name).map(|(_, slot)| *slot).collect()
+    }
+}
+
+/// Runs `run()` and the runner task from `from_slot` to the end of
+/// `to_slot`, with local validator 42 and no builder. The attester and
+/// proposer duties of E and E+1 (E is `from_slot`'s epoch) are fetched
+/// before boot, so the slot loop requests none of them.
+///
+/// Each slot lasts 12 s of paused time. Every phase is due at slot start, so
+/// the slot loop processes the slot then, and its post-duty window ends at
+/// the next slot start. The clock moves to the next slot 1 ms before that.
+async fn drive_boundary(
+    mock: bn_manager::MockBeaconNodeClient,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
+    use ::timing::{DeadlineBps, DeadlineSchedule};
+    use tracing_subscriber::layer::SubscriberExt;
+    use validator_store::ValidatorConfig;
+
+    let mock = Arc::new(mock);
+    mock.track_admission();
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+    let clock =
+        Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, BOUNDARY_SLOT, ::timing::SLOTS_PER_EPOCH));
+    clock.set_slot(from_slot);
+
+    let local = SecretKey::generate();
+    let pubkey = local.public_key();
+    let pk_bytes = pubkey.to_bytes();
+    let validator_store = create_mock_validator_store();
+    validator_store.add_validator(ValidatorConfig::new(pk_bytes)).expect("add validator");
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(local);
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+            Arc::new(SlashingDb::open_in_memory().expect("slashing db")),
+        )
+        .with_enablement(always_enabled()),
+    );
+
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec![BOUNDARY_INDEX.to_string()]));
+    let epoch = from_slot / ::timing::SLOTS_PER_EPOCH;
+    for epoch in [epoch, epoch + 1] {
+        duty_tracker.fetch_duties_for_epoch(epoch).await.expect("seed attester duties");
+        duty_tracker.fetch_proposer_duties(epoch).await.expect("seed proposer duties");
+    }
+    let seeded = mock.get_proposer_duties_calls().len();
+
+    let at_slot_start = DeadlineBps {
+        attestation: 0,
+        aggregate: 0,
+        sync_message: 0,
+        contribution: 0,
+        payload: 0,
+        payload_attestation: 0,
+    };
+    let config =
+        create_test_config().with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start));
+    let deps = OrchestratorDeps::for_test(
+        Arc::clone(&clock),
+        duty_tracker,
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        validator_store,
+        config,
+        Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)]))),
+    );
+    deps.pubkey_index.write().insert(pk_bytes, BOUNDARY_INDEX.to_string());
+    let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let mut processed = orchestrator.processed_slot_tx.subscribe();
+
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let boot = tokio::time::Instant::now();
+    for slot in from_slot..=to_slot {
+        let slot_end = boot + BOUNDARY_SLOT * u32::try_from(slot - from_slot + 1).expect("slots");
+        let seen = tokio::time::timeout_at(slot_end, processed.wait_for(|p| *p == Some(slot)))
+            .await
+            .map(|seen| seen.map(|_| ()));
+        assert!(matches!(seen, Ok(Ok(()))), "slot {slot} must be processed in its slot");
+        tokio::time::sleep_until(slot_end - Duration::from_millis(1)).await;
+        if slot < to_slot {
+            clock.set_slot(slot + 1);
+        }
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+
+    let proposer_requests = mock.get_proposer_duties_calls()[seeded..].to_vec();
+    let spans = capture.spans.lock().clone();
+    let warns = capture.warns.lock().clone();
+    BoundaryRun { mock, spans, warns, proposer_requests }
+}
+
+/// 653-AC1: the slot-32 pass's prepare POST answers 503, so PrepareProposers
+/// runs again in the slot-33 pass, and the steps already done in epoch 1 do
+/// not: ReorgCheck's proposer requests for E and E+1 are made once, and
+/// slot 34 has nothing pending. The startup preparation's own prepare at
+/// boot, outside any pass, is answered `Ok`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
+    let _metrics = m2_metric_lock().await;
+    let attempts = AtomicUsize::new(0);
+    let mock = retirement_beacon().with_prepare_beacon_proposer(move |_preparations| {
+        // Attempt 0 is the startup preparation's, at boot; 1 is the slot-32 pass's.
+        if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+        } else {
+            Ok(())
+        }
+    });
+
+    let run = drive_boundary(mock, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers"),
+        [None, Some(32), Some(33)],
+        "startup preparation at boot, the slot-32 pass, then its retry in the slot-33 pass"
+    );
+    assert_eq!(run.mock.prepare_beacon_proposer_calls().len(), 3, "one POST per attempt");
+    let in_passes: Vec<&(Option<Slot>, String)> =
+        run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
+    assert!(
+        matches!(in_passes.as_slice(), [(Some(32), warn)]
+            if warn.starts_with("Failed to send proposer preparations")),
+        "the 503 is the only warn in any pass: {in_passes:?}"
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.check_reorg"),
+        [Some(32)],
+        "ReorgCheck is not repeated in the slot-33 pass"
+    );
+    assert_eq!(
+        run.proposer_requests,
+        [1, 2],
+        "one proposer-duties request each for E and E+1, ReorgCheck's in the slot-32 pass"
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33)],
+        "nothing is pending at slot 34"
+    );
+}
