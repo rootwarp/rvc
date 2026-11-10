@@ -1073,6 +1073,106 @@ mod tests {
         assert_ok_with_drain(&outcome, &res);
     }
 
+    /// Shutdown while the runner's prepare POST is held: the drain joins
+    /// both Orchestrator-tier tasks inside the tier budget and aborts none.
+    /// The hold, and the preparation and duty-fetch bounds, outlast that
+    /// budget, so only shutdown can end the held pass in time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_joins_the_boundary_work_with_a_step_in_flight() {
+        use bn_manager::{MockBeaconNodeClient, MockMethod, Propagator};
+        use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+
+        use crate::beacon_adapter::BeaconBlockAdapter;
+        use crate::orchestrator::{
+            epoch_boundary, DutyOrchestrator, OrchestratorConfig, OrchestratorDeps,
+        };
+
+        const HOLD: Duration = Duration::from_secs(3_600);
+        let mock = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_prepare_beacon_proposer(|_| Ok(()))
+                .with_method_delay(MockMethod::PrepareBeaconProposer, HOLD),
+        );
+        let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+        let local = SecretKey::generate().public_key();
+        let local_bytes = local.to_bytes();
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(
+            local_bytes,
+            local,
+        )])));
+        let clock =
+            Arc::new(timing::MockSlotClock::new(1_606_824_023, Duration::from_secs(12), 32));
+        clock.set_slot(32);
+        // Past every duty deadline, so slot 32 is processed at once.
+        clock.advance_time(9);
+        let timeouts = OperationTimeouts {
+            preparation: 2 * HOLD,
+            duty_fetch: 2 * HOLD,
+            ..OperationTimeouts::default()
+        };
+        let schedule = Arc::new(eth_types::ForkSchedule::unscheduled_gloas());
+        let config = OrchestratorConfig::new([0xaa; 32], schedule).with_timeouts(timeouts);
+        let keys = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+        let signer = Arc::new(
+            ::signer::SignerService::new(keys, slashing_db)
+                .with_enablement(::signer::always_enabled()),
+        );
+        let deps = OrchestratorDeps::for_test(
+            clock,
+            Arc::new(duty_tracker::DutyTracker::new(mock.clone(), vec!["7".to_string()])),
+            signer,
+            Arc::new(Propagator::new(Arc::clone(&mock))),
+            Arc::clone(&beacon),
+            Arc::new(BeaconBlockAdapter::new(beacon)),
+            None,
+            Arc::new(validator_store::ValidatorStore::new([0; 20], 100)),
+            config,
+            pubkey_map,
+        );
+        deps.pubkey_index.write().insert(local_bytes, "7".to_string());
+        let (mut orchestrator, orchestrator_handle) = DutyOrchestrator::new(deps);
+
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let boundary = orchestrator.take_epoch_boundary_runner().expect("runner");
+        executor.spawn("epoch.boundary.runner", ShutdownTier::Orchestrator, boundary.run());
+        executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async move {
+            orchestrator.run().await
+        });
+
+        // Startup preparation's prepare and the runner's, both held.
+        let prepares = || {
+            let stamps = mock.call_stamps();
+            stamps.iter().filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer).count()
+        };
+        let mut waited_ms = 0u64;
+        while prepares() < 2 {
+            waited_ms += 1;
+            assert!(waited_ms <= 5_000, "the runner's prepare did not start: {}", prepares());
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+
+        token.cancel();
+        let inputs = ShutdownInputs {
+            executor,
+            orchestrator_handle,
+            shutdown_rx,
+            shutdown_token: token,
+            budget: TierBudget::default(),
+            detection: None,
+        };
+        let (outcome, res) =
+            await_shutdown_and_drain_with_signal(inputs, std::future::pending::<()>()).await;
+
+        assert!(res.is_ok(), "token cancel drains to Ok: {res:?}");
+        assert!(outcome.aborted.is_empty(), "nothing outlives the budget: {:?}", outcome.aborted);
+        for task in ["duty_orchestrator", epoch_boundary::TASK_NAME] {
+            assert!(outcome.joined.contains(&task), "{task} joins: {:?}", outcome.joined);
+        }
+        assert!(mock.prepare_beacon_proposer_calls().is_empty(), "the held prepares were dropped");
+    }
+
     /// ARCH-2i / NFR-3: pin EXIT_* numeric values so a silent renumber fails CI.
     #[test]
     fn test_exit_codes_are_unchanged() {
