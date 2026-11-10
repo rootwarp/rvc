@@ -3412,6 +3412,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_same_root_proposer_refresh_revoked_before_release_does_not_restamp() {
+        let mock = mock_proposer_queue(vec![
+            proposer_stamp_response("0xroot_a"),
+            proposer_stamp_response("0xroot_a"),
+        ])
+        .with_method_delay(MockMethod::GetProposerDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        let seeded_gen = generation.load(Ordering::Acquire);
+        tracker.fetch_proposer_duties(STAMP_EPOCH).await.expect("seed root A");
+        assert_eq!(proposer_entry(&tracker).await, entry("0xroot_a", seeded_gen));
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_proposer_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::GetProposerDuties, 2).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = refresh.await.expect("refresh task");
+        assert!(
+            matches!(result, Ok(false)),
+            "a same-root refresh must report no root change, got {result:?}"
+        );
+        assert_eq!(
+            proposer_entry(&tracker).await,
+            entry("0xroot_a", seeded_gen),
+            "a same-root answer fetched across a bump must not restamp the entry"
+        );
+        assert_no_proposer_reader_hits(&tracker, "same-root refresh held across a bump").await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn held_proposer_fetch_revoked_before_release_is_discarded() {
         let mock = mock_proposer(proposer_stamp_response("0xroot_a"))
             .with_method_delay(MockMethod::GetProposerDuties, HOLD);
