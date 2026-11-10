@@ -1,14 +1,19 @@
 //! Epoch boundary runner: the boundary steps, one method each, in a fixed order.
 //!
 //! [`EpochBoundaryRunner::run_pending`] runs every step of the slot's epoch
-//! that is still pending, in [`BoundaryStep`] order, and marks each step done
-//! after one attempt, with two exceptions. `DutyFetch` has no done mark: it
-//! runs in every pass while a step that needs duties is pending.
-//! `CommitteeSubscriptions` stays pending until the attester duties of E and
-//! E+1 are cached. The epoch summary is logged once per epoch, at the end of
-//! the epoch's first pass. [`EpochBoundaryTask::run`] calls it on its own
-//! task ([`TASK_NAME`]) after each slot the slot loop processed, while that
-//! slot's epoch has a step pending. Each pass is a root `epoch.boundary` span.
+//! that is still pending, in [`BoundaryStep`] order. Each step returns a
+//! [`StepOutcome`], and only `Done` marks it done. A `Failed` or `NotReady`
+//! step stays pending and runs again in the next pass, at the next processed
+//! slot of the same epoch: at most one retry per processed slot, and none
+//! after the epoch ends. The order is per pass, not a barrier: the steps
+//! after a `Failed` or `NotReady` one still run in that pass. `DutyFetch` has
+//! no done mark: it runs in every pass while a step that needs duties is
+//! pending. `CommitteeSubscriptions` is `NotReady` until the attester duties
+//! of E and E+1 are cached. The epoch summary is logged once per epoch, at
+//! the end of the epoch's first pass. [`EpochBoundaryTask::run`] calls it on
+//! its own task ([`TASK_NAME`]) after each slot the slot loop processed,
+//! while that slot's epoch has a step pending. Each pass is a root
+//! `epoch.boundary` span.
 //!
 //! # Step order
 //!
@@ -29,12 +34,12 @@
 //!
 //! The progress mutex is taken only between steps and is never held across
 //! an `.await`, so `run_pending(&self)` can run inside a future that borrows
-//! the runner shared, and a pass dropped mid-step leaves it unlocked. A step
-//! is marked done only after it returns. Outside tests, only
+//! the runner shared, and a pass dropped mid-step leaves it unlocked. A
+//! step's outcome is recorded only after it returns. Outside tests, only
 //! [`EpochBoundaryTask::run`] calls `run_pending`, and it awaits or drops
 //! each pass before the next wake, so one pass runs at a time.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bn_manager::OperationTimeouts;
@@ -138,13 +143,31 @@ impl BoundaryStep {
     }
 }
 
-/// Steps already run in `epoch`.
+/// How a step ended in one pass. `Failed` and `NotReady` retry the same way;
+/// they stay apart so a step that never finishes can say which it was.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StepOutcome {
+    /// Finished for the epoch: the step does not run again in it.
+    Done,
+    /// Its beacon-node work failed or timed out.
+    Failed,
+    /// Its inputs are not there yet.
+    NotReady,
+}
+
+/// Steps done in `epoch`, and each step's latest outcome.
 pub(crate) struct EpochProgress {
     epoch: u64,
     done: BTreeSet<BoundaryStep>,
+    /// For the warn about steps that did not finish in the epoch (W4-E3b).
+    last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
 }
 
 impl EpochProgress {
+    fn new(epoch: u64) -> Self {
+        Self { epoch, done: BTreeSet::new(), last_outcome: BTreeMap::new() }
+    }
+
     /// DutyFetch is never marked done: it is pending while a step that needs
     /// duties is.
     fn is_pending(&self, step: BoundaryStep) -> bool {
@@ -157,7 +180,7 @@ impl EpochProgress {
     }
 }
 
-/// Runs the epoch-boundary steps once per epoch.
+/// Runs each epoch-boundary step until it is done in its epoch.
 pub(crate) struct EpochBoundaryRunner {
     duty_management: Arc<DutyManagementService>,
     circuit_breaker: Arc<CircuitBreakerState>,
@@ -196,30 +219,18 @@ impl EpochBoundaryRunner {
             if !self.is_pending(epoch, step) {
                 continue;
             }
-            let done = match step {
-                BoundaryStep::BreakerReset => {
-                    self.breaker_reset(epoch);
-                    true
-                }
-                BoundaryStep::ReorgCheck => {
-                    self.reorg_check(epoch).await;
-                    true
-                }
+            let outcome = match step {
+                BoundaryStep::BreakerReset => self.breaker_reset(epoch),
+                BoundaryStep::ReorgCheck => self.reorg_check(epoch).await,
                 BoundaryStep::DutyFetch => {
-                    let cached = self.duty_fetch(epoch).await;
-                    debug!(epoch, cached, "Epoch boundary duty fetch finished");
-                    // No done mark: `EpochProgress::is_pending` derives DutyFetch's state.
-                    false
+                    let outcome = self.duty_fetch(epoch).await;
+                    debug!(epoch, ?outcome, "Epoch boundary duty fetch finished");
+                    outcome
                 }
-                BoundaryStep::PrepareProposers => {
-                    self.prepare_proposers(epoch).await;
-                    true
-                }
+                BoundaryStep::PrepareProposers => self.prepare_proposers(epoch).await,
                 BoundaryStep::CommitteeSubscriptions => self.committee_subscriptions(epoch).await,
             };
-            if done {
-                self.mark_done(epoch, step);
-            }
+            self.record(epoch, step, outcome);
         }
         if first_pass {
             self.duty_management.log_epoch_boundary_summary(epoch, slot).await;
@@ -242,30 +253,38 @@ impl EpochBoundaryRunner {
 
     fn is_pending(&self, epoch: u64, step: BoundaryStep) -> bool {
         let mut progress = self.progress.lock();
-        let current =
-            progress.get_or_insert_with(|| EpochProgress { epoch, done: BTreeSet::new() });
+        let current = progress.get_or_insert_with(|| EpochProgress::new(epoch));
         if epoch > current.epoch {
-            *current = EpochProgress { epoch, done: BTreeSet::new() };
+            *current = EpochProgress::new(epoch);
         }
         current.epoch == epoch && current.is_pending(step)
     }
 
-    fn mark_done(&self, epoch: u64, step: BoundaryStep) {
+    /// Keeps `outcome` as the step's latest. Only `Done` marks a step done,
+    /// and DutyFetch never: `EpochProgress::is_pending` derives its state.
+    fn record(&self, epoch: u64, step: BoundaryStep, outcome: StepOutcome) {
         if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
-            current.done.insert(step);
+            current.last_outcome.insert(step, outcome);
+            if outcome == StepOutcome::Done && step != BoundaryStep::DutyFetch {
+                current.done.insert(step);
+            }
         }
     }
 
-    fn breaker_reset(&self, epoch: u64) {
+    fn breaker_reset(&self, epoch: u64) -> StepOutcome {
         self.circuit_breaker.reset_epoch(epoch);
         publish_circuit_breaker_metrics(&self.circuit_breaker);
         info!(epoch, "Circuit breaker reset at epoch boundary");
+        StepOutcome::Done
     }
 
-    async fn reorg_check(&self, epoch: u64) {
+    /// `Done` after one attempt. Its fetch errors are logged; whether the
+    /// duties are cached is DutyFetch's concern.
+    async fn reorg_check(&self, epoch: u64) -> StepOutcome {
         if self.duty_management.check_reorg_at_epoch_boundary(epoch).await {
             self.preferences.on_proposer_dependent_root_changed(epoch).await;
         }
+        StepOutcome::Done
     }
 
     /// Fetches the E and E+1 attester and proposer duties that are not
@@ -273,8 +292,10 @@ impl EpochBoundaryRunner {
     ///
     /// Calls the tracker directly. Eviction, PTC duties and the next-period
     /// sync prefetch stay with the slot loop's warm-up. A failed fetch does
-    /// not stop the next one. Returns whether all four entries are cached.
-    async fn duty_fetch(&self, epoch: u64) -> bool {
+    /// not stop the next one. `Done` when all four entries are cached after
+    /// the step, else `Failed`: a failed or timed-out request leaves its
+    /// entry uncached.
+    async fn duty_fetch(&self, epoch: u64) -> StepOutcome {
         let epochs = [epoch, epoch + 1];
         let fetch = async {
             for epoch in epochs {
@@ -303,28 +324,34 @@ impl EpochBoundaryRunner {
             if !self.duty_tracker.is_epoch_cached(epoch).await
                 || !self.duty_tracker.is_proposer_epoch_cached(epoch).await
             {
-                return false;
+                return StepOutcome::Failed;
             }
         }
-        true
+        StepOutcome::Done
     }
 
-    async fn prepare_proposers(&self, epoch: u64) {
-        self.duty_management.prepare_proposers(epoch).await;
+    /// `Failed` when the epoch still needs a send: a failed or timed-out
+    /// POST, or a local validator whose index is not known yet.
+    async fn prepare_proposers(&self, epoch: u64) -> StepOutcome {
+        if self.duty_management.prepare_proposers(epoch).await {
+            StepOutcome::Done
+        } else {
+            StepOutcome::Failed
+        }
     }
 
-    /// Sends the E and E+1 subscriptions once both epochs' attester duties
-    /// are cached. `false` leaves the step pending for the next wake.
-    async fn committee_subscriptions(&self, epoch: u64) -> bool {
+    /// `NotReady` until the attester duties of E and E+1 are cached; then
+    /// sends both epochs' subscriptions and is `Done`.
+    async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
         for duty_epoch in [epoch, epoch + 1] {
             if !self.duty_tracker.is_epoch_cached(duty_epoch).await {
                 debug!(epoch, duty_epoch, "Committee subscriptions wait for cached duties");
-                return false;
+                return StepOutcome::NotReady;
             }
         }
         self.duty_management.submit_committee_subscriptions(epoch).await;
         self.duty_management.submit_committee_subscriptions(epoch + 1).await;
-        true
+        StepOutcome::Done
     }
 }
 
@@ -479,6 +506,8 @@ mod tests {
         subscription_slots: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
         /// Attester-duties requests still to answer 503, per epoch.
         failing_attester: FailPlan,
+        /// Prepare POSTs still to answer 503.
+        failing_prepare: Arc<parking_lot::Mutex<usize>>,
         /// The tracker's index source: the production one, over the fixture's
         /// pubkey map and index registry.
         index_source: Arc<PubkeyIndexSource>,
@@ -616,6 +645,8 @@ mod tests {
         let recorded = Arc::clone(&subscription_slots);
         let failing_attester = FailPlan::default();
         let failing = Arc::clone(&failing_attester);
+        let failing_prepare = Arc::new(parking_lot::Mutex::new(0_usize));
+        let prepare_failures = Arc::clone(&failing_prepare);
         let mock = Arc::new(
             mock.with_get_attester_duties(move |epoch, _indices| {
                 if take_failure(&failing, epoch) {
@@ -635,7 +666,14 @@ mod tests {
                     }],
                 })
             })
-            .with_prepare_beacon_proposer(|_preparations| Ok(()))
+            .with_prepare_beacon_proposer(move |_preparations| {
+                let mut left = prepare_failures.lock();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(unavailable());
+                }
+                Ok(())
+            })
             .with_submit_beacon_committee_subscriptions(move |subscriptions| {
                 recorded.lock().push(subscriptions.into_iter().map(|s| s.slot).collect());
                 Ok(())
@@ -710,6 +748,7 @@ mod tests {
             runner,
             subscription_slots,
             failing_attester,
+            failing_prepare,
             index_source,
         }
     }
@@ -957,10 +996,14 @@ mod tests {
         assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
 
         let calls = f.mock.call_stamps().len();
-        assert!(f.runner.duty_fetch(1).await, "all four entries are cached");
+        assert_eq!(f.runner.duty_fetch(1).await, StepOutcome::Done, "all four entries are cached");
         assert_eq!(f.mock.call_stamps().len(), calls, "a cache read, no beacon node call");
         failing_proposer.lock().insert(3, 1);
-        assert!(!f.runner.duty_fetch(2).await, "E+1's proposer duties are still uncached");
+        assert_eq!(
+            f.runner.duty_fetch(2).await,
+            StepOutcome::Failed,
+            "E+1's proposer request failed: still uncached"
+        );
 
         let f = fixture(proposer_duties_at(ROOT_A)).await;
         for epoch in [1, 2] {
@@ -1064,6 +1107,11 @@ mod tests {
             "ReorgCheck's and DutyFetch's E+1 requests failed: no subscription POST"
         );
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1, "the other steps ran");
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::CommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "cold E+1: not ready, and not done"
+        );
         assert!(f.runner.has_pending(33), "the subscription step stays pending");
 
         f.runner.run_pending(33).await;
@@ -1084,6 +1132,16 @@ mod tests {
         tokio::join!(f.runner.run_pending(64), clear_during_prepare);
         assert_eq!(f.subscription_slots.lock().len(), 2, "E uncached at the step: no POST");
         assert!(!f.duty_tracker.is_epoch_cached(2).await, "the miss came after DutyFetch");
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::DutyFetch).0,
+            Some(StepOutcome::Done),
+            "every entry was cached after DutyFetch"
+        );
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::CommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "E was uncached at the subscription step"
+        );
         assert!(f.runner.has_pending(65), "the subscription step stays pending");
 
         f.runner.run_pending(65).await;
@@ -1132,6 +1190,120 @@ mod tests {
         );
         assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
         assert!(!f.runner.has_pending(34), "nothing is pending once both epochs are subscribed");
+    }
+
+    /// The latest outcome of `step` in the runner's epoch, and whether it is done.
+    fn step_state(runner: &EpochBoundaryRunner, step: BoundaryStep) -> (Option<StepOutcome>, bool) {
+        let progress = runner.progress.lock();
+        let progress = progress.as_ref().expect("a pass ran");
+        (progress.last_outcome.get(&step).copied(), progress.done.contains(&step))
+    }
+
+    /// DutyFetch's E+1 attester request fails at slot 32, after ReorgCheck's:
+    /// DutyFetch is `Failed`, CommitteeSubscriptions is `NotReady` and not
+    /// done, and PrepareProposers between them still runs. At slot 33 only
+    /// the fetch runs again; it succeeds, and the subscriptions go out once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn duty_fetch_failure_is_retried_next_slot() {
+        use BoundaryStep::{CommitteeSubscriptions, DutyFetch};
+        let [att, subs] =
+            [MockMethod::GetAttesterDuties, MockMethod::SubmitBeaconCommitteeSubscriptions];
+        let f =
+            fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[1]).await;
+        f.failing_attester.lock().insert(2, 2);
+        let attester_seeded = f.mock.get_attester_duties_calls().len();
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            attester_epochs_since(&f.mock, attester_seeded),
+            [1, 2, 2],
+            "ReorgCheck E and E+1, then DutyFetch's E+1, which fails too"
+        );
+        assert_eq!(
+            step_state(&f.runner, DutyFetch),
+            (Some(StepOutcome::Failed), false),
+            "the E+1 fetch failed"
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "E+1 uncached: not ready, and not done"
+        );
+        assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1, "PrepareProposers still ran");
+        assert!(f.subscription_slots.lock().is_empty(), "E+1 is uncached: no POST");
+        assert!(f.runner.has_pending(33));
+        let seeded = f.mock.call_stamps().len();
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            methods_since(&f.mock, seeded),
+            [att, subs, subs],
+            "DutyFetch's E+1 request, then the subscriptions; no done step runs again"
+        );
+        assert_eq!(attester_epochs_since(&f.mock, attester_seeded + 3), [2]);
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]), "E and E+1, once");
+        assert_eq!(
+            step_state(&f.runner, DutyFetch),
+            (Some(StepOutcome::Done), false),
+            "DutyFetch is never marked done"
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "sent: done"
+        );
+        assert!(!f.runner.has_pending(34));
+    }
+
+    /// The order is per pass, not a barrier: PrepareProposers fails at slot
+    /// 32, and the subscription step after it still POSTs in that pass. At
+    /// slot 33 only PrepareProposers runs again: the breaker is not reset,
+    /// and the prepare POST is the only beacon-node request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_steps_run_after_an_earlier_failure() {
+        use BoundaryStep::{CommitteeSubscriptions, PrepareProposers};
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        *f.failing_prepare.lock() = 1;
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1);
+        assert_eq!(
+            step_state(&f.runner, PrepareProposers),
+            (Some(StepOutcome::Failed), false),
+            "the 503 leaves PrepareProposers failed, and not done"
+        );
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"], &["65"]]),
+            "the subscriptions after the failed prepare go out in the same pass"
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "sent: done"
+        );
+        assert!(f.runner.has_pending(33), "PrepareProposers stays pending");
+        f.breaker.record_miss();
+        let seeded = f.mock.call_stamps().len();
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            methods_since(&f.mock, seeded),
+            [MockMethod::PrepareBeaconProposer],
+            "only PrepareProposers runs again"
+        );
+        assert_eq!(f.breaker.epoch_misses(), 1, "BreakerReset is not repeated");
+        assert_eq!(
+            step_state(&f.runner, PrepareProposers),
+            (Some(StepOutcome::Done), true),
+            "the retry succeeded: done"
+        );
+        assert_eq!(f.subscription_slots.lock().len(), 2, "the subscriptions are not sent again");
+        assert!(!f.runner.has_pending(34));
     }
 
     /// A hung beacon node does not hold the runner: the pass returns when
