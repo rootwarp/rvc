@@ -216,3 +216,113 @@ async fn a_fence_captured_after_a_revocation_never_sees_older_duties() {
     assert!(!fence.holds());
     assert!(tracker.get_proposer_duty(SLOT).await.is_none(), "a second revocation drops it again");
 }
+
+fn ptc_path() -> String {
+    format!("/eth/v1/validator/duties/ptc/{EPOCH}")
+}
+
+fn sync_path() -> String {
+    format!("/eth/v1/validator/duties/sync/{EPOCH}")
+}
+
+/// A BN that answers PTC and sync-committee duties for `VALIDATOR_INDEX`.
+async fn ptc_and_sync_bn(dependent_root: &str, pubkey_hex: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ptc_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": dependent_root,
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": VALIDATOR_INDEX,
+                "slot": SLOT.to_string()
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(sync_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": VALIDATOR_INDEX,
+                "validator_sync_committee_indices": ["0"]
+            }]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// (PTC, sync) duty requests received by `server`.
+async fn ptc_and_sync_hits(server: &MockServer) -> (usize, usize) {
+    let requests: Vec<Request> = server.received_requests().await.expect("requests");
+    let count =
+        |route: String| requests.iter().filter(|request| request.url.path() == route).count();
+    (count(ptc_path()), count(sync_path()))
+}
+
+#[tokio::test]
+async fn ptc_and_sync_duties_cached_before_a_revocation_are_not_served() {
+    let pubkey = SecretKey::generate().public_key();
+    let pubkey_bytes = pubkey.to_bytes();
+    let pubkey_hex = pubkey_bytes_to_0x(&pubkey_bytes);
+    let first = ptc_and_sync_bn(FIRST_ROOT, &pubkey_hex).await;
+    let second = ptc_and_sync_bn(SECOND_ROOT, &pubkey_hex).await;
+    let bn_manager = Arc::new(
+        BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager"),
+    );
+
+    let mut registry = PubkeyIndexRegistry::new();
+    registry.insert(pubkey_bytes, VALIDATOR_INDEX.to_string());
+    let pubkey_map: PubkeyMap = Arc::new(RwLock::new(HashMap::from([(pubkey_bytes, pubkey)])));
+    let index_source =
+        Arc::new(PubkeyIndexSource { registry: Arc::new(RwLock::new(registry)), pubkey_map });
+    let tracker = DutyTracker::new_with_source(
+        Arc::clone(&bn_manager) as Arc<dyn DutiesProvider>,
+        index_source,
+    )
+    .with_fork_schedule(ForkSchedule::unscheduled_gloas());
+
+    tracker.fetch_ptc_duties_for_epoch(EPOCH).await.expect("PTC duties from the first node");
+    tracker.fetch_sync_committee_duties(EPOCH).await.expect("sync duties from the first node");
+    assert_eq!(tracker.get_ptc_duties_for_slot(SLOT).await.len(), 1);
+    assert_eq!(tracker.get_sync_committee_duties(SLOT).await.len(), 1);
+    assert!(tracker.is_ptc_epoch_cached(EPOCH).await);
+    assert!(tracker.is_sync_period_cached(EPOCH).await);
+    assert_eq!(
+        (ptc_and_sync_hits(&first).await, ptc_and_sync_hits(&second).await),
+        ((1, 1), (0, 0))
+    );
+
+    bn_manager.testing_revoke_admission(0);
+
+    assert!(
+        tracker.get_ptc_duties_for_slot(SLOT).await.is_empty(),
+        "PTC duties cached from the revoked node must not be served"
+    );
+    assert!(
+        tracker.get_sync_committee_duties(SLOT).await.is_empty(),
+        "sync duties cached from the revoked node must not be served"
+    );
+    assert!(
+        !tracker.is_ptc_epoch_cached(EPOCH).await,
+        "the revoked node's PTC epoch reads as uncached"
+    );
+    assert!(
+        !tracker.is_sync_period_cached(EPOCH).await,
+        "the revoked node's sync period reads as uncached"
+    );
+
+    tracker.fetch_ptc_duties_for_epoch(EPOCH).await.expect("PTC duties from the admitted node");
+    tracker.fetch_sync_committee_duties(EPOCH).await.expect("sync duties from the admitted node");
+    assert_eq!(
+        (ptc_and_sync_hits(&first).await, ptc_and_sync_hits(&second).await),
+        ((1, 1), (1, 1))
+    );
+    assert_eq!(tracker.get_ptc_duties_for_slot(SLOT).await.len(), 1);
+    assert_eq!(tracker.get_sync_committee_duties(SLOT).await.len(), 1);
+    assert_eq!(tracker.get_cached_ptc_dependent_root(EPOCH).await.as_deref(), Some(SECOND_ROOT));
+}

@@ -148,11 +148,13 @@ struct PtcEpochDutyCache {
     dependent_root: String,
     /// Index list posted to produce `duties`. `dependent_root` does not cover it.
     indices: Vec<String>,
+    /// Revocation generation captured before the request that produced `duties`.
+    fetched_gen: Option<u64>,
 }
 
 impl PtcEpochDutyCache {
     fn new(dependent_root: String) -> Self {
-        Self { duties: HashMap::new(), dependent_root, indices: Vec::new() }
+        Self { duties: HashMap::new(), dependent_root, indices: Vec::new(), fetched_gen: None }
     }
 
     /// Parse PTC duties from a BN response into a slot-keyed epoch cache.
@@ -191,12 +193,14 @@ struct SyncPeriodDutyCache {
     duties: Vec<SyncCommitteeDuty>,
     /// Index list posted to produce `duties`.
     indices: Vec<String>,
+    /// Revocation generation captured before the request that produced `duties`.
+    fetched_gen: Option<u64>,
 }
 
 impl SyncPeriodDutyCache {
     /// Construct a period cache from a BN sync-committee duties response body.
     fn from_response(duties: Vec<SyncCommitteeDuty>) -> Self {
-        Self { duties, indices: Vec::new() }
+        Self { duties, indices: Vec::new(), fetched_gen: None }
     }
 }
 
@@ -250,11 +254,23 @@ impl Stamped for ProposerEpochDutyCache {
     }
 }
 
-/// `epoch`'s entry when it is visible under `now`.
+impl Stamped for PtcEpochDutyCache {
+    fn fetched_gen(&self) -> Option<u64> {
+        self.fetched_gen
+    }
+}
+
+impl Stamped for SyncPeriodDutyCache {
+    fn fetched_gen(&self) -> Option<u64> {
+        self.fetched_gen
+    }
+}
+
+/// The entry at `key` (an epoch, or a sync period) when it is visible under `now`.
 ///
 /// A stale entry reads as absent.
-fn servable<E: Stamped>(cache: &HashMap<u64, E>, epoch: u64, now: Option<u64>) -> Option<&E> {
-    let entry = cache.get(&epoch).filter(|entry| visible(entry.fetched_gen(), now));
+fn servable<E: Stamped>(cache: &HashMap<u64, E>, key: u64, now: Option<u64>) -> Option<&E> {
+    let entry = cache.get(&key).filter(|entry| visible(entry.fetched_gen(), now));
     #[cfg(test)]
     hooks::fire(&hooks::AFTER_STAMP_CHECK);
     entry
@@ -292,7 +308,7 @@ mod hooks {
         pub(super) static AFTER_READ_LOCK: Slot = const { RefCell::new(None) };
         /// After a reader's stamp check, still inside its guard.
         pub(super) static AFTER_STAMP_CHECK: Slot = const { RefCell::new(None) };
-        /// In `admit_attester` and `admit_proposer`, after the re-check and before the insert.
+        /// In the `admit_*` helpers, after the re-check and before the insert.
         pub(super) static BEFORE_INSERT: Slot = const { RefCell::new(None) };
         /// In `admit_proposer`, after it takes the write guard, before the re-check.
         pub(super) static AFTER_WRITE_LOCK: Slot = const { RefCell::new(None) };
@@ -356,8 +372,9 @@ impl DutyTracker {
     /// static set.
     ///
     /// When `beacon` has a [`DutiesProvider::revocation_generation`], a
-    /// cached attester or proposer entry is served only while that generation
-    /// equals the one captured before the request that produced it.
+    /// cached attester, proposer, PTC or sync-committee entry is served only
+    /// while that generation equals the one captured before the request that
+    /// produced it.
     pub fn new_with_source(
         beacon: Arc<dyn DutiesProvider>,
         index_source: Arc<dyn ValidatorIndexSource>,
@@ -400,6 +417,24 @@ impl DutyTracker {
     /// then checks the stamp while it holds the guard.
     async fn proposer_read(&self) -> RwLockReadGuard<'_, HashMap<u64, ProposerEpochDutyCache>> {
         let guard = self.proposer_cache.read().await;
+        #[cfg(test)]
+        hooks::fire(&hooks::AFTER_READ_LOCK);
+        guard
+    }
+
+    /// Read guard on the PTC cache. Every PTC reader starts here, then checks
+    /// the stamp while it holds the guard.
+    async fn ptc_read(&self) -> RwLockReadGuard<'_, HashMap<u64, PtcEpochDutyCache>> {
+        let guard = self.ptc_cache.read().await;
+        #[cfg(test)]
+        hooks::fire(&hooks::AFTER_READ_LOCK);
+        guard
+    }
+
+    /// Read guard on the sync-committee cache. Every sync reader starts here,
+    /// then checks the stamp while it holds the guard.
+    async fn sync_read(&self) -> RwLockReadGuard<'_, HashMap<u64, SyncPeriodDutyCache>> {
+        let guard = self.sync_committee_cache.read().await;
         #[cfg(test)]
         hooks::fire(&hooks::AFTER_READ_LOCK);
         guard
@@ -458,6 +493,51 @@ impl DutyTracker {
         #[cfg(test)]
         hooks::fire(&hooks::BEFORE_INSERT);
         Ok(insert_proposer(&mut cache, epoch, dependent_root, duties, stamp))
+    }
+
+    /// Insert `entry` stamped with `stamp`, the only PTC insert path.
+    ///
+    /// The generation is re-loaded under the write guard. If it moved since
+    /// `stamp` was captured, nothing is inserted and the caller must not use
+    /// the answer.
+    fn admit_ptc(
+        &self,
+        cache: &mut RwLockWriteGuard<'_, HashMap<u64, PtcEpochDutyCache>>,
+        epoch: u64,
+        mut entry: PtcEpochDutyCache,
+        stamp: FetchStamp,
+    ) -> Result<(), DutyTrackerError> {
+        if !visible(stamp.0, self.generation_now()) {
+            return Err(DutyTrackerError::RevokedDuringFetch { epoch });
+        }
+        #[cfg(test)]
+        hooks::fire(&hooks::BEFORE_INSERT);
+        entry.fetched_gen = stamp.0;
+        cache.insert(epoch, entry);
+        Ok(())
+    }
+
+    /// Insert `entry`, fetched for `epoch`, under its sync period stamped with
+    /// `stamp`: the only sync-committee insert path.
+    ///
+    /// The generation is re-loaded under the write guard. If it moved since
+    /// `stamp` was captured, nothing is inserted and the caller must not use
+    /// the answer.
+    fn admit_sync(
+        &self,
+        cache: &mut RwLockWriteGuard<'_, HashMap<u64, SyncPeriodDutyCache>>,
+        epoch: u64,
+        mut entry: SyncPeriodDutyCache,
+        stamp: FetchStamp,
+    ) -> Result<(), DutyTrackerError> {
+        if !visible(stamp.0, self.generation_now()) {
+            return Err(DutyTrackerError::RevokedDuringFetch { epoch });
+        }
+        #[cfg(test)]
+        hooks::fire(&hooks::BEFORE_INSERT);
+        entry.fetched_gen = stamp.0;
+        cache.insert(Self::sync_committee_period(epoch), entry);
+        Ok(())
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Attestation.as_str()))]
@@ -804,6 +884,7 @@ impl DutyTracker {
     ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
         debug!(epoch = epoch, "Fetching PTC duties for epoch");
 
+        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .post_ptc_duties(epoch, validator_indices)
@@ -816,10 +897,10 @@ impl DutyTracker {
             PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
         epoch_cache.indices = validator_indices.to_vec();
 
-        info!(epoch = epoch, count = response.data.len(), "Cached PTC duties for epoch");
-
         let mut cache = self.ptc_cache.write().await;
-        cache.insert(epoch, epoch_cache);
+        self.admit_ptc(&mut cache, epoch, epoch_cache, stamp)?;
+
+        info!(epoch = epoch, count = response.data.len(), "Cached PTC duties for epoch");
 
         Ok(response.data)
     }
@@ -835,8 +916,9 @@ impl DutyTracker {
 
     pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<TypedPtcDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
-        let cache = self.ptc_cache.read().await;
-        match cache.get(&epoch).and_then(|c| c.get(&slot)) {
+        let cache = self.ptc_read().await;
+        let now = self.generation_now();
+        match servable(&cache, epoch, now).and_then(|c| c.get(&slot)) {
             Some(duties) => {
                 debug!(slot, epoch, cache_type = "ptc", count = duties.len(), "Cache hit");
                 duties.to_vec()
@@ -849,8 +931,9 @@ impl DutyTracker {
     }
 
     pub async fn get_cached_ptc_dependent_root(&self, epoch: u64) -> Option<String> {
-        let cache = self.ptc_cache.read().await;
-        cache.get(&epoch).map(|c| c.dependent_root.clone())
+        let cache = self.ptc_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).map(|c| c.dependent_root.clone())
     }
 
     #[tracing::instrument(name = "duty_tracker.check_ptc_reorg", level = "debug", skip_all, fields(epoch =epoch))]
@@ -858,16 +941,19 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
+        let stamp = self.fetch_stamp();
         let indices = self.index_source.indices();
+        // A stale entry counts as uncached.
         let cached = {
-            let cache = self.ptc_cache.read().await;
-            cache.get(&epoch).map(|c| (c.dependent_root.clone(), c.indices.clone()))
+            let cache = self.ptc_read().await;
+            let now = self.generation_now();
+            servable(&cache, epoch, now).is_some()
         };
 
-        let Some((cached_root, cached_indices)) = cached else {
+        if !cached {
             self.fetch_ptc_duties(epoch, &indices).await?;
             return Ok(true);
-        };
+        }
 
         let response = self
             .beacon
@@ -875,15 +961,22 @@ impl DutyTracker {
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        if cached_root == response.dependent_root && cached_indices == indices {
+        // Compare against the entry visible now, under the write guard: the
+        // read above may be outdated by another writer.
+        let mut cache = self.ptc_cache.write().await;
+        let cached = servable(&cache, epoch, stamp.0);
+        let same_snapshot = cached
+            .is_some_and(|c| c.dependent_root == response.dependent_root && c.indices == indices);
+        if same_snapshot {
             return Ok(false);
         }
 
-        let root_changed = cached_root != response.dependent_root;
+        let root_changed =
+            cached.map(|c| c.dependent_root != response.dependent_root).unwrap_or(true);
         if root_changed {
             info!(
                 epoch = epoch,
-                old_root = %cached_root,
+                old_root = ?cached.map(|c| c.dependent_root.clone()),
                 new_root = %response.dependent_root,
                 "PTC dependent root changed, refetching duties"
             );
@@ -895,15 +988,15 @@ impl DutyTracker {
             PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
         epoch_cache.indices = indices;
 
-        let mut cache = self.ptc_cache.write().await;
-        cache.insert(epoch, epoch_cache);
+        self.admit_ptc(&mut cache, epoch, epoch_cache, stamp)?;
         Ok(root_changed)
     }
 
     pub async fn is_ptc_epoch_cached(&self, epoch: u64) -> bool {
         let indices = self.index_source.indices();
-        let cache = self.ptc_cache.read().await;
-        cache.get(&epoch).is_some_and(|entry| entry.indices == indices)
+        let cache = self.ptc_read().await;
+        let now = self.generation_now();
+        servable(&cache, epoch, now).is_some_and(|entry| entry.indices == indices)
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_sync_committee_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::SyncCommittee.as_str()))]
@@ -915,11 +1008,17 @@ impl DutyTracker {
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         debug!(epoch = epoch, period = period, "Fetching sync committee duties");
 
+        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .post_sync_committee_duties(epoch, &indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
+
+        let mut period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
+        period_cache.indices = indices;
+        let mut cache = self.sync_committee_cache.write().await;
+        self.admit_sync(&mut cache, epoch, period_cache, stamp)?;
 
         info!(
             epoch = epoch,
@@ -927,11 +1026,6 @@ impl DutyTracker {
             count = response.data.len(),
             "Cached sync committee duties for period"
         );
-
-        let mut period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
-        period_cache.indices = indices;
-        let mut cache = self.sync_committee_cache.write().await;
-        cache.insert(period, period_cache);
 
         Ok(response.data)
     }
@@ -945,8 +1039,9 @@ impl DutyTracker {
     pub async fn get_sync_committee_duties(&self, slot: u64) -> Vec<SyncCommitteeDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let cache = self.sync_committee_cache.read().await;
-        match cache.get(&period) {
+        let cache = self.sync_read().await;
+        let now = self.generation_now();
+        match servable(&cache, period, now) {
             Some(period_cache) => {
                 debug!(slot, epoch, cache_type = "sync", "Cache hit");
                 period_cache.duties.clone()
@@ -961,8 +1056,9 @@ impl DutyTracker {
     pub async fn is_sync_period_cached(&self, epoch: u64) -> bool {
         let indices = self.index_source.indices();
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let cache = self.sync_committee_cache.read().await;
-        cache.get(&period).is_some_and(|entry| entry.indices == indices)
+        let cache = self.sync_read().await;
+        let now = self.generation_now();
+        servable(&cache, period, now).is_some_and(|entry| entry.indices == indices)
     }
 
     pub fn sync_committee_period(epoch: u64) -> u64 {
@@ -993,9 +1089,16 @@ impl DutyTracker {
             servable(&cache, epoch, now).map_or(0, |c| c.duties.len())
         };
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let sync_count =
-            self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.duties.len());
-        let ptc_count = self.ptc_cache.read().await.get(&epoch).map_or(0, |c| c.duty_count());
+        let sync_count = {
+            let cache = self.sync_read().await;
+            let now = self.generation_now();
+            servable(&cache, period, now).map_or(0, |c| c.duties.len())
+        };
+        let ptc_count = {
+            let cache = self.ptc_read().await;
+            let now = self.generation_now();
+            servable(&cache, epoch, now).map_or(0, |c| c.duty_count())
+        };
         (attester_count, proposer_count, sync_count, ptc_count)
     }
 }
@@ -3698,6 +3801,533 @@ mod tests {
         );
         assert_eq!(mock.get_proposer_duties_calls().len(), 2, "seed, then the cold-path fetch");
         assert_eq!(proposer_entry(&tracker).await, entry("0xroot_a", 1), "re-stamped");
+    }
+
+    // -- Revocation-stamped PTC and sync caches (W4-E7c2) --
+
+    fn ptc_stamp_response(dependent_root: &str) -> PtcDutiesResponse {
+        ptc_response(vec![(STAMP_SLOT, "1234", "0xpubkey_1234")], dependent_root)
+    }
+
+    /// PTC duties from `ptc` in order, and one sync-committee duty.
+    fn mock_ptc_and_sync(ptc: Vec<PtcDutiesResponse>) -> MockBeaconNodeClient {
+        mock_ptc_queue(ptc).with_post_sync_committee_duties(|_epoch, _indices| {
+            Ok(sync_response(vec![(1234, mock_sync_pubkey(), vec![0])]))
+        })
+    }
+
+    async fn seed_ptc_and_sync(tracker: &DutyTracker) {
+        tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed PTC");
+        tracker.fetch_sync_committee_duties(STAMP_EPOCH).await.expect("seed sync");
+    }
+
+    /// The stored PTC root for `STAMP_EPOCH`, stale or not.
+    async fn stored_ptc_root(tracker: &DutyTracker) -> Option<String> {
+        tracker.ptc_cache.read().await.get(&STAMP_EPOCH).map(|entry| entry.dependent_root.clone())
+    }
+
+    /// Whether a sync entry is stored for `STAMP_EPOCH`'s period, stale or not.
+    async fn sync_period_stored(tracker: &DutyTracker) -> bool {
+        let period = DutyTracker::sync_committee_period(STAMP_EPOCH);
+        tracker.sync_committee_cache.read().await.contains_key(&period)
+    }
+
+    /// The PTC and sync readers that take a cache read guard.
+    #[derive(Debug, Clone, Copy)]
+    enum PtcSyncReader {
+        PtcDuties,
+        PtcDependentRoot,
+        IsPtcEpochCached,
+        PtcCount,
+        SyncDuties,
+        IsSyncPeriodCached,
+        SyncCount,
+    }
+
+    impl PtcSyncReader {
+        const ALL: [Self; 7] = [
+            Self::PtcDuties,
+            Self::PtcDependentRoot,
+            Self::IsPtcEpochCached,
+            Self::PtcCount,
+            Self::SyncDuties,
+            Self::IsSyncPeriodCached,
+            Self::SyncCount,
+        ];
+
+        /// Which run of a read-path hook is this reader's guard.
+        /// `cached_duty_counts` takes the attester, proposer, sync, then PTC guard.
+        fn guard_run(self) -> usize {
+            match self {
+                Self::SyncCount => 3,
+                Self::PtcCount => 4,
+                _ => 1,
+            }
+        }
+
+        /// Whether this reader serves the entry cached for `STAMP_EPOCH`.
+        async fn hits(self, tracker: &DutyTracker) -> bool {
+            match self {
+                Self::PtcDuties => !tracker.get_ptc_duties_for_slot(STAMP_SLOT).await.is_empty(),
+                Self::PtcDependentRoot => {
+                    tracker.get_cached_ptc_dependent_root(STAMP_EPOCH).await.is_some()
+                }
+                Self::IsPtcEpochCached => tracker.is_ptc_epoch_cached(STAMP_EPOCH).await,
+                Self::PtcCount => tracker.cached_duty_counts(STAMP_EPOCH).await.3 > 0,
+                Self::SyncDuties => !tracker.get_sync_committee_duties(STAMP_SLOT).await.is_empty(),
+                Self::IsSyncPeriodCached => tracker.is_sync_period_cached(STAMP_EPOCH).await,
+                Self::SyncCount => tracker.cached_duty_counts(STAMP_EPOCH).await.2 > 0,
+            }
+        }
+    }
+
+    async fn assert_no_ptc_or_sync_reader_hits(tracker: &DutyTracker, context: &str) {
+        for reader in PtcSyncReader::ALL {
+            assert!(!reader.hits(tracker).await, "{context}: {reader:?} served the entry");
+        }
+    }
+
+    /// A PTC or sync writer that sends one BN request.
+    #[derive(Debug, Clone, Copy)]
+    enum PtcSyncWriter {
+        PtcFetch,
+        PtcRefresh,
+        SyncFetch,
+    }
+
+    impl PtcSyncWriter {
+        async fn write(self, tracker: &DutyTracker) -> Result<(), DutyTrackerError> {
+            match self {
+                Self::PtcFetch => {
+                    tracker.fetch_ptc_duties(STAMP_EPOCH, &["1234".to_string()]).await.map(|_| ())
+                }
+                Self::PtcRefresh => {
+                    tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await.map(|_| ())
+                }
+                Self::SyncFetch => {
+                    tracker.fetch_sync_committee_duties(STAMP_EPOCH).await.map(|_| ())
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_ptc_reorg_refresh_revoked_before_release_is_discarded() {
+        let mock =
+            mock_ptc_queue(vec![ptc_stamp_response("0xroot_a"), ptc_stamp_response("0xroot_b")])
+                .with_method_delay(MockMethod::PostPtcDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+        assert_eq!(
+            tracker.get_cached_ptc_dependent_root(STAMP_EPOCH).await.as_deref(),
+            Some("0xroot_a")
+        );
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::PostPtcDuties, 2).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = refresh.await.expect("refresh task");
+        assert!(
+            is_revoked_during_fetch(&result),
+            "a refresh answer fetched across a bump must be discarded, got {result:?}"
+        );
+        assert_eq!(stored_ptc_root(&tracker).await.as_deref(), Some("0xroot_a"), "B is not stored");
+        assert_eq!(tracker.get_cached_ptc_dependent_root(STAMP_EPOCH).await, None);
+        assert!(tracker.get_ptc_duties_for_slot(STAMP_SLOT).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_same_root_ptc_refresh_revoked_before_release_does_not_restamp() {
+        let mock = mock_ptc_queue(vec![ptc_stamp_response("0xroot_a"); 2])
+            .with_method_delay(MockMethod::PostPtcDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+        tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::PostPtcDuties, 2).await;
+        bump(&generation);
+        tokio::time::advance(HOLD).await;
+
+        let result = refresh.await.expect("refresh task");
+        assert!(
+            matches!(result, Ok(false)),
+            "a same-root refresh must report no root change, got {result:?}"
+        );
+        assert_eq!(stored_ptc_root(&tracker).await.as_deref(), Some("0xroot_a"));
+        assert_no_ptc_or_sync_reader_hits(&tracker, "same-root refresh held across a bump").await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_ptc_refresh_compares_against_the_entry_under_its_write_guard() {
+        let mock = mock_ptc_queue(vec![ptc_stamp_response("0xroot_a"); 2])
+            .with_method_delay(MockMethod::PostPtcDuties, HOLD);
+        let (mock, tracker, _generation) = stamped(mock);
+        tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+
+        let refresh = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await }
+        });
+        wait_for_arrivals(&mock, MockMethod::PostPtcDuties, 2).await;
+        tracker.clear_cache().await;
+        tokio::time::advance(HOLD).await;
+
+        let changed =
+            refresh.await.expect("refresh task").expect("no bump: the answer is admitted");
+        assert!(changed, "the entry read before the request is gone, so root A is a change");
+        assert_eq!(stored_ptc_root(&tracker).await.as_deref(), Some("0xroot_a"), "re-inserted");
+        for reader in &PtcSyncReader::ALL[..4] {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the re-inserted entry");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_ptc_and_sync_fetches_revoked_before_release_are_discarded() {
+        let mock = mock_ptc_and_sync(vec![ptc_stamp_response("0xroot_a"); 2])
+            .with_method_delay(MockMethod::PostPtcDuties, HOLD)
+            .with_method_delay(MockMethod::PostSyncCommitteeDuties, HOLD);
+        let (mock, tracker, generation) = stamped(mock);
+
+        // The refresh of an uncached epoch takes its cold path.
+        for (writer, method, arrivals) in [
+            (PtcSyncWriter::PtcFetch, MockMethod::PostPtcDuties, 1),
+            (PtcSyncWriter::PtcRefresh, MockMethod::PostPtcDuties, 2),
+            (PtcSyncWriter::SyncFetch, MockMethod::PostSyncCommitteeDuties, 1),
+        ] {
+            let held = tokio::spawn({
+                let tracker = Arc::clone(&tracker);
+                async move { writer.write(&tracker).await }
+            });
+            wait_for_arrivals(&mock, method, arrivals).await;
+            bump(&generation);
+            tokio::time::advance(HOLD).await;
+
+            let result = held.await.expect("writer task");
+            assert!(
+                is_revoked_during_fetch(&result),
+                "{writer:?}: an answer fetched across a bump must be discarded, got {result:?}"
+            );
+            assert_eq!(stored_ptc_root(&tracker).await, None, "{writer:?}: no PTC entry");
+            assert!(!sync_period_stored(&tracker).await, "{writer:?}: no sync entry");
+            assert_no_ptc_or_sync_reader_hits(&tracker, &format!("{writer:?}")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn every_ptc_and_sync_reader_misses_after_a_bump() {
+        let (_mock, tracker, generation) =
+            stamped(mock_ptc_and_sync(vec![ptc_stamp_response("0xroot_a"); 3]));
+        seed_ptc_and_sync(&tracker).await;
+        for reader in PtcSyncReader::ALL {
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+        }
+        let changed =
+            tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(!changed, "the refresh read sees the fresh entry");
+
+        bump(&generation);
+
+        assert_no_ptc_or_sync_reader_hits(&tracker, "after a bump").await;
+        let changed =
+            tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await.expect("refresh");
+        assert!(changed, "the refresh read treats the stale entry as uncached");
+    }
+
+    #[tokio::test]
+    async fn bump_between_ptc_or_sync_read_lock_and_stamp_check_is_a_miss() {
+        let mock =
+            mock_ptc_and_sync(vec![ptc_stamp_response("0xroot_a"); PtcSyncReader::ALL.len()]);
+        let (_mock, tracker, generation) = stamped(mock);
+        for reader in PtcSyncReader::ALL {
+            seed_ptc_and_sync(&tracker).await;
+            assert!(reader.hits(&tracker).await, "{reader:?} serves the fresh entry");
+            let before = generation.load(Ordering::Acquire);
+
+            let hit = {
+                let hook = bump_on_run(&generation, reader.guard_run());
+                let _armed = hooks::arm(&hooks::AFTER_READ_LOCK, hook);
+                reader.hits(&tracker).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{reader:?}: hook ran");
+            assert!(!hit, "{reader:?} must load the generation inside its guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn bump_between_ptc_refresh_read_lock_and_stamp_check_takes_the_cold_path() {
+        let (mock, tracker, generation) =
+            stamped(mock_ptc_queue(vec![ptc_stamp_response("0xroot_a"); 2]));
+        tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed");
+
+        let changed = {
+            let _armed = hooks::arm(&hooks::AFTER_READ_LOCK, bump_on_run(&generation, 1));
+            tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await
+        };
+
+        assert_eq!(generation.load(Ordering::Acquire), 1, "hook ran");
+        assert!(
+            changed.expect("refresh"),
+            "the refresh read loads the generation inside its guard, so it sees a stale entry"
+        );
+        assert_eq!(mock.post_ptc_duties_calls().len(), 2, "seed, then the cold-path fetch");
+        assert!(tracker.is_ptc_epoch_cached(STAMP_EPOCH).await, "re-stamped");
+    }
+
+    #[tokio::test]
+    async fn bump_between_ptc_or_sync_recheck_and_insert_leaves_nothing_servable() {
+        // The warm refresh answers root B over a freshly seeded root A.
+        let ptc = ["0xroot_a", "0xroot_a", "0xroot_b"].map(ptc_stamp_response).to_vec();
+        let (_mock, tracker, generation) = stamped(mock_ptc_and_sync(ptc));
+
+        for (writer, root) in [
+            (PtcSyncWriter::PtcFetch, Some("0xroot_a")),
+            (PtcSyncWriter::PtcRefresh, Some("0xroot_b")),
+            (PtcSyncWriter::SyncFetch, None),
+        ] {
+            if matches!(writer, PtcSyncWriter::PtcRefresh) {
+                tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+            }
+            let before = generation.load(Ordering::Acquire);
+            let written = {
+                let _armed = hooks::arm(&hooks::BEFORE_INSERT, bump_on_run(&generation, 1));
+                writer.write(&tracker).await
+            };
+
+            written.unwrap_or_else(|err| panic!("{writer:?}: the re-check passed, got {err}"));
+            assert_eq!(generation.load(Ordering::Acquire), before + 1, "{writer:?}: hook ran");
+            match root {
+                Some(root) => assert_eq!(stored_ptc_root(&tracker).await.as_deref(), Some(root)),
+                None => assert!(sync_period_stored(&tracker).await, "{writer:?}: stored"),
+            }
+            assert_no_ptc_or_sync_reader_hits(&tracker, &format!("{writer:?}")).await;
+        }
+    }
+
+    // -- Source scans: every cache read and insert follows the stamp rule (W4-E7c2) --
+
+    /// `tracker.rs` before its test module, with `//` comments removed.
+    fn production_code() -> String {
+        let source = include_str!("tracker.rs");
+        let end = source.find("\n#[cfg(test)]\nmod tests {").expect("test module boundary");
+        let lines = source[..end].lines().map(|line| line.split("//").next().unwrap_or_default());
+        lines.collect::<Vec<_>>().join("\n")
+    }
+
+    /// One `fn` with a body: its name, and its signature and braced body with
+    /// whitespace removed, so a call that rustfmt splits over lines still matches.
+    struct FnItem<'a> {
+        name: &'a str,
+        signature: String,
+        body: String,
+    }
+
+    fn compact(code: &str) -> String {
+        code.split_whitespace().collect()
+    }
+
+    /// Every `fn` with a body in `code`, outermost only, in source order.
+    fn fn_items(code: &str) -> Vec<FnItem<'_>> {
+        let mut items = Vec::new();
+        let mut from = 0;
+        while let Some(found) = code[from..].find("fn ") {
+            let start = from + found;
+            from = start + "fn ".len();
+            if code[..start].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let rest = &code[from..];
+            let name_len = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(0);
+            let Some(open) = rest.find(['{', ';']) else { break };
+            if rest[open..].starts_with(';') {
+                continue;
+            }
+            let body_start = from + open;
+            let mut depth = 0;
+            let mut body_end = code.len();
+            for (offset, c) in code[body_start..].char_indices() {
+                depth += i32::from(c == '{') - i32::from(c == '}');
+                if depth == 0 {
+                    body_end = body_start + offset + 1;
+                    break;
+                }
+            }
+            items.push(FnItem {
+                name: &rest[..name_len],
+                signature: compact(&code[start..body_start]),
+                body: compact(&code[body_start..body_end]),
+            });
+            from = body_end;
+        }
+        items
+    }
+
+    /// The `fn`s in `code` that read a cache without checking the stamp before
+    /// their next `.await`, once per unchecked read.
+    ///
+    /// A read is `.read().await`, or a call to a guard helper: a `fn` returning
+    /// `RwLockReadGuard`, which leaves the check to its caller. A check is
+    /// `visible(`, or a call to a `fn` whose body calls `visible(`.
+    fn unchecked_reads(code: &str) -> Vec<String> {
+        let items = fn_items(code);
+        let is_guard_helper = |item: &FnItem<'_>| item.signature.contains("->RwLockReadGuard<");
+        let mut reads = vec![".read().await".to_string()];
+        reads.extend(
+            items.iter().filter(|i| is_guard_helper(i)).map(|i| format!(".{}().await", i.name)),
+        );
+        let mut checks = vec!["visible(".to_string()];
+        checks.extend(
+            items.iter().filter(|i| i.body.contains("visible(")).map(|i| format!("{}(", i.name)),
+        );
+
+        let mut offenders = Vec::new();
+        for item in items.iter().filter(|item| !is_guard_helper(item)) {
+            let mut at: Vec<usize> = reads
+                .iter()
+                .flat_map(|read| item.body.match_indices(read.as_str()).map(|(i, m)| i + m.len()))
+                .collect();
+            at.sort_unstable();
+            for end in at {
+                let section = item.body[end..].split(".await").next().unwrap_or_default();
+                if !checks.iter().any(|check| section.contains(check.as_str())) {
+                    offenders.push(item.name.to_string());
+                }
+            }
+        }
+        offenders
+    }
+
+    /// The `fn`s in `code` that break the insert rule, with the reason.
+    ///
+    /// A cache guard (`.write().await` or a `RwLockWriteGuard` parameter) is
+    /// inserted into only by an `admit_*` helper or by `insert_proposer`, which
+    /// only `admit_proposer` and the test-only `cache_proposer_duties` call. An
+    /// `admit_*` caller sends a BN request, and every `fn` that sends one
+    /// assigns `fetch_stamp()` before its first `self.beacon.`.
+    fn unstamped_writes(code: &str) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for item in fn_items(code) {
+            let holds_guard =
+                item.signature.contains("RwLockWriteGuard") || item.body.contains(".write().await");
+            let inserter = item.name.starts_with("admit_") || item.name == "insert_proposer";
+            if holds_guard && item.body.contains(".insert(") && !inserter {
+                offenders.push(format!("{}: inserts outside the admit_* helpers", item.name));
+            }
+            let proposer_admitters = ["admit_proposer", "cache_proposer_duties"];
+            if item.body.contains("insert_proposer(") && !proposer_admitters.contains(&item.name) {
+                offenders.push(format!("{}: calls insert_proposer", item.name));
+            }
+            let first_request = item.body.find("self.beacon.");
+            if item.body.contains(".admit_") && first_request.is_none() {
+                offenders.push(format!("{}: admits an answer it did not request", item.name));
+            }
+            if first_request.is_some_and(|at| !item.body[..at].contains("=self.fetch_stamp();")) {
+                offenders.push(format!("{}: no fetch_stamp() before its first request", item.name));
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn every_cache_read_checks_the_revocation_stamp() {
+        let code = production_code();
+        assert_eq!(unchecked_reads(&code), Vec::<String>::new(), "unchecked cache reads");
+
+        let items = fn_items(&code);
+        let read_count = |name: &str| {
+            let item = items.iter().find(|item| item.name == name).expect(name);
+            item.body.matches("read().await").count()
+        };
+        for helper in ["attester_read", "proposer_read", "ptc_read", "sync_read"] {
+            assert_eq!(read_count(helper), 1, "{helper} takes one read guard");
+        }
+        for reader in [
+            "get_duty",
+            "get_duties_for_slot",
+            "is_epoch_cached",
+            "get_cached_dependent_root",
+            "get_proposer_duty",
+            "get_cached_proposer_dependent_root",
+            "check_and_refetch_proposer_if_root_changed",
+            "is_proposer_epoch_cached",
+            "get_ptc_duties_for_slot",
+            "get_cached_ptc_dependent_root",
+            "check_and_refetch_ptc_if_root_changed",
+            "is_ptc_epoch_cached",
+            "get_sync_committee_duties",
+            "is_sync_period_cached",
+        ] {
+            assert_eq!(read_count(reader), 1, "the scan sees {reader}'s read");
+        }
+        assert_eq!(read_count("cached_duty_counts"), 4, "one read per cache");
+
+        let fixture = "
+            fn check(stamp: u64) -> bool { visible(stamp, 0) }
+            async fn guard(&self) -> RwLockReadGuard<'_, Map> { self.map.read().await }
+            async fn checked(&self) -> bool { let m = self.guard().await; check(m.len()) }
+            async fn skipped(&self) -> bool { let m = self.map.read().await; m.is_empty() }
+            async fn late(&self) -> bool { let m = self.guard().await; self.x().await; check(1) }
+            async fn twice(&self) { let a = self.guard().await; check(a.len()); self.guard().await; }
+        ";
+        assert_eq!(unchecked_reads(fixture), ["skipped", "late", "twice"]);
+    }
+
+    #[test]
+    fn every_cache_insert_is_stamped_before_the_bn_request() {
+        let code = production_code();
+        assert_eq!(unstamped_writes(&code), Vec::<String>::new(), "unstamped cache writes");
+
+        let items = fn_items(&code);
+        let body = |name: &str| &items.iter().find(|item| item.name == name).expect(name).body;
+        for admit in ["admit_attester", "admit_proposer", "admit_ptc", "admit_sync"] {
+            assert!(body(admit).contains("visible("), "the scan sees {admit}'s re-check");
+        }
+        for writer in [
+            "fetch_duties_for_epoch",
+            "check_and_refetch_if_root_changed",
+            "fetch_proposer_duties",
+            "check_and_refetch_proposer_if_root_changed",
+            "fetch_ptc_duties",
+            "check_and_refetch_ptc_if_root_changed",
+            "fetch_sync_committee_duties",
+        ] {
+            let writer_body = body(writer);
+            assert!(writer_body.contains("self.beacon."), "the scan sees {writer}'s request");
+            assert!(writer_body.contains(".admit_"), "{writer} inserts through an admit_* helper");
+        }
+        let test_only = "#[cfg(any(test,feature=\"test-utils\"))]pubasyncfncache_proposer_duties(";
+        assert!(
+            compact(&code).contains(test_only),
+            "the insert_proposer exception stays test-only"
+        );
+
+        let fixture = "
+            fn admit_x(c: &mut RwLockWriteGuard<'_, Map>, e: E, s: FetchStamp) { c.insert(1, e); }
+            async fn stamped_first(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; let mut c = self.m.write().await; self.admit_x(&mut c, e, s); }
+            async fn bypass(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; self.m.write().await.insert(1, e); }
+            async fn late(&self) { let e = self.beacon.x().await; let s = self.fetch_stamp(); let mut c = self.m.write().await; self.admit_x(&mut c, e, s); }
+            async fn setter(&self, e: E) { let mut c = self.m.write().await; self.admit_x(&mut c, e, self.fetch_stamp()); }
+            fn helper(c: &mut RwLockWriteGuard<'_, Map>, e: E) { c.insert(1, e); }
+            async fn reuse(&self, e: E) { let mut c = self.m.write().await; insert_proposer(&mut c, e); }
+        ";
+        assert_eq!(
+            unstamped_writes(fixture),
+            [
+                "bypass: inserts outside the admit_* helpers",
+                "late: no fetch_stamp() before its first request",
+                "setter: admits an answer it did not request",
+                "helper: inserts outside the admit_* helpers",
+                "reuse: calls insert_proposer",
+            ]
+        );
     }
 
     fn key_set(keys: &[&str]) -> BTreeSet<String> {
