@@ -2161,6 +2161,18 @@ async fn drive_boundary(
     from_slot: Slot,
     to_slot: Slot,
 ) -> BoundaryRun {
+    let timeouts = create_test_config().timeouts;
+    drive_boundary_with(mock, SecretKey::generate(), timeouts, from_slot, to_slot).await
+}
+
+/// [`drive_boundary`] with `local` as validator 42, under `timeouts`.
+async fn drive_boundary_with(
+    mock: bn_manager::MockBeaconNodeClient,
+    local: SecretKey,
+    timeouts: OperationTimeouts,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
     use ::timing::{DeadlineBps, DeadlineSchedule};
     use tracing_subscriber::layer::SubscriberExt;
     use validator_store::ValidatorConfig;
@@ -2172,7 +2184,6 @@ async fn drive_boundary(
         Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, BOUNDARY_SLOT, ::timing::SLOTS_PER_EPOCH));
     clock.set_slot(from_slot);
 
-    let local = SecretKey::generate();
     let pubkey = local.public_key();
     let pk_bytes = pubkey.to_bytes();
     let validator_store = create_mock_validator_store();
@@ -2203,8 +2214,9 @@ async fn drive_boundary(
         payload: 0,
         payload_attestation: 0,
     };
-    let config =
-        create_test_config().with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start));
+    let config = create_test_config()
+        .with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start))
+        .with_timeouts(timeouts);
     let deps = OrchestratorDeps::for_test(
         Arc::clone(&clock),
         duty_tracker,
@@ -2298,4 +2310,133 @@ async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
         [Some(32), Some(33)],
         "nothing is pending at slot 34"
     );
+}
+
+// --- W4-E3b: per-step timeouts, and one warn for the steps an epoch did not finish ---
+
+const ABANDONED: &str = "epoch-boundary steps did not finish before the epoch ended";
+
+/// Outlasts every drive, so only a step bound ends a held request.
+const DRIVE_HOLD: Duration = Duration::from_secs(3_600);
+
+/// The attester duty of validator 42 at the last slot of `epoch`, outside
+/// the drives' slot ranges, so the slot loop never attests.
+fn last_slot_attester_duty(
+    pubkey: &str,
+    epoch: u64,
+) -> beacon::DependentRootResponse<Vec<AttesterDuty>> {
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    beacon::DependentRootResponse {
+        dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+        execution_optimistic: false,
+        data: vec![AttesterDuty {
+            pubkey: pubkey.to_string(),
+            validator_index: BOUNDARY_INDEX.to_string(),
+            committee_index: "1".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "4".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: (epoch * slots + slots - 1).to_string(),
+        }],
+    }
+}
+
+/// The fields of each abandoned-steps WARN, with its pass slot.
+fn abandoned_warns(run: &BoundaryRun) -> Vec<(Option<Slot>, &str)> {
+    run.warns
+        .iter()
+        .filter_map(|(pass, warn)| Some((*pass, warn.strip_prefix(ABANDONED)?.trim_start())))
+        .collect()
+}
+
+/// 653-AC2: each step has its own bound. With `duty_fetch` at 2 s and
+/// `preparation` at 60 s, every subscription POST is held past the
+/// subscription step's 2 s bound. The step ends `Failed` there, its POST is
+/// dropped before E+1's, and the next slot's pass sends it again. The
+/// prepare POST takes 3 s, past `duty_fetch` but inside `preparation`: its
+/// step is done in one attempt.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_step_timeout_leaves_step_pending() {
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(last_slot_attester_duty(&local_hex, epoch))
+        })
+        .with_method_delay(subs, DRIVE_HOLD)
+        .with_method_delay(bn_manager::MockMethod::PrepareBeaconProposer, Duration::from_secs(3));
+    let timeouts = OperationTimeouts {
+        duty_fetch: Duration::from_secs(2),
+        preparation: Duration::from_secs(60),
+        ..OperationTimeouts::default()
+    };
+
+    let run = drive_boundary_with(mock, local, timeouts, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(32), Some(33), Some(34)],
+        "E's POST, cut at the step bound, is sent again in each next slot's pass"
+    );
+    let posts = run.mock.call_stamps().iter().filter(|stamp| stamp.method == subs).count();
+    assert_eq!(posts, 3, "one subscription POST per pass");
+    let in_passes: Vec<&(Option<Slot>, String)> =
+        run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
+    let cut = |slot: Slot| {
+        (Some(slot), "Epoch boundary step timed out epoch=1 step=CommitteeSubscriptions timeout=2s")
+    };
+    assert_eq!(
+        in_passes.iter().map(|(pass, warn)| (*pass, warn.as_str())).collect::<Vec<_>>(),
+        [cut(32), cut(33), cut(34)],
+        "the step bound fires in each pass, not the 60 s POST bound"
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers"),
+        [None, Some(32)],
+        "startup preparation at boot, then the slot-32 pass: the 3 s POST is inside its bound"
+    );
+}
+
+/// 653-AC3: an epoch whose prepare never succeeds warns once, in the first
+/// pass of the next epoch, naming the step and its last outcome. Every
+/// prepare after the startup preparation's answers 503. A control run in
+/// which every step of epoch 1 is done warns nothing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_abandoned_steps_warn_at_epoch_end() {
+    let _metrics = m2_metric_lock().await;
+    let attempts = AtomicUsize::new(0);
+    let mock = retirement_beacon().with_prepare_beacon_proposer(move |_preparations| {
+        // Attempt 0 is the startup preparation's, at boot.
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+        }
+    });
+
+    let run = drive_boundary(mock, 32, 64).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers").len(),
+        34,
+        "startup, one attempt in each of the 32 passes of epoch 1, then epoch 2's"
+    );
+    assert_eq!(
+        abandoned_warns(&run),
+        [(
+            Some(64),
+            "epoch=1 abandoned_steps=[PrepareProposers] last_outcomes={PrepareProposers: Failed}"
+        )],
+        "one warn for epoch 1, in the slot-64 pass"
+    );
+
+    let control = drive_boundary(retirement_beacon(), 32, 64).await;
+    assert_eq!(
+        control.pass_slots("epoch.boundary"),
+        [Some(32), Some(64)],
+        "control: epoch 1 is done in one pass, and slot 64 starts epoch 2"
+    );
+    assert_eq!(abandoned_warns(&control), [], "control: every step of epoch 1 is done");
 }

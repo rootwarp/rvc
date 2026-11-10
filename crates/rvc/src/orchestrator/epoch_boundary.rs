@@ -11,11 +11,15 @@
 //! `NotReady` one still run in that pass. `DutyFetch` has no done mark: it
 //! runs in every pass while a step that needs duties is pending.
 //! `CommitteeSubscriptions` is `NotReady` until the attester duties of E and
-//! E+1 are cached. The epoch summary is logged once per epoch, at the end of
-//! the epoch's first pass. [`EpochBoundaryTask::run`] calls it on its own
-//! task ([`TASK_NAME`]) after each slot the slot loop processed, while that
-//! slot's epoch has a step pending. Each pass is a root `epoch.boundary`
-//! span.
+//! E+1 are cached. Each step with beacon-node work runs under its own bound,
+//! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and CommitteeSubscriptions
+//! and `timeouts.preparation` for PrepareProposers: a step that reaches it is
+//! dropped and `Failed`. The first pass of a later epoch logs one warn for
+//! the steps the old epoch did not finish, with each one's last outcome. The
+//! epoch summary is logged once per epoch, at the end of the epoch's first
+//! pass. [`EpochBoundaryTask::run`] calls it on its own task ([`TASK_NAME`])
+//! after each slot the slot loop processed, while that slot's epoch has a
+//! step pending. Each pass is a root `epoch.boundary` span.
 //!
 //! # Step order
 //!
@@ -43,7 +47,9 @@
 //! time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
 use builder::{BuilderService, UpcomingProposal};
@@ -163,7 +169,7 @@ pub(crate) enum StepOutcome {
 pub(crate) struct EpochProgress {
     epoch: u64,
     done: BTreeSet<BoundaryStep>,
-    /// For the warn about steps that did not finish in the epoch (W4-E3b).
+    /// Read by the warn for the steps the epoch did not finish.
     last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
 }
 
@@ -181,6 +187,38 @@ impl EpochProgress {
                 .any(|step| step.needs_duties() && !self.done.contains(&step)),
             _ => !self.done.contains(&step),
         }
+    }
+
+    /// The pending steps, in order. DutyFetch is named only when its last
+    /// attempt failed; otherwise the step that needs duties stands for it.
+    fn unfinished(&self) -> Vec<BoundaryStep> {
+        BoundaryStep::ALL
+            .into_iter()
+            .filter(|&step| self.is_pending(step))
+            .filter(|&step| {
+                step != BoundaryStep::DutyFetch
+                    || self.last_outcome.get(&step) == Some(&StepOutcome::Failed)
+            })
+            .collect()
+    }
+
+    /// One warn for the steps the epoch did not finish, with the last outcome
+    /// of each one that ran. Silent when every step finished.
+    fn warn_unfinished(&self) {
+        let pending = self.unfinished();
+        if pending.is_empty() {
+            return;
+        }
+        let outcomes: BTreeMap<BoundaryStep, StepOutcome> = pending
+            .iter()
+            .filter_map(|step| Some((*step, *self.last_outcome.get(step)?)))
+            .collect();
+        warn!(
+            epoch = self.epoch,
+            abandoned_steps = ?pending,
+            last_outcomes = ?outcomes,
+            "epoch-boundary steps did not finish before the epoch ended"
+        );
     }
 }
 
@@ -232,12 +270,13 @@ impl EpochBoundaryRunner {
 
     /// Runs the pending steps of `slot`'s epoch, in order.
     ///
-    /// A slot past the progress epoch starts a new epoch. A slot before it
-    /// runs nothing. Once a slot of a later epoch is processed, the pass
-    /// starts no further step.
+    /// A slot past the progress epoch starts a new epoch, after one warn for
+    /// the steps the old epoch did not finish. A slot before it runs nothing.
+    /// Once a slot of a later epoch is processed, the pass starts no further
+    /// step.
     pub(crate) async fn run_pending(&self, slot: Slot) {
         let epoch = slot / SLOTS_PER_EPOCH;
-        let first_pass = self.progress.lock().as_ref().is_none_or(|p| p.epoch < epoch);
+        let first_pass = self.begin_epoch(epoch);
         for step in BoundaryStep::ALL {
             if !self.is_pending(epoch, step) {
                 continue;
@@ -252,14 +291,22 @@ impl EpochBoundaryRunner {
             }
             let outcome = match step {
                 BoundaryStep::BreakerReset => self.breaker_reset(epoch),
-                BoundaryStep::ReorgCheck => self.reorg_check(epoch).await,
+                BoundaryStep::ReorgCheck => {
+                    bounded(epoch, step, self.timeouts.duty_fetch, self.reorg_check(epoch)).await
+                }
                 BoundaryStep::DutyFetch => {
                     let outcome = self.duty_fetch(epoch).await;
                     debug!(epoch, ?outcome, "Epoch boundary duty fetch finished");
                     outcome
                 }
-                BoundaryStep::PrepareProposers => self.prepare_proposers(epoch).await,
-                BoundaryStep::CommitteeSubscriptions => self.committee_subscriptions(epoch).await,
+                BoundaryStep::PrepareProposers => {
+                    let prepare = self.prepare_proposers(epoch);
+                    bounded(epoch, step, self.timeouts.preparation, prepare).await
+                }
+                BoundaryStep::CommitteeSubscriptions => {
+                    let subscriptions = self.committee_subscriptions(epoch);
+                    bounded(epoch, step, self.timeouts.duty_fetch, subscriptions).await
+                }
             };
             self.record(epoch, step, outcome);
         }
@@ -282,13 +329,24 @@ impl EpochBoundaryRunner {
         }
     }
 
-    fn is_pending(&self, epoch: u64, step: BoundaryStep) -> bool {
+    /// Moves the progress to `epoch` when that is later, and warns once for
+    /// the steps the old epoch did not finish. `true` when it moved.
+    fn begin_epoch(&self, epoch: u64) -> bool {
         let mut progress = self.progress.lock();
-        let current = progress.get_or_insert_with(|| EpochProgress::new(epoch));
-        if epoch > current.epoch {
-            *current = EpochProgress::new(epoch);
+        if progress.as_ref().is_some_and(|current| current.epoch >= epoch) {
+            return false;
         }
-        current.epoch == epoch && current.is_pending(step)
+        let old = progress.replace(EpochProgress::new(epoch));
+        drop(progress);
+        if let Some(old) = old {
+            old.warn_unfinished();
+        }
+        true
+    }
+
+    fn is_pending(&self, epoch: u64, step: BoundaryStep) -> bool {
+        let progress = self.progress.lock();
+        progress.as_ref().is_some_and(|current| current.epoch == epoch && current.is_pending(step))
     }
 
     /// Keeps `outcome` as the step's latest. Only `Done` marks a step done,
@@ -384,6 +442,19 @@ impl EpochBoundaryRunner {
         self.duty_management.submit_committee_subscriptions(epoch + 1).await;
         StepOutcome::Done
     }
+}
+
+/// Runs `step` under `bound`. At the bound the step is dropped and `Failed`.
+async fn bounded(
+    epoch: u64,
+    step: BoundaryStep,
+    bound: Duration,
+    work: impl Future<Output = StepOutcome>,
+) -> StepOutcome {
+    tokio::time::timeout(bound, work).await.unwrap_or_else(|_| {
+        warn!(epoch, ?step, timeout = ?bound, "Epoch boundary step timed out");
+        StepOutcome::Failed
+    })
 }
 
 /// Picks local proposals and broadcasts proposer and builder preferences for them.
@@ -1477,8 +1548,9 @@ mod tests {
 
     /// A hung beacon node does not hold the runner: the pass returns when
     /// DutyFetch's `timeouts.duty_fetch` bound fires, with DutyFetch `Failed`
-    /// and the subscription step pending, and the next wake retries under
-    /// the same bound.
+    /// and the subscription step pending. ReorgCheck's own `duty_fetch` bound
+    /// fired before it, at its E+1 request. The next wake retries both, each
+    /// under its own bound.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn duty_fetch_is_bounded_by_the_duty_fetch_timeout() {
         let held = proposer_duties_at(ROOT_A)
@@ -1503,13 +1575,22 @@ mod tests {
             (Some(StepOutcome::Failed), false),
             "timed out: failed, and not done"
         );
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::ReorgCheck),
+            (Some(StepOutcome::Failed), false),
+            "ReorgCheck timed out at its own bound: failed, and not done"
+        );
         assert!(f.subscription_slots.lock().is_empty());
         assert!(f.runner.has_pending(33), "the subscription step stays pending");
 
         let start = tokio::time::Instant::now();
         f.runner.run_pending(33).await;
-        assert_eq!(start.elapsed(), duty_fetch, "the next wake retries under the same bound");
-        assert_eq!(attester_stamps().len(), 4);
+        assert_eq!(
+            start.elapsed(),
+            2 * duty_fetch,
+            "the next wake retries ReorgCheck and DutyFetch, each under its bound"
+        );
+        assert_eq!(attester_stamps().len(), 6, "ReorgCheck E and E+1, then DutyFetch's E");
         assert_eq!(
             step_state(&f.runner, BoundaryStep::DutyFetch),
             (Some(StepOutcome::Failed), false),
@@ -1826,12 +1907,12 @@ mod tests {
     }
 
     /// Retries stop at the epoch's end, also in a pass held past it. Pass 62
-    /// leaves PrepareProposers `Failed` and the subscription step pending.
-    /// Pass 63 parks in DutyFetch, and slot 64 is processed meanwhile. When
-    /// DutyFetch's bound ends the hold, pass 63 starts no prepare retry, and
-    /// epoch 2's pass parks in ReorgCheck's first request. Epoch 2's own
-    /// prepare comes after its ReorgCheck, so any prepare by then is epoch
-    /// 1's.
+    /// leaves ReorgCheck and PrepareProposers `Failed` and the subscription
+    /// step pending. Pass 63 parks in ReorgCheck's retry, and slot 64 is
+    /// processed meanwhile. When ReorgCheck's bound ends the hold, pass 63
+    /// starts no prepare retry, and epoch 2's pass parks in ReorgCheck's
+    /// first request. Epoch 2's own prepare comes after its ReorgCheck, so
+    /// any prepare by then is epoch 1's.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_held_pass_starts_no_step_once_the_next_epoch_is_processed() {
         use BoundaryStep::{CommitteeSubscriptions, PrepareProposers, ReorgCheck};
@@ -2137,6 +2218,265 @@ mod tests {
         assert!(
             shutdown < pass,
             "the in-flight select lists the shutdown arm before the pass arm: {inner}"
+        );
+    }
+
+    const ABANDONED: &str = "epoch-boundary steps did not finish before the epoch ended";
+
+    /// Records each WARN as `message key=value ...`, fields in order.
+    #[derive(Clone, Default)]
+    struct Warns(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    #[derive(Default)]
+    struct WarnLine {
+        message: String,
+        fields: String,
+    }
+
+    impl tracing::field::Visit for WarnLine {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut line = WarnLine::default();
+                event.record(&mut line);
+                self.0.lock().push(line.message + &line.fields);
+            }
+        }
+    }
+
+    impl Warns {
+        /// Captures this thread's events until the guard drops.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().clone()
+        }
+
+        /// The fields of each abandoned-steps warn.
+        fn abandoned(&self) -> Vec<String> {
+            self.lines()
+                .iter()
+                .filter_map(|line| Some(line.strip_prefix(ABANDONED)?.trim_start().to_string()))
+                .collect()
+        }
+    }
+
+    /// `duty_fetch` at 2 s and `preparation` at 60 s.
+    fn short_duty_fetch() -> OrchestratorConfig {
+        create_test_config().with_timeouts(OperationTimeouts {
+            duty_fetch: Duration::from_secs(2),
+            preparation: Duration::from_secs(60),
+            ..OperationTimeouts::default()
+        })
+    }
+
+    /// The step bounds, as source: `duty_fetch` for ReorgCheck and
+    /// CommitteeSubscriptions, `preparation` for PrepareProposers, DutyFetch's
+    /// inside the step, and none for BreakerReset (no I/O). PrepareProposers'
+    /// bound has the length of its POST's own `preparation` bound, which runs
+    /// inside it and fires first, so no behavioural test can see it today.
+    #[test]
+    fn each_step_with_beacon_node_work_has_its_own_bound() {
+        let source = include_str!("epoch_boundary.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production part");
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .flat_map(str::split_whitespace)
+            .collect();
+        let run = code
+            .split("pub(crate)asyncfnrun_pending(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub(crate)fnhas_pending(").next())
+            .expect("`run_pending`, then `has_pending`");
+        assert_eq!(run.matches("bounded(").count(), 3, "three steps run under a bound: {run}");
+        for arm in [
+            "BoundaryStep::BreakerReset=>self.breaker_reset(epoch),",
+            "BoundaryStep::ReorgCheck=>{bounded(epoch,step,self.timeouts.duty_fetch,\
+             self.reorg_check(epoch)).await}",
+            "BoundaryStep::DutyFetch=>{letoutcome=self.duty_fetch(epoch).await;",
+            "BoundaryStep::PrepareProposers=>{letprepare=self.prepare_proposers(epoch);\
+             bounded(epoch,step,self.timeouts.preparation,prepare).await}",
+            "BoundaryStep::CommitteeSubscriptions=>{letsubscriptions=\
+             self.committee_subscriptions(epoch);\
+             bounded(epoch,step,self.timeouts.duty_fetch,subscriptions).await}",
+        ] {
+            assert!(run.contains(arm), "`run_pending` has the arm `{arm}`: {run}");
+        }
+    }
+
+    /// With the default timeouts, the prepare POST's own 3 s `preparation`
+    /// bound fires at the same instant as the step's, and first: the step is
+    /// `Failed`, the held POST is dropped unanswered, and the next slot's pass
+    /// retries it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inner_preparation_timeout_is_a_failed_step() {
+        use BoundaryStep::PrepareProposers;
+        let prep = MockMethod::PrepareBeaconProposer;
+        let f = fixture(proposer_duties_at(ROOT_A).with_method_delay(prep, Duration::from_secs(5)))
+            .await;
+        let defaults = OperationTimeouts::default();
+        assert_eq!(
+            (f.runner.timeouts.preparation, f.runner.timeouts.duty_fetch),
+            (defaults.preparation, defaults.duty_fetch),
+            "default timeouts"
+        );
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(arrivals(&f.mock, prep), 1);
+        assert!(f.mock.prepare_beacon_proposer_calls().is_empty(), "dropped, not answered");
+        assert_eq!(
+            step_state(&f.runner, PrepareProposers),
+            (Some(StepOutcome::Failed), false),
+            "the inner timeout leaves PrepareProposers failed, and not done"
+        );
+        assert_eq!(
+            warns.lines(),
+            ["Proposer preparation timed out after 3s"],
+            "the POST's own bound fired, not the step's"
+        );
+        assert!(f.runner.has_pending(33));
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(arrivals(&f.mock, prep), 2, "the next slot's pass retries it");
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Failed), false));
+    }
+
+    /// A cold cache that never fills is visible at the epoch end. Every
+    /// attester request is held past `duty_fetch`, so in each pass of epoch
+    /// 1 ReorgCheck and DutyFetch end `Failed` at their bounds and the
+    /// subscription step is `NotReady`. Epoch 2's first pass warns once for
+    /// epoch 1, naming the three steps and their last outcomes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duty_fetch_failure_is_named_in_the_abandoned_warn() {
+        let held =
+            proposer_duties_at(ROOT_A).with_method_delay(MockMethod::GetAttesterDuties, HOLD);
+        let f = fixture_config(held, SecretKey::generate(), false, &[], short_duty_fetch()).await;
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        for slot in 32..64 {
+            f.runner.run_pending(slot).await;
+        }
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::DutyFetch),
+            (Some(StepOutcome::Failed), false),
+            "the last pass of epoch 1 left the cache cold"
+        );
+        assert_eq!(warns.abandoned(), Vec::<String>::new(), "no warn inside the epoch");
+
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            warns.abandoned(),
+            [
+                "epoch=1 abandoned_steps=[ReorgCheck, DutyFetch, CommitteeSubscriptions] \
+                 last_outcomes={ReorgCheck: Failed, DutyFetch: Failed, CommitteeSubscriptions: NotReady}"
+            ],
+            "one warn for epoch 1, at epoch 2's first pass"
+        );
+    }
+
+    /// A watch that jumps several epochs warns once, for the last epoch with
+    /// progress. Epoch 1's prepare answers 503 at slot 32, and the next pass
+    /// is at slot 130, in epoch 4. It warns for epoch 1 only, as the runner
+    /// never saw epochs 2 and 3, and runs epoch 4's steps in the same pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn epoch_jump_warns_once_for_the_last_progress() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        *f.failing_prepare.lock() = 1;
+        f.runner.run_pending(32).await;
+        assert!(f.runner.has_pending(33), "PrepareProposers is pending in epoch 1");
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        f.runner.run_pending(130).await;
+
+        assert_eq!(
+            warns.abandoned(),
+            ["epoch=1 abandoned_steps=[PrepareProposers] last_outcomes={PrepareProposers: Failed}"],
+            "one warn, for epoch 1"
+        );
+        assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 2, "epoch 4's prepare ran");
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"], &["65"], &["129"], &["161"]]),
+            "epoch 4's subscriptions went out in the same pass"
+        );
+        assert!(!f.runner.has_pending(131), "every step of epoch 4 is done");
+    }
+
+    /// RSA N2 (#980): a new epoch's progress keeps no outcome from the last
+    /// one. Epoch 1 attempts every step, and PrepareProposers ends `Failed`.
+    /// Epoch 2's pass is held in ReorgCheck's proposer request: only
+    /// BreakerReset has an outcome, and the later steps have none. That pass
+    /// is dropped, so epoch 3's first pass warns for epoch 2 with the steps
+    /// it never attempted and no outcome for any of them. DutyFetch is not
+    /// named: it never failed in epoch 2.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn new_epoch_progress_keeps_no_outcome_from_the_previous_epoch() {
+        let timeouts = OperationTimeouts {
+            preparation: 4 * HOLD,
+            duty_fetch: 4 * HOLD,
+            ..OperationTimeouts::default()
+        };
+        let held =
+            proposer_duties_at(ROOT_A).with_method_delay(MockMethod::GetProposerDuties, HOLD);
+        let config = create_test_config().with_timeouts(timeouts);
+        let f = fixture_config(held, SecretKey::generate(), false, &[1, 2], config).await;
+        *f.failing_prepare.lock() = 1;
+        f.runner.run_pending(32).await;
+        for step in BoundaryStep::ALL {
+            let want = if step == BoundaryStep::PrepareProposers {
+                StepOutcome::Failed
+            } else {
+                StepOutcome::Done
+            };
+            assert_eq!(step_state(&f.runner, step).0, Some(want), "{step:?} in epoch 1");
+        }
+
+        let mut pass = Box::pin(f.runner.run_pending(64));
+        let held_pass = tokio::time::timeout(HOLD / 2, &mut pass).await;
+        assert!(held_pass.is_err(), "epoch 2's pass is held in ReorgCheck");
+        assert_eq!(f.runner.progress.lock().as_ref().map(|p| p.epoch), Some(2));
+        for step in BoundaryStep::ALL {
+            let want = (step == BoundaryStep::BreakerReset).then_some(StepOutcome::Done);
+            assert_eq!(
+                step_state(&f.runner, step).0,
+                want,
+                "{step:?}: no outcome from epoch 1 while epoch 2's pass is held"
+            );
+        }
+        drop(pass);
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        f.runner.run_pending(96).await;
+
+        assert_eq!(
+            warns.abandoned(),
+            ["epoch=2 abandoned_steps=[ReorgCheck, PrepareProposers, CommitteeSubscriptions] \
+                 last_outcomes={}"],
+            "epoch 2's unattempted steps, with no outcome from epoch 1"
         );
     }
 }
