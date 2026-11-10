@@ -3832,6 +3832,37 @@ mod tests {
         tracker.sync_committee_cache.read().await.contains_key(&period)
     }
 
+    /// The stored PTC entry for `STAMP_EPOCH`, stale or not: root and stamp.
+    async fn ptc_entry(tracker: &DutyTracker) -> Option<(String, Option<u64>)> {
+        let cache = tracker.ptc_cache.read().await;
+        cache.get(&STAMP_EPOCH).map(|entry| (entry.dependent_root.clone(), entry.fetched_gen))
+    }
+
+    /// Polls `future` on the test task until `reached()` holds; it must stay
+    /// pending. Not spawned, it makes no progress while the test awaits
+    /// anything else.
+    async fn poll_until<F>(
+        future: &mut std::pin::Pin<Box<F>>,
+        reached: impl Fn() -> bool,
+        what: &str,
+    ) where
+        F: std::future::Future,
+        F::Output: std::fmt::Debug,
+    {
+        for _ in 0..10_000 {
+            let polled =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await;
+            if let std::task::Poll::Ready(output) = polled {
+                panic!("{what} finished early: {output:?}");
+            }
+            if reached() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{what} never got there");
+    }
+
     /// The PTC and sync readers that take a cache read guard.
     #[derive(Debug, Clone, Copy)]
     enum PtcSyncReader {
@@ -3989,6 +4020,37 @@ mod tests {
         }
     }
 
+    /// A warm refresh requested under G0 finishes after a fetch requested
+    /// under G1 stored the same answer. It compares against the entry visible
+    /// under its own stamp, so it refuses its answer and keeps the newer entry.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_ptc_refresh_overtaken_by_a_newer_same_snapshot_write_is_refused() {
+        for answer in ["0xroot_a", "0xroot_b"] {
+            let ptc = ["0xroot_a", answer, answer].map(ptc_stamp_response).to_vec();
+            let mock = mock_ptc_queue(ptc).with_method_delay(MockMethod::PostPtcDuties, HOLD);
+            let (mock, tracker, generation) = stamped(mock);
+            tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+
+            let mut refresh = Box::pin(tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH));
+            let arrived = || mock.call_stamps().len() == 2;
+            poll_until(&mut refresh, arrived, "the warm refresh request").await;
+            bump(&generation);
+            tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("newer fetch");
+            assert_eq!(ptc_entry(&tracker).await, entry(answer, 1), "{answer}: newer entry");
+
+            let result = refresh.await;
+            assert!(
+                is_revoked_during_fetch(&result),
+                "{answer}: an answer requested before the bump must be refused, got {result:?}"
+            );
+            assert_eq!(ptc_entry(&tracker).await, entry(answer, 1), "{answer}: newer entry kept");
+            assert_eq!(mock.post_ptc_duties_calls().len(), 3, "{answer}: no cold-path fetch");
+            for reader in &PtcSyncReader::ALL[..4] {
+                assert!(reader.hits(&tracker).await, "{answer}: {reader:?} serves the newer entry");
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn held_ptc_and_sync_fetches_revoked_before_release_are_discarded() {
         let mock = mock_ptc_and_sync(vec![ptc_stamp_response("0xroot_a"); 2])
@@ -4016,6 +4078,44 @@ mod tests {
                 "{writer:?}: an answer fetched across a bump must be discarded, got {result:?}"
             );
             assert_eq!(stored_ptc_root(&tracker).await, None, "{writer:?}: no PTC entry");
+            assert!(!sync_period_stored(&tracker).await, "{writer:?}: no sync entry");
+            assert_no_ptc_or_sync_reader_hits(&tracker, &format!("{writer:?}")).await;
+        }
+    }
+
+    /// The writer has its BN answer and waits for the cache write guard when
+    /// the generation moves: the re-check under that guard refuses the answer.
+    #[tokio::test]
+    async fn bump_while_a_ptc_or_sync_fetch_waits_for_its_write_guard_is_discarded() {
+        for (writer, answered) in
+            [(PtcSyncWriter::PtcFetch, (1, 0)), (PtcSyncWriter::SyncFetch, (0, 1))]
+        {
+            let sync_answers = Arc::new(AtomicU64::new(0));
+            let mock = mock_ptc_queue(vec![ptc_stamp_response("0xroot_a")])
+                .with_post_sync_committee_duties({
+                    let sync_answers = Arc::clone(&sync_answers);
+                    move |_epoch, _indices| {
+                        sync_answers.fetch_add(1, Ordering::Relaxed);
+                        Ok(sync_response(vec![(1234, mock_sync_pubkey(), vec![0])]))
+                    }
+                });
+            let (mock, tracker, generation) = stamped(mock);
+            let answers =
+                || (mock.post_ptc_duties_calls().len(), sync_answers.load(Ordering::Relaxed));
+            let ptc_guard = tracker.ptc_cache.write().await;
+            let sync_guard = tracker.sync_committee_cache.write().await;
+
+            let mut write = Box::pin(writer.write(&tracker));
+            poll_until(&mut write, || answers() == answered, &format!("{writer:?}")).await;
+            bump(&generation);
+            drop((ptc_guard, sync_guard));
+
+            let result = write.await;
+            assert!(
+                is_revoked_during_fetch(&result),
+                "{writer:?}: the re-check runs under the write guard it waited for, got {result:?}"
+            );
+            assert_eq!(ptc_entry(&tracker).await, None, "{writer:?}: no PTC entry");
             assert!(!sync_period_stored(&tracker).await, "{writer:?}: no sync entry");
             assert_no_ptc_or_sync_reader_hits(&tracker, &format!("{writer:?}")).await;
         }
@@ -4082,6 +4182,38 @@ mod tests {
         assert!(tracker.is_ptc_epoch_cached(STAMP_EPOCH).await, "re-stamped");
     }
 
+    /// The refresh captures its stamp before its cached read, so a bump right
+    /// after that read is a bump during its request.
+    #[tokio::test]
+    async fn ptc_refresh_captures_its_stamp_before_its_cached_read() {
+        for (answer, same_root) in [("0xroot_a", true), ("0xroot_b", false)] {
+            let (mock, tracker, generation) =
+                stamped(mock_ptc_queue(["0xroot_a", answer].map(ptc_stamp_response).to_vec()));
+            tracker.fetch_ptc_duties_for_epoch(STAMP_EPOCH).await.expect("seed root A");
+
+            let result = {
+                let _armed = hooks::arm(&hooks::AFTER_STAMP_CHECK, bump_on_run(&generation, 1));
+                tracker.check_and_refetch_ptc_if_root_changed(STAMP_EPOCH).await
+            };
+
+            assert_eq!(generation.load(Ordering::Acquire), 1, "{answer}: hook ran");
+            assert_eq!(mock.post_ptc_duties_calls().len(), 2, "{answer}: seed, then the warm path");
+            if same_root {
+                assert!(
+                    matches!(result, Ok(false)),
+                    "{answer}: the entry visible under the stamp has this root, got {result:?}"
+                );
+            } else {
+                assert!(
+                    is_revoked_during_fetch(&result),
+                    "{answer}: an answer requested before the bump must be refused, got {result:?}"
+                );
+            }
+            assert_eq!(ptc_entry(&tracker).await, entry("0xroot_a", 0), "{answer}: not restamped");
+            assert_no_ptc_or_sync_reader_hits(&tracker, answer).await;
+        }
+    }
+
     #[tokio::test]
     async fn bump_between_ptc_or_sync_recheck_and_insert_leaves_nothing_servable() {
         // The warm refresh answers root B over a freshly seeded root A.
@@ -4122,10 +4254,12 @@ mod tests {
         lines.collect::<Vec<_>>().join("\n")
     }
 
-    /// One `fn` with a body: its name, and its signature and braced body with
-    /// whitespace removed, so a call that rustfmt splits over lines still matches.
+    /// One `fn` with a body: its name, whether it is `pub`, and its signature
+    /// and braced body with whitespace removed, so a call that rustfmt splits
+    /// over lines still matches.
     struct FnItem<'a> {
         name: &'a str,
+        public: bool,
         signature: String,
         body: String,
     }
@@ -4160,8 +4294,10 @@ mod tests {
                     break;
                 }
             }
+            let line = code[..start].rsplit('\n').next().unwrap_or_default();
             items.push(FnItem {
                 name: &rest[..name_len],
+                public: line.split_whitespace().any(|word| word.starts_with("pub")),
                 signature: compact(&code[start..body_start]),
                 body: compact(&code[body_start..body_end]),
             });
@@ -4205,19 +4341,25 @@ mod tests {
         offenders
     }
 
+    /// The only `admit_*` helpers: with `insert_proposer`, the only cache inserters.
+    const ADMIT_HELPERS: [&str; 4] =
+        ["admit_attester", "admit_proposer", "admit_ptc", "admit_sync"];
+
     /// The `fn`s in `code` that break the insert rule, with the reason.
     ///
     /// A cache guard (`.write().await` or a `RwLockWriteGuard` parameter) is
-    /// inserted into only by an `admit_*` helper or by `insert_proposer`, which
-    /// only `admit_proposer` and the test-only `cache_proposer_duties` call. An
-    /// `admit_*` caller sends a BN request, and every `fn` that sends one
-    /// assigns `fetch_stamp()` before its first `self.beacon.`.
+    /// inserted into only by one of `ADMIT_HELPERS` or by `insert_proposer`,
+    /// which only `admit_proposer` and the test-only `cache_proposer_duties`
+    /// call. Each of these insert helpers is private and takes a `FetchStamp`.
+    /// A `fn` that names an admit helper in any form (`self.admit_ptc(`,
+    /// `Self::admit_ptc(`, a fn pointer) sends a BN request, and every `fn`
+    /// that sends one assigns `fetch_stamp()` before its first `self.beacon.`.
     fn unstamped_writes(code: &str) -> Vec<String> {
         let mut offenders = Vec::new();
         for item in fn_items(code) {
             let holds_guard =
                 item.signature.contains("RwLockWriteGuard") || item.body.contains(".write().await");
-            let inserter = item.name.starts_with("admit_") || item.name == "insert_proposer";
+            let inserter = ADMIT_HELPERS.contains(&item.name) || item.name == "insert_proposer";
             if holds_guard && item.body.contains(".insert(") && !inserter {
                 offenders.push(format!("{}: inserts outside the admit_* helpers", item.name));
             }
@@ -4226,11 +4368,18 @@ mod tests {
                 offenders.push(format!("{}: calls insert_proposer", item.name));
             }
             let first_request = item.body.find("self.beacon.");
-            if item.body.contains(".admit_") && first_request.is_none() {
+            let admits = ADMIT_HELPERS.iter().any(|helper| item.body.contains(helper));
+            if admits && first_request.is_none() {
                 offenders.push(format!("{}: admits an answer it did not request", item.name));
             }
             if first_request.is_some_and(|at| !item.body[..at].contains("=self.fetch_stamp();")) {
                 offenders.push(format!("{}: no fetch_stamp() before its first request", item.name));
+            }
+            if inserter && item.public {
+                offenders.push(format!("{}: insert helper is public", item.name));
+            }
+            if inserter && !item.signature.contains(":FetchStamp") {
+                offenders.push(format!("{}: insert helper takes no FetchStamp", item.name));
             }
         }
         offenders
@@ -4287,7 +4436,7 @@ mod tests {
 
         let items = fn_items(&code);
         let body = |name: &str| &items.iter().find(|item| item.name == name).expect(name).body;
-        for admit in ["admit_attester", "admit_proposer", "admit_ptc", "admit_sync"] {
+        for admit in ADMIT_HELPERS {
             assert!(body(admit).contains("visible("), "the scan sees {admit}'s re-check");
         }
         for writer in [
@@ -4310,13 +4459,18 @@ mod tests {
         );
 
         let fixture = "
-            fn admit_x(c: &mut RwLockWriteGuard<'_, Map>, e: E, s: FetchStamp) { c.insert(1, e); }
-            async fn stamped_first(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; let mut c = self.m.write().await; self.admit_x(&mut c, e, s); }
+            fn admit_ptc(c: &mut RwLockWriteGuard<'_, Map>, e: E, s: FetchStamp) { c.insert(1, e); }
+            async fn stamped_first(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; let mut c = self.m.write().await; self.admit_ptc(&mut c, e, s); }
+            async fn ufcs(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; let mut c = self.m.write().await; Self::admit_ptc(self, &mut c, e, s); }
             async fn bypass(&self) { let s = self.fetch_stamp(); let e = self.beacon.x().await; self.m.write().await.insert(1, e); }
-            async fn late(&self) { let e = self.beacon.x().await; let s = self.fetch_stamp(); let mut c = self.m.write().await; self.admit_x(&mut c, e, s); }
-            async fn setter(&self, e: E) { let mut c = self.m.write().await; self.admit_x(&mut c, e, self.fetch_stamp()); }
+            async fn late(&self) { let e = self.beacon.x().await; let s = self.fetch_stamp(); let mut c = self.m.write().await; self.admit_ptc(&mut c, e, s); }
+            async fn setter(&self, e: E) { let mut c = self.m.write().await; self.admit_ptc(&mut c, e, self.fetch_stamp()); }
+            async fn ufcs_setter(&self, e: E) { let mut c = self.m.write().await; Self::admit_ptc(self, &mut c, e, self.fetch_stamp()); }
+            pub async fn admit_unrequested(&self, e: E) { let mut c = self.m.write().await; c.insert(1, e); }
             fn helper(c: &mut RwLockWriteGuard<'_, Map>, e: E) { c.insert(1, e); }
             async fn reuse(&self, e: E) { let mut c = self.m.write().await; insert_proposer(&mut c, e); }
+            pub fn admit_sync(c: &mut RwLockWriteGuard<'_, Map>, e: E, s: FetchStamp) { c.insert(1, e); }
+            fn admit_attester(c: &mut RwLockWriteGuard<'_, Map>, e: E, g: Option<u64>) { c.insert(1, e); }
         ";
         assert_eq!(
             unstamped_writes(fixture),
@@ -4324,8 +4478,12 @@ mod tests {
                 "bypass: inserts outside the admit_* helpers",
                 "late: no fetch_stamp() before its first request",
                 "setter: admits an answer it did not request",
+                "ufcs_setter: admits an answer it did not request",
+                "admit_unrequested: inserts outside the admit_* helpers",
                 "helper: inserts outside the admit_* helpers",
                 "reuse: calls insert_proposer",
+                "admit_sync: insert helper is public",
+                "admit_attester: insert helper takes no FetchStamp",
             ]
         );
     }
