@@ -336,8 +336,8 @@ impl MockBeaconNodeClient {
         Self::default()
     }
 
-    /// `duty_fence`, `admission_duty_fence` and `revocation_generation`
-    /// follow this generation.
+    /// `duty_fence`, `admission_duty_fence`, `revocation_generation` and
+    /// `revocation_watch` follow this generation.
     ///
     /// A `DutyTracker` reads `revocation_generation` once, when it is built.
     /// Call this first to get stamped duty caches.
@@ -1467,11 +1467,34 @@ impl BeaconNodeClient for MockBeaconNodeClient {
     fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
         Ok(self.fence_now())
     }
+
+    /// Open (the trait default) until [`Self::track_admission`] is called.
+    fn revocation_watch(&self) -> beacon::DutyFence {
+        self.fence_now()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revocation_watch_follows_the_generation_only_after_track_admission() {
+        let mock = MockBeaconNodeClient::new();
+        let untracked = mock.revocation_watch();
+        assert!(untracked.generation().is_none(), "untracked keeps the open default");
+        assert!(untracked.holds());
+
+        let generation = mock.track_admission();
+        generation.fetch_add(1, Ordering::Release);
+        let watch = mock.revocation_watch();
+        assert_eq!(watch.seen(), 1);
+        assert!(Arc::ptr_eq(&watch.generation().expect("tracked watch"), &generation));
+        assert!(watch.holds());
+        generation.fetch_add(1, Ordering::Release);
+        assert!(!watch.holds(), "a bump after the sample breaks the watch");
+        assert_eq!(mock.revocation_watch().seen(), 2);
+    }
 
     #[tokio::test]
     async fn test_shared_mock_errors_by_default_for_unconfigured_methods() {

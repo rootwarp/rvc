@@ -20,7 +20,9 @@ use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::liveness_loop::merge_validator_indices;
 use crate::metrics::RVC_DUTY_INDEX_SET_SIZE;
 use crate::orchestrator::PubkeyMap;
-use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
+use crate::pubkey_index::{
+    parse_pubkey_bytes, pubkey_bytes_to_0x, RegistryFreshness, SharedPubkeyIndexRegistry,
+};
 
 /// Task name registered on [`TaskExecutor`] (`rvc_tasks_running{task}`).
 pub const TASK_NAME: &str = "index.resolve";
@@ -33,7 +35,7 @@ pub struct IndexResolverDeps {
     pub pubkey_map: PubkeyMap,
     /// Beacon node used for `get_validators`.
     pub beacon: Arc<dyn BeaconNodeClient>,
-    /// Re-sent after a merge that grows the registry.
+    /// Re-sent after a merge that grows the registry, and after a revalidation.
     pub key_gen_tx: watch::Sender<u64>,
     /// Wake signal for admission and for our own post-insert re-send.
     pub key_gen_rx: watch::Receiver<u64>,
@@ -53,7 +55,7 @@ pub struct ResolvePass {
     pub len_after_write: usize,
     /// `key_gen` immediately after the merge, before any re-send.
     pub key_gen_after_write: u64,
-    /// `key_gen` after the pass (incremented only when the set grew).
+    /// `key_gen` after the pass (incremented when the set grew or a revalidation committed).
     pub key_gen_after: u64,
     /// `get_validators` returned `Err`; [`IndexResolver::run`] retries at the next slot.
     pub bn_error: bool,
@@ -70,6 +72,8 @@ enum PassTrigger {
     Empty,
     /// One epoch has passed since the last pass.
     EpochDue,
+    /// A revocation left the registry stale: every key is asked again.
+    Revalidate,
 }
 
 /// When the last pass started, and whether its `get_validators` failed.
@@ -90,6 +94,9 @@ struct LastPass {
 /// epoch. A failed `get_validators` sets no backoff.
 /// When the merge grows the set, `key_gen` is re-sent **after** the registry
 /// write so duty-cache invalidation observes the new index.
+///
+/// While a revocation leaves the registry stale, every pass revalidates it
+/// instead (see [`Self::revalidate_at`]).
 pub struct IndexResolver {
     registry: SharedPubkeyIndexRegistry,
     pubkey_map: PubkeyMap,
@@ -177,6 +184,9 @@ impl IndexResolver {
 
     /// Why a slot wake makes a BN pass; `None` keeps the wake silent.
     fn slot_trigger(&self, last: LastPass, epoch: Duration) -> Option<PassTrigger> {
+        if !self.registry.read().is_fresh() {
+            return Some(PassTrigger::Revalidate);
+        }
         if last.bn_error {
             return Some(PassTrigger::Failed);
         }
@@ -219,7 +229,7 @@ impl IndexResolver {
 
     /// One wake: resolve, then consume this task's own `key_gen` re-send.
     ///
-    /// A growth re-send whose generation is still the value just written is marked
+    /// Our own re-send whose generation is still the value just written is marked
     /// seen so the next `select` does not call this again for that echo. A newer
     /// generation, or a pubkey that appeared during the in-flight `get_validators`,
     /// is resolved in this same turn. Returns the last resolve.
@@ -249,18 +259,12 @@ impl IndexResolver {
     }
 
     async fn resolve_at(&mut self, epoch: u64) -> ResolvePass {
+        if let Some(seen) = self.stale_generation() {
+            return self.revalidate_at(epoch, seen).await;
+        }
         let unresolved = self.unresolved_pubkeys(epoch);
         if unresolved.is_empty() {
-            let len = self.registry.read().len();
-            self.publish_gauge();
-            let key_gen = *self.key_gen_tx.borrow();
-            return ResolvePass {
-                len_before: len,
-                len_after_write: len,
-                key_gen_after_write: key_gen,
-                key_gen_after: key_gen,
-                bn_error: false,
-            };
+            return self.unchanged_pass(false);
         }
 
         let hexes: Vec<String> =
@@ -279,14 +283,7 @@ impl IndexResolver {
                 merge_validator_indices(&self.registry, &resolved);
                 let len_after_write = self.registry.read().len();
                 let key_gen_after_write = *self.key_gen_tx.borrow();
-                let next_epoch = epoch.saturating_add(1);
-                for pk in &unresolved {
-                    if found.contains(pk) {
-                        self.retry_at.remove(pk);
-                    } else {
-                        self.retry_at.insert(*pk, next_epoch);
-                    }
-                }
+                self.back_off_omitted(&unresolved, |pk| found.contains(pk), epoch);
                 self.publish_gauge();
                 if len_after_write > len_before {
                     self.key_gen_tx.send_modify(|gen| *gen += 1);
@@ -314,16 +311,7 @@ impl IndexResolver {
                     count = unresolved.len(),
                     "index resolver get_validators failed; retrying at the next slot"
                 );
-                let len = self.registry.read().len();
-                self.publish_gauge();
-                let key_gen = *self.key_gen_tx.borrow();
-                ResolvePass {
-                    len_before: len,
-                    len_after_write: len,
-                    key_gen_after_write: key_gen,
-                    key_gen_after: key_gen,
-                    bn_error: true,
-                }
+                self.unchanged_pass(true)
             }
         }
     }
@@ -343,6 +331,108 @@ impl IndexResolver {
                     && self.retry_at.get(pk).is_none_or(|ready| epoch >= *ready)
             })
             .collect()
+    }
+
+    /// The generation sampled now if the registry is stale, else `None`.
+    fn stale_generation(&self) -> Option<u64> {
+        let registry = self.registry.read();
+        match registry.freshness() {
+            RegistryFreshness::Stale => registry.generation(),
+            RegistryFreshness::Untracked | RegistryFreshness::Fresh(_) => None,
+        }
+    }
+
+    /// Ask again for every key in the map after a revocation.
+    ///
+    /// `seen` was sampled before the request. Under the registry write lock the
+    /// answer replaces every entry only if the generation is still `seen`; then
+    /// `key_gen` is re-sent, because the duty index set comes back from empty.
+    /// A failed request, or a generation that moved, changes nothing, and the
+    /// next slot wake asks again.
+    async fn revalidate_at(&mut self, epoch: u64, seen: u64) -> ResolvePass {
+        let queried: Vec<[u8; 48]> = self.pubkey_map.read().keys().copied().collect();
+        let answer: HashMap<[u8; 48], String> = if queried.is_empty() {
+            HashMap::new()
+        } else {
+            let hexes: Vec<String> = queried.iter().map(pubkey_bytes_to_0x).collect();
+            match self.beacon.get_validators(&hexes).await {
+                Ok(resp) => resp
+                    .data
+                    .into_iter()
+                    .filter_map(|v| Some((parse_pubkey_bytes(&v.validator.pubkey)?, v.index)))
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        epoch,
+                        count = queried.len(),
+                        "index resolver revalidation failed; indices stay hidden; \
+                         retrying at the next slot"
+                    );
+                    return self.unchanged_pass(true);
+                }
+            }
+        };
+        let (len_before, committed, len_after_write) = {
+            let mut registry = self.registry.write();
+            let len_before = registry.len();
+            let committed = registry.revalidate(seen, &answer);
+            (len_before, committed, registry.len())
+        };
+        if !committed {
+            info!(
+                seen,
+                "index resolver revalidation crossed a revocation; retrying at the next slot"
+            );
+            return self.unchanged_pass(false);
+        }
+        self.back_off_omitted(&queried, |pk| answer.contains_key(pk), epoch);
+        self.publish_gauge();
+        let key_gen_after_write = *self.key_gen_tx.borrow();
+        self.key_gen_tx.send_modify(|gen| *gen += 1);
+        info!(
+            total = len_after_write,
+            generation = seen,
+            "index resolver re-checked validator indices after a revocation"
+        );
+        ResolvePass {
+            len_before,
+            len_after_write,
+            key_gen_after_write,
+            key_gen_after: *self.key_gen_tx.borrow(),
+            bn_error: false,
+        }
+    }
+
+    /// A key that an `Ok` answer omits is not asked again before the next epoch.
+    fn back_off_omitted(
+        &mut self,
+        queried: &[[u8; 48]],
+        found: impl Fn(&[u8; 48]) -> bool,
+        epoch: u64,
+    ) {
+        let next_epoch = epoch.saturating_add(1);
+        for pk in queried {
+            if found(pk) {
+                self.retry_at.remove(pk);
+            } else {
+                self.retry_at.insert(*pk, next_epoch);
+            }
+        }
+    }
+
+    /// A pass that wrote nothing; lengths and `key_gen` as of now.
+    fn unchanged_pass(&self, bn_error: bool) -> ResolvePass {
+        let len = self.registry.read().len();
+        self.publish_gauge();
+        let key_gen = *self.key_gen_tx.borrow();
+        ResolvePass {
+            len_before: len,
+            len_after_write: len,
+            key_gen_after_write: key_gen,
+            key_gen_after: key_gen,
+            bn_error,
+        }
     }
 }
 
@@ -370,12 +460,13 @@ mod tests {
         wire_signing_enablement, BeaconHandles, ShutdownTier, TaskExecutor, TierBudget,
     };
     use crate::config::{Config, ServiceBuilder};
-    use crate::pubkey_index::PubkeyIndexRegistry;
+    use crate::pubkey_index::{PubkeyIndexRegistry, PubkeyIndexSource, RegistryFreshness};
     use beacon::{BeaconClient, BeaconError, ValidatorData, ValidatorInfo, ValidatorsResponse};
     use bn_manager::{BnManager, MockBeaconNodeClient, MockMethod, OperationTimeouts};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+    use duty_tracker::ValidatorIndexSource;
     use slashing::SlashingDb;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
@@ -1235,5 +1326,243 @@ mod tests {
         assert_eq!(resolver_at(0).tick_interval(), capped);
         assert_eq!(resolver_at(u64::MAX).tick_interval(), capped);
         assert!(std::time::Instant::now().checked_add(capped).is_some());
+    }
+
+    /// A held revalidation answer: long enough that only `advance` releases it.
+    const HOLD: Duration = Duration::from_secs(3_600);
+
+    /// Attach `registry` to `mock`'s tracked generation through its `revocation_watch`.
+    fn track(mock: &MockBeaconNodeClient, registry: &SharedPubkeyIndexRegistry) -> Arc<AtomicU64> {
+        let generation = mock.track_admission();
+        let watch = mock.revocation_watch();
+        let current = watch.generation().expect("a tracked mock watch carries the generation");
+        assert!(Arc::ptr_eq(&current, &generation));
+        registry.write().attach_revocation(current, watch.seen());
+        generation
+    }
+
+    /// Answers `hex` with the index in `index` at the time of each call.
+    fn answers(hex: String, index: Arc<Mutex<&'static str>>) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            let index = *index.lock().expect("answer");
+            let data = pks.iter().filter(|p| **p == hex).map(|p| validator(p, index)).collect();
+            Ok(ValidatorsResponse { data })
+        })
+    }
+
+    /// Step paused time 1 ms at a time until `n` `get_validators` calls have arrived.
+    async fn wait_for_bn_calls(mock: &MockBeaconNodeClient, n: usize) {
+        for _ in 0..1_000 {
+            let stamps = mock.call_stamps();
+            if stamps.iter().filter(|s| s.method == MockMethod::GetValidators).count() >= n {
+                return;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        panic!("get_validators call {n} did not arrive within 1 s of paused time");
+    }
+
+    /// Yield until `n` `index.resolve.tick` spans have closed.
+    async fn wait_for_ticks(log: &ResolverLog, start: tokio::time::Instant, n: usize) {
+        for _ in 0..1_000 {
+            if log.ticks(start).len() >= n {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("pass {n} did not finish: {:?}", log.ticks(start));
+    }
+
+    /// Index 4 resolved, then a revocation: the next slot wake asks again and
+    /// the new index 9 replaces it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn index_resolver_re_resolves_after_revocation() {
+        let (pk, bytes, hex) = fresh_key();
+        let index = Arc::new(Mutex::new("4"));
+        let mock = Arc::new(answers(hex, Arc::clone(&index)));
+        let registry = PubkeyIndexRegistry::shared();
+        let generation = track(&mock, &registry);
+        let (key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let start = tokio::time::Instant::now();
+        spawn_index_resolver(
+            IndexResolverDeps {
+                registry: Arc::clone(&registry),
+                pubkey_map: map_with(&pk),
+                beacon: mock.clone(),
+                key_gen_tx,
+                key_gen_rx,
+                epoch_clock: fixed_clock(),
+            },
+            &executor,
+        );
+
+        tokio::time::sleep(SLOT / 2).await;
+        assert_eq!(registry.read().index_of(&bytes), Some("4"));
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(0));
+
+        *index.lock().expect("answer") = "9";
+        generation.fetch_add(1, Ordering::Release);
+        tokio::time::sleep_until(start + SLOT + SLOT / 2).await;
+        assert_eq!(registry.read().index_of(&bytes), Some("9"), "replaced within one slot");
+        assert_eq!(registry.read().bare_hex_of_index("4"), None);
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
+        assert_eq!(bn_calls(&mock, start), [Duration::ZERO, SLOT]);
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), executor.shutdown(TierBudget::default()))
+                .await;
+    }
+
+    /// After a revocation the admitted pool omits the key: its index is
+    /// removed, `key_gen` is re-sent once, and the key backs off to the next epoch.
+    #[tokio::test]
+    async fn revalidation_removes_an_index_the_admitted_pool_omits() {
+        let (pk, bytes, _hex) = fresh_key();
+        let omits = |_| Ok(ValidatorsResponse { data: Vec::new() });
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(omits));
+        let (mut resolver, registry, _tx, mut seen) = resolver_for(mock.clone(), map_with(&pk));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        seen.borrow_and_update();
+        let start = tokio::time::Instant::now();
+
+        let pass = resolver.drive_once_for_test(5).await;
+        assert_eq!(bn_calls(&mock, start).len(), 1, "a resolved key is asked again");
+        assert_eq!(registry.read().index_of(&bytes), None);
+        assert_eq!(registry.read().bare_hex_of_index("4"), None);
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
+        assert_eq!((pass.len_before, pass.len_after_write), (1, 0));
+        assert_eq!(pass.key_gen_after, pass.key_gen_after_write + 1);
+        assert_eq!(*seen.borrow_and_update(), 1, "key_gen re-sent once");
+
+        resolver.drive_once_for_test(5).await;
+        assert_eq!(bn_calls(&mock, start).len(), 1, "the omitted key waits for the next epoch");
+        assert!(!seen.has_changed().expect("sender alive"));
+
+        let src = include_str!("index_resolver.rs");
+        let body = &src[src.find("async fn revalidate_at(").expect("revalidate_at")..];
+        let body = &body[..body.find("\n    fn back_off_omitted").expect("next fn")];
+        let commit = body.find("registry.revalidate(").expect("commit");
+        assert!(commit < body.find("send_modify(").expect("re-send"), "re-send after the commit");
+    }
+
+    /// A second bump while the revalidation answer is held: the answer is
+    /// dropped under the write lock, and the next slot's pass revalidates.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn revalidation_straddling_a_second_bump_changes_nothing() {
+        let log = ResolverLog::default();
+        let _guard = log.install();
+        let (pk, bytes, hex) = fresh_key();
+        let held = answers(hex, Arc::new(Mutex::new("9")));
+        let mock = Arc::new(held.with_method_delay(MockMethod::GetValidators, HOLD));
+        let (resolver, registry, _tx, mut seen) = resolver_for(mock.clone(), map_with(&pk));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        seen.borrow_and_update();
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        wait_for_bn_calls(&mock, 1).await;
+        generation.fetch_add(1, Ordering::Release);
+        tokio::time::advance(HOLD).await;
+        wait_for_ticks(&log, start, 1).await;
+        assert_eq!(registry.read().index_of(&bytes), Some("4"), "the held answer is dropped");
+        assert_eq!(registry.read().bare_hex_of_index("9"), None);
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Stale);
+        assert!(!seen.has_changed().expect("sender alive"), "nothing changed, nothing re-sent");
+
+        wait_for_bn_calls(&mock, 2).await;
+        let calls = bn_calls(&mock, start);
+        assert_eq!(calls[1], log.ticks(start)[0], "the next slot wake, right after the held pass");
+        tokio::time::advance(HOLD).await;
+        wait_for_ticks(&log, start, 2).await;
+        assert_eq!(registry.read().index_of(&bytes), Some("9"));
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(2));
+        assert_eq!(*seen.borrow_and_update(), 1);
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// `Err` after a bump: the indices stay hidden, one retry per slot until an `Ok`.
+    ///
+    /// The `Ok` repeats index 4, and `key_gen` is still re-sent once, because
+    /// the duty index set comes back from empty.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn revalidation_error_keeps_entries_hidden_and_retries() {
+        let (pk, bytes, hex) = fresh_key();
+        let attempts = AtomicUsize::new(0);
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(unavailable());
+            }
+            let data = pks.iter().filter(|p| *p == &hex).map(|p| validator(p, "4")).collect();
+            Ok(ValidatorsResponse { data })
+        }));
+        let pubkey_map = map_with(&pk);
+        let (resolver, registry, _tx, mut seen) =
+            resolver_for(mock.clone(), Arc::clone(&pubkey_map));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        seen.borrow_and_update();
+        let source = PubkeyIndexSource { registry: Arc::clone(&registry), pubkey_map };
+        let start = tokio::time::Instant::now();
+        let (cancel, task) = spawn_run(resolver);
+
+        for slot in 0..2u32 {
+            tokio::time::sleep_until(start + slot * SLOT + SLOT / 2).await;
+            assert!(!registry.read().is_fresh(), "slot {slot}: hidden after an Err");
+            assert_eq!(source.indices(), Vec::<String>::new());
+            assert!(!seen.has_changed().expect("sender alive"));
+        }
+        tokio::time::sleep_until(start + 4 * SLOT + SLOT / 2).await;
+        assert_eq!(bn_calls(&mock, start), [Duration::ZERO, SLOT, 2 * SLOT]);
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
+        assert_eq!(source.indices(), vec!["4".to_string()]);
+        assert_eq!(*seen.borrow_and_update(), 1, "re-sent once, on the Ok");
+        cancel.cancel();
+        task.await.expect("resolver task");
+    }
+
+    /// No keys in the map: the stale registry is emptied and stamped without a
+    /// BN call. An empty `get_validators` would ask the pool for every validator.
+    #[tokio::test]
+    async fn revalidating_an_empty_map_makes_no_bn_call() {
+        let (_pk, bytes, _hex) = fresh_key();
+        let mock = Arc::new(MockBeaconNodeClient::new());
+        let (mut resolver, registry, _tx, _rx) = resolver_for(mock.clone(), empty_map());
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        let start = tokio::time::Instant::now();
+
+        resolver.drive_once_for_test(5).await;
+        assert_eq!(bn_calls(&mock, start), Vec::<Duration>::new());
+        assert_eq!(registry.read().index_of(&bytes), None, "a deleted key's index is dropped");
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
+    }
+
+    /// A resolver dropped during a held revalidation leaves the registry as it was.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn revalidation_dropped_mid_request_changes_nothing() {
+        let (pk, bytes, hex) = fresh_key();
+        let held = answers(hex, Arc::new(Mutex::new("9")));
+        let mock = Arc::new(held.with_method_delay(MockMethod::GetValidators, HOLD));
+        let (resolver, registry, _tx, mut seen) = resolver_for(mock.clone(), map_with(&pk));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        seen.borrow_and_update();
+        let (_cancel, task) = spawn_run(resolver);
+
+        wait_for_bn_calls(&mock, 1).await;
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        tokio::time::advance(HOLD).await;
+        assert_eq!(registry.read().index_of(&bytes), Some("4"));
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Stale);
+        assert!(!seen.has_changed().expect("sender alive"));
     }
 }

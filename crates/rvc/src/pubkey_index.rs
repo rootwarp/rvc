@@ -11,6 +11,7 @@
 //! pubkey bytes (`[u8; 48]`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use duty_tracker::ValidatorIndexSource;
@@ -31,6 +32,25 @@ pub struct PubkeyIndexRegistry {
     by_pubkey: HashMap<[u8; 48], String>,
     /// Numeric index → bare lowercase pubkey hex (machine state key).
     by_index: HashMap<String, String>,
+    /// Revocation generation the entries follow; `None` when untracked.
+    revocation: Option<Arc<AtomicU64>>,
+    /// Generation the entries were last validated under.
+    validated_gen: Option<u64>,
+}
+
+/// Whether the registry's indices may be acted on.
+///
+/// `Fresh(g)` is a comparable token. A caller that awaits between reading
+/// indices and acting on them can compare it again afterwards: it changes on
+/// every revocation and on every revalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryFreshness {
+    /// No revocation generation is attached; every index is served.
+    Untracked,
+    /// Validated under generation `g`, which is still the current one.
+    Fresh(u64),
+    /// A revocation since the last validation; no index may be acted on.
+    Stale,
 }
 
 impl PubkeyIndexRegistry {
@@ -42,6 +62,53 @@ impl PubkeyIndexRegistry {
     /// Shared empty registry handle (tests / opt-out paths).
     pub fn shared() -> SharedPubkeyIndexRegistry {
         Arc::new(RwLock::new(Self::new()))
+    }
+
+    /// Follow `revocation`, with the entries validated under `validated_gen`.
+    ///
+    /// Boot passes a generation sampled before its index fetch, so a
+    /// revocation during the fetch leaves the registry [`RegistryFreshness::Stale`].
+    pub(crate) fn attach_revocation(&mut self, revocation: Arc<AtomicU64>, validated_gen: u64) {
+        self.revocation = Some(revocation);
+        self.validated_gen = Some(validated_gen);
+    }
+
+    /// Current revocation generation, or `None` when untracked.
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.revocation.as_ref().map(|current| current.load(Ordering::Acquire))
+    }
+
+    /// Freshness of the entries. Call it under the registry lock you read them with.
+    pub(crate) fn freshness(&self) -> RegistryFreshness {
+        match self.generation() {
+            None => RegistryFreshness::Untracked,
+            Some(now) if self.validated_gen == Some(now) => RegistryFreshness::Fresh(now),
+            Some(_) => RegistryFreshness::Stale,
+        }
+    }
+
+    /// `false` only while [`RegistryFreshness::Stale`].
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.freshness() != RegistryFreshness::Stale
+    }
+
+    /// Replace every entry with a revalidation `answer` requested under `seen`.
+    ///
+    /// Call it under the write lock. If the generation is no longer `seen`,
+    /// nothing changes and this returns `false`. Otherwise the entries become
+    /// exactly `answer` (an omitted key loses both directions), the registry is
+    /// stamped `seen`, and this returns `true`.
+    pub(crate) fn revalidate(&mut self, seen: u64, answer: &HashMap<[u8; 48], String>) -> bool {
+        if self.generation() != Some(seen) {
+            return false;
+        }
+        self.by_pubkey.clear();
+        self.by_index.clear();
+        for (pubkey, index) in answer {
+            self.insert(*pubkey, index.clone());
+        }
+        self.validated_gen = Some(seen);
+        true
     }
 
     /// Insert or replace a pubkey → index mapping (both directions).
@@ -143,8 +210,9 @@ pub fn pubkey_bytes_to_0x(bytes: &[u8; 48]) -> String {
 
 /// Duty indices are [`PubkeyIndexRegistry`] ∩ [`PubkeyMap`] (ADR-R06).
 ///
-/// [`PubkeyIndexRegistry`] has no `remove`. A deleted key stays in the registry
-/// and drops out of this set when it leaves the pubkey map. `indices` holds one
+/// A deleted key stays in the registry until the next revalidation, and drops
+/// out of this set when it leaves the pubkey map. While a revocation leaves the
+/// registry [`RegistryFreshness::Stale`], the set is empty. `indices` holds one
 /// read lock on each map for the whole intersection, then returns one snapshot.
 /// Order is lexicographic (`sort` then `dedup`), a total order on the strings.
 pub struct PubkeyIndexSource {
@@ -156,6 +224,9 @@ impl ValidatorIndexSource for PubkeyIndexSource {
     fn indices(&self) -> Vec<String> {
         let map = self.pubkey_map.read();
         let registry = self.registry.read();
+        if !registry.is_fresh() {
+            return Vec::new();
+        }
         let mut indices: Vec<String> =
             map.keys().filter_map(|pk| registry.index_of(pk).map(str::to_owned)).collect();
         indices.sort();
@@ -254,5 +325,87 @@ mod tests {
         let source = PubkeyIndexSource { registry, pubkey_map: Arc::new(RwLock::new(map)) };
         // Total order: "10" < "2". Numeric order would panic or cycle on mixed keys.
         assert_eq!(source.indices(), vec!["10".to_string(), "2".to_string()]);
+    }
+
+    fn source_with(
+        pubkey: &crypto::PublicKey,
+        registry: SharedPubkeyIndexRegistry,
+    ) -> PubkeyIndexSource {
+        let map = HashMap::from([(pubkey.to_bytes(), pubkey.clone())]);
+        PubkeyIndexSource { registry, pubkey_map: Arc::new(RwLock::new(map)) }
+    }
+
+    #[test]
+    fn freshness_token_changes_on_bump_and_on_revalidation() {
+        use RegistryFreshness::{Fresh, Stale, Untracked};
+
+        let (kept, omitted) = ([0x01; 48], [0x02; 48]);
+        let mut reg = PubkeyIndexRegistry::new();
+        reg.insert(kept, "4".to_string());
+        reg.insert(omitted, "5".to_string());
+        assert_eq!(reg.freshness(), Untracked, "no generation attached yet");
+        let generation = Arc::new(AtomicU64::new(3));
+        reg.attach_revocation(Arc::clone(&generation), 3);
+        assert_eq!(reg.freshness(), Fresh(3));
+        assert!(reg.is_fresh());
+
+        generation.fetch_add(1, Ordering::Release);
+        assert_eq!(reg.freshness(), Stale, "a bump makes every entry stale");
+        assert!(!reg.is_fresh());
+        let answer = HashMap::from([(kept, "9".to_string())]);
+        assert!(!reg.revalidate(3, &answer), "an answer taken before the bump is refused");
+        assert_eq!((reg.freshness(), reg.index_of(&kept)), (Stale, Some("4")));
+
+        assert!(reg.revalidate(4, &answer));
+        assert_eq!(reg.freshness(), Fresh(4), "the token moved: a holder of Fresh(3) sees it");
+        assert_eq!(reg.index_of(&kept), Some("9"));
+        assert_eq!(reg.bare_hex_of_index("4"), None, "the replaced index is gone both ways");
+        assert_eq!(reg.index_of(&omitted), None, "an omitted key is removed");
+        assert_eq!(reg.bare_hex_of_index("5"), None, "and its reverse entry");
+        assert_eq!(reg.len(), 1);
+
+        reg.attach_revocation(Arc::clone(&generation), 3);
+        assert_eq!(reg.freshness(), Stale, "attached under an older sample: stale at once");
+        reg.attach_revocation(generation, 4);
+        assert_eq!(reg.freshness(), Fresh(4));
+    }
+
+    #[test]
+    fn without_a_generation_the_registry_is_always_fresh() {
+        use crypto::SecretKey;
+
+        let registry = PubkeyIndexRegistry::shared();
+        let pk = SecretKey::generate().public_key();
+        registry.write().insert(pk.to_bytes(), "4".to_string());
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Untracked);
+        assert!(registry.read().is_fresh());
+        let source = source_with(&pk, Arc::clone(&registry));
+        assert_eq!(source.indices(), vec!["4".to_string()], "today's behaviour");
+
+        let omits_everything = HashMap::new();
+        assert!(!registry.write().revalidate(0, &omits_everything), "nothing to revalidate");
+        assert_eq!(registry.read().index_of(&pk.to_bytes()), Some("4"));
+        assert_eq!(source.indices(), vec!["4".to_string()]);
+    }
+
+    #[test]
+    fn duty_index_set_is_empty_while_the_registry_is_stale() {
+        use crypto::SecretKey;
+
+        let registry = PubkeyIndexRegistry::shared();
+        let pk = SecretKey::generate().public_key();
+        registry.write().insert(pk.to_bytes(), "4".to_string());
+        let generation = Arc::new(AtomicU64::new(0));
+        registry.write().attach_revocation(Arc::clone(&generation), 0);
+        let source = source_with(&pk, Arc::clone(&registry));
+        assert_eq!(source.indices(), vec!["4".to_string()]);
+
+        generation.fetch_add(1, Ordering::Release);
+        assert_eq!(source.indices(), Vec::<String>::new(), "no index from before the revocation");
+        assert_eq!(registry.read().index_of(&pk.to_bytes()), Some("4"), "raw lookups stay raw");
+
+        let answer = HashMap::from([(pk.to_bytes(), "4".to_string())]);
+        assert!(registry.write().revalidate(1, &answer));
+        assert_eq!(source.indices(), vec!["4".to_string()], "restored after revalidation");
     }
 }

@@ -486,7 +486,15 @@ impl LivenessObservationLoop {
         if pending.is_empty() {
             return Vec::new();
         }
-        let index_to_bare = self.pubkey_index.read().index_to_bare_hex().clone();
+        let index_to_bare = {
+            let registry = self.pubkey_index.read();
+            // A stale index may name another validator: ask about none until revalidated.
+            if registry.is_fresh() {
+                registry.index_to_bare_hex().clone()
+            } else {
+                HashMap::new()
+            }
+        };
         let mut bare_to_index: HashMap<&str, &str> = HashMap::with_capacity(index_to_bare.len());
         for (index, bare) in &index_to_bare {
             bare_to_index.insert(bare.as_str(), index.as_str());
@@ -1495,6 +1503,30 @@ mod tests {
             epochs,
             vec![start, start + 1, start, start + 1, start + 1, start + 2, start + 2, start + 3,]
         );
+    }
+
+    /// A revocation makes index 4 stale: the pass asks the BN nothing about it,
+    /// and the pending key gets no sample (fail-closed, not decremented).
+    #[tokio::test]
+    async fn liveness_never_queries_an_index_from_before_a_revocation() {
+        use std::sync::atomic::AtomicU64;
+
+        let m = machine();
+        let pk = new_pk();
+        let start = 10u64;
+        m.register(&pk, start);
+        let bn = Arc::new(all_not_live(&["4"]).0);
+        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&bn) as Arc<dyn LivenessApi>, "4", &pk);
+        let generation = Arc::new(AtomicU64::new(0));
+        loop_.pubkey_index().write().attach_revocation(Arc::clone(&generation), 0);
+        let pending = m.pending_keys();
+        generation.fetch_add(1, Ordering::Release);
+
+        loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+
+        assert_eq!(bn.post_validator_liveness_calls(), Vec::<(u64, Vec<String>)>::new());
+        assert_eq!(m.pending_keys(), pending, "no sample: the closed epoch is not counted");
+        assert_eq!(m.status(&pk), ForwardWindowStatus::Pending);
     }
 
     /// Register at epoch 10. Ticks (11, 24) and (12, 24) are not live. At

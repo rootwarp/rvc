@@ -109,6 +109,8 @@ pub async fn wire_signing_enablement(
     // + prepare_proposers all share this handle).
     let beacon_for_resolve: &dyn BeaconNodeClient = beacon.bn_manager.as_ref();
     let pubkey_index = PubkeyIndexRegistry::shared();
+    // Sampled before the fetch: a revocation during it leaves the registry stale.
+    let revocation = beacon_for_resolve.revocation_watch();
     let resolve_result = resolve_validator_indices(beacon_for_resolve, &keys.pubkey_map).await;
 
     if doppelganger_enabled && !keys.pubkey_map.read().is_empty() {
@@ -139,6 +141,9 @@ pub async fn wire_signing_enablement(
                  duties stay empty until the index resolver succeeds"
             ),
         }
+    }
+    if let Some(generation) = revocation.generation() {
+        pubkey_index.write().attach_revocation(generation, revocation.seen());
     }
 
     if epoch0_bypass && doppelganger_enabled {
@@ -951,6 +956,122 @@ mod tests {
         .await
         .expect("doppelganger-off boot");
         assert_eq!(handles.pubkey_index.read().index_of(&pk.to_bytes()), Some("5"));
+        executor.token().cancel();
+    }
+
+    /// Releases a held `validators` responder when dropped, also on a failed assert.
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// A `validators` answer that blocks wiremock's server thread until released.
+    struct HeldValidators {
+        arrived: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        body: serde_json::Value,
+    }
+
+    impl wiremock::Respond for HeldValidators {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let _ = self.arrived.send(());
+            let _ = self.release.lock().expect("release channel").recv();
+            ResponseTemplate::new(200).set_body_json(self.body.clone())
+        }
+    }
+
+    fn validators_body(pubkey: &crypto::PublicKey, index: &str) -> serde_json::Value {
+        serde_json::json!({
+            "data": [{
+                "index": index,
+                "status": "active_ongoing",
+                "validator": { "pubkey": pubkey_bytes_to_0x(&pubkey.to_bytes()) }
+            }]
+        })
+    }
+
+    /// A revocation during the boot index fetch leaves the registry stale, and
+    /// the resolver's first pass revalidates it.
+    ///
+    /// Node 1 is revoked while node 0 holds the answer: the pool keeps node 0's
+    /// answer, and the process revocation generation still moves.
+    #[tokio::test]
+    async fn boot_fetch_straddling_a_bump_starts_stale() {
+        use crate::index_resolver::{IndexResolver, IndexResolverDeps};
+        use crate::pubkey_index::RegistryFreshness;
+        use bn_manager::MockBeaconNodeClient;
+
+        let (server, mut beacon) = mock_beacon(0).await;
+        let revoked = MockServer::start().await;
+        let pool = Config {
+            beacon_url: server.uri(),
+            beacon_nodes: vec![server.uri(), revoked.uri()],
+            ..base_config(false)
+        };
+        beacon.bn_manager = ServiceBuilder::new(pool)
+            .build_bn_manager_with_timeouts(OperationTimeouts::default())
+            .expect("two-node pool");
+        let pk = SecretKey::generate().public_key();
+        let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = ReleaseOnDrop(release_tx);
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(HeldValidators {
+                arrived: arrived_tx,
+                release: std::sync::Mutex::new(release_rx),
+                body: validators_body(&pk, "5"),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let config = base_config(false);
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let revoke_during_fetch = async {
+            arrived.recv().await.expect("the boot validators request arrives");
+            beacon.bn_manager.testing_revoke_admission(1);
+            drop(release);
+        };
+        let boot = wire_signing_enablement(
+            &config,
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        );
+        let (handles, ()) = tokio::join!(boot, revoke_during_fetch);
+        let handles = handles.expect("boot");
+        let registry = Arc::clone(&handles.pubkey_index);
+        assert_eq!(registry.read().index_of(&pk.to_bytes()), Some("5"));
+        assert_eq!(
+            registry.read().freshness(),
+            RegistryFreshness::Stale,
+            "attached under the generation sampled before the fetch"
+        );
+
+        let answer = validators_body(&pk, "9");
+        let revalidating = MockBeaconNodeClient::new().with_get_validators(move |_| {
+            Ok(serde_json::from_value(answer.clone()).expect("body"))
+        });
+        let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
+        let mut resolver = IndexResolver::new(
+            IndexResolverDeps {
+                registry: Arc::clone(&registry),
+                pubkey_map: Arc::clone(&handles.pubkey_map),
+                beacon: Arc::new(revalidating),
+                key_gen_tx,
+                key_gen_rx,
+                epoch_clock: Arc::clone(&handles.epoch_clock),
+            },
+            executor.token(),
+        );
+        resolver.drive_once_for_test(0).await;
+        assert_eq!(registry.read().index_of(&pk.to_bytes()), Some("9"));
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
         executor.token().cancel();
     }
 
