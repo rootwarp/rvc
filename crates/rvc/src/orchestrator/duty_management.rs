@@ -18,6 +18,7 @@ use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
+use super::error::OrchestratorError;
 use super::utils::{self, TimedOutcome};
 use crate::pubkey_index::{parse_pubkey_bytes, SharedPubkeyIndexRegistry};
 
@@ -26,6 +27,24 @@ const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 
 /// How many epochs before the end of a period to start prefetching next-period duties.
 const PREFETCH_LOOKAHEAD: u64 = 2;
+
+/// The prepare POST, as timed and as named by a timeout.
+const PROPOSER_PREPARATION: &str = "proposer_preparation";
+
+/// The committee-subscription POST, as timed and as named by a timeout.
+const COMMITTEE_SUBSCRIPTION: &str = "committee_subscription";
+
+/// How a [`DutyManagementService::prepare_proposers`] call that met no error ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrepareOutcome {
+    /// The epoch needs no further send: Gloas, no local key, or a POST that
+    /// covered every local key.
+    Complete,
+    /// The keys with a validator index were POSTed; `unresolved` have none yet.
+    Partial { unresolved: usize },
+    /// No local key has a validator index yet, so nothing was sent.
+    NoIndices,
+}
 
 pub(crate) struct DutyManagementService {
     signer: Arc<SignerService>,
@@ -386,26 +405,33 @@ impl DutyManagementService {
         }
     }
 
-    #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
-    /// `true` when this epoch needs no further send.
+    /// POSTs `prepare_beacon_proposer` for the local keys whose validator
+    /// index is known.
     ///
-    /// Gloas, and a process with no local validators, are done. Validators
-    /// whose index is not known yet, and a failed or timed-out POST, are not:
-    /// startup retries once per slot.
-    pub(crate) async fn prepare_proposers(&self, epoch: u64) -> bool {
+    /// [`PrepareOutcome::Complete`] at Gloas (the call is retired), with no
+    /// local key, or after a POST that covered every local key. `Partial`
+    /// after a POST of the keys with an index while others have none yet,
+    /// and `NoIndices`, with no POST, while no key has one. A failed POST is
+    /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
+    /// is [`OrchestratorError::OperationTimedOut`].
+    #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
+    pub(crate) async fn prepare_proposers(
+        &self,
+        epoch: u64,
+    ) -> Result<PrepareOutcome, OrchestratorError> {
         let fork = ForkName::from_epoch(epoch, &self.config.fork_schedule);
         if legacy_proposer_ops_retired(fork) {
             info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
-            return true;
+            return Ok(PrepareOutcome::Complete);
         }
 
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
-        let (preparations, had_local_validators): (Vec<ProposerPreparation>, bool) = {
+        let (preparations, unresolved): (Vec<ProposerPreparation>, usize) = {
             let pubkey_snapshot = self.pubkey_map.read().clone();
-            let had_local_validators = !pubkey_snapshot.is_empty();
             let index_registry = self.pubkey_index.read();
             let mut out = Vec::with_capacity(pubkey_snapshot.len());
+            let mut unresolved = 0;
             for (pubkey_bytes, pubkey) in &pubkey_snapshot {
                 let fee_recipient =
                     self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
@@ -419,6 +445,7 @@ impl DutyManagementService {
                         });
                     }
                     None => {
+                        unresolved += 1;
                         debug!(
                             pubkey = %format!("0x{}", hex::encode(pubkey_bytes)),
                             "No validator index found for proposer preparation"
@@ -426,55 +453,79 @@ impl DutyManagementService {
                     }
                 }
             }
-            (out, had_local_validators)
+            (out, unresolved)
         };
 
         if preparations.is_empty() {
-            return !had_local_validators;
+            return Ok(if unresolved == 0 {
+                PrepareOutcome::Complete
+            } else {
+                PrepareOutcome::NoIndices
+            });
         }
 
         let count = preparations.len();
         match utils::timed(
-            "proposer_preparation",
+            PROPOSER_PREPARATION,
             self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
         {
-            TimedOutcome::Ok(_) => {
+            TimedOutcome::Ok(()) => {
                 info!(count, "Sent proposer preparations");
-                true
+                Ok(if unresolved == 0 {
+                    PrepareOutcome::Complete
+                } else {
+                    PrepareOutcome::Partial { unresolved }
+                })
             }
             TimedOutcome::Err(e) => {
                 warn!(error = %e, "Failed to send proposer preparations");
-                false
+                Err(OrchestratorError::Beacon(e))
             }
             TimedOutcome::Timeout => {
                 warn!(
                     "Proposer preparation timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
                 );
-                false
+                Err(OrchestratorError::OperationTimedOut { operation: PROPOSER_PREPARATION })
             }
         }
     }
 
+    /// The local keys whose validator index is known: the size of the POST
+    /// a [`Self::prepare_proposers`] call would make now.
+    pub(crate) fn resolved_proposer_count(&self) -> usize {
+        let pubkeys: Vec<[u8; 48]> = self.pubkey_map.read().keys().copied().collect();
+        let index_registry = self.pubkey_index.read();
+        pubkeys.iter().filter(|pubkey| index_registry.index_of(pubkey).is_some()).count()
+    }
+
     /// [`Self::submit_committee_subscriptions_with`], keeping no proof.
-    pub(crate) async fn submit_committee_subscriptions(&self, epoch: u64) {
-        self.submit_committee_subscriptions_with(epoch, &SelectionProofs::default()).await;
+    pub(crate) async fn submit_committee_subscriptions(
+        &self,
+        epoch: u64,
+    ) -> Result<(), OrchestratorError> {
+        self.submit_committee_subscriptions_with(epoch, &SelectionProofs::default()).await
     }
 
     /// Signs a selection proof for each local attester duty of `epoch` that
     /// `proofs` does not hold yet, keeping it there, and POSTs the epoch's
-    /// committee subscriptions. `true` when the epoch needs no further send:
-    /// the POST went out, or there is nothing to send. A failed or timed-out
-    /// POST is `false`.
+    /// committee subscriptions.
+    ///
+    /// `Ok` when the epoch needs no further send: the POST went out, or there
+    /// is nothing to send (no own duty, or the store gate closed or the
+    /// admission revoked for each one). A selection proof that fails to sign
+    /// is a warn, and skips its duty. A failed POST is
+    /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
+    /// is [`OrchestratorError::OperationTimedOut`].
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn submit_committee_subscriptions_with(
         &self,
         epoch: u64,
         proofs: &SelectionProofs,
-    ) -> bool {
+    ) -> Result<(), OrchestratorError> {
         let mut subscriptions = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
@@ -567,24 +618,24 @@ impl DutyManagementService {
         }
 
         if subscriptions.is_empty() {
-            return true;
+            return Ok(());
         }
 
         let count = subscriptions.len();
         match utils::timed(
-            "committee_subscription",
+            COMMITTEE_SUBSCRIPTION,
             self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
         {
-            TimedOutcome::Ok(_) => {
+            TimedOutcome::Ok(()) => {
                 info!(count, epoch, "Sent committee subscriptions");
-                true
+                Ok(())
             }
             TimedOutcome::Err(e) => {
                 warn!(epoch, error = %e, "Failed to send committee subscriptions");
-                false
+                Err(OrchestratorError::Beacon(e))
             }
             TimedOutcome::Timeout => {
                 warn!(
@@ -592,7 +643,7 @@ impl DutyManagementService {
                     "Committee subscription timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
                 );
-                false
+                Err(OrchestratorError::OperationTimedOut { operation: COMMITTEE_SUBSCRIPTION })
             }
         }
     }

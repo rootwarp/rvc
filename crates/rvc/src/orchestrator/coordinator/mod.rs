@@ -34,7 +34,7 @@ use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, TimingError, SLOT
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
-use super::duty_management::DutyManagementService;
+use super::duty_management::{DutyManagementService, PrepareOutcome};
 use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
@@ -247,7 +247,10 @@ async fn run_startup_proposer_preparation<C: SlotClock>(
                 continue;
             }
         };
-        let prepared = duty.prepare_proposers(epoch).await;
+        let prepared = matches!(
+            duty.prepare_proposers(epoch).await,
+            Ok(PrepareOutcome::Complete | PrepareOutcome::Partial { .. })
+        );
         let registered = startup_register_validators(builder.as_ref(), epoch).await;
         if prepared && registered {
             info!(epoch, "startup proposer preparation completed");
@@ -1801,8 +1804,18 @@ where
     ///
     /// A validator with `ValidatorStore::is_signing_enabled == false` is skipped
     /// before any selection proof (same store gate as aggregate production).
-    pub async fn submit_committee_subscriptions(&self, epoch: u64) {
-        self.duty_management.submit_committee_subscriptions(epoch).await;
+    /// `Ok` when the POST went out or there is nothing to send.
+    ///
+    /// # Errors
+    ///
+    /// [`OrchestratorError::Beacon`] when the POST fails, and
+    /// [`OrchestratorError::OperationTimedOut`] when it outlasts
+    /// `timeouts.preparation`.
+    pub async fn submit_committee_subscriptions(
+        &self,
+        epoch: u64,
+    ) -> Result<(), OrchestratorError> {
+        self.duty_management.submit_committee_subscriptions(epoch).await
     }
 
     /// Updates fork-resolution gauges and logs one info line per fork change.

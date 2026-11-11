@@ -10,8 +10,10 @@
 //! The order is per pass, not a barrier: the steps after a `Failed` or
 //! `NotReady` one still run in that pass. `DutyFetch` has no done mark: it
 //! runs in every pass while a step that needs duties is pending.
-//! `CommitteeSubscriptions` is `NotReady` until the attester duties of E and
-//! E+1 are cached. Each step with beacon-node work runs under its own bound,
+//! `PrepareProposers` is `NotReady` while a local key has no validator index,
+//! and sends again only once more keys have one. `CommitteeSubscriptions` is
+//! `NotReady` until the attester duties of E and E+1 are cached. Each step
+//! with beacon-node work runs under its own bound,
 //! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and CommitteeSubscriptions
 //! and `timeouts.preparation` for PrepareProposers: a step that reaches it is
 //! dropped and `Failed`. The first pass of a later epoch logs one warn for
@@ -65,7 +67,7 @@ use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
-use super::duty_management::{DutyManagementService, SelectionProofs};
+use super::duty_management::{DutyManagementService, PrepareOutcome, SelectionProofs};
 use super::utils;
 
 /// Executor task name. The runner's loop span has the same name.
@@ -175,6 +177,9 @@ pub(crate) struct EpochProgress {
     last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
     /// The duty epochs whose committee subscriptions went out.
     subscribed: BTreeSet<u64>,
+    /// The keys with a validator index when the last `Partial` prepare POST
+    /// went out.
+    prepared_count: Option<usize>,
 }
 
 impl EpochProgress {
@@ -184,6 +189,7 @@ impl EpochProgress {
             done: BTreeSet::new(),
             last_outcome: BTreeMap::new(),
             subscribed: BTreeSet::new(),
+            prepared_count: None,
         }
     }
 
@@ -450,13 +456,42 @@ impl EpochBoundaryRunner {
         StepOutcome::Done
     }
 
-    /// `Failed` when the epoch still needs a send: a failed or timed-out
-    /// POST, or a local validator whose index is not known yet.
+    /// `Done` once a POST covered every local key, and `Failed` on a failed
+    /// or timed-out POST. `NotReady` while a local key has no validator
+    /// index. After a `Partial` POST the step reads the registry and sends
+    /// again only when more keys have an index. The count is read before the
+    /// POST is built, so an index that lands after the read is sent at the
+    /// next pass, whether or not that POST had it.
     async fn prepare_proposers(&self, epoch: u64) -> StepOutcome {
-        if self.duty_management.prepare_proposers(epoch).await {
-            StepOutcome::Done
-        } else {
-            StepOutcome::Failed
+        let resolved = self.duty_management.resolved_proposer_count();
+        if self.prepared_count(epoch) == Some(resolved) {
+            debug!(epoch, resolved, "Proposer preparations wait for more validator indices");
+            return StepOutcome::NotReady;
+        }
+        match self.duty_management.prepare_proposers(epoch).await {
+            Ok(PrepareOutcome::Complete) => StepOutcome::Done,
+            Ok(PrepareOutcome::Partial { unresolved }) => {
+                debug!(
+                    epoch,
+                    resolved, unresolved, "Proposer preparations sent for part of the keys"
+                );
+                self.set_prepared_count(epoch, resolved);
+                StepOutcome::NotReady
+            }
+            Ok(PrepareOutcome::NoIndices) => StepOutcome::NotReady,
+            Err(_) => StepOutcome::Failed,
+        }
+    }
+
+    /// The `prepared_count` of `epoch`.
+    fn prepared_count(&self, epoch: u64) -> Option<usize> {
+        let progress = self.progress.lock();
+        progress.as_ref().filter(|p| p.epoch == epoch).and_then(|p| p.prepared_count)
+    }
+
+    fn set_prepared_count(&self, epoch: u64, resolved: usize) {
+        if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
+            current.prepared_count = Some(resolved);
         }
     }
 
@@ -477,7 +512,8 @@ impl EpochBoundaryRunner {
                 continue;
             }
             let proofs = &self.selection_proofs;
-            if self.duty_management.submit_committee_subscriptions_with(duty_epoch, proofs).await {
+            let post = self.duty_management.submit_committee_subscriptions_with(duty_epoch, proofs);
+            if post.await.is_ok() {
                 self.mark_subscribed(epoch, duty_epoch);
             } else {
                 outcome = StepOutcome::Failed;
@@ -677,10 +713,16 @@ mod tests {
         /// index resolver does mid-epoch. Every cached attester epoch stays
         /// present, under an index snapshot that is now stale.
         fn resolve_new_key(&self, index: &str) {
+            let pk_bytes = self.add_unresolved_key();
+            self.index_source.registry.write().insert(pk_bytes, index.to_string());
+        }
+
+        /// Adds a local key with no validator index yet, and returns it.
+        fn add_unresolved_key(&self) -> [u8; 48] {
             let pubkey = SecretKey::generate().public_key();
             let pk_bytes = pubkey.to_bytes();
             self.index_source.pubkey_map.write().insert(pk_bytes, pubkey);
-            self.index_source.registry.write().insert(pk_bytes, index.to_string());
+            pk_bytes
         }
     }
 
@@ -768,8 +810,9 @@ mod tests {
         fixture_with(mock, SecretKey::generate(), false).await
     }
 
-    /// Local validator 42 with an attester duty at slot 1 of every epoch;
-    /// epochs 1 and 2 are seeded through `fetch_duties_for_epoch`.
+    /// Local validator 42 with an attester duty at slot 1 of every epoch
+    /// requested with its index; epochs 1 and 2 are seeded through
+    /// `fetch_duties_for_epoch`.
     /// `with_builder` attaches a `BuilderService` over the same mock.
     async fn fixture_with(
         mock: MockBeaconNodeClient,
@@ -809,22 +852,25 @@ mod tests {
         let failing_subscriptions = Arc::new(parking_lot::Mutex::new(0_usize));
         let subscription_failures = Arc::clone(&failing_subscriptions);
         let mock = Arc::new(
-            mock.with_get_attester_duties(move |epoch, _indices| {
+            mock.with_get_attester_duties(move |epoch, indices| {
                 if take_failure(&failing, epoch) {
                     return Err(unavailable());
                 }
+                let duty = beacon::AttesterDuty {
+                    pubkey: pk_hex.clone(),
+                    validator_index: "42".to_string(),
+                    committee_index: "1".to_string(),
+                    committee_length: "8".to_string(),
+                    committees_at_slot: "4".to_string(),
+                    validator_committee_index: "0".to_string(),
+                    slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
+                };
+                let data =
+                    if indices.iter().any(|index| index == "42") { vec![duty] } else { Vec::new() };
                 Ok(beacon::DependentRootResponse {
                     dependent_root: ROOT_A.to_string(),
                     execution_optimistic: false,
-                    data: vec![beacon::AttesterDuty {
-                        pubkey: pk_hex.clone(),
-                        validator_index: "42".to_string(),
-                        committee_index: "1".to_string(),
-                        committee_length: "8".to_string(),
-                        committees_at_slot: "4".to_string(),
-                        validator_committee_index: "0".to_string(),
-                        slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
-                    }],
+                    data,
                 })
             })
             .with_prepare_beacon_proposer(move |_preparations| {
@@ -2903,5 +2949,125 @@ mod tests {
             ["Epoch boundary step timed out epoch=1 step=PrepareProposers timeout=3s"],
             "the step's bound fired, not the POST's"
         );
+    }
+
+    // --- W4-E3c: a key with no validator index keeps PrepareProposers pending ---
+
+    /// The validator indices of each prepare POST, sorted.
+    fn prepared_indices(mock: &MockBeaconNodeClient) -> Vec<Vec<String>> {
+        mock.prepare_beacon_proposer_calls()
+            .into_iter()
+            .map(|preparations| {
+                let mut indices: Vec<String> =
+                    preparations.into_iter().map(|p| p.validator_index).collect();
+                indices.sort();
+                indices
+            })
+            .collect()
+    }
+
+    /// 653-AC7: three local keys, two with an index. The slot-32 pass POSTs
+    /// the two, and PrepareProposers is `NotReady`. The slot-33 pass finds
+    /// the same two and sends nothing. Once the third index lands, the
+    /// slot-34 pass POSTs all three, and the step is done.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_partial_index_resolution_is_not_ready() {
+        use BoundaryStep::PrepareProposers;
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.resolve_new_key("43");
+        let late = f.add_unresolved_key();
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(prepared_indices(&f.mock), [["42", "43"]], "one POST of the two resolved");
+        assert_eq!(
+            step_state(&f.runner, PrepareProposers),
+            (Some(StepOutcome::NotReady), false),
+            "the third key has no index: not ready, and not done"
+        );
+        assert!(f.runner.has_pending(33));
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(arrivals(&f.mock, MockMethod::PrepareBeaconProposer), 1, "same two: no POST");
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::NotReady), false));
+
+        f.index_source.registry.write().insert(late, "44".to_string());
+        f.runner.run_pending(34).await;
+
+        assert_eq!(
+            prepared_indices(&f.mock),
+            [vec!["42", "43"], vec!["42", "43", "44"]],
+            "the third index landed: one POST of all three"
+        );
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
+        assert!(!f.runner.has_pending(35));
+    }
+
+    /// 653-AC8, the runner half: with no index for any local key, each of the
+    /// 32 passes of epoch 1 leaves PrepareProposers `NotReady`, with no
+    /// prepare POST and no signature. Control: once validator 42's index
+    /// lands, epoch 2's first pass POSTs it and signs its selection proofs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_no_resolved_indices_does_not_register_every_slot() {
+        use BoundaryStep::PrepareProposers;
+        let prep = MockMethod::PrepareBeaconProposer;
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        let registry = std::mem::take(&mut *f.index_source.registry.write());
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let named = |name: &str| spans.0.lock().iter().filter(|opened| **opened == name).count();
+        let signed = || spans.0.lock().iter().filter(|name| name.starts_with("sign.")).count();
+
+        for slot in 32..64 {
+            f.runner.run_pending(slot).await;
+            assert_eq!(
+                step_state(&f.runner, PrepareProposers),
+                (Some(StepOutcome::NotReady), false),
+                "slot {slot}: no index, not ready"
+            );
+        }
+
+        assert_eq!(arrivals(&f.mock, prep), 0, "no prepare POST in any pass");
+        assert_eq!(signed(), 0, "no signature in any pass");
+        assert_eq!(named("orchestrator.prepare_proposers"), 32, "the step ran in each pass");
+
+        *f.index_source.registry.write() = registry;
+        f.runner.run_pending(64).await;
+
+        assert_eq!(prepared_indices(&f.mock), [["42"]], "control: the index landed");
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
+        assert_eq!(signed(), 2, "control: the selection proofs of epochs 2 and 3 are signed");
+    }
+
+    /// The resolved count is read before the prepare POST. A key whose
+    /// index lands while the partial POST of validator 42 is in flight is
+    /// not in that POST, and the next pass sends it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_index_that_lands_during_a_partial_post_is_sent_at_the_next_pass() {
+        use BoundaryStep::PrepareProposers;
+        let prep = MockMethod::PrepareBeaconProposer;
+        let hold = Duration::from_secs(1);
+        let f = fixture(proposer_duties_at(ROOT_A).with_call_delays(prep, [hold])).await;
+        let late = f.add_unresolved_key();
+        let registry = Arc::clone(&f.index_source.registry);
+
+        tokio::join!(f.runner.run_pending(32), async {
+            tokio::time::sleep(hold / 2).await;
+            registry.write().insert(late, "44".to_string());
+        });
+
+        assert_eq!(prepared_indices(&f.mock), [["42"]], "built before the index landed");
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::NotReady), false));
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            prepared_indices(&f.mock),
+            [vec!["42"], vec!["42", "44"]],
+            "the next pass sends the key that resolved during the POST"
+        );
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
     }
 }

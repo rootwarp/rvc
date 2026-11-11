@@ -521,7 +521,8 @@ impl Harness {
         deps.pubkey_index = Arc::clone(&self.registry);
         let (orchestrator, _handle) = rvc::orchestrator::DutyOrchestrator::new(deps);
         let mark = self.mark().await;
-        orchestrator.submit_committee_subscriptions(epoch).await;
+        let sent = orchestrator.submit_committee_subscriptions(epoch).await;
+        assert!(matches!(sent, Ok(())), "a closed store gate is nothing to send: {sent:?}");
         let signed = self.since(mark).await.into_iter().any(|r| {
             r.method.as_str() == "POST"
                 && r.url.path() == "/eth/v1/validator/beacon_committee_subscriptions"
