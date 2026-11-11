@@ -607,6 +607,8 @@ impl LivenessObservationLoop {
                 fresh
             },
         );
+        #[cfg(test)]
+        tests::after_commit();
         drop(held);
         let Some(unobserved) = admitted else {
             debug!(
@@ -813,6 +815,7 @@ mod tests {
         static BEFORE_ADMISSION: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_COMMIT: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static INSIDE_COMMIT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static AFTER_COMMIT: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     fn fire(slot: &'static Slot) {
@@ -836,6 +839,11 @@ mod tests {
     /// After the token check, with the commit lock held, before the state write.
     pub(super) fn inside_commit() {
         fire(&INSIDE_COMMIT);
+    }
+
+    /// After the state write has returned, with the commit lock still held.
+    pub(super) fn after_commit() {
+        fire(&AFTER_COMMIT);
     }
 
     /// Clears its slot when dropped, also on a failed assert.
@@ -1849,6 +1857,264 @@ mod tests {
         assert!(!counted.registry.read().is_fresh());
         let requests = counted.bn.post_validator_liveness_calls().split_off(counted.before);
         assert_eq!(requests, vec![ask(12), ask(13)]);
+    }
+
+    /// A production writer raced against the closing tick's state commit.
+    #[derive(Debug, Clone, Copy)]
+    enum CommitRacer {
+        /// A real beacon-node revocation.
+        Revoker,
+        /// A real index-resolver revalidation of the same registry.
+        Revalidator,
+    }
+
+    /// When the racer starts.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RacerStart {
+        /// In the admission check, before the state write.
+        BeforeTheWrite,
+        /// After the state write has returned, before the commit lock is released.
+        AfterTheWrite,
+    }
+
+    /// One step of a commit race, in the order the steps happened.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        /// The state write returned; the key's status right then.
+        Committed(ForwardWindowStatus),
+        /// The racer had to wait for the commit lock.
+        RacerWaiting,
+        /// The racer finished; the key's status it then saw.
+        RacerDone(ForwardWindowStatus),
+    }
+
+    struct CommitRace {
+        counted: Counted,
+        steps: Vec<Step>,
+    }
+
+    /// Close the window on a real `BnManager`'s generation and commit lock,
+    /// with `racer` started at `start`, and record the steps in order.
+    ///
+    /// A racer started after the write is the latest point at which a racer
+    /// could get in before the commit lock is released: it must still have to
+    /// wait. The rendezvous waits only for the racer's first step (it waited,
+    /// or it finished), so a racer that does not wait shows up at once.
+    async fn race_the_commit(racer: Option<(CommitRacer, RacerStart)>) -> CommitRace {
+        use crate::index_resolver::{IndexResolver, IndexResolverDeps};
+        use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+
+        let manager = Arc::new(
+            BnManager::new(BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]))
+                .expect("one-node pool"),
+        );
+        let generation = manager.revocation_watch().generation().expect("a tracked generation");
+        let commit = manager.revocation_commit().expect("a commit lock");
+        let counted = counted_to_the_closing_epoch(
+            MidQuery::Nothing,
+            Arc::clone(&generation),
+            Some(Arc::clone(&commit)),
+        )
+        .await;
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (first_tx, first) = std::sync::mpsc::channel();
+        {
+            let (steps, first_tx) = (Arc::clone(&steps), first_tx.clone());
+            commit.on_contended(Some(Arc::new(move || {
+                steps.lock().push(Step::RacerWaiting);
+                let _ = first_tx.send(());
+            })));
+        }
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            counted.bytes,
+            counted.pk.clone(),
+        )])));
+        let hex = pubkey_bytes_to_0x(&counted.bytes);
+        let resolver_bn = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            let data = pks
+                .iter()
+                .filter(|pk| *pk == &hex)
+                .map(|pk| ValidatorData {
+                    index: "9".to_string(),
+                    status: "active_ongoing".to_string(),
+                    validator: ValidatorInfo { pubkey: pk.clone() },
+                })
+                .collect();
+            Ok(ValidatorsResponse { data })
+        }));
+        let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
+        let resolver = IndexResolver::new(
+            IndexResolverDeps {
+                registry: Arc::clone(&counted.registry),
+                pubkey_map,
+                beacon: resolver_bn,
+                key_gen_tx,
+                key_gen_rx,
+                epoch_clock: Arc::new(MonotonicEpochClock::with_start_time(
+                    0,
+                    std::time::Instant::now(),
+                    0,
+                    12_000,
+                )),
+            },
+            CancellationToken::new(),
+        );
+        let mut resolver = Some(resolver);
+        let handle = Arc::new(parking_lot::Mutex::new(None));
+        // Starts the racer on another thread and waits for its first step.
+        let start_racer = {
+            let (machine, pk) = (Arc::clone(&counted.machine), counted.pk.clone());
+            let (steps, handle) = (Arc::clone(&steps), Arc::clone(&handle));
+            let (manager, generation) = (Arc::clone(&manager), Arc::clone(&generation));
+            move |kind: CommitRacer| {
+                let (machine, pk, steps, done) =
+                    (Arc::clone(&machine), pk.clone(), Arc::clone(&steps), first_tx.clone());
+                let finish = move || {
+                    steps.lock().push(Step::RacerDone(machine.status(&pk)));
+                    let _ = done.send(());
+                };
+                let thread = match kind {
+                    CommitRacer::Revoker => {
+                        let manager = Arc::clone(&manager);
+                        std::thread::spawn(move || {
+                            manager.testing_revoke_admission(0);
+                            finish();
+                        })
+                    }
+                    CommitRacer::Revalidator => {
+                        // Only to put the resolver into revalidation: production
+                        // bumps go through `revoke_at`, under the commit lock.
+                        generation.fetch_add(1, Ordering::Release);
+                        let mut resolver = resolver.take().expect("one revalidator");
+                        std::thread::spawn(move || {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("revalidator runtime");
+                            runtime.block_on(resolver.drive_once_for_test(0));
+                            finish();
+                        })
+                    }
+                };
+                *handle.lock() = Some(thread);
+                first.recv_timeout(WATCHDOG).expect("the racer's first step");
+            }
+        };
+        let (racer_in_check, racer_after_write) = match racer {
+            Some((kind, RacerStart::BeforeTheWrite)) => (Some(kind), None),
+            Some((kind, RacerStart::AfterTheWrite)) => (None, Some(kind)),
+            None => (None, None),
+        };
+        // The rendezvous run on this thread, so the racer's starter needs no `Send`.
+        type Start = std::rc::Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+        let start_in_check = Start::default();
+        let _in_check = {
+            let start_in_check = Start::clone(&start_in_check);
+            arm(&INSIDE_COMMIT, move || {
+                let start = start_in_check.borrow_mut().take();
+                if let Some(start) = start {
+                    start();
+                }
+            })
+        };
+        let start_after_write = Start::default();
+        let _after_write = {
+            let (machine, pk) = (Arc::clone(&counted.machine), counted.pk.clone());
+            let (steps, start_after_write) = (Arc::clone(&steps), Start::clone(&start_after_write));
+            arm(&AFTER_COMMIT, move || {
+                steps.lock().push(Step::Committed(machine.status(&pk)));
+                let start = start_after_write.borrow_mut().take();
+                if let Some(start) = start {
+                    start();
+                }
+            })
+        };
+        // Exactly one of the two rendezvous gets the racer.
+        let start_racer: Box<dyn FnOnce(CommitRacer)> = Box::new(start_racer);
+        if let Some(kind) = racer_in_check {
+            *start_in_check.borrow_mut() = Some(Box::new(move || start_racer(kind)));
+        } else if let Some(kind) = racer_after_write {
+            *start_after_write.borrow_mut() = Some(Box::new(move || start_racer(kind)));
+        }
+
+        counted.loop_.drive_once_for_test(counted.closing, CLOSED_EPOCH_SLOT).await;
+
+        let racer_thread = handle.lock().take();
+        if let Some(thread) = racer_thread {
+            thread.join().expect("racer thread");
+        }
+        commit.on_contended(None);
+        let steps = steps.lock().clone();
+        CommitRace { counted, steps }
+    }
+
+    /// RSA M3 boundary: a revocation that starts after the state write has
+    /// returned still waits for the commit lock, and finishes after the commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_after_the_state_write_waits_until_the_commit_is_released() {
+        let race = race_the_commit(Some((CommitRacer::Revoker, RacerStart::AfterTheWrite))).await;
+
+        assert_eq!(
+            race.steps,
+            vec![
+                Step::Committed(ForwardWindowStatus::Safe),
+                Step::RacerWaiting,
+                Step::RacerDone(ForwardWindowStatus::Safe),
+            ],
+            "the revocation is excluded until the commit is released, then sees the commit"
+        );
+        assert_eq!(race.counted.generation.load(Ordering::Acquire), 1);
+        assert!(race.counted.machine.is_signing_enabled(&race.counted.pk));
+    }
+
+    /// RSA M3 boundary, revalidation side: a revalidation that starts after the
+    /// state write has returned still waits for the commit lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revalidation_after_the_state_write_waits_until_the_commit_is_released() {
+        let race =
+            race_the_commit(Some((CommitRacer::Revalidator, RacerStart::AfterTheWrite))).await;
+
+        assert_eq!(
+            race.steps,
+            vec![
+                Step::Committed(ForwardWindowStatus::Safe),
+                Step::RacerWaiting,
+                Step::RacerDone(ForwardWindowStatus::Safe),
+            ],
+            "the revalidation is excluded until the commit is released, then sees the commit"
+        );
+        let registry = race.counted.registry.read();
+        assert_eq!(registry.freshness(), crate::pubkey_index::RegistryFreshness::Fresh(1));
+        assert_eq!(registry.index_of(&race.counted.bytes), Some("9"), "it ran after the commit");
+    }
+
+    /// A revocation that starts in the admission check, before the state write,
+    /// is still waiting when the write has returned, and finishes after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_started_before_the_state_write_finishes_after_the_commit() {
+        let race = race_the_commit(Some((CommitRacer::Revoker, RacerStart::BeforeTheWrite))).await;
+
+        assert_eq!(
+            race.steps,
+            vec![
+                Step::RacerWaiting,
+                Step::Committed(ForwardWindowStatus::Safe),
+                Step::RacerDone(ForwardWindowStatus::Safe),
+            ],
+            "the revocation waits through the state write and finishes after the commit"
+        );
+        assert_eq!(race.counted.generation.load(Ordering::Acquire), 1);
+    }
+
+    /// Healthy control: the same rendezvous with no racer commits Safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_commit_rendezvous_with_no_racer_reaches_safe() {
+        let race = race_the_commit(None).await;
+
+        assert_eq!(race.steps, vec![Step::Committed(ForwardWindowStatus::Safe)]);
+        assert_eq!(race.counted.generation.load(Ordering::Acquire), 0);
+        assert!(race.counted.machine.is_signing_enabled(&race.counted.pk));
+        assert!(race.counted.registry.read().is_fresh());
     }
 
     /// What happens to the index registry during the closing tick.
