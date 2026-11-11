@@ -586,7 +586,8 @@ impl ForwardWindowMachine {
         current_epoch: Epoch,
         slot_in_epoch: u64,
     ) -> Vec<(Epoch, String)> {
-        self.apply_liveness(answers, current_epoch, slot_in_epoch, false)
+        self.apply_liveness_if(answers, current_epoch, slot_in_epoch, false, || true)
+            .unwrap_or_default()
     }
 
     /// Apply live samples and skip every not-live decrement.
@@ -596,16 +597,26 @@ impl ForwardWindowMachine {
     /// not-live answer does not decrement.
     #[must_use = "unobserved keys stay Pending; log or retry them"]
     pub fn apply_live_answers_only(&self, answers: &[EpochLiveness]) -> Vec<(Epoch, String)> {
-        self.apply_liveness(answers, 0, 0, true)
+        self.apply_liveness_if(answers, 0, 0, true, || true).unwrap_or_default()
     }
 
-    fn apply_liveness(
+    /// [`Self::apply_liveness_tick`], or [`Self::apply_live_answers_only`] when
+    /// `skip_decrement`, applied only if `admit` returns `true`.
+    ///
+    /// `admit` runs under the state lock, before any state changes. For every
+    /// reader of this machine the check and the batch are one step, so a change
+    /// the caller checks for that lands after `admit` is ordered after the
+    /// batch. A refused batch changes nothing and returns `None`. `admit` must
+    /// not call back into this machine.
+    #[must_use = "unobserved keys stay Pending; log or retry them"]
+    pub fn apply_liveness_if(
         &self,
         answers: &[EpochLiveness],
         current_epoch: Epoch,
         slot_in_epoch: u64,
         skip_decrement: bool,
-    ) -> Vec<(Epoch, String)> {
+        admit: impl FnOnce() -> bool,
+    ) -> Option<Vec<(Epoch, String)>> {
         let folded: Vec<(Epoch, Option<HashMap<&str, bool>>)> = answers
             .iter()
             .map(|answer| (answer.epoch, answer.samples.as_deref().map(or_fold_samples)))
@@ -614,6 +625,9 @@ impl ForwardWindowMachine {
 
         let latch_hook = self.latch_hook_snapshot();
         let mut states = self.states.lock();
+        if !admit() {
+            return None;
+        }
         let mut unobserved = Vec::new();
         let mut arm_latch = false;
         let mut window_completed = false;
@@ -702,7 +716,7 @@ impl ForwardWindowMachine {
             self.consume_force_window();
         }
         unobserved.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        unobserved
+        Some(unobserved)
     }
 
     /// Drop `Pending`, `Safe`, or `Unmonitored` state so the next register starts fresh.
@@ -822,6 +836,105 @@ mod tests {
             epoch,
             0,
         );
+    }
+
+    fn not_live_tick(pubkey: &crypto::PublicKey, current: Epoch) -> [EpochLiveness; 2] {
+        let sample =
+            || ValidatorLivenessData { index: hex::encode(pubkey.to_bytes()), is_live: false };
+        [current - 1, current].map(|epoch| EpochLiveness { epoch, samples: Some(vec![sample()]) })
+    }
+
+    /// A refused batch changes nothing: not the count, not `Safe`, not a detection.
+    #[test]
+    fn a_refused_liveness_batch_changes_nothing() {
+        let machine = machine();
+        let key = pubkey();
+        machine.register(&key, 10);
+        let first = not_live_tick(&key, 11);
+        let admitted =
+            machine.apply_liveness_if(&first, 11, crate::CLOSED_EPOCH_SLOT, false, || true);
+        assert_eq!(admitted, Some(Vec::new()));
+        let counted = machine.pending_keys();
+        assert_eq!(counted.iter().map(|k| k.next_check_epoch).collect::<Vec<_>>(), vec![11]);
+
+        let closing = not_live_tick(&key, 12);
+        let refused =
+            machine.apply_liveness_if(&closing, 12, crate::CLOSED_EPOCH_SLOT, false, || false);
+        assert_eq!(refused, None);
+        assert_eq!(
+            machine.status(&key),
+            ForwardWindowStatus::Pending,
+            "a refused batch does not open"
+        );
+        assert_eq!(machine.pending_keys(), counted, "and does not count");
+        let live = [EpochLiveness {
+            epoch: 12,
+            samples: Some(vec![ValidatorLivenessData {
+                index: hex::encode(key.to_bytes()),
+                is_live: true,
+            }]),
+        }];
+        assert_eq!(machine.apply_liveness_if(&live, 12, 0, true, || false), None);
+        assert_eq!(machine.status(&key), ForwardWindowStatus::Pending, "nor detect");
+        assert!(!machine.detected_latch());
+
+        let admitted =
+            machine.apply_liveness_if(&closing, 12, crate::CLOSED_EPOCH_SLOT, false, || true);
+        assert_eq!(admitted, Some(Vec::new()));
+        assert_eq!(machine.status(&key), ForwardWindowStatus::Safe, "the same batch, admitted");
+    }
+
+    /// A live-only pass detects a live key, counts no not-live answer and
+    /// reports a due key with no sample.
+    #[test]
+    fn a_live_only_pass_detects_and_never_counts() {
+        let machine = machine();
+        let (live, quiet, silent) = (pubkey(), pubkey(), pubkey());
+        for key in [&live, &quiet, &silent] {
+            machine.register(key, 10);
+        }
+        let sample = |key: &crypto::PublicKey, is_live| ValidatorLivenessData {
+            index: hex::encode(key.to_bytes()),
+            is_live,
+        };
+        let answers = [EpochLiveness {
+            epoch: 10,
+            samples: Some(vec![sample(&live, true), sample(&quiet, false)]),
+        }];
+
+        let unobserved = machine.apply_live_answers_only(&answers);
+
+        assert_eq!(machine.status(&live), ForwardWindowStatus::Detected);
+        assert_eq!(machine.status(&quiet), ForwardWindowStatus::Pending);
+        let quiet_hex = hex::encode(quiet.to_bytes());
+        let quiet_next = machine
+            .pending_keys()
+            .into_iter()
+            .find(|key| key.pubkey_hex == quiet_hex)
+            .map(|key| key.next_check_epoch);
+        assert_eq!(quiet_next, Some(10), "a not-live answer is not counted");
+        assert_eq!(unobserved, vec![(10, hex::encode(silent.to_bytes()))]);
+    }
+
+    /// The admission check runs while the state lock is held.
+    #[test]
+    fn liveness_admission_runs_under_the_state_lock() {
+        let machine = machine();
+        let key = pubkey();
+        machine.register(&key, 10);
+        let mut checked = false;
+        let admitted = machine.apply_liveness_if(
+            &not_live_tick(&key, 11),
+            11,
+            crate::CLOSED_EPOCH_SLOT,
+            false,
+            || {
+                checked = true;
+                machine.states.try_lock().is_none()
+            },
+        );
+        assert!(checked, "admit ran");
+        assert_eq!(admitted, Some(Vec::new()), "admit saw the state lock held");
     }
 
     #[test]
