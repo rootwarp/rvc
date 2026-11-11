@@ -394,6 +394,16 @@ fn sync_committee_subscription() -> SyncCommitteeSubscription {
     }
 }
 
+async fn sync_committee_subscription_posts(server: &MockServer) -> usize {
+    let requests = server.received_requests().await.expect("received_requests");
+    requests
+        .iter()
+        .filter(|req| {
+            req.method.as_str() == "POST" && req.url.path() == SYNC_COMMITTEE_SUBSCRIPTIONS_PATH
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn test_submit_sync_committee_subscriptions_delegates() {
     let mock_server = MockServer::start().await;
@@ -2689,12 +2699,16 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// BN-A answers at once and BN-B is held until the test releases it. First OK
-/// returns while BN-B is held; waiting for every BN would block until the hang
-/// guard, which is shorter than the 30 s client timeout that would end BN-B.
+/// BN-A answers at once and BN-B is held until the test releases it. The task
+/// records whether BN-B was still held when the call returned. The test
+/// releases BN-B when the call returns, or after `HOLD_LIMIT` if it has not,
+/// and then requires that record. A call that waits for every BN cannot return
+/// before the release, so it fails the assertion on every run. `HOLD_LIMIT` is
+/// shorter than the 30 s client timeout that would end BN-B.
 #[tokio::test]
 async fn test_submit_sync_committee_subscriptions_first_ok_with_held_bn() {
     const HANG_GUARD: Duration = Duration::from_secs(10);
+    const HOLD_LIMIT: Duration = Duration::from_secs(10);
 
     let bn_a = MockServer::start().await;
     let bn_b = MockServer::start().await;
@@ -2710,28 +2724,43 @@ async fn test_submit_sync_committee_subscriptions_first_ok_with_held_bn() {
         .await;
     Mock::given(method("POST"))
         .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
-        .respond_with(HeldResponder { arrived: Arc::clone(&arrived), released })
+        .respond_with(HeldResponder {
+            arrived: Arc::clone(&arrived),
+            released: Arc::clone(&released),
+        })
         .expect(1)
         .mount(&bn_b)
         .await;
 
     let manager = Arc::new(make_multi_manager(&[&bn_a.uri(), &bn_b.uri()]));
-    let call = tokio::spawn({
+    let mut call = tokio::spawn({
         let manager = Arc::clone(&manager);
         async move {
-            manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await
+            let result =
+                manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+            let held = !*released.0.lock().unwrap_or_else(|err| err.into_inner());
+            (result, held)
         }
     });
 
     tokio::time::timeout(HANG_GUARD, arrived.notified())
         .await
         .expect("BN-B never received the subscriptions");
-    let result = tokio::time::timeout(HANG_GUARD, call)
-        .await
-        .expect("the call waited for the held BN-B")
-        .expect("submit task panicked");
-    assert!(matches!(result, Ok(())), "{result:?}");
+    let early = tokio::time::timeout(HOLD_LIMIT, &mut call).await;
     drop(release);
+    let joined = match early {
+        Ok(joined) => joined,
+        Err(_) => tokio::time::timeout(HANG_GUARD, call)
+            .await
+            .expect("the call did not end after BN-B was released"),
+    };
+    let (result, held_at_return) = joined.expect("submit task panicked");
+    assert!(
+        held_at_return,
+        "first OK must return while BN-B is held; the call returned only after BN-B was \
+         released: {result:?}"
+    );
+    assert!(matches!(result, Ok(())), "{result:?}");
 }
 
 #[tokio::test]
@@ -2758,6 +2787,62 @@ async fn test_submit_sync_committee_subscriptions_query_first_when_broadcast_off
     let result =
         manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
     assert!(matches!(result, Ok(())), "{result:?}");
+
+    // A broadcast would leave BN-2's POST on a detached drain. Zero waits until
+    // every drain ends, so a broadcast has reached BN-2 before the count.
+    manager.wait_for_broadcast_drains(Duration::ZERO).await;
+    assert_eq!(sync_committee_subscription_posts(&bn1).await, 1);
+    assert_eq!(
+        sync_committee_subscription_posts(&bn2).await,
+        0,
+        "query-first must not reach BN-2 after BN-1 answered"
+    );
+}
+
+/// BN-0 holds every concrete role except Submission and BN-1 is Submission
+/// only. Both answer 200, so only the request counts show which role was used.
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_uses_the_submission_role() {
+    let off_role = MockServer::start().await;
+    let submission = MockServer::start().await;
+
+    for bn in [&off_role, &submission] {
+        Mock::given(method("POST"))
+            .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(bn)
+            .await;
+    }
+
+    let mut config = BnManagerConfig::new(vec![off_role.uri(), submission.uri()]);
+    config.roles = vec![
+        HashSet::from([
+            BnRole::Attestation,
+            BnRole::Proposal,
+            BnRole::SyncCommittee,
+            BnRole::Aggregation,
+        ]),
+        role_set(BnRole::Submission),
+    ];
+    let manager = BnManager::new(config).unwrap();
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(
+        matches!(result, Ok(())),
+        "a Submission-only BN must accept this operation: {result:?}"
+    );
+
+    manager.wait_for_broadcast_drains(Duration::ZERO).await;
+    assert_eq!(
+        sync_committee_subscription_posts(&submission).await,
+        1,
+        "the Submission-only BN must receive the subscriptions"
+    );
+    assert_eq!(
+        sync_committee_subscription_posts(&off_role).await,
+        0,
+        "a BN without the Submission role must not receive the subscriptions"
+    );
 }
 
 #[tokio::test]
