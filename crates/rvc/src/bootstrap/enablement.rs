@@ -145,6 +145,9 @@ pub async fn wire_signing_enablement(
     if let Some(generation) = revocation.generation() {
         pubkey_index.write().attach_revocation(generation, revocation.seen());
     }
+    if let Some(commit) = beacon_for_resolve.revocation_commit() {
+        pubkey_index.write().attach_commit(commit);
+    }
 
     if epoch0_bypass && doppelganger_enabled {
         info!(
@@ -1138,6 +1141,12 @@ mod tests {
             let booted: Vec<String> = if indexed { vec!["5".to_string()] } else { Vec::new() };
 
             assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(0), "{mode:?}");
+            let attached = registry.read().revocation_commit();
+            let owned = beacon.bn_manager.revocation_commit().expect("BnManager has a commit lock");
+            assert!(
+                attached.is_some_and(|attached| Arc::ptr_eq(&attached, &owned)),
+                "{mode:?}: boot attaches the BnManager's commit lock"
+            );
             assert_eq!(source.indices(), booted, "{mode:?}");
             beacon.bn_manager.testing_revoke_admission(0);
             assert_eq!(

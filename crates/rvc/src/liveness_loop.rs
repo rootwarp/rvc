@@ -32,9 +32,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::LivenessApi;
 #[cfg(any(test, feature = "test-utils"))]
 use bn_manager::NodeStatusApi;
+use bn_manager::{LivenessApi, RevocationCommit};
 use doppelganger::{
     EpochLiveness, ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock,
     ValidatorLivenessData,
@@ -570,11 +570,14 @@ impl LivenessObservationLoop {
     /// Apply one tick's answers if the index registry still has the freshness
     /// token they were read under.
     ///
-    /// The token is compared under the forward-window state lock, before any
-    /// state changes; that check is the tick's linearization point. A
-    /// revocation or revalidation before it drops the whole tick, so nothing
-    /// from it counts, opens the gate or detects. One after it is ordered after
-    /// the tick.
+    /// The token check and the state change run under the registry's
+    /// [`RevocationCommit`], which every revocation-generation bump and every
+    /// registry revalidation also holds. Lock order: the commit lock, then the
+    /// forward-window state mutex (inside `apply_liveness_if`), then the
+    /// registry read in the check. A revocation or revalidation that finished
+    /// before the commit lock was taken moves the token, and the whole tick is
+    /// dropped: nothing from it counts, opens the gate or detects. One that
+    /// arrives while the lock is held waits until the state is written.
     ///
     /// A key with no validator index is logged once at info. An omitted or
     /// failed answer for a key that has an index is warned once per
@@ -588,13 +591,23 @@ impl LivenessObservationLoop {
     ) {
         #[cfg(test)]
         tests::before_admission();
+        let commit = self.pubkey_index.read().revocation_commit();
+        #[cfg(test)]
+        tests::before_commit();
+        let held = commit.as_deref().map(RevocationCommit::hold);
         let admitted = self.machine.apply_liveness_if(
             &observation.answers,
             current_epoch,
             slot_in_epoch,
             skip_decrement,
-            || self.indices_unchanged_since(observation.freshness),
+            || {
+                let fresh = self.indices_unchanged_since(observation.freshness);
+                #[cfg(test)]
+                tests::inside_commit();
+                fresh
+            },
         );
+        drop(held);
         let Some(unobserved) = admitted else {
             debug!(
                 current_epoch,
@@ -791,35 +804,61 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    // Test-only rendezvous between a tick's last answer and its admission. It
-    // lives in this module because the spawn census needs the test module last.
+    // Test-only rendezvous points in `record_liveness`. They live in this
+    // module because the spawn census needs the test module last.
     type Hook = Box<dyn FnMut()>;
+    type Slot = std::thread::LocalKey<RefCell<Option<Hook>>>;
 
     thread_local! {
         static BEFORE_ADMISSION: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_COMMIT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static INSIDE_COMMIT: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
-    /// Runs the armed hook after the last answer, before the answers are applied.
-    pub(super) fn before_admission() {
-        BEFORE_ADMISSION.with(|slot| {
-            if let Some(hook) = slot.borrow_mut().as_mut() {
+    fn fire(slot: &'static Slot) {
+        slot.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
                 hook();
             }
         });
     }
 
-    /// Clears the hook when dropped, also on a failed assert.
-    struct Armed;
+    /// After the last answer, before admission starts.
+    pub(super) fn before_admission() {
+        fire(&BEFORE_ADMISSION);
+    }
+
+    /// The last point before the state commit at which a writer can finish.
+    pub(super) fn before_commit() {
+        fire(&BEFORE_COMMIT);
+    }
+
+    /// After the token check, with the commit lock held, before the state write.
+    pub(super) fn inside_commit() {
+        fire(&INSIDE_COMMIT);
+    }
+
+    /// Clears its slot when dropped, also on a failed assert.
+    struct Armed(&'static Slot);
 
     impl Drop for Armed {
         fn drop(&mut self) {
-            BEFORE_ADMISSION.with(|slot| *slot.borrow_mut() = None);
+            self.0.with(|hook| *hook.borrow_mut() = None);
         }
     }
 
+    fn arm(slot: &'static Slot, hook: impl FnMut() + 'static) -> Armed {
+        slot.with(|armed| *armed.borrow_mut() = Some(Box::new(hook)));
+        Armed(slot)
+    }
+
     fn arm_before_admission(hook: impl FnMut() + 'static) -> Armed {
-        BEFORE_ADMISSION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-        Armed
+        arm(&BEFORE_ADMISSION, hook)
+    }
+
+    /// Runs `writer` on another thread and waits for it, so the order is fixed.
+    fn on_another_thread<T: Send + 'static>(writer: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(writer).join().expect("writer thread")
     }
     use crate::pubkey_index::PubkeyIndexRegistry;
     use bn_manager::MockBeaconNodeClient;
@@ -1638,6 +1677,15 @@ mod tests {
             Self { machine, pk, bn, loop_, generation }
         }
 
+        /// Revoke on another thread at the last point before the state commit.
+        fn revoke_before_commit(&self) -> Armed {
+            let generation = Arc::clone(&self.generation);
+            arm(&BEFORE_COMMIT, move || {
+                let generation = Arc::clone(&generation);
+                on_another_thread(move || generation.fetch_add(1, Ordering::Release));
+            })
+        }
+
         /// Revoke after the last answer, at the admission rendezvous.
         fn revoke_before_admission(&self) -> Armed {
             let generation = Arc::clone(&self.generation);
@@ -1730,6 +1778,79 @@ mod tests {
         assert_eq!(probe.next_checks(), vec![10], "nothing from the tick is counted");
     }
 
+    /// What a writer reported first.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Writer {
+        /// It has to wait for the commit lock.
+        Waiting,
+        /// It finished.
+        Done,
+    }
+
+    /// Bound for a signal that arrives at once; only a missing lock waits it out.
+    const WATCHDOG: Duration = Duration::from_secs(10);
+
+    /// A real beacon-node revocation that starts after the closing tick's token
+    /// check, while the commit lock is held, waits until the state is written.
+    /// The key goes Safe on answers that were fresh at the check, and the
+    /// revocation lands after that write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_during_the_commit_waits_until_the_state_is_written() {
+        use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+
+        let manager = Arc::new(
+            BnManager::new(BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]))
+                .expect("one-node pool"),
+        );
+        let generation = manager.revocation_watch().generation().expect("a tracked generation");
+        let commit = manager.revocation_commit().expect("a commit lock");
+        let counted = counted_to_the_closing_epoch(
+            MidQuery::Nothing,
+            Arc::clone(&generation),
+            Some(Arc::clone(&commit)),
+        )
+        .await;
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let contended = events_tx.clone();
+        commit.on_contended(Some(Arc::new(move || {
+            let _ = contended.send(Writer::Waiting);
+        })));
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let revoker = Arc::new(parking_lot::Mutex::new(None));
+        let _armed = {
+            let (manager, generation) = (Arc::clone(&manager), Arc::clone(&generation));
+            let (seen, revoker) = (Arc::clone(&seen), Arc::clone(&revoker));
+            arm(&INSIDE_COMMIT, move || {
+                let (manager, done) = (Arc::clone(&manager), events_tx.clone());
+                *revoker.lock() = Some(std::thread::spawn(move || {
+                    manager.testing_revoke_admission(0);
+                    let _ = done.send(Writer::Done);
+                }));
+                let first = events.recv_timeout(WATCHDOG).ok();
+                *seen.lock() = Some((first, generation.load(Ordering::Acquire)));
+            })
+        };
+
+        counted.loop_.drive_once_for_test(counted.closing, CLOSED_EPOCH_SLOT).await;
+
+        let revoker = revoker.lock().take().expect("the rendezvous ran");
+        revoker.join().expect("revoker");
+        commit.on_contended(None);
+        let (first, generation_then) = seen.lock().take().expect("the rendezvous ran");
+        assert_eq!(first, Some(Writer::Waiting), "the revocation waited for the commit lock");
+        assert_eq!(generation_then, 0, "and had not bumped the generation");
+        assert_eq!(
+            counted.machine.status(&counted.pk),
+            ForwardWindowStatus::Safe,
+            "the state was written first, on answers fresh at the check"
+        );
+        assert!(counted.machine.is_signing_enabled(&counted.pk));
+        assert_eq!(generation.load(Ordering::Acquire), 1, "the revocation landed after the write");
+        assert!(!counted.registry.read().is_fresh());
+        let requests = counted.bn.post_validator_liveness_calls().split_off(counted.before);
+        assert_eq!(requests, vec![ask(12), ask(13)]);
+    }
+
     /// What happens to the index registry during the closing tick.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum MidQuery {
@@ -1737,6 +1858,8 @@ mod tests {
         Revoke,
         /// Revoke, then revalidate the key to index 9 before the old answer is used.
         RevokeAndRevalidateTo9,
+        /// Revoke, revalidate the key to index 9, then revoke again.
+        TwoRevokers,
     }
 
     /// When the closing tick's change happens.
@@ -1746,6 +1869,8 @@ mod tests {
         FirstQuery,
         /// After the last answer, at the admission rendezvous.
         BeforeAdmission,
+        /// At the last point before the state commit at which a writer can finish.
+        BeforeCommit,
     }
 
     struct ClosingTick {
@@ -1754,38 +1879,63 @@ mod tests {
         registry: SharedPubkeyIndexRegistry,
         /// The closing tick's liveness requests.
         requests: Vec<(u64, Vec<String>)>,
-        /// Whether the admission rendezvous ran during the closing tick.
-        reached_admission: bool,
+        /// Whether the armed rendezvous ran during the closing tick.
+        reached_rendezvous: bool,
     }
 
-    /// Another thread applies `change`, joined so the order is fixed.
+    /// Applies `change` with each writer on its own joined thread, so the order is fixed.
     fn change_registry(
         change: MidQuery,
         generation: &Arc<std::sync::atomic::AtomicU64>,
         registry: &SharedPubkeyIndexRegistry,
         key: [u8; 48],
     ) {
-        if change == MidQuery::Nothing {
-            return;
-        }
-        let (generation, registry) = (Arc::clone(generation), Arc::clone(registry));
-        std::thread::spawn(move || {
-            let now = generation.fetch_add(1, Ordering::Release) + 1;
-            if change == MidQuery::RevokeAndRevalidateTo9 {
+        let revoke = || {
+            let generation = Arc::clone(generation);
+            on_another_thread(move || generation.fetch_add(1, Ordering::Release) + 1)
+        };
+        let revalidate_to_9 = |seen: u64| {
+            let registry = Arc::clone(registry);
+            on_another_thread(move || {
                 let answer = HashMap::from([(key, "9".to_string())]);
-                assert!(registry.write().revalidate(now, &answer));
+                assert!(registry.write().revalidate(seen, &answer));
+            });
+        };
+        match change {
+            MidQuery::Nothing => {}
+            MidQuery::Revoke => {
+                revoke();
             }
-        })
-        .join()
-        .expect("registry change");
+            MidQuery::RevokeAndRevalidateTo9 => revalidate_to_9(revoke()),
+            MidQuery::TwoRevokers => {
+                revalidate_to_9(revoke());
+                revoke();
+            }
+        }
     }
 
-    /// Register at epoch 10 with index 4 under generation 0, and count every
-    /// epoch but the last with no change. Then run the closing tick at epoch 13
-    /// and apply `change` `at` the given point.
-    async fn closing_tick(change: MidQuery, at: ChangeAt) -> ClosingTick {
-        use std::sync::atomic::AtomicU64;
+    /// A key registered at epoch 10 with index 4 under `generation` (at 0),
+    /// with every epoch but the closing one counted with no change.
+    struct Counted {
+        machine: Arc<ForwardWindowMachine>,
+        pk: crypto::PublicKey,
+        bytes: [u8; 48],
+        registry: SharedPubkeyIndexRegistry,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        /// Applies the fixture's change inside the next liveness query.
+        armed: Arc<AtomicBool>,
+        bn: Arc<MockBeaconNodeClient>,
+        loop_: LivenessObservationLoop,
+        closing: u64,
+        /// Liveness requests made before the closing tick.
+        before: usize,
+    }
 
+    async fn counted_to_the_closing_epoch(
+        change: MidQuery,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        commit: Option<Arc<RevocationCommit>>,
+    ) -> Counted {
         let machine = machine();
         let pk = new_pk();
         let bytes = pk.to_bytes();
@@ -1793,8 +1943,10 @@ mod tests {
         machine.register(&pk, start);
         let registry = PubkeyIndexRegistry::shared();
         registry.write().insert(bytes, "4".to_string());
-        let generation = Arc::new(AtomicU64::new(0));
         registry.write().attach_revocation(Arc::clone(&generation), 0);
+        if let Some(commit) = commit {
+            registry.write().attach_commit(commit);
+        }
         let armed = Arc::new(AtomicBool::new(false));
         let bn = {
             let (armed, generation, registry) =
@@ -1830,13 +1982,29 @@ mod tests {
             "precondition: one count left"
         );
         let before = bn.post_validator_liveness_calls().len();
+        Counted { machine, pk, bytes, registry, generation, armed, bn, loop_, closing, before }
+    }
+
+    /// Run the closing tick at epoch 13 of [`counted_to_the_closing_epoch`] and
+    /// apply `change` `at` the given point.
+    async fn closing_tick(change: MidQuery, at: ChangeAt) -> ClosingTick {
+        use std::sync::atomic::AtomicU64;
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let Counted { machine, pk, bytes, registry, generation, armed, bn, loop_, closing, before } =
+            counted_to_the_closing_epoch(change, generation, None).await;
         let reached = Arc::new(AtomicBool::new(false));
 
         armed.store(at == ChangeAt::FirstQuery, Ordering::SeqCst);
-        let _armed = (at == ChangeAt::BeforeAdmission).then(|| {
+        let slot: Option<&'static Slot> = match at {
+            ChangeAt::FirstQuery => None,
+            ChangeAt::BeforeAdmission => Some(&BEFORE_ADMISSION),
+            ChangeAt::BeforeCommit => Some(&BEFORE_COMMIT),
+        };
+        let _armed = slot.map(|slot| {
             let (reached, generation, registry) =
                 (Arc::clone(&reached), Arc::clone(&generation), Arc::clone(&registry));
-            arm_before_admission(move || {
+            arm(slot, move || {
                 reached.store(true, Ordering::SeqCst);
                 change_registry(change, &generation, &registry, bytes);
             })
@@ -1844,8 +2012,8 @@ mod tests {
         loop_.drive_once_for_test(closing, CLOSED_EPOCH_SLOT).await;
 
         let requests = bn.post_validator_liveness_calls().split_off(before);
-        let reached_admission = reached.load(Ordering::SeqCst);
-        ClosingTick { machine, pk, registry, requests, reached_admission }
+        let reached_rendezvous = reached.load(Ordering::SeqCst);
+        ClosingTick { machine, pk, registry, requests, reached_rendezvous }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1896,7 +2064,7 @@ mod tests {
     async fn a_revocation_after_the_last_answer_keeps_signing_closed() {
         let tick = closing_tick(MidQuery::Revoke, ChangeAt::BeforeAdmission).await;
 
-        assert!(tick.reached_admission, "precondition: the rendezvous ran");
+        assert!(tick.reached_rendezvous, "precondition: the rendezvous ran");
         assert!(!tick.registry.read().is_fresh(), "precondition: revoked before admission");
         assert_eq!(tick.requests, vec![ask(12), ask(13)], "both queries ran before it");
         assert_eq!(
@@ -1913,7 +2081,7 @@ mod tests {
     async fn a_revalidation_to_another_index_after_the_last_answer_keeps_signing_closed() {
         let tick = closing_tick(MidQuery::RevokeAndRevalidateTo9, ChangeAt::BeforeAdmission).await;
 
-        assert!(tick.reached_admission, "precondition: the rendezvous ran");
+        assert!(tick.reached_rendezvous, "precondition: the rendezvous ran");
         let registry = tick.registry.read();
         assert_eq!(registry.freshness(), crate::pubkey_index::RegistryFreshness::Fresh(1));
         assert_eq!(registry.index_of(&tick.pk.to_bytes()), Some("9"), "precondition");
@@ -1931,10 +2099,91 @@ mod tests {
     async fn the_closing_tick_opens_signing_through_the_admission_rendezvous() {
         let tick = closing_tick(MidQuery::Nothing, ChangeAt::BeforeAdmission).await;
 
-        assert!(tick.reached_admission, "the rendezvous ran with no change");
+        assert!(tick.reached_rendezvous, "the rendezvous ran with no change");
         assert_eq!(tick.requests, vec![ask(12), ask(13)]);
         assert_eq!(tick.machine.status(&tick.pk), ForwardWindowStatus::Safe);
         assert!(tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    /// A revocation finishes at the last point a writer can finish before the
+    /// closing tick's state commit. A finished revocation is never followed by
+    /// that commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_finished_just_before_the_commit_keeps_signing_closed() {
+        let tick = closing_tick(MidQuery::Revoke, ChangeAt::BeforeCommit).await;
+
+        assert!(tick.reached_rendezvous, "precondition: the rendezvous ran");
+        assert!(!tick.registry.read().is_fresh(), "precondition: revoked");
+        assert_eq!(tick.requests, vec![ask(12), ask(13)], "both queries ran before it");
+        assert_eq!(
+            tick.machine.status(&tick.pk),
+            ForwardWindowStatus::Pending,
+            "a finished revocation must keep the key Pending"
+        );
+        assert!(!tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revalidation_to_another_index_finished_just_before_the_commit_keeps_signing_closed()
+    {
+        let tick = closing_tick(MidQuery::RevokeAndRevalidateTo9, ChangeAt::BeforeCommit).await;
+
+        assert!(tick.reached_rendezvous, "precondition: the rendezvous ran");
+        let registry = tick.registry.read();
+        assert_eq!(registry.freshness(), crate::pubkey_index::RegistryFreshness::Fresh(1));
+        assert_eq!(registry.index_of(&tick.pk.to_bytes()), Some("9"), "precondition");
+        drop(registry);
+        assert_eq!(
+            tick.machine.status(&tick.pk),
+            ForwardWindowStatus::Pending,
+            "answers about index 4 must not count once the key is index 9"
+        );
+        assert!(!tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_revocations_around_a_revalidation_finished_just_before_the_commit_keep_signing_closed(
+    ) {
+        let tick = closing_tick(MidQuery::TwoRevokers, ChangeAt::BeforeCommit).await;
+
+        assert!(tick.reached_rendezvous, "precondition: the rendezvous ran");
+        let registry = tick.registry.read();
+        assert_eq!(registry.generation(), Some(2), "precondition: two revocations");
+        assert!(!registry.is_fresh(), "precondition: revalidated under 1, now 2");
+        assert_eq!(registry.index_of(&tick.pk.to_bytes()), Some("9"), "precondition");
+        drop(registry);
+        assert_eq!(tick.machine.status(&tick.pk), ForwardWindowStatus::Pending);
+        assert!(!tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closing_tick_opens_signing_through_the_commit_rendezvous() {
+        let tick = closing_tick(MidQuery::Nothing, ChangeAt::BeforeCommit).await;
+
+        assert!(tick.reached_rendezvous, "the rendezvous ran with no change");
+        assert_eq!(tick.requests, vec![ask(12), ask(13)]);
+        assert_eq!(tick.machine.status(&tick.pk), ForwardWindowStatus::Safe);
+        assert!(tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    /// No detection is counted from an answer whose index was revoked before
+    /// the state commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_answer_is_not_counted_once_a_revocation_finishes_just_before_the_commit() {
+        const NO_BUMP: usize = usize::MAX;
+        let probe = RevokedMidTick::new(NO_BUMP, [false, true]);
+        let _armed = probe.revoke_before_commit();
+
+        probe.tick().await;
+
+        assert!(!probe.is_fresh(), "precondition: revoked");
+        assert_eq!(probe.bn.post_validator_liveness_calls(), vec![ask(10), ask(11)]);
+        assert_eq!(
+            probe.machine.status(&probe.pk),
+            ForwardWindowStatus::Pending,
+            "a live answer through a revoked index must not detect"
+        );
+        assert_eq!(probe.next_checks(), vec![10], "nothing from the tick is counted");
     }
 
     /// Register at epoch 10. Ticks (11, 24) and (12, 24) are not live. At

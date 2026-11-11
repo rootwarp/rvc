@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+
+use crate::RevocationCommit;
 use beacon::{
     block_value, hex_ids_equal, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
     BeaconCommitteeSubscription, BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig,
@@ -463,6 +465,8 @@ pub struct BnManager {
     admission_gate: Arc<Vec<Mutex<()>>>,
     /// Bumped once per revocation. Duty fences compare against it.
     revocation_generation: Arc<AtomicU64>,
+    /// Held around each `revocation_generation` bump; see [`RevocationCommit`].
+    revocation_commit: Arc<RevocationCommit>,
     /// Boot-agreed slot length in milliseconds. Zero until agreement completes.
     slot_duration_ms: AtomicU64,
     /// Identity from the beacon nodes that completed spec and genesis.
@@ -741,6 +745,7 @@ impl BnManager {
             admission_generation,
             admission_gate,
             revocation_generation: Arc::new(AtomicU64::new(0)),
+            revocation_commit: Arc::new(RevocationCommit::default()),
             slot_duration_ms: AtomicU64::new(0),
             chain_identity: Arc::new(tokio::sync::RwLock::new(None)),
             halt_when_empty: AtomicBool::new(true),
@@ -1069,6 +1074,7 @@ impl BnManager {
             &self.admission_generation,
             &self.admission_gate,
             &self.revocation_generation,
+            &self.revocation_commit,
             index,
         );
     }
@@ -1081,6 +1087,7 @@ impl BnManager {
             admission_generation: Arc::clone(&self.admission_generation),
             admission_gate: Arc::clone(&self.admission_gate),
             revocation_generation: Arc::clone(&self.revocation_generation),
+            revocation_commit: Arc::clone(&self.revocation_commit),
             chain_identity: Arc::clone(&self.chain_identity),
             tier_thresholds: self.tier_thresholds.clone(),
             halt_when_empty: self.halt_when_empty.load(Ordering::Acquire),
@@ -3749,6 +3756,7 @@ impl BnManager {
             &self.admission_generation,
             &self.admission_gate,
             &self.revocation_generation,
+            &self.revocation_commit,
             &self.chain_identity,
             index,
         )
@@ -3871,11 +3879,18 @@ fn agree_hex(prev: Option<String>, next: &str, field: &str) -> Result<Option<Str
     }
 }
 
+/// Revoke node `index`, and bump the process-wide `revocation` generation if
+/// the node was admitted.
+///
+/// Lock order: the node's admission gate, then `commit` (see
+/// [`RevocationCommit`]). The bump happens under `commit`, so it cannot land
+/// between a liveness admission's freshness check and its state write.
 fn revoke_at(
     admitted: &[AtomicBool],
     generations: &[AtomicU64],
     gates: &[Mutex<()>],
     revocation: &AtomicU64,
+    commit: &RevocationCommit,
     index: usize,
 ) {
     let Some(gate) = gates.get(index) else {
@@ -3897,7 +3912,9 @@ fn revoke_at(
     if let Some(flag) = admitted.get(index) {
         flag.store(false, Ordering::Release);
     }
+    let held = commit.hold();
     revocation.fetch_add(1, Ordering::Release);
+    drop(held);
     warn!(bn_index = index, "beacon node admission revoked");
 }
 
@@ -3948,6 +3965,7 @@ struct AdmissionWatch {
     admission_generation: Arc<Vec<AtomicU64>>,
     admission_gate: Arc<Vec<Mutex<()>>>,
     revocation_generation: Arc<AtomicU64>,
+    revocation_commit: Arc<RevocationCommit>,
     chain_identity: Arc<tokio::sync::RwLock<Option<ChainIdentity>>>,
     tier_thresholds: TierThresholds,
     halt_when_empty: bool,
@@ -3994,6 +4012,7 @@ impl AdmissionWatch {
                             &self.admission_generation,
                             &self.admission_gate,
                             &self.revocation_generation,
+                            &self.revocation_commit,
                             index,
                         );
                     }
@@ -4059,12 +4078,14 @@ fn publish_admission(watch: &AdmissionWatch, index: usize, admitted: bool, detai
         .set(tier.as_metric_value());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn admit_client(
     clients: &[BeaconClient],
     admitted: &[AtomicBool],
     generations: &[AtomicU64],
     gates: &[Mutex<()>],
     revocation: &AtomicU64,
+    commit: &RevocationCommit,
     identity: &tokio::sync::RwLock<Option<ChainIdentity>>,
     index: usize,
 ) -> Result<(), BeaconError> {
@@ -4084,7 +4105,7 @@ async fn admit_client(
     match classify_identity(&spec, &genesis, &agreed) {
         IdentityClass::Match => {}
         IdentityClass::Mismatch(field) => {
-            revoke_at(admitted, generations, gates, revocation, index);
+            revoke_at(admitted, generations, gates, revocation, commit, index);
             return Err(BeaconError::ParseError(format!("beacon nodes disagree on {field}")));
         }
         IdentityClass::Transient => return Err(identity_evidence_error(spec, genesis)),
@@ -5125,6 +5146,10 @@ impl BeaconNodeClient for BnManager {
     fn revocation_watch(&self) -> DutyFence {
         let seen = self.revocation_generation.load(Ordering::Acquire);
         DutyFence::at(seen, Arc::clone(&self.revocation_generation))
+    }
+
+    fn revocation_commit(&self) -> Option<Arc<RevocationCommit>> {
+        Some(Arc::clone(&self.revocation_commit))
     }
 }
 
@@ -11803,7 +11828,7 @@ mod tests {
         let gates = vec![Mutex::new(())];
         let revocation = AtomicU64::new(0);
         let observed = generations[0].load(Ordering::Acquire);
-        revoke_at(&admitted, &generations, &gates, &revocation, 0);
+        revoke_at(&admitted, &generations, &gates, &revocation, &RevocationCommit::default(), 0);
         grant_at(&admitted, &generations, &gates, 0, observed);
         assert!(
             !admitted[0].load(Ordering::Acquire),
@@ -11830,7 +11855,7 @@ mod tests {
         let gates = vec![Mutex::new(())];
         let revocation = AtomicU64::new(4);
         let observed = generations[0].load(Ordering::Acquire);
-        revoke_at(&admitted, &generations, &gates, &revocation, 0);
+        revoke_at(&admitted, &generations, &gates, &revocation, &RevocationCommit::default(), 0);
         grant_at(&admitted, &generations, &gates, 0, observed);
         assert!(
             !admitted[0].load(Ordering::Acquire),

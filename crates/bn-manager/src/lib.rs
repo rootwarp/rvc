@@ -23,6 +23,7 @@ mod manager;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 mod mock;
+mod revocation_commit;
 pub mod sse;
 mod submit;
 mod sync_status;
@@ -38,6 +39,9 @@ pub use mock::{
     mainnet_fork_schedule, mainnet_fork_spec, MockBeaconNodeClient, MockCallStamp, MockMethod,
     RecordedProduce, MAINNET_FORK_SPEC_FIELDS,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use revocation_commit::ContentionHook;
+pub use revocation_commit::{RevocationCommit, RevocationCommitGuard};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bn_manager::RevocationCommit;
 use duty_tracker::ValidatorIndexSource;
 use parking_lot::RwLock;
 
@@ -36,6 +37,8 @@ pub struct PubkeyIndexRegistry {
     revocation: Option<Arc<AtomicU64>>,
     /// Generation the entries were last validated under.
     validated_gen: Option<u64>,
+    /// The revoker's commit lock; see [`RevocationCommit`].
+    commit: Option<Arc<RevocationCommit>>,
 }
 
 /// Whether the registry's indices may be acted on.
@@ -71,6 +74,19 @@ impl PubkeyIndexRegistry {
     pub(crate) fn attach_revocation(&mut self, revocation: Arc<AtomicU64>, validated_gen: u64) {
         self.revocation = Some(revocation);
         self.validated_gen = Some(validated_gen);
+    }
+
+    /// Share `commit`, the lock the revoker holds around each generation bump.
+    ///
+    /// The index resolver holds it around [`Self::revalidate`], and the
+    /// liveness loop from its freshness check through its state write.
+    pub(crate) fn attach_commit(&mut self, commit: Arc<RevocationCommit>) {
+        self.commit = Some(commit);
+    }
+
+    /// The attached commit lock, or `None` when none is attached.
+    pub(crate) fn revocation_commit(&self) -> Option<Arc<RevocationCommit>> {
+        self.commit.clone()
     }
 
     /// Current revocation generation, or `None` when untracked.

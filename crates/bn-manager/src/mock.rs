@@ -1496,6 +1496,16 @@ mod tests {
         assert_eq!(mock.revocation_watch().seen(), 2);
     }
 
+    /// The trait default: a client that does not track revocations has no
+    /// commit lock, so boot attaches none.
+    #[test]
+    fn a_client_without_revocation_tracking_has_no_commit_lock() {
+        let mock = MockBeaconNodeClient::new();
+        assert!(mock.revocation_commit().is_none());
+        let _ = mock.track_admission();
+        assert!(mock.revocation_commit().is_none(), "the mock keeps the trait default");
+    }
+
     #[tokio::test]
     async fn test_shared_mock_errors_by_default_for_unconfigured_methods() {
         let mock = MockBeaconNodeClient::new();

@@ -606,6 +606,13 @@ pub trait BeaconNodeClient:
     fn revocation_watch(&self) -> beacon::DutyFence {
         beacon::DutyFence::open()
     }
+
+    /// The commit lock this client holds around each revocation-generation
+    /// bump, or `None` when it does not track revocations. See
+    /// [`crate::RevocationCommit`] for who else holds it and in what order.
+    fn revocation_commit(&self) -> Option<Arc<crate::RevocationCommit>> {
+        None
+    }
 }
 
 /// Per-operation timeout configuration for beacon node API calls.

@@ -604,10 +604,12 @@ impl ForwardWindowMachine {
     /// `skip_decrement`, applied only if `admit` returns `true`.
     ///
     /// `admit` runs under the state lock, before any state changes. For every
-    /// reader of this machine the check and the batch are one step, so a change
-    /// the caller checks for that lands after `admit` is ordered after the
-    /// batch. A refused batch changes nothing and returns `None`. `admit` must
-    /// not call back into this machine.
+    /// reader of this machine the check and the batch are one step. The state
+    /// lock does not exclude writers of whatever `admit` reads: a caller that
+    /// needs them excluded until the batch is written holds its own lock
+    /// across this call, taken before the state lock. A refused batch changes
+    /// nothing and returns `None`. `admit` must not call back into this
+    /// machine.
     #[must_use = "unobserved keys stay Pending; log or retry them"]
     pub fn apply_liveness_if(
         &self,

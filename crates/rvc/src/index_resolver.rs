@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, RevocationCommit};
 use doppelganger::MonotonicEpochClock;
 use eth_types::SLOTS_PER_EPOCH;
 use tokio::sync::watch;
@@ -349,6 +349,11 @@ impl IndexResolver {
     /// `key_gen` is re-sent, because the duty index set comes back from empty.
     /// A failed request, or a generation that moved, changes nothing, and the
     /// next slot wake asks again.
+    ///
+    /// The replacement runs under the registry's [`RevocationCommit`], taken
+    /// after the request and before the registry write lock (the lock order),
+    /// so it cannot land between a liveness admission's check and its state
+    /// write.
     async fn revalidate_at(&mut self, epoch: u64, seen: u64) -> ResolvePass {
         let queried: Vec<[u8; 48]> = self.pubkey_map.read().keys().copied().collect();
         let answer: HashMap<[u8; 48], String> = if queried.is_empty() {
@@ -373,7 +378,9 @@ impl IndexResolver {
                 }
             }
         };
+        let commit = self.registry.read().revocation_commit();
         let (len_before, committed, len_after_write) = {
+            let _commit = commit.as_deref().map(RevocationCommit::hold);
             let mut registry = self.registry.write();
             let len_before = registry.len();
             let committed = registry.revalidate(seen, &answer);
@@ -1550,6 +1557,54 @@ mod tests {
         assert_eq!(registry.read().index_of(&bytes), Some("4"));
         assert_eq!(registry.read().len(), 1, "entries unchanged");
         assert!(!seen.has_changed().expect("sender alive"), "no key_gen re-send");
+    }
+
+    /// What the revalidation reported first.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Writer {
+        /// It has to wait for the commit lock.
+        Waiting,
+        /// It finished.
+        Done,
+    }
+
+    /// A revalidation holds the registry's revocation commit lock around the
+    /// replacement: while another holder has it, the stale entries stay put.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revalidation_waits_for_the_revocation_commit_lock() {
+        const WATCHDOG: Duration = Duration::from_secs(10);
+        let (pk, bytes, hex) = fresh_key();
+        let mock = Arc::new(MockBeaconNodeClient::new().with_get_validators(move |pks| {
+            let data = pks.iter().filter(|p| *p == &hex).map(|p| validator(p, "9")).collect();
+            Ok(ValidatorsResponse { data })
+        }));
+        let (mut resolver, registry, _tx, _rx) = resolver_for(mock.clone(), map_with(&pk));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        let commit = Arc::new(RevocationCommit::default());
+        registry.write().attach_commit(Arc::clone(&commit));
+        generation.fetch_add(1, Ordering::Release);
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let contended = events_tx.clone();
+        commit.on_contended(Some(Arc::new(move || {
+            let _ = contended.send(Writer::Waiting);
+        })));
+
+        let held = commit.hold();
+        let revalidation = tokio::spawn(async move {
+            resolver.drive_once_for_test(5).await;
+            let _ = events_tx.send(Writer::Done);
+        });
+        let first = events.recv_timeout(WATCHDOG).ok();
+
+        assert_eq!(first, Some(Writer::Waiting), "the revalidation waited for the commit lock");
+        assert_eq!(registry.read().index_of(&bytes), Some("4"), "and replaced nothing yet");
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Stale);
+        drop(held);
+        revalidation.await.expect("revalidation task");
+        commit.on_contended(None);
+        assert_eq!(registry.read().index_of(&bytes), Some("9"));
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
     }
 
     /// No keys in the map: the stale registry is emptied and stamped without a
