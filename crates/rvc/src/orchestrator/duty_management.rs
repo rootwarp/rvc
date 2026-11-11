@@ -1341,4 +1341,120 @@ mod tests {
             mock.post_ptc_duties_calls()
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // W4-E3c R1 (Harper B5): no admitted beacon node is nothing to send
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// [`build_service_with_mock`] with `local` as an enabled local key that
+    /// the signer holds, and an attester duty for it at slot 1 of each epoch.
+    async fn build_subscribing_service(
+        local: crypto::SecretKey,
+    ) -> (DutyManagementService, Arc<bn_manager::MockBeaconNodeClient>) {
+        let pubkey = local.public_key();
+        let pk_bytes = pubkey.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let mock = Arc::new(
+            bn_manager::MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |epoch, _indices| {
+                    Ok(beacon::DependentRootResponse {
+                        dependent_root: "0xdeproot".into(),
+                        execution_optimistic: false,
+                        data: vec![beacon::AttesterDuty {
+                            pubkey: pk_hex.clone(),
+                            validator_index: "1".to_string(),
+                            committee_index: "0".to_string(),
+                            committee_length: "8".to_string(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: "0".to_string(),
+                            slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
+                        }],
+                    })
+                })
+                .with_submit_beacon_committee_subscriptions(|_subscriptions| Ok(())),
+        );
+        mock.track_admission();
+        let beacon = mock.clone() as Arc<dyn BeaconNodeClient>;
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(1).await.expect("seed attester duties");
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(local);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)])));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        validator_store
+            .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
+            .expect("add validator");
+        let service = DutyManagementService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            validator_store,
+            pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            make_config(),
+        );
+        (service, mock)
+    }
+
+    /// With the admission of every beacon node revoked, the cached duty of an
+    /// enabled local key is skipped before its selection proof: the call is
+    /// `Ok`, with no subscription POST. Control: the same service over an
+    /// admitting beacon node POSTs that duty.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_subscriptions_with_admission_revoked_send_nothing() {
+        let local = crypto::SecretKey::generate();
+        let pk_bytes = local.public_key().to_bytes();
+        let (mut service, mock) = build_subscribing_service(local).await;
+        assert!(service.validator_store.is_signing_enabled(&pk_bytes), "the key is enabled");
+        assert_eq!(service.duty_tracker.get_duties_for_slot(33).await.len(), 1, "duty cached");
+
+        let manager = bn_manager::BnManager::new(bn_manager::BnManagerConfig::new(vec![
+            "http://127.0.0.1:9".to_string(),
+        ]))
+        .expect("bn manager");
+        assert!(BeaconNodeClient::duty_fence(&manager).is_ok(), "a new manager starts admitted");
+        manager.testing_revoke_admission(0);
+        assert!(
+            matches!(
+                BeaconNodeClient::duty_fence(&manager),
+                Err(bn_manager::BeaconError::NoAdmittedNode)
+            ),
+            "its only node is revoked"
+        );
+        let revoked = Arc::new(manager) as Arc<dyn BeaconNodeClient>;
+        let admitting = std::mem::replace(&mut service.beacon, revoked);
+
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(matches!(outcome, Ok(())), "nothing to send is Ok: {outcome:?}");
+        logs_assert(|lines: &[&str]| {
+            let count = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+            let skipped = count("skipping committee subscription: beacon node admission revoked");
+            let posted = count("Sent committee subscriptions")
+                + count("Failed to send committee subscriptions")
+                + count("Committee subscription timed out");
+            match (skipped, posted) {
+                (1, 0) => Ok(()),
+                other => Err(format!("(skipped, posted) = {other:?}, want (1, 0)")),
+            }
+        });
+
+        service.beacon = admitting;
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(matches!(outcome, Ok(())), "control: {outcome:?}");
+        let posts = mock
+            .call_stamps()
+            .iter()
+            .filter(|stamp| {
+                stamp.method == bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions
+            })
+            .count();
+        assert_eq!(posts, 1, "control: an admitting beacon node gets the duty's POST");
+    }
 }

@@ -682,7 +682,8 @@ mod tests {
         TEST_GENESIS_TIME,
     };
     use crate::orchestrator::{
-        DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle,
+        DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorError,
+        OrchestratorHandle,
     };
     use crate::pubkey_index::{PubkeyIndexRegistry, PubkeyIndexSource};
 
@@ -3002,6 +3003,76 @@ mod tests {
         );
         assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
         assert!(!f.runner.has_pending(35));
+    }
+
+    /// RSA R1 B1 (Harper R1 B3): the prepare service's own result. With validator 42 and two
+    /// keys with no index, the call POSTs 42 and is `Partial` with 2
+    /// unresolved; once one index lands, `Partial` with 1; once the other
+    /// lands, `Complete`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_partial_prepare_counts_the_keys_still_without_an_index() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let first = f.add_unresolved_key();
+        let second = f.add_unresolved_key();
+        let prepare = || f.runner.duty_management.prepare_proposers(1);
+
+        let outcome = prepare().await.expect("the POST is answered");
+        assert_eq!(outcome, PrepareOutcome::Partial { unresolved: 2 }, "two keys have no index");
+
+        f.index_source.registry.write().insert(first, "43".to_string());
+        let outcome = prepare().await.expect("the POST is answered");
+        assert_eq!(outcome, PrepareOutcome::Partial { unresolved: 1 }, "one key has no index");
+
+        f.index_source.registry.write().insert(second, "44".to_string());
+        let outcome = prepare().await.expect("the POST is answered");
+        assert_eq!(outcome, PrepareOutcome::Complete, "every key has an index");
+
+        assert_eq!(
+            prepared_indices(&f.mock),
+            [vec!["42"], vec!["42", "43"], vec!["42", "43", "44"]],
+            "each call POSTs the keys with an index"
+        );
+    }
+
+    /// Harper R1 B4: the beacon node's 503 for the prepare POST, unchanged:
+    /// same status, same message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_a_failed_prepare_post_keeps_the_beacon_error() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        *f.failing_prepare.lock() = 1;
+
+        let outcome = f.runner.duty_management.prepare_proposers(1).await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 503, message }))
+                    if message == "unavailable"
+            ),
+            "the beacon node's own error: {outcome:?}"
+        );
+        assert_eq!(arrivals(&f.mock, MockMethod::PrepareBeaconProposer), 1);
+    }
+
+    /// Harper R1 B4: the beacon node's 503 for the subscription POST,
+    /// unchanged: same status, same message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_a_failed_subscription_post_keeps_the_beacon_error() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        *f.failing_subscriptions.lock() = 1;
+
+        let outcome = f.runner.duty_management.submit_committee_subscriptions(1).await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 503, message }))
+                    if message == "unavailable"
+            ),
+            "the beacon node's own error: {outcome:?}"
+        );
+        assert_eq!(arrivals(&f.mock, MockMethod::SubmitBeaconCommitteeSubscriptions), 1);
+        assert!(f.subscription_slots.lock().is_empty(), "the one POST was refused");
     }
 
     /// 653-AC8, the runner half: with no index for any local key, each of the
