@@ -102,6 +102,8 @@ impl PubkeyIndexRegistry {
         if self.generation() != Some(seen) {
             return false;
         }
+        #[cfg(test)]
+        hooks::after_revalidate_check();
         self.by_pubkey.clear();
         self.by_index.clear();
         for (pubkey, index) in answer {
@@ -215,6 +217,9 @@ pub fn pubkey_bytes_to_0x(bytes: &[u8; 48]) -> String {
 /// registry [`RegistryFreshness::Stale`], the set is empty. `indices` holds one
 /// read lock on each map for the whole intersection, then returns one snapshot.
 /// Order is lexicographic (`sort` then `dedup`), a total order on the strings.
+/// The snapshot carries no generation: `DutyTracker` captures its revocation
+/// stamp before calling `indices`, so a copy taken before a revocation is
+/// never admitted under a later generation.
 pub struct PubkeyIndexSource {
     pub registry: SharedPubkeyIndexRegistry,
     pub pubkey_map: PubkeyMap,
@@ -232,6 +237,41 @@ impl ValidatorIndexSource for PubkeyIndexSource {
         indices.sort();
         indices.dedup();
         indices
+    }
+}
+
+/// Test-only rendezvous inside [`PubkeyIndexRegistry::revalidate`].
+#[cfg(test)]
+mod hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static AFTER_REVALIDATE_CHECK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs the armed hook after the generation check, before the stamp.
+    pub(super) fn after_revalidate_check() {
+        AFTER_REVALIDATE_CHECK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Clears the hook when dropped, also on a failed assert.
+    pub(super) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            AFTER_REVALIDATE_CHECK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn arm_after_revalidate_check(hook: impl FnMut() + 'static) -> Armed {
+        AFTER_REVALIDATE_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Armed
     }
 }
 
@@ -407,5 +447,218 @@ mod tests {
         let answer = HashMap::from([(pk.to_bytes(), "4".to_string())]);
         assert!(registry.write().revalidate(1, &answer));
         assert_eq!(source.indices(), vec!["4".to_string()], "restored after revalidation");
+    }
+
+    /// A revocation between the generation check and the stamp leaves the
+    /// answer stale: the stamp is the checked sample, not a later load.
+    #[test]
+    fn revalidation_stamps_the_checked_generation_not_a_later_one() {
+        let pk = [0x44; 48];
+        let mut reg = PubkeyIndexRegistry::new();
+        let generation = Arc::new(AtomicU64::new(3));
+        reg.attach_revocation(Arc::clone(&generation), 2);
+        let revoker = Arc::clone(&generation);
+        let _armed = hooks::arm_after_revalidate_check(move || {
+            let revoker = Arc::clone(&revoker);
+            std::thread::spawn(move || revoker.fetch_add(1, Ordering::Release))
+                .join()
+                .expect("revoking thread");
+        });
+
+        assert!(reg.revalidate(3, &HashMap::from([(pk, "4".to_string())])));
+
+        assert_eq!(generation.load(Ordering::Acquire), 4, "the revocation ran after the check");
+        assert_eq!(reg.index_of(&pk), Some("4"));
+        assert_eq!(
+            reg.freshness(),
+            RegistryFreshness::Stale,
+            "stamped 3, the generation the answer was checked under"
+        );
+    }
+
+    /// Wraps the production source. After its first copy, another thread
+    /// revokes (joined, so the order is fixed) before the copy is returned.
+    struct RevokedAfterCopy {
+        inner: PubkeyIndexSource,
+        generation: Arc<AtomicU64>,
+        revoke: bool,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ValidatorIndexSource for RevokedAfterCopy {
+        fn indices(&self) -> Vec<String> {
+            let copy = self.inner.indices();
+            if self.copies.fetch_add(1, Ordering::SeqCst) == 0 && self.revoke {
+                let generation = Arc::clone(&self.generation);
+                std::thread::spawn(move || generation.fetch_add(1, Ordering::Release))
+                    .join()
+                    .expect("revoking thread");
+                assert_eq!(self.inner.indices(), Vec::<String>::new(), "the source is stale now");
+            }
+            copy
+        }
+    }
+
+    /// The tracker paths that take an index snapshot and cache the answer.
+    #[derive(Debug, Clone, Copy)]
+    enum DutyPath {
+        Attester,
+        AttesterReorg,
+        Ptc,
+        PtcColdReorg,
+        Sync,
+    }
+
+    const EPOCH: u64 = 10;
+    const SLOT: u64 = EPOCH * 32;
+
+    /// Fetch along `path` with index 4 fresh under generation 0, where the
+    /// first index copy is followed by a revocation if `revoke`. Returns the
+    /// fetch result and how many duties a reader is then served.
+    async fn fetch_after_copy(
+        path: DutyPath,
+        revoke: bool,
+    ) -> (Result<(), duty_tracker::DutyTrackerError>, usize) {
+        use beacon::{
+            AttesterDutiesResponse, AttesterDuty, PtcDutiesResponse, PtcDuty,
+            SyncCommitteeDutiesResponse,
+        };
+        use bn_manager::MockBeaconNodeClient;
+        use duty_tracker::DutyTracker;
+        use eth_types::SyncCommitteeDuty;
+
+        let pk = crypto::SecretKey::generate().public_key();
+        let bytes = pk.to_bytes();
+        let hex = pubkey_bytes_to_0x(&bytes);
+        let (attester_hex, ptc_hex) = (hex.clone(), hex);
+        let asked_for_4 = |indices: &[String]| assert_eq!(indices, ["4".to_string()]);
+        let mock = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |_, indices| {
+                    asked_for_4(&indices);
+                    Ok(AttesterDutiesResponse {
+                        dependent_root: "0xaaa".to_string(),
+                        execution_optimistic: false,
+                        data: vec![AttesterDuty {
+                            pubkey: attester_hex.clone(),
+                            validator_index: "4".to_string(),
+                            slot: SLOT.to_string(),
+                            committee_index: "0".to_string(),
+                            committee_length: "1".to_string(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: "0".to_string(),
+                        }],
+                    })
+                })
+                .with_post_ptc_duties(move |_, indices| {
+                    asked_for_4(&indices);
+                    Ok(PtcDutiesResponse {
+                        dependent_root: "0xaaa".to_string(),
+                        execution_optimistic: false,
+                        data: vec![PtcDuty {
+                            pubkey: ptc_hex.clone(),
+                            validator_index: "4".to_string(),
+                            slot: SLOT.to_string(),
+                        }],
+                    })
+                })
+                .with_post_sync_committee_duties(move |_, indices| {
+                    asked_for_4(&indices);
+                    Ok(SyncCommitteeDutiesResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: bytes,
+                            validator_index: 4,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                }),
+        );
+        let registry = PubkeyIndexRegistry::shared();
+        registry.write().insert(bytes, "4".to_string());
+        let generation = mock.track_admission();
+        registry.write().attach_revocation(Arc::clone(&generation), 0);
+        let source = Arc::new(RevokedAfterCopy {
+            inner: source_with(&pk, registry),
+            generation: Arc::clone(&generation),
+            revoke,
+            copies: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tracker = DutyTracker::new_with_source(mock, source);
+
+        let fetched = match path {
+            DutyPath::Attester => tracker.fetch_duties_for_epoch(EPOCH).await.map(drop),
+            DutyPath::AttesterReorg => {
+                tracker.check_and_refetch_if_root_changed(EPOCH).await.map(drop)
+            }
+            DutyPath::Ptc => tracker.fetch_ptc_duties_for_epoch(EPOCH).await.map(drop),
+            DutyPath::PtcColdReorg => {
+                tracker.check_and_refetch_ptc_if_root_changed(EPOCH).await.map(drop)
+            }
+            DutyPath::Sync => tracker.fetch_sync_committee_duties(EPOCH).await.map(drop),
+        };
+        let served = match path {
+            DutyPath::Attester | DutyPath::AttesterReorg => {
+                tracker.get_duties_for_slot(SLOT).await.len()
+            }
+            DutyPath::Ptc | DutyPath::PtcColdReorg => {
+                tracker.get_ptc_duties_for_slot(SLOT).await.len()
+            }
+            DutyPath::Sync => tracker.get_sync_committee_duties(SLOT).await.len(),
+        };
+        assert_eq!(generation.load(Ordering::Acquire), u64::from(revoke), "{path:?}");
+        (fetched, served)
+    }
+
+    async fn assert_a_pre_revocation_copy_is_not_served(path: DutyPath) {
+        let (fetched, served) = fetch_after_copy(path, true).await;
+        assert_eq!(served, 0, "{path:?}: duties fetched with a pre-revocation copy are not served");
+        assert!(
+            matches!(
+                fetched,
+                Err(duty_tracker::DutyTrackerError::RevokedDuringFetch { epoch: EPOCH })
+            ),
+            "{path:?}: the fetch fails closed: {fetched:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attester_duties_fetched_with_a_pre_revocation_copy_are_not_served() {
+        assert_a_pre_revocation_copy_is_not_served(DutyPath::Attester).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attester_reorg_duties_fetched_with_a_pre_revocation_copy_are_not_served() {
+        assert_a_pre_revocation_copy_is_not_served(DutyPath::AttesterReorg).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ptc_duties_fetched_with_a_pre_revocation_copy_are_not_served() {
+        assert_a_pre_revocation_copy_is_not_served(DutyPath::Ptc).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_ptc_refetch_with_a_pre_revocation_copy_is_not_served() {
+        assert_a_pre_revocation_copy_is_not_served(DutyPath::PtcColdReorg).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_duties_fetched_with_a_pre_revocation_copy_are_not_served() {
+        assert_a_pre_revocation_copy_is_not_served(DutyPath::Sync).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duties_fetched_with_no_revocation_are_served_on_every_path() {
+        for path in [
+            DutyPath::Attester,
+            DutyPath::AttesterReorg,
+            DutyPath::Ptc,
+            DutyPath::PtcColdReorg,
+            DutyPath::Sync,
+        ] {
+            let (fetched, served) = fetch_after_copy(path, false).await;
+            assert!(fetched.is_ok(), "{path:?}: {fetched:?}");
+            assert_eq!(served, 1, "{path:?}: the cache is populated normally");
+        }
     }
 }

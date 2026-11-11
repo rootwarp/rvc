@@ -1526,6 +1526,32 @@ mod tests {
         task.await.expect("resolver task");
     }
 
+    /// A revalidation `Err` is a BN error in the pass, as [`ResolvePass`]
+    /// documents, and changes nothing: the registry stays stale with its
+    /// entries, and `key_gen` is not re-sent.
+    #[tokio::test]
+    async fn a_revalidation_error_is_reported_as_a_bn_error() {
+        let (pk, bytes, _hex) = fresh_key();
+        let mock =
+            Arc::new(MockBeaconNodeClient::new().with_get_validators(|_| Err(unavailable())));
+        let (mut resolver, registry, _tx, mut seen) = resolver_for(mock.clone(), map_with(&pk));
+        registry.write().insert(bytes, "4".to_string());
+        let generation = track(&mock, &registry);
+        generation.fetch_add(1, Ordering::Release);
+        seen.borrow_and_update();
+
+        let pass = resolver.drive_once_for_test(5).await;
+
+        let requests = mock.call_stamps().into_iter();
+        let requests = requests.filter(|stamp| stamp.method == MockMethod::GetValidators).count();
+        assert_eq!(requests, 1, "one revalidation request");
+        assert!(pass.bn_error, "get_validators returned Err");
+        assert_eq!(registry.read().freshness(), RegistryFreshness::Stale);
+        assert_eq!(registry.read().index_of(&bytes), Some("4"));
+        assert_eq!(registry.read().len(), 1, "entries unchanged");
+        assert!(!seen.has_changed().expect("sender alive"), "no key_gen re-send");
+    }
+
     /// No keys in the map: the stale registry is emptied and stamped without a
     /// BN call. An empty `get_validators` would ask the pool for every validator.
     #[tokio::test]

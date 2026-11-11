@@ -211,7 +211,9 @@ impl SyncPeriodDutyCache {
 /// request the call makes — one duty request never observes two sets.
 /// A cached epoch or sync period stays fresh only while that stored snapshot
 /// still equals the current set; `dependent_root` does not identify the posted
-/// indices. [`DutyTracker::new`] is the static-set convenience wrapper.
+/// indices. A fetch captures its revocation stamp before the snapshot, so a
+/// revocation after the copy fails the fetch's admission re-check.
+/// [`DutyTracker::new`] is the static-set convenience wrapper.
 pub trait ValidatorIndexSource: Send + Sync {
     /// Snapshot of the validator indices to query, as decimal strings.
     fn indices(&self) -> Vec<String>;
@@ -225,7 +227,8 @@ impl ValidatorIndexSource for StaticIndexSource {
     }
 }
 
-/// Revocation generation captured before a duty request is sent.
+/// Revocation generation captured before a duty request is sent, and before
+/// the index snapshot the request carries.
 ///
 /// Only [`DutyTracker::fetch_stamp`] creates one, so an entry can only carry
 /// a generation sampled before its request.
@@ -545,10 +548,10 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<AttesterDuty>, DutyTrackerError> {
+        let stamp = self.fetch_stamp();
         let indices = self.index_source.indices();
         debug!(epoch = epoch, "Fetching duties for epoch");
 
-        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .get_attester_duties(epoch, &indices)
@@ -625,8 +628,8 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
-        let indices = self.index_source.indices();
         let stamp = self.fetch_stamp();
+        let indices = self.index_source.indices();
         // Fetch from BN first (no lock held) to avoid TOCTOU race
         let response = self
             .beacon
@@ -887,15 +890,30 @@ impl DutyTracker {
         servable(&cache, epoch, now).is_some()
     }
 
-    #[tracing::instrument(name = "duty_tracker.fetch_ptc_duties", level = "debug", skip_all, fields(epoch =epoch))]
+    /// Fetch PTC duties for caller-supplied `validator_indices`.
+    ///
+    /// The stamp is captured at this call, so it is no older than indices the
+    /// caller already holds. Use [`Self::fetch_ptc_duties_for_epoch`] to fetch
+    /// the tracker's own snapshot.
     pub async fn fetch_ptc_duties(
         &self,
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
+        self.fetch_ptc_duties_stamped(epoch, validator_indices, self.fetch_stamp()).await
+    }
+
+    /// Request PTC duties for `validator_indices` and admit them under `stamp`,
+    /// captured before those indices were snapshotted.
+    #[tracing::instrument(name = "duty_tracker.fetch_ptc_duties", level = "debug", skip_all, fields(epoch =epoch))]
+    async fn fetch_ptc_duties_stamped(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+        stamp: FetchStamp,
+    ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
         debug!(epoch = epoch, "Fetching PTC duties for epoch");
 
-        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .post_ptc_duties(epoch, validator_indices)
@@ -921,8 +939,9 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
+        let stamp = self.fetch_stamp();
         let indices = self.index_source.indices();
-        self.fetch_ptc_duties(epoch, &indices).await
+        self.fetch_ptc_duties_stamped(epoch, &indices, stamp).await
     }
 
     pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<TypedPtcDuty> {
@@ -962,7 +981,7 @@ impl DutyTracker {
         };
 
         if !cached {
-            self.fetch_ptc_duties(epoch, &indices).await?;
+            self.fetch_ptc_duties_stamped(epoch, &indices, stamp).await?;
             return Ok(true);
         }
 
@@ -1015,11 +1034,11 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<SyncCommitteeDuty>, DutyTrackerError> {
+        let stamp = self.fetch_stamp();
         let indices = self.index_source.indices();
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         debug!(epoch = epoch, period = period, "Fetching sync committee duties");
 
-        let stamp = self.fetch_stamp();
         let response = self
             .beacon
             .post_sync_committee_duties(epoch, &indices)
@@ -4173,6 +4192,10 @@ mod tests {
         }
     }
 
+    /// The refresh read loads the generation inside its guard, so a bump there
+    /// makes the entry stale and the refresh takes the cold path. That fetch is
+    /// admitted under the refresh's own stamp, captured before its index
+    /// snapshot, so the answer is refused rather than re-stamped.
     #[tokio::test]
     async fn bump_between_ptc_refresh_read_lock_and_stamp_check_takes_the_cold_path() {
         let (mock, tracker, generation) =
@@ -4186,11 +4209,12 @@ mod tests {
 
         assert_eq!(generation.load(Ordering::Acquire), 1, "hook ran");
         assert!(
-            changed.expect("refresh"),
-            "the refresh read loads the generation inside its guard, so it sees a stale entry"
+            is_revoked_during_fetch(&changed),
+            "the stale entry sends the refresh to the cold path, and its pre-bump stamp \
+             refuses the answer (the warm path would return Ok(false)): {changed:?}"
         );
         assert_eq!(mock.post_ptc_duties_calls().len(), 2, "seed, then the cold-path fetch");
-        assert!(tracker.is_ptc_epoch_cached(STAMP_EPOCH).await, "re-stamped");
+        assert!(!tracker.is_ptc_epoch_cached(STAMP_EPOCH).await, "nothing re-stamped");
     }
 
     /// The refresh captures its stamp before its cached read, so a bump right
@@ -4364,7 +4388,9 @@ mod tests {
     /// call. Each of these insert helpers is private and takes a `FetchStamp`.
     /// A `fn` that names an admit helper in any form (`self.admit_ptc(`,
     /// `Self::admit_ptc(`, a fn pointer) sends a BN request, and every `fn`
-    /// that sends one assigns `fetch_stamp()` before its first `self.beacon.`.
+    /// that sends one assigns `fetch_stamp()` before its first `self.beacon.`,
+    /// or takes a `FetchStamp` its caller captured. A `fn` that takes an index
+    /// snapshot and calls `fetch_stamp()` calls it before the snapshot.
     fn unstamped_writes(code: &str) -> Vec<String> {
         let mut offenders = Vec::new();
         for item in fn_items(code) {
@@ -4383,8 +4409,18 @@ mod tests {
             if admits && first_request.is_none() {
                 offenders.push(format!("{}: admits an answer it did not request", item.name));
             }
-            if first_request.is_some_and(|at| !item.body[..at].contains("=self.fetch_stamp();")) {
+            let stamped_by_caller = item.signature.contains(":FetchStamp");
+            if first_request.is_some_and(|at| !item.body[..at].contains("=self.fetch_stamp();"))
+                && !stamped_by_caller
+            {
                 offenders.push(format!("{}: no fetch_stamp() before its first request", item.name));
+            }
+            let stamp_at = item.body.find("self.fetch_stamp()");
+            let snapshot_at = item.body.find("self.index_source.indices()");
+            if let (Some(stamp_at), Some(snapshot_at)) = (stamp_at, snapshot_at) {
+                if snapshot_at < stamp_at {
+                    offenders.push(format!("{}: index snapshot before fetch_stamp()", item.name));
+                }
             }
             if inserter && item.public {
                 offenders.push(format!("{}: insert helper is public", item.name));
@@ -4455,13 +4491,27 @@ mod tests {
             "check_and_refetch_if_root_changed",
             "fetch_proposer_duties",
             "check_and_refetch_proposer_if_root_changed",
-            "fetch_ptc_duties",
+            "fetch_ptc_duties_stamped",
             "check_and_refetch_ptc_if_root_changed",
             "fetch_sync_committee_duties",
         ] {
             let writer_body = body(writer);
             assert!(writer_body.contains("self.beacon."), "the scan sees {writer}'s request");
             assert!(writer_body.contains(".admit_"), "{writer} inserts through an admit_* helper");
+        }
+        for snapshot_writer in [
+            "fetch_duties_for_epoch",
+            "check_and_refetch_if_root_changed",
+            "fetch_ptc_duties_for_epoch",
+            "check_and_refetch_ptc_if_root_changed",
+            "fetch_sync_committee_duties",
+        ] {
+            let writer_body = body(snapshot_writer);
+            assert!(
+                writer_body.contains("self.index_source.indices()")
+                    && writer_body.contains("self.fetch_stamp()"),
+                "the scan sees {snapshot_writer}'s snapshot and stamp"
+            );
         }
         let test_only = "#[cfg(any(test,feature=\"test-utils\"))]pubasyncfncache_proposer_duties(";
         assert!(
@@ -4482,6 +4532,10 @@ mod tests {
             async fn reuse(&self, e: E) { let mut c = self.m.write().await; insert_proposer(&mut c, e); }
             pub fn admit_sync(c: &mut RwLockWriteGuard<'_, Map>, e: E, s: FetchStamp) { c.insert(1, e); }
             fn admit_attester(c: &mut RwLockWriteGuard<'_, Map>, e: E, g: Option<u64>) { c.insert(1, e); }
+            async fn stamped_by_caller(&self, s: FetchStamp) { let e = self.beacon.x().await; let mut c = self.m.write().await; self.admit_ptc(&mut c, e, s); }
+            async fn snapshot_first(&self) { let i = self.index_source.indices(); let s = self.fetch_stamp(); let e = self.beacon.x(&i).await; let mut c = self.m.write().await; self.admit_ptc(&mut c, e, s); }
+            async fn snapshot_then_inline(&self) { let i = self.index_source.indices(); self.stamped_by_caller_for(&i, self.fetch_stamp()).await; }
+            async fn stamp_then_snapshot(&self) { let s = self.fetch_stamp(); let i = self.index_source.indices(); self.stamped_by_caller_for(&i, s).await; }
         ";
         assert_eq!(
             unstamped_writes(fixture),
@@ -4495,6 +4549,8 @@ mod tests {
                 "reuse: calls insert_proposer",
                 "admit_sync: insert helper is public",
                 "admit_attester: insert helper takes no FetchStamp",
+                "snapshot_first: index snapshot before fetch_stamp()",
+                "snapshot_then_inline: index snapshot before fetch_stamp()",
             ]
         );
     }

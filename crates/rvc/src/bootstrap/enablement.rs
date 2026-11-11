@@ -1075,6 +1075,81 @@ mod tests {
         executor.token().cancel();
     }
 
+    /// Every boot mode that goes on, by doppelganger detection on or off. The
+    /// detection-on `Err` with keys present returns from boot, so it has no
+    /// registry to follow.
+    #[derive(Debug, Clone, Copy)]
+    enum ContinuingBoot {
+        OnIndexed,
+        OnUnindexed,
+        OnNoKeys,
+        OffIndexed,
+        OffUnindexed,
+        OffResolveErr,
+    }
+
+    /// In each continuing mode the registry follows the revocation generation:
+    /// fresh (not untracked) after boot, and hidden after a post-boot revocation.
+    #[tokio::test]
+    async fn every_continuing_boot_mode_attaches_the_revocation_generation() {
+        use crate::pubkey_index::{PubkeyIndexSource, RegistryFreshness};
+        use duty_tracker::ValidatorIndexSource;
+        use ContinuingBoot::*;
+
+        for mode in [OnIndexed, OnUnindexed, OnNoKeys, OffIndexed, OffUnindexed, OffResolveErr] {
+            let detection = matches!(mode, OnIndexed | OnUnindexed | OnNoKeys);
+            let indexed = matches!(mode, OnIndexed | OffIndexed);
+            let (server, beacon) = if matches!(mode, OffResolveErr) {
+                mock_beacon_validators_503().await
+            } else {
+                mock_beacon(0).await
+            };
+            let pk = SecretKey::generate().public_key();
+            if indexed {
+                Mock::given(method("GET"))
+                    .and(path("/eth/v1/beacon/states/head/validators"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(validators_body(&pk, "5")),
+                    )
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+            let keys = if matches!(mode, OnNoKeys) {
+                empty_loaded_keys()
+            } else {
+                loaded_keys_with_pubkey(pk)
+            };
+            let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+            let handles = wire_signing_enablement(
+                &base_config(detection),
+                &keys,
+                &beacon,
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+                &executor,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: boot goes on: {e}"));
+            let registry = Arc::clone(&handles.pubkey_index);
+            let source = PubkeyIndexSource {
+                registry: Arc::clone(&registry),
+                pubkey_map: Arc::clone(&handles.pubkey_map),
+            };
+            let booted: Vec<String> = if indexed { vec!["5".to_string()] } else { Vec::new() };
+
+            assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(0), "{mode:?}");
+            assert_eq!(source.indices(), booted, "{mode:?}");
+            beacon.bn_manager.testing_revoke_admission(0);
+            assert_eq!(
+                registry.read().freshness(),
+                RegistryFreshness::Stale,
+                "{mode:?}: a revocation after boot makes the registry stale"
+            );
+            assert_eq!(source.indices(), Vec::<String>::new(), "{mode:?}: and hides its indices");
+            executor.token().cancel();
+        }
+    }
+
     /// The same boot error with doppelganger on and keys present still fails closed.
     #[tokio::test]
     async fn boot_get_validators_err_with_doppelganger_on_fails_closed() {

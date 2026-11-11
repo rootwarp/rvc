@@ -45,9 +45,9 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use crate::bootstrap::executor::{ShutdownHandle, ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
-use crate::pubkey_index::SharedPubkeyIndexRegistry;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x};
+use crate::pubkey_index::{RegistryFreshness, SharedPubkeyIndexRegistry};
 use crate::quiesce::TrackedKeys;
 use crate::startup::EXIT_DOPPELGANGER_DETECTED;
 
@@ -477,6 +477,14 @@ impl LivenessObservationLoop {
     /// decrement, so signing stays closed until both answers of this tick are
     /// applied. A failed or partial current-epoch query does not let the
     /// previous epoch's decrement open the gate.
+    ///
+    /// The indices are read under one registry freshness token, and a stale
+    /// registry asks about no index. The token is read again before each query
+    /// and after each answer. Once it has moved (a revocation or a
+    /// revalidation), the answer in flight is dropped and the rest of the tick
+    /// asks about no index. The check after an answer is its linearization
+    /// point: an answer counts only if no revocation landed between the index
+    /// snapshot and that check.
     async fn observe_adjacent(
         &self,
         current_epoch: Epoch,
@@ -486,14 +494,16 @@ impl LivenessObservationLoop {
         if pending.is_empty() {
             return Vec::new();
         }
-        let index_to_bare = {
+        let (freshness, index_to_bare) = {
             let registry = self.pubkey_index.read();
+            let freshness = registry.freshness();
             // A stale index may name another validator: ask about none until revalidated.
-            if registry.is_fresh() {
-                registry.index_to_bare_hex().clone()
-            } else {
+            let index_to_bare = if freshness == RegistryFreshness::Stale {
                 HashMap::new()
-            }
+            } else {
+                registry.index_to_bare_hex().clone()
+            };
+            (freshness, index_to_bare)
         };
         let mut bare_to_index: HashMap<&str, &str> = HashMap::with_capacity(index_to_bare.len());
         for (index, bare) in &index_to_bare {
@@ -523,11 +533,17 @@ impl LivenessObservationLoop {
             // One request per index. Response duplicates are OR-folded when
             // the tick is applied; this dedup does not choose `is_live`.
             numeric.dedup();
-            if numeric.is_empty() {
+            if numeric.is_empty() || !self.indices_unchanged_since(freshness) {
                 answers.push(EpochLiveness { epoch, samples: Some(Vec::new()) });
                 continue;
             }
-            match self.beacon.post_validator_liveness_merged(epoch, &numeric).await {
+            let result = self.beacon.post_validator_liveness_merged(epoch, &numeric).await;
+            if !self.indices_unchanged_since(freshness) {
+                debug!(epoch, "index registry changed during the liveness query; answer dropped");
+                answers.push(EpochLiveness { epoch, samples: Some(Vec::new()) });
+                continue;
+            }
+            match result {
                 Ok(response) => {
                     let samples: Vec<ValidatorLivenessData> = response
                         .data
@@ -555,6 +571,11 @@ impl LivenessObservationLoop {
         }
 
         answers
+    }
+
+    /// Whether the index registry still has the freshness token `snapshot`.
+    fn indices_unchanged_since(&self, snapshot: RegistryFreshness) -> bool {
+        self.pubkey_index.read().freshness() == snapshot
     }
 
     /// Apply one tick's answers.
@@ -1527,6 +1548,240 @@ mod tests {
         assert_eq!(bn.post_validator_liveness_calls(), Vec::<(u64, Vec<String>)>::new());
         assert_eq!(m.pending_keys(), pending, "no sample: the closed epoch is not counted");
         assert_eq!(m.status(&pk), ForwardWindowStatus::Pending);
+    }
+
+    /// A key registered at epoch 10 with index 4, validated under revocation
+    /// generation 0 and observed at `(11, CLOSED_EPOCH_SLOT)`. The mock bumps
+    /// the generation while it answers liveness call `bump_on_call` (0 asks
+    /// epoch 10, 1 asks epoch 11) and answers call `n` with `live[n]`.
+    struct RevokedMidTick {
+        machine: Arc<ForwardWindowMachine>,
+        pk: crypto::PublicKey,
+        bn: Arc<MockBeaconNodeClient>,
+        loop_: LivenessObservationLoop,
+    }
+
+    impl RevokedMidTick {
+        fn new(bump_on_call: usize, live: [bool; 2]) -> Self {
+            use std::sync::atomic::AtomicU64;
+
+            let machine = machine();
+            let pk = new_pk();
+            machine.register(&pk, 10);
+            let generation = Arc::new(AtomicU64::new(0));
+            let bump = Arc::clone(&generation);
+            let calls = AtomicUsize::new(0);
+            let bn = Arc::new(MockBeaconNodeClient::new().with_post_validator_liveness(
+                move |_epoch, indices| {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    if call == bump_on_call {
+                        bump.fetch_add(1, Ordering::Release);
+                    }
+                    let is_live = live[call];
+                    let data = indices
+                        .into_iter()
+                        .map(|index| ValidatorLiveness { index, is_live })
+                        .collect();
+                    Ok(ValidatorLivenessResponse { data })
+                },
+            ));
+            let loop_ =
+                loop_with(Arc::clone(&machine), Arc::clone(&bn) as Arc<dyn LivenessApi>, "4", &pk);
+            loop_.pubkey_index().write().attach_revocation(generation, 0);
+            Self { machine, pk, bn, loop_ }
+        }
+
+        async fn tick(&self) {
+            self.loop_.drive_once_for_test(11, CLOSED_EPOCH_SLOT).await;
+        }
+
+        fn next_checks(&self) -> Vec<u64> {
+            self.machine.pending_keys().iter().map(|key| key.next_check_epoch).collect()
+        }
+
+        fn is_fresh(&self) -> bool {
+            self.loop_.pubkey_index().read().is_fresh()
+        }
+    }
+
+    fn ask(epoch: u64) -> (u64, Vec<String>) {
+        (epoch, vec!["4".to_string()])
+    }
+
+    #[tokio::test]
+    async fn a_revocation_during_the_first_liveness_query_stops_the_tick() {
+        let probe = RevokedMidTick::new(0, [false, false]);
+        assert_eq!(probe.next_checks(), vec![10]);
+
+        probe.tick().await;
+
+        assert!(!probe.is_fresh(), "precondition: the first query straddled the bump");
+        assert_eq!(
+            probe.bn.post_validator_liveness_calls(),
+            vec![ask(10)],
+            "no liveness query is sent with an index from before the revocation"
+        );
+        assert_eq!(probe.next_checks(), vec![10], "the straddled not-live answer is not counted");
+        assert_eq!(probe.machine.status(&probe.pk), ForwardWindowStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_live_answer_after_a_revocation_does_not_detect() {
+        let probe = RevokedMidTick::new(0, [false, true]);
+
+        probe.tick().await;
+
+        assert!(!probe.is_fresh(), "precondition: the first query straddled the bump");
+        assert_eq!(
+            probe.machine.status(&probe.pk),
+            ForwardWindowStatus::Pending,
+            "a stale index's live answer must not detect: Detected is sticky"
+        );
+        assert_eq!(probe.bn.post_validator_liveness_calls(), vec![ask(10)]);
+        assert_eq!(probe.next_checks(), vec![10]);
+    }
+
+    /// The epoch-10 answer arrived before the bump, like a tick that ended just
+    /// before it, so it still counts. The epoch-11 answer straddled the bump and
+    /// is dropped.
+    #[tokio::test]
+    async fn a_live_answer_to_a_query_that_straddled_a_revocation_is_dropped() {
+        let probe = RevokedMidTick::new(1, [false, true]);
+
+        probe.tick().await;
+
+        assert!(!probe.is_fresh(), "precondition: the second query straddled the bump");
+        assert_eq!(probe.bn.post_validator_liveness_calls(), vec![ask(10), ask(11)]);
+        assert_eq!(probe.machine.status(&probe.pk), ForwardWindowStatus::Pending);
+        assert_eq!(probe.next_checks(), vec![11], "the answer from before the bump counts");
+    }
+
+    /// What happens to the index registry while the closing tick's first
+    /// liveness query is in flight.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MidQuery {
+        Nothing,
+        Revoke,
+        /// Revoke, then revalidate the key to index 9 before the old answer returns.
+        RevokeAndRevalidateTo9,
+    }
+
+    struct ClosingTick {
+        machine: Arc<ForwardWindowMachine>,
+        pk: crypto::PublicKey,
+        registry: SharedPubkeyIndexRegistry,
+        /// The closing tick's liveness requests.
+        requests: Vec<(u64, Vec<String>)>,
+    }
+
+    /// Register at epoch 10 with index 4 under generation 0, and count every
+    /// epoch but the last with no change. Then run the closing tick at epoch 13,
+    /// where another thread applies `change` during the first query and is
+    /// joined before that answer returns, so the order is fixed.
+    async fn closing_tick(change: MidQuery) -> ClosingTick {
+        use std::sync::atomic::AtomicU64;
+
+        let machine = machine();
+        let pk = new_pk();
+        let bytes = pk.to_bytes();
+        let start = 10u64;
+        machine.register(&pk, start);
+        let registry = PubkeyIndexRegistry::shared();
+        registry.write().insert(bytes, "4".to_string());
+        let generation = Arc::new(AtomicU64::new(0));
+        registry.write().attach_revocation(Arc::clone(&generation), 0);
+        let armed = Arc::new(AtomicBool::new(false));
+        let bn = {
+            let (armed, registry) = (Arc::clone(&armed), Arc::clone(&registry));
+            Arc::new(MockBeaconNodeClient::new().with_post_validator_liveness(
+                move |_epoch, indices| {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        let (generation, registry) =
+                            (Arc::clone(&generation), Arc::clone(&registry));
+                        std::thread::spawn(move || {
+                            let now = generation.fetch_add(1, Ordering::Release) + 1;
+                            if change == MidQuery::RevokeAndRevalidateTo9 {
+                                let answer = HashMap::from([(bytes, "9".to_string())]);
+                                assert!(registry.write().revalidate(now, &answer));
+                            }
+                        })
+                        .join()
+                        .expect("registry change");
+                    }
+                    let data = indices
+                        .into_iter()
+                        .map(|index| ValidatorLiveness { index, is_live: false })
+                        .collect();
+                    Ok(ValidatorLivenessResponse { data })
+                },
+            ))
+        };
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&machine),
+            Arc::clone(&bn) as Arc<dyn LivenessApi>,
+            Arc::clone(&registry),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
+            CancellationToken::new(),
+        );
+        let closing = start + DEFAULT_MONITORING_EPOCHS + 1;
+        for epoch in start + 1..closing {
+            loop_.drive_once_for_test(epoch, CLOSED_EPOCH_SLOT).await;
+        }
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Pending);
+        assert_eq!(
+            machine.pending_keys().iter().map(|key| key.next_check_epoch).collect::<Vec<_>>(),
+            vec![closing - 1],
+            "precondition: one count left"
+        );
+        let before = bn.post_validator_liveness_calls().len();
+
+        armed.store(change != MidQuery::Nothing, Ordering::SeqCst);
+        loop_.drive_once_for_test(closing, CLOSED_EPOCH_SLOT).await;
+
+        let requests = bn.post_validator_liveness_calls().split_off(before);
+        ClosingTick { machine, pk, registry, requests }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closing_tick_opens_signing_when_the_registry_holds_still() {
+        let tick = closing_tick(MidQuery::Nothing).await;
+
+        assert_eq!(tick.requests, vec![ask(12), ask(13)]);
+        assert_eq!(tick.machine.status(&tick.pk), ForwardWindowStatus::Safe);
+        assert!(tick.machine.is_signing_enabled(&tick.pk));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_during_the_closing_tick_keeps_signing_closed() {
+        let tick = closing_tick(MidQuery::Revoke).await;
+
+        assert!(!tick.registry.read().is_fresh(), "precondition: the first query straddled it");
+        assert_eq!(
+            tick.machine.status(&tick.pk),
+            ForwardWindowStatus::Pending,
+            "observations through a pre-revocation index must not open the gate"
+        );
+        assert!(!tick.machine.is_signing_enabled(&tick.pk));
+        assert_eq!(tick.requests, vec![ask(12)], "no query after the revocation");
+    }
+
+    /// The registry is fresh again by the time the old answer returns, so a
+    /// `bool` freshness check would pass. The token check does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revalidation_to_another_index_during_the_closing_tick_keeps_signing_closed() {
+        let tick = closing_tick(MidQuery::RevokeAndRevalidateTo9).await;
+
+        let registry = tick.registry.read();
+        assert_eq!(registry.freshness(), crate::pubkey_index::RegistryFreshness::Fresh(1));
+        assert_eq!(registry.index_of(&tick.pk.to_bytes()), Some("9"), "precondition");
+        drop(registry);
+        assert_eq!(
+            tick.machine.status(&tick.pk),
+            ForwardWindowStatus::Pending,
+            "an answer about index 4 must not count once the key is index 9"
+        );
+        assert!(!tick.machine.is_signing_enabled(&tick.pk));
+        assert_eq!(tick.requests, vec![ask(12)], "index 4 is not asked again");
     }
 
     /// Register at epoch 10. Ticks (11, 24) and (12, 24) are not live. At
