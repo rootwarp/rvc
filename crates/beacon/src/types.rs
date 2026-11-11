@@ -1033,6 +1033,21 @@ pub struct BeaconCommitteeSubscription {
     pub is_aggregator: bool,
 }
 
+/// Sync-committee subnet subscription for
+/// `POST /eth/v1/validator/sync_committee_subscriptions`.
+///
+/// Integers go on the wire quoted, as on [`SyncCommitteeDuty`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncCommitteeSubscription {
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub validator_index: u64,
+    #[serde(with = "serde_utils::quoted_u64_vec")]
+    pub sync_committee_indices: Vec<u64>,
+    /// First epoch at which the subscription no longer applies.
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub until_epoch: u64,
+}
+
 /// Validator liveness data from the beacon node.
 ///
 /// Per the standard Eth2 Beacon API (`POST /eth/v1/validator/liveness/{epoch}`),
@@ -2450,6 +2465,23 @@ mod tests {
         assert_eq!(sub.committees_at_slot, "64");
         assert_eq!(sub.slot, "10000");
         assert!(!sub.is_aggregator);
+    }
+
+    #[test]
+    fn sync_committee_subscription_round_trips_quoted_ints() {
+        let json =
+            r#"{"validator_index":"7","sync_committee_indices":["1","300"],"until_epoch":"512"}"#;
+
+        let sub: SyncCommitteeSubscription = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            sub,
+            SyncCommitteeSubscription {
+                validator_index: 7,
+                sync_committee_indices: vec![1, 300],
+                until_epoch: 512,
+            }
+        );
+        assert_eq!(serde_json::to_string(&sub).unwrap(), json);
     }
 
     #[test]

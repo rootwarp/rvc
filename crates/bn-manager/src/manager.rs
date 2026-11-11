@@ -16,9 +16,9 @@ use beacon::{
     ProposerPreparation, PtcDutiesResponse, RankedBlock, ShapeConstraint,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, WireBody,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLiveness,
+    ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -4974,6 +4974,23 @@ impl AttestationApi for BnManager {
         )
         .await
     }
+
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.submit(
+            "submit_sync_committee_subscriptions",
+            self.broadcast_topics.subscriptions,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.preparation),
+            owned_attempt!(subscriptions.to_vec(), |client, payload| client
+                .submit_sync_committee_subscriptions(payload.as_slice())
+                .await),
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -5266,6 +5283,10 @@ impl_beacon_client_passthrough! {
         async fn submit_beacon_committee_subscriptions(
             &self,
             subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError>;
+        async fn submit_sync_committee_subscriptions(
+            &self,
+            subscriptions: &[SyncCommitteeSubscription],
         ) -> Result<(), BeaconError>;
     }
     PayloadAttestationApi {
@@ -5638,13 +5659,13 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 27 passthrough methods, plus 15 hand-written BlockProducer methods.
+        // 28 passthrough methods, plus 15 hand-written BlockProducer methods.
         // Duty-carrying produce methods cannot sit in the macro (async_trait).
         let mut surface: Vec<&str> = BEACON_CLIENT_PASSTHROUGH_METHODS.to_vec();
         surface.extend_from_slice(BEACON_CLIENT_BLOCK_PRODUCER_METHODS);
         assert_eq!(
             surface.len(),
-            42,
+            43,
             "update the passthrough macro or BEACON_CLIENT_BLOCK_PRODUCER_METHODS"
         );
 
@@ -5677,6 +5698,7 @@ mod tests {
             "submit_proposer_preferences",
             "submit_builder_preferences",
             "submit_attestation",
+            "submit_sync_committee_subscriptions",
             "get_payload_attestation_data",
             "submit_payload_attestations",
             "submit_sync_committee_messages",

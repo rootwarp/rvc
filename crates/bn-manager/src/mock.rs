@@ -18,8 +18,9 @@ use beacon::{
     ProposerPreparation, PtcDutiesResponse, RankedBlock, SignedContributionAndProof,
     StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -186,6 +187,7 @@ pub enum MockMethod {
     GetAggregateAttestation,
     SubmitAggregateAndProofs,
     SubmitBeaconCommitteeSubscriptions,
+    SubmitSyncCommitteeSubscriptions,
     GetPayloadAttestationData,
     SubmitPayloadAttestations,
     SubmitSyncCommitteeMessages,
@@ -198,7 +200,7 @@ pub enum MockMethod {
 #[cfg(test)]
 impl MockMethod {
     /// Every role-trait method, discriminants `0..ALL.len()` with no gaps.
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 38] = [
         Self::GetGenesis,
         Self::GetGenesisMatchingValidatorsRoot,
         Self::GetConfigSpec,
@@ -229,6 +231,7 @@ impl MockMethod {
         Self::GetAggregateAttestation,
         Self::SubmitAggregateAndProofs,
         Self::SubmitBeaconCommitteeSubscriptions,
+        Self::SubmitSyncCommitteeSubscriptions,
         Self::GetPayloadAttestationData,
         Self::SubmitPayloadAttestations,
         Self::SubmitSyncCommitteeMessages,
@@ -289,6 +292,7 @@ pub struct MockBeaconNodeClient {
         MethodHook<(u64, String, Option<u64>, ForkName), VersionedAggregateAttestation>,
     submit_aggregate_and_proofs: MethodHook<VersionedSignedAggregateAndProof, ()>,
     submit_beacon_committee_subscriptions: MethodHook<Vec<BeaconCommitteeSubscription>, ()>,
+    submit_sync_committee_subscriptions: MethodHook<Vec<SyncCommitteeSubscription>, ()>,
     // PayloadAttestationApi
     get_payload_attestation_data: MethodHook<u64, Option<PayloadAttestationDataResponse>>,
     submit_payload_attestations: MethodHook<Vec<PayloadAttestationMessage>, ()>,
@@ -821,6 +825,14 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_submit_sync_committee_subscriptions(
+        self,
+        f: impl Fn(Vec<SyncCommitteeSubscription>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_sync_committee_subscriptions.set_handler(Arc::new(f));
+        self
+    }
+
     // -- PayloadAttestationApi builders --
 
     pub fn with_get_payload_attestation_data(
@@ -992,6 +1004,10 @@ impl MockBeaconNodeClient {
 
     pub fn submit_attestation_calls(&self) -> Vec<VersionedAttestation> {
         self.submit_attestation.calls()
+    }
+
+    pub fn submit_sync_committee_subscriptions_calls(&self) -> Vec<Vec<SyncCommitteeSubscription>> {
+        self.submit_sync_committee_subscriptions.calls()
     }
 }
 
@@ -1379,6 +1395,15 @@ impl AttestationApi for MockBeaconNodeClient {
         self.submit_beacon_committee_subscriptions
             .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
     }
+
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitSyncCommitteeSubscriptions).await;
+        self.submit_sync_committee_subscriptions
+            .invoke("submit_sync_committee_subscriptions", subscriptions.to_vec())
+    }
 }
 
 #[async_trait]
@@ -1562,6 +1587,49 @@ mod tests {
         }];
         mock.submit_proposer_preferences(&prefs).await.unwrap();
         assert_eq!(mock.submit_proposer_preferences_calls(), vec![prefs]);
+    }
+
+    fn sample_sync_committee_subscription() -> SyncCommitteeSubscription {
+        SyncCommitteeSubscription {
+            validator_index: 7,
+            sync_committee_indices: vec![1, 300],
+            until_epoch: 512,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_submit_sync_committee_subscriptions_captures() {
+        let mock = MockBeaconNodeClient::new().with_submit_sync_committee_subscriptions(|_| Ok(()));
+        let subscriptions = vec![sample_sync_committee_subscription()];
+        mock.submit_sync_committee_subscriptions(&subscriptions).await.expect("handler set");
+        assert_eq!(mock.submit_sync_committee_subscriptions_calls(), vec![subscriptions]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_method_delay_holds_submit_sync_committee_subscriptions() {
+        use std::time::Duration;
+
+        let delay = Duration::from_millis(30);
+        let mock = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::SubmitSyncCommitteeSubscriptions, delay)
+            .with_submit_sync_committee_subscriptions(|_| Ok(()))
+            .with_submit_beacon_committee_subscriptions(|_| Ok(()));
+        let start = tokio::time::Instant::now();
+        mock.submit_sync_committee_subscriptions(&[sample_sync_committee_subscription()])
+            .await
+            .expect("handler set");
+        assert_eq!(start.elapsed(), delay);
+        mock.submit_beacon_committee_subscriptions(&[]).await.expect("handler set");
+        assert_eq!(start.elapsed(), delay, "the override is keyed to the sync method only");
+        let methods: Vec<MockMethod> =
+            mock.call_stamps().iter().map(|stamp| stamp.method).collect();
+        assert_eq!(
+            methods,
+            [
+                MockMethod::SubmitSyncCommitteeSubscriptions,
+                MockMethod::SubmitBeaconCommitteeSubscriptions
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1980,6 +2048,9 @@ mod tests {
             }
             MockMethod::SubmitBeaconCommitteeSubscriptions => {
                 let _ = mock.submit_beacon_committee_subscriptions(&[]).await;
+            }
+            MockMethod::SubmitSyncCommitteeSubscriptions => {
+                let _ = mock.submit_sync_committee_subscriptions(&[]).await;
             }
             MockMethod::GetPayloadAttestationData => {
                 let _ = mock.get_payload_attestation_data(0).await;

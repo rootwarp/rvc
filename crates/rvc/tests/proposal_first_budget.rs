@@ -28,9 +28,9 @@ use beacon::{
     ProposerDutiesResponse, ProposerDuty, ProposerPreparation, PtcDutiesResponse,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
@@ -423,6 +423,12 @@ impl AttestationApi for DutyStallBeacon {
     ) -> Result<(), BeaconError> {
         self.inner.submit_beacon_committee_subscriptions(subscriptions).await
     }
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.inner.submit_sync_committee_subscriptions(subscriptions).await
+    }
 }
 
 #[async_trait]
@@ -706,7 +712,8 @@ fn build_duty_stall_beacon(
         })
         .with_post_sync_committee_duties(move |_epoch, _indices| Ok(empty_sync_response()))
         .with_prepare_beacon_proposer(|_p| Ok(()))
-        .with_submit_beacon_committee_subscriptions(|_s| Ok(()));
+        .with_submit_beacon_committee_subscriptions(|_s| Ok(()))
+        .with_submit_sync_committee_subscriptions(|_s| Ok(()));
 
     DutyStallBeacon { inner, stalls }
 }

@@ -12,9 +12,9 @@ use beacon::{
     ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, RankedBlock,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 
 use eth_types::{
@@ -429,6 +429,19 @@ pub trait AttestationApi: Send + Sync {
     async fn submit_beacon_committee_subscriptions(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError>;
+
+    /// Subscribe validators to sync-committee subnets
+    /// (`POST /eth/v1/validator/sync_committee_subscriptions`).
+    ///
+    /// An empty slice is a no-op at the caller, which skips the call instead
+    /// of sending `[]`.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent `Ok`.
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
     ) -> Result<(), BeaconError>;
 }
 

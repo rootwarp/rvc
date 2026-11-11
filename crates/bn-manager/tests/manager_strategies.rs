@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use beacon::{
@@ -15,7 +15,7 @@ use beacon::{
 };
 use eth_types::{ForkName, ForkSchedule};
 use serde_json::json;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::metrics::{
@@ -27,8 +27,8 @@ use rvc_bn_manager::{
     BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
     FeeRecipientPolicy, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
     ProduceDuty, Propagator, ShapeConstraint, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SingleAttestation, SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    SingleAttestation, SubmitAttestationResult, SyncCommitteeApi, SyncCommitteeSubscription,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -382,6 +382,36 @@ async fn test_submit_beacon_committee_subscriptions_delegates() {
     let manager = make_manager(&mock_server.uri());
     let result = manager.submit_beacon_committee_subscriptions(&[]).await;
     assert!(result.is_ok());
+}
+
+const SYNC_COMMITTEE_SUBSCRIPTIONS_PATH: &str = "/eth/v1/validator/sync_committee_subscriptions";
+
+fn sync_committee_subscription() -> SyncCommitteeSubscription {
+    SyncCommitteeSubscription {
+        validator_index: 7,
+        sync_committee_indices: vec![1, 300],
+        until_epoch: 512,
+    }
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .and(body_json(json!([
+            {"validator_index": "7", "sync_committee_indices": ["1", "300"], "until_epoch": "512"}
+        ])))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Ok(())), "{result:?}");
 }
 
 #[tokio::test]
@@ -2630,6 +2660,124 @@ async fn test_multi_broadcast_committee_subscriptions() {
     assert!(result.is_ok());
     poll_received(&bn1, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
     poll_received(&bn2, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+}
+
+/// Wiremock route that signals arrival, then blocks its server thread until released.
+struct HeldResponder {
+    arrived: Arc<tokio::sync::Notify>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl wiremock::Respond for HeldResponder {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.arrived.notify_one();
+        let (lock, cv) = &*self.released;
+        let released = lock.lock().unwrap_or_else(|err| err.into_inner());
+        drop(cv.wait_while(released, |released| !*released).unwrap_or_else(|err| err.into_inner()));
+        ResponseTemplate::new(200)
+    }
+}
+
+/// Releases a [`HeldResponder`] on drop, so no path leaves its server thread blocked.
+struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.0;
+        *lock.lock().unwrap_or_else(|err| err.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+/// BN-A answers at once and BN-B is held until the test releases it. First OK
+/// returns while BN-B is held; waiting for every BN would block until the hang
+/// guard, which is shorter than the 30 s client timeout that would end BN-B.
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_first_ok_with_held_bn() {
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = ReleaseOnDrop(Arc::clone(&released));
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(HeldResponder { arrived: Arc::clone(&arrived), released })
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = Arc::new(make_multi_manager(&[&bn_a.uri(), &bn_b.uri()]));
+    let call = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await
+        }
+    });
+
+    tokio::time::timeout(HANG_GUARD, arrived.notified())
+        .await
+        .expect("BN-B never received the subscriptions");
+    let result = tokio::time::timeout(HANG_GUARD, call)
+        .await
+        .expect("the call waited for the held BN-B")
+        .expect("submit task panicked");
+    assert!(matches!(result, Ok(())), "{result:?}");
+    drop(release);
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_query_first_when_broadcast_off() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bn2)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+    config.broadcast_topics.subscriptions = false;
+    let manager = BnManager::new(config).unwrap();
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Ok(())), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_all_fail() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    for bn in [&bn1, &bn2] {
+        Mock::given(method("POST"))
+            .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(bn)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Err(BeaconError::ApiError { status: 500, .. })), "{result:?}");
 }
 
 #[tokio::test]

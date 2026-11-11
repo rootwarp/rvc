@@ -16,13 +16,13 @@ use beacon::{
     parse_slot_duration_ms, ssz_deser, AttestationData, BeaconClient, BeaconClientConfig,
     BeaconCommitteeSubscription, BeaconError, BuilderConfig, BuilderPreferencesEntry, Checkpoint,
     LegacyAttestation, ProduceBlockV4Body, ProposerPreparation, SignedBuilderRequestAuth,
-    SingleAttestation, SubmitBuilderPreferencesResult, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody, BUILDER_PREFERENCES_PATH,
-    HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
-    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
-    PRODUCE_BLOCK_V4_PATH_PREFIX, PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH,
-    QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
-    QUERY_SKIP_RANDAO_VERIFICATION,
+    SingleAttestation, SubmitBuilderPreferencesResult, SyncCommitteeSubscription,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody, BUILDER_PREFERENCES_PATH, HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL,
+    HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
+    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX,
+    PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH, QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI,
+    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL, QUERY_SKIP_RANDAO_VERIFICATION,
 };
 use eth_types::{
     BodyForkLayout, ForkName, ForkSchedule, SignedBlindedBeaconBlock, SignedBlindedBeaconBlockJson,
@@ -4429,6 +4429,60 @@ async fn test_submit_beacon_committee_subscriptions_error() {
             assert_eq!(message, "Invalid subscription data");
         }
         _ => panic!("Expected ApiError with status 400"),
+    }
+}
+
+const SYNC_COMMITTEE_SUBSCRIPTIONS_PATH: &str = "/eth/v1/validator/sync_committee_subscriptions";
+
+fn sync_committee_subscription() -> SyncCommitteeSubscription {
+    SyncCommitteeSubscription {
+        validator_index: 7,
+        sync_committee_indices: vec![1, 300],
+        until_epoch: 512,
+    }
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_path_and_body() {
+    let mock_server = MockServer::start().await;
+    let body: serde_json::Value = serde_json::from_str(
+        r#"[{"validator_index":"7","sync_committee_indices":["1","300"],"until_epoch":"512"}]"#,
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .and(body_json(body))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Ok(())), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    match result {
+        Err(BeaconError::ApiError { status: 500, .. }) => {}
+        other => panic!("expected ApiError with status 500, got {other:?}"),
     }
 }
 

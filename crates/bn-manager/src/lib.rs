@@ -68,10 +68,10 @@ pub use beacon::{
     PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedBuilderRequestAuth,
     SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorLiveness,
-    ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
-    FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingData, SyncingResponse,
+    ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody, FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
 };
 pub use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,

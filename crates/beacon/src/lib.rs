@@ -35,10 +35,10 @@ pub use types::{
     RankedBlock, SignedAggregateAndProof, SignedContributionAndProof, SingleAttestation, StateFork,
     StateForkResponse, StateResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingData, SyncingResponse, ValidatorData, ValidatorInfo, ValidatorLiveness,
-    ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
-    MAX_PLAUSIBLE_BLOCK_VALUE_WEI,
+    SyncCommitteeSubscription, SyncingData, SyncingResponse, ValidatorData, ValidatorInfo,
+    ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody, MAX_PLAUSIBLE_BLOCK_VALUE_WEI,
 };
 pub use v4_wire::{
     BuilderConfig, BuilderEntry, BuilderPreferencesEntry, BuilderRequestAuth,

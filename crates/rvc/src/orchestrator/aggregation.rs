@@ -1267,8 +1267,8 @@ mod tests {
     use async_trait::async_trait;
     use beacon::{
         AttestationDataResponse, BeaconCommitteeSubscription, BeaconError, DataResponse,
-        DependentRootResponse, SubmitAttestationResult, VersionedAggregateAttestation,
-        VersionedAttestation, VersionedSignedAggregateAndProof,
+        DependentRootResponse, SubmitAttestationResult, SyncCommitteeSubscription,
+        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
     };
     use bn_manager::{AttestationApi, MockBeaconNodeClient};
     use crypto::{
@@ -2421,6 +2421,13 @@ mod tests {
         async fn submit_beacon_committee_subscriptions(
             &self,
             _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+
+        async fn submit_sync_committee_subscriptions(
+            &self,
+            _subscriptions: &[SyncCommitteeSubscription],
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("attestation-only mock".into()))
         }

@@ -31,9 +31,9 @@ use crate::types::{
     ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use crate::v4_wire::{
     BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, FIELD_BLOBS,
@@ -1679,6 +1679,17 @@ impl BeaconClient {
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions)
             .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
+            .await
+    }
+
+    /// Subscribes validators to sync-committee subnets ahead of their period
+    /// (`POST /eth/v1/validator/sync_committee_subscriptions`).
+    pub async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/sync_committee_subscriptions", &subscriptions)
+            .instrument(tracing::info_span!("beacon.submit_sync_committee_subscriptions"))
             .await
     }
 
