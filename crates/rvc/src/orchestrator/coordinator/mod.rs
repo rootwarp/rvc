@@ -35,7 +35,9 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::{DutyManagementService, PrepareOutcome};
-use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster};
+use super::epoch_boundary::{
+    EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster, BUILDER_REGISTRATION_TIMEOUT,
+};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
@@ -319,9 +321,6 @@ impl AttestationOutcome {
         }
     }
 }
-
-/// Timeout for builder registration API calls.
-const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of a timed wait that can be interrupted by shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,10 +658,13 @@ where
             Arc::clone(&preferences),
             duty_tracker.clone(),
             config.timeouts.clone(),
+            builder_service.clone(),
+            Arc::clone(&config.fork_schedule),
         ));
         let (processed_slot_tx, processed_slots) = watch::channel(None);
         let epoch_boundary_task = EpochBoundaryTask::new(
             Arc::clone(&epoch_boundary),
+            clock.clone(),
             processed_slots,
             shutdown_rx.clone(),
         );
@@ -752,8 +754,8 @@ where
     ///
     /// Spawn it beside [`Self::run`] on the Orchestrator shutdown tier. It
     /// runs the boundary steps at the first processed slot of every epoch,
-    /// the boot epoch included, and ends when shutdown is requested or this
-    /// orchestrator is dropped.
+    /// the boot epoch included, and epoch 0's before genesis. It ends when
+    /// shutdown is requested or this orchestrator is dropped.
     pub fn take_epoch_boundary_runner(&mut self) -> Option<EpochBoundaryTask> {
         self.epoch_boundary_task.take()
     }

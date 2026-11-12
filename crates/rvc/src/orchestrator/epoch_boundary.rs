@@ -12,16 +12,21 @@
 //! runs in every pass while a step that needs duties is pending.
 //! `PrepareProposers` is `NotReady` while a local key has no validator index,
 //! and sends again only once more keys have one. `CommitteeSubscriptions` is
-//! `NotReady` until the attester duties of E and E+1 are cached. Each step
-//! with beacon-node work runs under its own bound,
-//! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and CommitteeSubscriptions
-//! and `timeouts.preparation` for PrepareProposers: a step that reaches it is
-//! dropped and `Failed`. The first pass of a later epoch logs one warn for
-//! the steps the old epoch did not finish, with each one's last outcome. The
-//! epoch summary is logged once per epoch, at the end of the epoch's first
-//! pass. [`EpochBoundaryTask::run`] calls it on its own task ([`TASK_NAME`])
-//! after each slot the slot loop processed, while that slot's epoch has a
-//! step pending. Each pass is a root `epoch.boundary` span.
+//! `NotReady` until the attester duties of E and E+1 are cached.
+//! `BuilderRegistration` runs only in the boot epoch, the first epoch the
+//! runner ran, and needs no duties. Each step with beacon-node work runs
+//! under its own bound, `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
+//! CommitteeSubscriptions, `timeouts.preparation` for PrepareProposers and
+//! [`BUILDER_REGISTRATION_TIMEOUT`] for BuilderRegistration: a step that
+//! reaches it is dropped and `Failed`. The first pass of a later epoch logs
+//! one warn for the steps the old epoch did not finish, with each one's last
+//! outcome. The epoch summary is logged once per epoch, at the end of the
+//! epoch's first pass. [`EpochBoundaryTask::run`] calls it on its own task
+//! ([`TASK_NAME`]) after each slot the slot loop processed, while that
+//! slot's epoch has a step pending. Before the first processed slot, while
+//! the clock reads before genesis, the task runs epoch 0's pending steps
+//! itself once per tick; that progress is epoch 0's, so slot 0 does not
+//! repeat it. Each pass is a root `epoch.boundary` span.
 //!
 //! # Step order
 //!
@@ -35,7 +40,7 @@
 //! 4. `PrepareProposers`
 //! 5. `CommitteeSubscriptions` (epoch E, then E+1)
 //! 6. `SyncCommitteeSubscriptions` (reserved, W4-E9b)
-//! 7. `BuilderRegistration` (reserved, W4-E4b boot epoch, W4-E6a every epoch)
+//! 7. `BuilderRegistration` (the boot epoch only; every epoch from W4-E6a)
 //! 8. `ProposerPreferences` (reserved, W4-E6a interim, W4-E6b1)
 //!
 //! # Lock rule
@@ -56,13 +61,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
-use builder::{BuilderService, UpcomingProposal};
+use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
 use duty_tracker::DutyTracker;
-use eth_types::{Root, Slot};
+use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use signer::CircuitBreakerState;
-use timing::SLOTS_PER_EPOCH;
+use timing::{SlotClock, TimingError, SLOTS_PER_EPOCH};
 use tokio::sync::watch;
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument, Span};
 use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
@@ -73,9 +78,18 @@ use super::utils;
 /// Executor task name. The runner's loop span has the same name.
 pub const TASK_NAME: &str = "epoch.boundary.runner";
 
+/// Timeout for builder registration API calls.
+pub(crate) const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The wait before the next read of a clock that fails for a reason other
+/// than genesis.
+const CLOCK_RETRY: Duration = Duration::from_secs(1);
+
 /// The runner on its own task, woken by each slot the slot loop processed.
 pub struct EpochBoundaryTask {
     runner: Arc<EpochBoundaryRunner>,
+    /// Read only before the first processed slot.
+    clock: Arc<dyn SlotClock>,
     slots: watch::Receiver<Option<Slot>>,
     shutdown: watch::Receiver<bool>,
 }
@@ -83,14 +97,18 @@ pub struct EpochBoundaryTask {
 impl EpochBoundaryTask {
     pub(crate) fn new(
         runner: Arc<EpochBoundaryRunner>,
+        clock: Arc<dyn SlotClock>,
         slots: watch::Receiver<Option<Slot>>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
         runner.follow(slots.clone());
-        Self { runner, slots, shutdown }
+        Self { runner, clock, slots, shutdown }
     }
 
     /// Runs the pending steps at each processed slot until shutdown.
+    ///
+    /// Before the first processed slot, while the clock reads before genesis,
+    /// it runs epoch 0's pending steps once per tick instead.
     ///
     /// Returns when the shutdown watch reads `true` or loses its sender, or
     /// when the processed-slot sender is dropped (the slot loop is gone). A
@@ -99,6 +117,9 @@ impl EpochBoundaryTask {
     /// step it was in stays pending. Shutdown wins ties in both waits.
     pub async fn run(mut self) {
         let loop_span = info_span!(parent: None, "epoch.boundary.runner");
+        if !self.run_before_genesis(&loop_span).await {
+            return;
+        }
         loop {
             tokio::select! {
                 biased;
@@ -125,6 +146,58 @@ impl EpochBoundaryTask {
             }
         }
     }
+
+    /// Until a slot is processed, runs epoch 0's pending steps once per tick
+    /// while the clock reads before genesis (see [`pre_genesis_tick`]). Any
+    /// other clock error is warned and read again after [`CLOCK_RETRY`]. A
+    /// pass is raced against shutdown, and each wait against shutdown and
+    /// the processed slots. `false` when the task must end.
+    async fn run_before_genesis(&mut self, loop_span: &Span) -> bool {
+        loop {
+            if self.slots.borrow().is_some() {
+                return true;
+            }
+            let wait = match self.clock.current_slot() {
+                Ok(_) => return true,
+                Err(TimingError::BeforeGenesis { .. }) => {
+                    if self.runner.has_pending(0) {
+                        let pass = info_span!(parent: None, "epoch.boundary", epoch = 0_u64);
+                        pass.follows_from(loop_span);
+                        tokio::select! {
+                            biased;
+                            () = shutdown_requested(&mut self.shutdown) => return false,
+                            () = self.runner.run_pending_for_epoch(0).instrument(pass) => {}
+                        }
+                    }
+                    pre_genesis_tick(self.clock.as_ref())
+                }
+                Err(e) => {
+                    warn!(error = %e, "Epoch boundary runner cannot read the current slot");
+                    CLOCK_RETRY
+                }
+            };
+            tokio::select! {
+                biased;
+                () = shutdown_requested(&mut self.shutdown) => return false,
+                changed = self.slots.changed() => {
+                    // `run` takes the slot from here.
+                    self.slots.mark_changed();
+                    return changed.is_ok();
+                }
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+}
+
+/// The wait between two pre-genesis passes: the time left to genesis, at
+/// most one slot, and one slot when the clock reads none left.
+fn pre_genesis_tick(clock: &dyn SlotClock) -> Duration {
+    let slot = clock.slot_duration();
+    match clock.time_until_slot(0) {
+        Ok(left) if !left.is_zero() => left.min(slot),
+        _ => slot,
+    }
 }
 
 /// Resolves once `shutdown` reads `true` or loses its sender.
@@ -140,15 +213,18 @@ pub(crate) enum BoundaryStep {
     DutyFetch,
     PrepareProposers,
     CommitteeSubscriptions,
+    /// The boot epoch only.
+    BuilderRegistration,
 }
 
 impl BoundaryStep {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::BreakerReset,
         Self::ReorgCheck,
         Self::DutyFetch,
         Self::PrepareProposers,
         Self::CommitteeSubscriptions,
+        Self::BuilderRegistration,
     ];
 
     /// Reads E and E+1 duties from the cache, so DutyFetch runs before it.
@@ -180,26 +256,33 @@ pub(crate) struct EpochProgress {
     /// The keys with a validator index when the last `Partial` prepare POST
     /// went out.
     prepared_count: Option<usize>,
+    /// The first epoch the runner ran, epoch 0 for a start before genesis.
+    /// Set once, and kept by each later epoch's progress.
+    boot_epoch: u64,
 }
 
 impl EpochProgress {
-    fn new(epoch: u64) -> Self {
+    fn new(epoch: u64, boot_epoch: u64) -> Self {
         Self {
             epoch,
             done: BTreeSet::new(),
             last_outcome: BTreeMap::new(),
             subscribed: BTreeSet::new(),
             prepared_count: None,
+            boot_epoch,
         }
     }
 
     /// DutyFetch is never marked done: it is pending while a step that needs
-    /// duties is.
+    /// duties is. BuilderRegistration is pending in the boot epoch only.
     fn is_pending(&self, step: BoundaryStep) -> bool {
         match step {
             BoundaryStep::DutyFetch => BoundaryStep::ALL
                 .into_iter()
                 .any(|step| step.needs_duties() && !self.done.contains(&step)),
+            BoundaryStep::BuilderRegistration => {
+                self.epoch == self.boot_epoch && !self.done.contains(&step)
+            }
             _ => !self.done.contains(&step),
         }
     }
@@ -244,6 +327,10 @@ pub(crate) struct EpochBoundaryRunner {
     preferences: Arc<PreferenceBroadcaster>,
     duty_tracker: Arc<DutyTracker>,
     timeouts: OperationTimeouts,
+    /// The boot epoch's registration; none without a builder service.
+    builder_service: Option<Arc<BuilderService>>,
+    /// Gloas retired the registration.
+    fork_schedule: Arc<ForkSchedule>,
     /// A proposer root change whose preferences are not broadcast yet. The
     /// reorg check sets it when it caches the change, and it is cleared once
     /// the broadcast returns, so an attempt cut in between leaves it to the
@@ -264,6 +351,8 @@ impl EpochBoundaryRunner {
         preferences: Arc<PreferenceBroadcaster>,
         duty_tracker: Arc<DutyTracker>,
         timeouts: OperationTimeouts,
+        builder_service: Option<Arc<BuilderService>>,
+        fork_schedule: Arc<ForkSchedule>,
     ) -> Self {
         Self {
             duty_management,
@@ -271,6 +360,8 @@ impl EpochBoundaryRunner {
             preferences,
             duty_tracker,
             timeouts,
+            builder_service,
+            fork_schedule,
             preferences_owed: AtomicBool::new(false),
             progress: parking_lot::Mutex::new(None),
             selection_proofs: SelectionProofs::default(),
@@ -300,7 +391,16 @@ impl EpochBoundaryRunner {
     /// Once a slot of a later epoch is processed, the pass starts no further
     /// step.
     pub(crate) async fn run_pending(&self, slot: Slot) {
-        let epoch = slot / SLOTS_PER_EPOCH;
+        self.run_epoch_steps(slot / SLOTS_PER_EPOCH, slot).await;
+    }
+
+    /// [`Self::run_pending`] with no processed slot: epoch 0 before genesis.
+    /// The summary reads the epoch's first slot.
+    pub(crate) async fn run_pending_for_epoch(&self, epoch: u64) {
+        self.run_epoch_steps(epoch, epoch.saturating_mul(SLOTS_PER_EPOCH)).await;
+    }
+
+    async fn run_epoch_steps(&self, epoch: u64, slot: Slot) {
         let first_pass = self.begin_epoch(epoch);
         for step in BoundaryStep::ALL {
             if !self.is_pending(epoch, step) {
@@ -332,6 +432,10 @@ impl EpochBoundaryRunner {
                     let subscriptions = self.committee_subscriptions(epoch);
                     bounded(epoch, step, self.timeouts.duty_fetch, subscriptions).await
                 }
+                BoundaryStep::BuilderRegistration => {
+                    let registration = self.builder_registration(epoch);
+                    bounded(epoch, step, BUILDER_REGISTRATION_TIMEOUT, registration).await
+                }
             };
             self.record(epoch, step, outcome);
         }
@@ -361,7 +465,8 @@ impl EpochBoundaryRunner {
         if progress.as_ref().is_some_and(|current| current.epoch >= epoch) {
             return false;
         }
-        let old = progress.replace(EpochProgress::new(epoch));
+        let boot_epoch = progress.as_ref().map_or(epoch, |current| current.boot_epoch);
+        let old = progress.replace(EpochProgress::new(epoch, boot_epoch));
         drop(progress);
         self.selection_proofs.lock().clear();
         if let Some(old) = old {
@@ -533,6 +638,29 @@ impl EpochBoundaryRunner {
             current.subscribed.insert(duty_epoch);
         }
     }
+
+    /// Registers through the cached `register_validators`, which signs and
+    /// sends only new or changed registrations: `Done` once it returns `Ok`,
+    /// `Failed` on an error. With no builder service, or from Gloas on,
+    /// `Done` with no call.
+    async fn builder_registration(&self, epoch: u64) -> StepOutcome {
+        let Some(builder) = &self.builder_service else {
+            return StepOutcome::Done;
+        };
+        if legacy_proposer_ops_retired(ForkName::from_epoch(epoch, &self.fork_schedule)) {
+            return StepOutcome::Done;
+        }
+        match builder.register_validators(epoch).await {
+            Ok(()) => {
+                info!(epoch, "Boot-epoch builder registration completed");
+                StepOutcome::Done
+            }
+            Err(e) => {
+                warn!(epoch, error = %e, "Boot-epoch builder registration failed");
+                StepOutcome::Failed
+            }
+        }
+    }
 }
 
 /// Runs `step` under `bound`. At the bound the step is dropped and `Failed`.
@@ -690,6 +818,8 @@ mod tests {
     const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const BREAKER_CONSECUTIVE_LIMIT: u32 = 3;
+    const SLOT: Duration = Duration::from_secs(12);
+    const GENESIS_MS: u64 = TEST_GENESIS_TIME * 1_000;
 
     struct Fixture {
         mock: Arc<MockBeaconNodeClient>,
@@ -707,6 +837,8 @@ mod tests {
         /// The tracker's index source: the production one, over the fixture's
         /// pubkey map and index registry.
         index_source: Arc<PubkeyIndexSource>,
+        /// The runner task's clock, at genesis until a test moves it.
+        clock: Arc<MockSlotClock>,
     }
 
     impl Fixture {
@@ -814,7 +946,8 @@ mod tests {
     /// Local validator 42 with an attester duty at slot 1 of every epoch
     /// requested with its index; epochs 1 and 2 are seeded through
     /// `fetch_duties_for_epoch`.
-    /// `with_builder` attaches a `BuilderService` over the same mock.
+    /// `with_builder` attaches a `BuilderService` over the same mock and
+    /// makes the local key builder-enabled.
     async fn fixture_with(
         mock: MockBeaconNodeClient,
         local: SecretKey,
@@ -909,7 +1042,9 @@ mod tests {
         }
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
-        validator_store.add_validator(ValidatorConfig::new(pk_bytes)).expect("add validator");
+        let mut validator = ValidatorConfig::new(pk_bytes);
+        validator.builder_proposals = with_builder;
+        validator_store.add_validator(validator).expect("add validator");
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(local);
@@ -930,8 +1065,9 @@ mod tests {
             ))
         });
         let timeouts = config.timeouts.clone();
+        let fork_schedule = Arc::clone(&config.fork_schedule);
         let preferences = Arc::new(PreferenceBroadcaster::new(
-            builder_service,
+            builder_service.clone(),
             Arc::clone(&duty_tracker),
             Arc::clone(&pubkey_map),
             Arc::clone(&validator_store),
@@ -953,7 +1089,10 @@ mod tests {
             preferences,
             Arc::clone(&duty_tracker),
             timeouts,
+            builder_service,
+            fork_schedule,
         ));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, SLOT, SLOTS_PER_EPOCH));
         Fixture {
             mock,
             duty_tracker,
@@ -964,6 +1103,7 @@ mod tests {
             failing_prepare,
             failing_subscriptions,
             index_source,
+            clock,
         }
     }
 
@@ -1901,9 +2041,14 @@ mod tests {
     }
 
     fn spawn_runner(f: &Fixture) -> RunnerTask {
+        spawn_runner_on(f, f.clock.clone())
+    }
+
+    /// [`spawn_runner`] over `clock`.
+    fn spawn_runner_on(f: &Fixture, clock: Arc<dyn SlotClock>) -> RunnerTask {
         let (slots, slots_rx) = watch::channel(None);
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let task = EpochBoundaryTask::new(Arc::clone(&f.runner), slots_rx, shutdown_rx);
+        let task = EpochBoundaryTask::new(Arc::clone(&f.runner), clock, slots_rx, shutdown_rx);
         RunnerTask { slots, shutdown, task: tokio::spawn(task.run()) }
     }
 
@@ -2160,10 +2305,10 @@ mod tests {
     }
 
     impl LocalRunner {
-        fn new(f: &Fixture) -> Self {
+        fn new(f: &Fixture, clock: Arc<dyn SlotClock>) -> Self {
             let (slots, slots_rx) = watch::channel(None);
             let (shutdown, shutdown_rx) = watch::channel(false);
-            let task = EpochBoundaryTask::new(Arc::clone(&f.runner), slots_rx, shutdown_rx);
+            let task = EpochBoundaryTask::new(Arc::clone(&f.runner), clock, slots_rx, shutdown_rx);
             Self { slots, shutdown, run: Box::pin(task.run()) }
         }
 
@@ -2207,7 +2352,7 @@ mod tests {
     async fn shutdown_wins_an_in_flight_tie_with_a_ready_pass() {
         let f = held_fixture(MockMethod::PrepareBeaconProposer, &[1, 2]).await;
         for round in 1..=32 {
-            let mut runner = LocalRunner::new(&f);
+            let mut runner = LocalRunner::new(&f, f.clock.clone());
             runner.slots.send_replace(Some(32));
             let held = runner.poll_until_prepare(&f.mock, round).await;
             let mut hold_end = std::pin::pin!(tokio::time::sleep_until(held.at + HOLD));
@@ -2232,7 +2377,7 @@ mod tests {
             assert!(tie.is_ready(), "round {round}: shutdown wins: the tie poll ends the runner");
         }
 
-        let mut runner = LocalRunner::new(&f);
+        let mut runner = LocalRunner::new(&f, f.clock.clone());
         runner.slots.send_replace(Some(32));
         runner.poll_until_prepare(&f.mock, 33).await;
         tokio::time::advance(HOLD).await;
@@ -2398,7 +2543,8 @@ mod tests {
     }
 
     /// The step bounds, as source: `duty_fetch` for ReorgCheck and
-    /// CommitteeSubscriptions, `preparation` for PrepareProposers, DutyFetch's
+    /// CommitteeSubscriptions, `preparation` for PrepareProposers,
+    /// `BUILDER_REGISTRATION_TIMEOUT` for BuilderRegistration, DutyFetch's
     /// inside the step, and none for BreakerReset (no I/O). PrepareProposers'
     /// bound has the length of its POST's own `preparation` bound but starts
     /// earlier: `the_prepare_step_bound_starts_before_the_map_read` sees it.
@@ -2416,7 +2562,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("pub(crate)fnhas_pending(").next())
             .expect("`run_pending`, then `has_pending`");
-        assert_eq!(run.matches("bounded(").count(), 3, "three steps run under a bound: {run}");
+        assert_eq!(run.matches("bounded(").count(), 4, "four steps run under a bound: {run}");
         for arm in [
             "BoundaryStep::BreakerReset=>self.breaker_reset(epoch),",
             "BoundaryStep::ReorgCheck=>{bounded(epoch,step,self.timeouts.duty_fetch,\
@@ -2427,6 +2573,9 @@ mod tests {
             "BoundaryStep::CommitteeSubscriptions=>{letsubscriptions=\
              self.committee_subscriptions(epoch);\
              bounded(epoch,step,self.timeouts.duty_fetch,subscriptions).await}",
+            "BoundaryStep::BuilderRegistration=>{letregistration=\
+             self.builder_registration(epoch);\
+             bounded(epoch,step,BUILDER_REGISTRATION_TIMEOUT,registration).await}",
         ] {
             assert!(run.contains(arm), "`run_pending` has the arm `{arm}`: {run}");
         }
@@ -3140,5 +3289,352 @@ mod tests {
             "the next pass sends the key that resolved during the POST"
         );
         assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
+    }
+
+    // --- W4-E4b: the runner covers boot: epoch 0 before genesis, and the
+    // boot epoch's builder registration ---
+
+    /// A clock with no time left to genesis whose every slot read returns
+    /// `slot`, stamped with the paused time of the read.
+    struct ScriptedClock {
+        slot: fn() -> Result<Slot, TimingError>,
+        reads: parking_lot::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl ScriptedClock {
+        fn new(slot: fn() -> Result<Slot, TimingError>) -> Arc<Self> {
+            Arc::new(Self { slot, reads: parking_lot::Mutex::new(Vec::new()) })
+        }
+
+        fn reads(&self) -> Vec<tokio::time::Instant> {
+            self.reads.lock().clone()
+        }
+    }
+
+    impl SlotClock for ScriptedClock {
+        fn genesis_time(&self) -> u64 {
+            TEST_GENESIS_TIME
+        }
+
+        fn slot_duration(&self) -> Duration {
+            SLOT
+        }
+
+        fn slots_per_epoch(&self) -> u64 {
+            SLOTS_PER_EPOCH
+        }
+
+        fn now_since_epoch(&self) -> Duration {
+            Duration::from_secs(TEST_GENESIS_TIME)
+        }
+
+        fn current_slot(&self) -> Result<Slot, TimingError> {
+            self.reads.lock().push(tokio::time::Instant::now());
+            (self.slot)()
+        }
+    }
+
+    fn before_genesis() -> Result<Slot, TimingError> {
+        Err(TimingError::BeforeGenesis {
+            current_time: TEST_GENESIS_TIME,
+            genesis_time: TEST_GENESIS_TIME,
+        })
+    }
+
+    fn arrival_stamps(
+        mock: &MockBeaconNodeClient,
+        method: MockMethod,
+    ) -> Vec<tokio::time::Instant> {
+        mock.call_stamps().iter().filter(|stamp| stamp.method == method).map(|s| s.at).collect()
+    }
+
+    /// W4-E4b AC1: 50 ms before genesis, with no slot processed, the runner
+    /// task prepares epoch 0 on its own: validator 7's prepare POST goes out
+    /// while the clock still reads before genesis. Shutdown ends the task
+    /// within the tier budget with a pre-genesis prepare held.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn runner_prepares_epoch_zero_before_genesis() {
+        let local = SecretKey::generate();
+        let pk_bytes = local.public_key().to_bytes();
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), local, false, &[]).await;
+        f.index_source.registry.write().insert(pk_bytes, "7".to_string());
+        f.clock.set_current_time_ms(GENESIS_MS - 50);
+        let runner = spawn_runner(&f);
+
+        advance_until(|| !f.mock.prepare_beacon_proposer_calls().is_empty()).await;
+
+        assert_eq!(
+            prepared_indices(&f.mock),
+            [["7"]],
+            "validator 7's prepare POST must go out before genesis"
+        );
+        assert!(
+            matches!(f.clock.current_slot(), Err(TimingError::BeforeGenesis { .. })),
+            "the clock must still read before genesis"
+        );
+        assert_eq!(*runner.slots.borrow(), None, "no slot was processed");
+        let epoch = f.runner.progress.lock().as_ref().map(|progress| progress.epoch);
+        assert_eq!(epoch, Some(0), "the runner ran epoch 0's steps");
+        shut_down_within_budget(runner, "before genesis").await;
+
+        // A pre-genesis pass held in its prepare POST is raced against
+        // shutdown, as a pass at a processed slot is.
+        let f = held_fixture(MockMethod::PrepareBeaconProposer, &[]).await;
+        f.clock.set_current_time_ms(GENESIS_MS - 50);
+        let runner = spawn_runner(&f);
+        await_arrivals(&f.mock, MockMethod::PrepareBeaconProposer, 1).await;
+        shut_down_within_budget(runner, "a pre-genesis prepare in flight").await;
+        assert!(f.mock.prepare_beacon_proposer_calls().is_empty(), "dropped, not finished");
+    }
+
+    /// W4-E4b AC2: the epoch-0 progress made before genesis carries into
+    /// slot 0. 30 s before genesis the first tick prepares epoch 0, and E+1's
+    /// attester requests fail, so the subscription step stays pending. Slot
+    /// 0, the first slot processed, comes during the 12 s wait. The task
+    /// runs slot 0's pass at once: it fetches E+1 and subscribes, and does
+    /// not prepare again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn pre_genesis_progress_carries_into_slot_zero() {
+        use BoundaryStep::{CommitteeSubscriptions, PrepareProposers};
+        let [att, prep, subs] = [
+            MockMethod::GetAttesterDuties,
+            MockMethod::PrepareBeaconProposer,
+            MockMethod::SubmitBeaconCommitteeSubscriptions,
+        ];
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        f.failing_attester.lock().insert(1, 2);
+        f.clock.set_current_time_ms(GENESIS_MS - 30_000);
+        let runner = spawn_runner(&f);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(arrivals(&f.mock, prep), 1, "the pre-genesis tick must prepare epoch 0");
+        assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Done), true));
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "E+1 is uncached"
+        );
+
+        f.clock.set_current_time_ms(GENESIS_MS);
+        let (calls, processed) = (f.mock.call_stamps().len(), tokio::time::Instant::now());
+        runner.slots.send_replace(Some(0));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let since: Vec<(MockMethod, tokio::time::Instant)> =
+            f.mock.call_stamps()[calls..].iter().map(|stamp| (stamp.method, stamp.at)).collect();
+        assert_eq!(
+            since,
+            [(att, processed), (subs, processed), (subs, processed)],
+            "slot 0's pass runs at once: DutyFetch's E+1 request and the subscriptions, \
+             and it must not prepare again"
+        );
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["1"], &["33"]]));
+        assert_eq!(arrivals(&f.mock, prep), 1, "slot 0 must not prepare again");
+        assert!(!f.runner.has_pending(1), "every epoch-0 step is done");
+        shut_down_within_budget(runner, "after slot 0").await;
+    }
+
+    /// W4-E4b AC3: a prepare that answers 503 before genesis is retried at
+    /// the next tick, not earlier. A tick is the time left to genesis, at
+    /// most one slot, and one slot when the clock reads none left: 50 ms,
+    /// 12 s and 12 s here. The retry succeeds, and the step is done.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn pre_genesis_prepare_failure_retries_next_tick() {
+        use BoundaryStep::PrepareProposers;
+        let prep = MockMethod::PrepareBeaconProposer;
+        for (arm, to_genesis_ms, tick) in [
+            ("50 ms to genesis", Some(50), Duration::from_millis(50)),
+            ("30 s to genesis: one slot at most", Some(30_000), SLOT),
+            ("no time left on the clock: one slot", None, SLOT),
+        ] {
+            let f =
+                fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+            *f.failing_prepare.lock() = 1;
+            let clock: Arc<dyn SlotClock> = match to_genesis_ms {
+                Some(ms) => {
+                    f.clock.set_current_time_ms(GENESIS_MS - ms);
+                    f.clock.clone()
+                }
+                None => ScriptedClock::new(before_genesis),
+            };
+            let start = tokio::time::Instant::now();
+            let runner = spawn_runner_on(&f, clock);
+
+            tokio::time::sleep(tick - Duration::from_millis(1)).await;
+            assert_eq!(
+                arrival_stamps(&f.mock, prep),
+                [start],
+                "{arm}: one prepare, at the first tick, and no retry before the next"
+            );
+            assert_eq!(
+                step_state(&f.runner, PrepareProposers),
+                (Some(StepOutcome::Failed), false),
+                "{arm}: the 503 leaves PrepareProposers failed, and not done"
+            );
+
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            assert_eq!(
+                arrival_stamps(&f.mock, prep),
+                [start, start + tick],
+                "{arm}: the 503 must be retried at the next tick"
+            );
+            assert_eq!(
+                step_state(&f.runner, PrepareProposers),
+                (Some(StepOutcome::Done), true),
+                "{arm}: the retry succeeded: done"
+            );
+            shut_down_within_budget(runner, arm).await;
+        }
+    }
+
+    /// W4-E4b AC4: a clock that cannot give the current slot for a reason
+    /// other than genesis gets one warn, and the next read 1 s of virtual
+    /// time later, not earlier. No pass runs on it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn clock_error_waits_one_second() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let calls = f.mock.call_stamps().len();
+        let clock = ScriptedClock::new(|| Err(TimingError::InvalidSlotDuration));
+        let warns = Warns::default();
+        let _default = warns.install();
+        let warn = "Epoch boundary runner cannot read the current slot \
+                    error=slot duration must be at least 1 second";
+        let start = tokio::time::Instant::now();
+        let mut runner = LocalRunner::new(&f, clock.clone());
+
+        assert!(futures::poll!(runner.run.as_mut()).is_pending(), "it waits");
+        assert_eq!(clock.reads(), [start], "the first read");
+        assert_eq!(warns.lines(), [warn], "one warn");
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(futures::poll!(runner.run.as_mut()).is_pending(), "it still waits");
+        assert_eq!(clock.reads(), [start], "no read before 1 s");
+        assert_eq!(warns.lines(), [warn], "still one warn");
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(runner.run.as_mut()).is_pending(), "it waits again");
+        assert_eq!(
+            clock.reads(),
+            [start, start + Duration::from_secs(1)],
+            "the next read must come 1 s later"
+        );
+        assert_eq!(warns.lines(), [warn, warn], "one warn per read");
+        assert_eq!(f.mock.call_stamps().len(), calls, "no pass runs on a broken clock");
+        assert!(f.runner.progress.lock().is_none(), "no epoch started");
+
+        runner.shutdown.send_replace(true);
+        assert!(futures::poll!(runner.run.as_mut()).is_ready(), "shutdown ends the waiting runner");
+    }
+
+    /// The `register_validators` calls: one `builder.register` span each,
+    /// cache hits included.
+    fn registrations(spans: &OpenedSpans) -> usize {
+        spans.0.lock().iter().filter(|name| **name == "builder.register").count()
+    }
+
+    /// W4-E4b AC5: the boot epoch's registration needs no validator index.
+    /// With none resolved, it is `Ok` at slot 2, and done; slots 3..31 make
+    /// no further `register_validators` call, while PrepareProposers stays
+    /// `NotReady` in every pass.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn boot_registration_is_not_repeated_after_it_succeeds() {
+        use BoundaryStep::{BuilderRegistration, PrepareProposers};
+        let mock = proposer_duties_at(ROOT_A).with_register_validators(|_registrations| Ok(()));
+        let f = fixture_seeded(mock, SecretKey::generate(), true, &[]).await;
+        let _resolved = std::mem::take(&mut *f.index_source.registry.write());
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        f.runner.run_pending(2).await;
+
+        assert_eq!(registrations(&spans), 1, "slot 2 must make one register_validators call");
+        assert_eq!(f.mock.register_validators_calls().len(), 1, "its POST was answered");
+        assert_eq!(
+            step_state(&f.runner, BuilderRegistration),
+            (Some(StepOutcome::Done), true),
+            "Ok: done"
+        );
+        for slot in 3..SLOTS_PER_EPOCH {
+            f.runner.run_pending(slot).await;
+            assert_eq!(
+                step_state(&f.runner, PrepareProposers),
+                (Some(StepOutcome::NotReady), false),
+                "slot {slot}: no index, not ready"
+            );
+        }
+
+        assert_eq!(
+            registrations(&spans),
+            1,
+            "slots 3..31 must make no further register_validators call"
+        );
+        assert_eq!(arrivals(&f.mock, MockMethod::RegisterValidators), 1, "one registration POST");
+    }
+
+    /// W4-E4b AC6: the registration step runs in the boot epoch only. Boot
+    /// at epoch 2: it runs there, and in epoch 3 it is not pending and makes
+    /// no call. When epoch 2's first POST is held past
+    /// `BUILDER_REGISTRATION_TIMEOUT`, the step is `Failed` at that bound and
+    /// the slot-65 pass retries it. With no builder service, or at a Gloas
+    /// boot epoch, it is `Done` with no call.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn registration_runs_only_in_the_boot_epoch() {
+        use BoundaryStep::BuilderRegistration;
+        let gloas = create_test_fork_schedule().gloas_fork_epoch;
+        let register = MockMethod::RegisterValidators;
+        for (arm, with_builder, boot, held, want_calls, want_posts) in [
+            ("boot epoch 2", true, 2, false, 1, 1),
+            ("boot epoch 2, first POST held", true, 2, true, 2, 1),
+            ("no builder service", false, 2, false, 0, 0),
+            ("Gloas boot epoch", true, gloas, false, 0, 0),
+        ] {
+            let delays = if held { vec![HOLD] } else { Vec::new() };
+            let mock = proposer_duties_at(ROOT_A)
+                .with_register_validators(|_registrations| Ok(()))
+                .with_call_delays(register, delays);
+            let f = fixture_seeded(mock, SecretKey::generate(), with_builder, &[]).await;
+            let spans = OpenedSpans::default();
+            let _default = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(spans.clone()),
+            );
+            let first = boot * SLOTS_PER_EPOCH;
+            let start = tokio::time::Instant::now();
+
+            f.runner.run_pending(first).await;
+
+            if held {
+                assert_eq!(
+                    start.elapsed(),
+                    BUILDER_REGISTRATION_TIMEOUT,
+                    "{arm}: cut at the bound"
+                );
+                assert_eq!(
+                    step_state(&f.runner, BuilderRegistration),
+                    (Some(StepOutcome::Failed), false),
+                    "{arm}: timed out: failed, and not done"
+                );
+                f.runner.run_pending(first + 1).await;
+            }
+            assert_eq!(
+                step_state(&f.runner, BuilderRegistration),
+                (Some(StepOutcome::Done), true),
+                "{arm}: done in the boot epoch"
+            );
+            assert_eq!(registrations(&spans), want_calls, "{arm}: calls in the boot epoch");
+            assert_eq!(
+                f.mock.register_validators_calls().len(),
+                want_posts,
+                "{arm}: answered POSTs"
+            );
+
+            f.runner.run_pending(first + SLOTS_PER_EPOCH).await;
+
+            assert_eq!(
+                step_state(&f.runner, BuilderRegistration),
+                (None, false),
+                "{arm}: not pending after the boot epoch"
+            );
+            assert_eq!(registrations(&spans), want_calls, "{arm}: no call after the boot epoch");
+        }
     }
 }

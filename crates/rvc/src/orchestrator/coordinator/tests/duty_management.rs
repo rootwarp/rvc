@@ -1384,8 +1384,9 @@ async fn test_legacy_404_or_501_does_not_retire_prepare_or_register() {
     );
     assert_eq!(
         driven.mock.register_validators_calls().len(),
-        1,
-        "BN 501 must not skip register_validators"
+        2,
+        "BN 501 must not skip register_validators: the runner's boot-epoch step and the \
+         slot-0 block each send it, as a refused registration is not cached"
     );
 }
 
@@ -1946,6 +1947,17 @@ struct StartupFeeRun {
     slashing_db: Arc<SlashingDb>,
     handle: OrchestratorHandle,
     run: tokio::task::JoinHandle<Result<(), super::super::OrchestratorError>>,
+    /// The epoch-boundary runner `run` sends processed slots to.
+    boundary: Arc<EpochBoundaryRunner>,
+    /// Its task, not spawned until [`spawn_boundary_runner`].
+    boundary_task: Option<EpochBoundaryTask>,
+}
+
+/// Spawns the epoch-boundary runner beside `run`, so the startup future and
+/// the runner both prepare and register at boot.
+fn spawn_boundary_runner(started: &mut StartupFeeRun) {
+    let task = started.boundary_task.take().expect("the runner is spawned once");
+    tokio::spawn(task.run());
 }
 
 fn fee_hex(fee: &[u8; 20]) -> String {
@@ -2045,8 +2057,10 @@ async fn spawn_startup_fee_run_with<B: BeaconBlockClient + 'static>(
     );
     deps.pubkey_index.write().insert(local_pk, "7".to_string());
     let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let boundary = Arc::clone(&orchestrator.epoch_boundary);
+    let boundary_task = orchestrator.take_epoch_boundary_runner();
     let run = tokio::spawn(async move { orchestrator.run().await });
-    StartupFeeRun { mock, clock, log, local_pk, slashing_db, handle, run }
+    StartupFeeRun { mock, clock, log, local_pk, slashing_db, handle, run, boundary, boundary_task }
 }
 
 /// The `timeout` is a hang guard on paused time, never an assertion.
@@ -2091,30 +2105,58 @@ async fn park_until(mut done: impl FnMut() -> bool) -> bool {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_prepare_and_register_payloads_at_startup() {
+    use tracing_subscriber::layer::SubscriberExt;
+
     let _metrics = m2_metric_lock().await;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
     clock.advance_time(9);
-    let started =
+    let mut started =
         spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), true)
             .await;
+    spawn_boundary_runner(&mut started);
 
     let ready = advance_until(None, || {
         let produced = started.log.lock().expect("order log").contains(&"produce");
         let prepared = !started.mock.prepare_beacon_proposer_calls().is_empty();
         let registered = !started.mock.register_validators_calls().is_empty();
-        produced && prepared && registered
+        produced && prepared && registered && !started.boundary.has_pending(2)
     })
     .await;
+    let boundary_done = !started.boundary.has_pending(2);
     let prepares = started.mock.prepare_beacon_proposer_calls();
     let registers = started.mock.register_validators_calls();
     shutdown_startup_fee_run(started).await;
+    let mut register_calls: Vec<Option<Slot>> = capture
+        .spans
+        .lock()
+        .iter()
+        .filter(|(name, _)| *name == "builder.register")
+        .map(|(_, pass)| *pass)
+        .collect();
+    register_calls.sort();
 
     assert!(ready, "startup prepare, register, and the proposer duty must run");
+    assert!(boundary_done, "the runner's boot-epoch pass must finish every step");
+    assert_eq!(
+        register_calls,
+        [None, Some(2)],
+        "one register_validators call from the startup future, and one from the runner's \
+         slot-2 pass"
+    );
     let fee = fee_hex(&[0xff; 20]);
     assert_eq!(prepares[0].len(), 1);
     assert_eq!(prepares[0][0].validator_index, "7");
     assert_eq!(prepares[0][0].fee_recipient, fee);
+    assert_eq!(
+        registers.len(),
+        1,
+        "the startup future and the runner's boot-epoch step register once: \
+         the second register_validators call is a cache hit"
+    );
     assert_eq!(registers[0][0].message.fee_recipient, [0xff; 20]);
 }
 
@@ -2170,9 +2212,10 @@ async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
         matches!(clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. })),
         "fixture must still be before genesis"
     );
-    let started =
+    let mut started =
         spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), false)
             .await;
+    spawn_boundary_runner(&mut started);
 
     let ready =
         advance_until(None, || !started.mock.prepare_beacon_proposer_calls().is_empty()).await;
@@ -2201,7 +2244,8 @@ async fn test_startup_preparation_does_not_block_the_proposer_duty() {
     // Longer than the wait below, so the timed wrapper does not cancel the
     // in-flight prepare and hide a blocked slot loop.
     timeouts.preparation = Duration::from_secs(5);
-    let started = spawn_startup_fee_run(mock, clock, timeouts, true).await;
+    let mut started = spawn_startup_fee_run(mock, clock, timeouts, true).await;
+    spawn_boundary_runner(&mut started);
 
     let ready = advance_until(None, || {
         let produced = started.log.lock().expect("order log").contains(&"produce");
@@ -2309,7 +2353,8 @@ async fn startup_preparation_finishes_while_the_slot_loop_continues() {
     timeouts.preparation = Duration::from_secs(7200);
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
-    let started = spawn_startup_fee_run(retirement_beacon_base(), clock, timeouts, false).await;
+    let mut started = spawn_startup_fee_run(retirement_beacon_base(), clock, timeouts, false).await;
+    spawn_boundary_runner(&mut started);
 
     let mut waited_ms = 0u64;
     while started.mock.prepare_beacon_proposer_calls().is_empty() && waited_ms < 5_000 {
