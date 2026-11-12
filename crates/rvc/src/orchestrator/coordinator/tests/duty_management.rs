@@ -1940,6 +1940,10 @@ struct StartupFeeRun {
     mock: Arc<bn_manager::MockBeaconNodeClient>,
     clock: Arc<MockSlotClock>,
     log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Validator 7's public key.
+    local_pk: [u8; 48],
+    /// The slashing DB the signer records each header sign in.
+    slashing_db: Arc<SlashingDb>,
     handle: OrchestratorHandle,
     run: tokio::task::JoinHandle<Result<(), super::super::OrchestratorError>>,
 }
@@ -1998,8 +2002,9 @@ async fn spawn_startup_fee_run_with<B: BeaconBlockClient + 'static>(
     key_manager.insert(local);
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let signer =
-        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let signer = Arc::new(
+        SignerService::new(composite, Arc::clone(&slashing_db)).with_enablement(always_enabled()),
+    );
 
     let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
     let mut cfg = ValidatorConfig::new(local_pk);
@@ -2041,7 +2046,7 @@ async fn spawn_startup_fee_run_with<B: BeaconBlockClient + 'static>(
     deps.pubkey_index.write().insert(local_pk, "7".to_string());
     let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
     let run = tokio::spawn(async move { orchestrator.run().await });
-    StartupFeeRun { mock, clock, log, handle, run }
+    StartupFeeRun { mock, clock, log, local_pk, slashing_db, handle, run }
 }
 
 /// The `timeout` is a hang guard on paused time, never an assertion.
@@ -2132,14 +2137,25 @@ async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
     clock.set_slot_with_offset_ms(2, 11_900);
     let started = spawn_startup_fee_run(mock, Arc::clone(&clock), fast_timeouts(), false).await;
 
-    // The clock follows paused time into slot 3, where the retry is due.
+    // The clock follows paused time. The count is read at each 1 ms step while
+    // the clock is still in slot 2, before the step that crosses into slot 3.
+    let mut calls_in_slot_two = 0;
+    while clock.current_slot().ok() == Some(2) {
+        calls_in_slot_two = started.mock.prepare_beacon_proposer_calls().len();
+        clock.advance_ms(1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    // Slot 3, where the retry is due.
     let ready =
         advance_until(Some(&*clock), || started.mock.prepare_beacon_proposer_calls().len() >= 2)
             .await;
+    let retry_slot = clock.current_slot().ok();
     let calls = started.mock.prepare_beacon_proposer_calls().len();
     shutdown_startup_fee_run(started).await;
 
+    assert_eq!(calls_in_slot_two, 1, "the failed prepare must not be retried before slot 3");
     assert!(ready, "a failed prepare must be retried within 2s; calls={calls}");
+    assert_eq!(retry_slot, Some(3), "the failed prepare must be retried in slot 3");
     assert!(calls >= 2, "startup must POST prepare again after the first failure; calls={calls}");
     assert!(attempts.load(Ordering::SeqCst) >= 2);
 }
@@ -2319,6 +2335,13 @@ const PENALTY_WARN: &str = "signing block with fee-recipient mismatch";
 struct HeldPrepareBoot {
     /// Execution-payload fee recipient of each signed block published.
     published_fees: Vec<[u8; 20]>,
+    /// The blocks published while the prepare was still held.
+    published_before_prepare: Vec<eth_types::SignedBeaconBlock>,
+    /// Validator 7's block records in the slashing DB at that moment: what a
+    /// successful header sign leaves behind.
+    header_signs: Vec<::slashing::SignedBlock>,
+    /// Validator 7's public key.
+    local_key: PublicKey,
     /// Each fee-recipient penalty WARN, as `message key=value ...`.
     penalty_warns: Vec<String>,
     /// `RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL` before boot and after shutdown.
@@ -2370,6 +2393,10 @@ async fn boot_with_held_startup_prepare(default_fee: [u8; 20]) -> HeldPrepareBoo
         started.mock.prepare_beacon_proposer_calls().is_empty(),
         "the hold must still be inside the mock when the block is published"
     );
+    let published_before_prepare = published.lock().expect("published blocks").clone();
+    let header_signs =
+        started.slashing_db.get_blocks(&hex::encode(started.local_pk)).expect("slashing DB blocks");
+    let local_key = local_pk_public(&started.local_pk);
 
     // One-second steps so the held call is polled as the hold expires.
     let mut moved_s = 0u64;
@@ -2405,10 +2432,30 @@ async fn boot_with_held_startup_prepare(default_fee: [u8; 20]) -> HeldPrepareBoo
         .collect();
     HeldPrepareBoot {
         published_fees,
+        published_before_prepare,
+        header_signs,
+        local_key,
         penalty_warns,
         penalty_total: (penalty_before, PENALTY_TOTAL.get()),
         prepares,
     }
+}
+
+/// The block published while prepare was held carries the slot-2 header
+/// signature: the header sign recorded a slot-2 signing root in the slashing
+/// DB, and the published signature verifies over it under validator 7's key.
+fn assert_published_header_signature(boot: &HeldPrepareBoot) {
+    let signed_slots: Vec<Slot> = boot.header_signs.iter().map(|block| block.slot).collect();
+    assert_eq!(signed_slots, [2], "the slot-2 block header must be signed before prepare lands");
+    let root = boot.header_signs[0].signing_root.as_ref().expect("recorded signing root");
+    let root = hex::decode(root.trim_start_matches("0x")).expect("signing root hex");
+    assert_eq!(boot.published_before_prepare.len(), 1, "one block published while prepare is held");
+    let verified = ::crypto::Signature::from_bytes(&boot.published_before_prepare[0].signature)
+        .and_then(|signature| signature.verify(&boot.local_key, &root));
+    assert!(
+        verified.is_ok(),
+        "the published signature must be the slot-2 header signature: {verified:?}"
+    );
 }
 
 /// 652-AC8, a baseline pin: a proposal that runs before the startup
@@ -2430,6 +2477,7 @@ async fn test_proposal_before_startup_prepare_is_signed_with_penalty_warn() {
         [BN_DEFAULT_FEE],
         "the block built on the beacon node's default fee must be signed and published"
     );
+    assert_published_header_signature(&boot);
     assert_eq!(boot.penalty_warns.len(), 1, "one penalty WARN: {:?}", boot.penalty_warns);
     let local = fee_hex(&[0xff; 20]);
     let warn = &boot.penalty_warns[0];
@@ -2450,6 +2498,7 @@ async fn test_proposal_before_startup_prepare_with_a_matching_fee_has_no_penalty
     let boot = boot_with_held_startup_prepare([0xff; 20]).await;
 
     assert_eq!(boot.published_fees, [[0xff; 20]], "the block must be signed and published");
+    assert_published_header_signature(&boot);
     assert!(
         boot.penalty_warns.is_empty(),
         "a matching fee must not warn: {:?}",
