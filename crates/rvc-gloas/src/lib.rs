@@ -8,9 +8,12 @@
 //! let _: rvc_gloas::Root = [0u8; 32];
 //! ```
 //!
-//! ```compile_fail
-//! let _ = rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT;
-//! ```
+// `test-fixtures` re-exports the KAT constants, so this check exists only
+// without that feature.
+#![cfg_attr(
+    not(feature = "test-fixtures"),
+    doc = "```compile_fail\nlet _ = rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT;\n```"
+)]
 
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.2";

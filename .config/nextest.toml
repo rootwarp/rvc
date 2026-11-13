@@ -1,0 +1,5 @@
+# A test that runs past one period is reported as slow. After terminate-after
+# periods nextest stops it and the run fails, so a stuck test cannot hang CI
+# (#789-6). An override for a slower test must keep terminate-after.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
