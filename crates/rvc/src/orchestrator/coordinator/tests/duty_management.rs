@@ -1,6 +1,7 @@
 //! Coordinator tests: proposer preparation, committee subscriptions, epoch reorg.
 
 use super::*;
+use crate::orchestrator::duty_management::PrepareOutcome;
 
 // --- B-05: Proposer preparation tests ---
 
@@ -1947,28 +1948,24 @@ struct StartupFeeRun {
     slashing_db: Arc<SlashingDb>,
     handle: OrchestratorHandle,
     run: tokio::task::JoinHandle<Result<(), super::super::OrchestratorError>>,
+    /// The task from `take_epoch_boundary_runner()`, spawned after `run`.
+    runner: tokio::task::JoinHandle<()>,
     /// The epoch-boundary runner `run` sends processed slots to.
     boundary: Arc<EpochBoundaryRunner>,
-    /// Its task, not spawned until [`spawn_boundary_runner`].
-    boundary_task: Option<EpochBoundaryTask>,
-}
-
-/// Spawns the epoch-boundary runner beside `run`, so the startup future and
-/// the runner both prepare and register at boot. It returns the runner task.
-fn spawn_boundary_runner(started: &mut StartupFeeRun) -> tokio::task::JoinHandle<()> {
-    let task = started.boundary_task.take().expect("the runner is spawned once");
-    tokio::spawn(task.run())
+    /// The last slot that `run` processed.
+    processed: watch::Receiver<Option<Slot>>,
 }
 
 /// This helper requests shutdown. Then it waits until `run` and the runner
 /// task both end, and checks how each one ended.
-async fn shut_down_both(started: StartupFeeRun, runner: tokio::task::JoinHandle<()>) {
+async fn shut_down_both(started: StartupFeeRun) {
     started.handle.shutdown();
-    let ended = advance_until(None, || started.run.is_finished() && runner.is_finished()).await;
+    let ended =
+        advance_until(None, || started.run.is_finished() && started.runner.is_finished()).await;
     assert!(ended, "Shutdown must end `run` and the runner task within 2,000 virtual ms.");
     let result = started.run.await.expect("The run task must not panic.");
     assert!(result.is_ok(), "Shutdown must end the slot loop with Ok: {result:?}");
-    runner.await.expect("The runner task must not panic.");
+    started.runner.await.expect("The runner task must not panic.");
 }
 
 fn fee_hex(fee: &[u8; 20]) -> String {
@@ -1976,25 +1973,29 @@ fn fee_hex(fee: &[u8; 20]) -> String {
 }
 
 /// Local validator index 7, default fee `0xff`, slot 2 (not an epoch boundary).
-async fn spawn_startup_fee_run(
+/// This helper spawns `run()`, and then the task from
+/// `take_epoch_boundary_runner()`.
+async fn spawn_startup_runner(
     mock: bn_manager::MockBeaconNodeClient,
     clock: Arc<MockSlotClock>,
     timeouts: OperationTimeouts,
     seed_duty: bool,
 ) -> StartupFeeRun {
-    spawn_startup_fee_run_with(mock, clock, timeouts, seed_duty, |log| StartupOrderBlockBeacon {
-        log,
+    spawn_startup_runner_with(mock, clock, timeouts, seed_duty, Some("7"), |log| {
+        StartupOrderBlockBeacon { log }
     })
     .await
 }
 
-/// [`spawn_startup_fee_run`] with the block beacon `blocks` builds from the
-/// order log.
-async fn spawn_startup_fee_run_with<B: BeaconBlockClient + 'static>(
+/// [`spawn_startup_runner`] with the block beacon that `blocks` builds from
+/// the order log. `index` is the index of validator 7 in the index registry.
+/// With `None`, the index registry is empty at boot.
+async fn spawn_startup_runner_with<B: BeaconBlockClient + 'static>(
     mock: bn_manager::MockBeaconNodeClient,
     clock: Arc<MockSlotClock>,
     timeouts: OperationTimeouts,
     seed_duty: bool,
+    index: Option<&'static str>,
     blocks: impl FnOnce(Arc<std::sync::Mutex<Vec<&'static str>>>) -> B,
 ) -> StartupFeeRun {
     use signer::ValidatorSigner;
@@ -2066,18 +2067,34 @@ async fn spawn_startup_fee_run_with<B: BeaconBlockClient + 'static>(
         config,
         pubkey_map,
     );
-    deps.pubkey_index.write().insert(local_pk, "7".to_string());
+    if let Some(index) = index {
+        deps.pubkey_index.write().insert(local_pk, index.to_string());
+    }
     let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
     let boundary = Arc::clone(&orchestrator.epoch_boundary);
-    let boundary_task = orchestrator.take_epoch_boundary_runner();
+    let processed = orchestrator.processed_slot_tx.subscribe();
+    let task = orchestrator.take_epoch_boundary_runner().expect("The runner task is taken once.");
     let run = tokio::spawn(async move { orchestrator.run().await });
-    StartupFeeRun { mock, clock, log, local_pk, slashing_db, handle, run, boundary, boundary_task }
+    let runner = tokio::spawn(task.run());
+    StartupFeeRun {
+        mock,
+        clock,
+        log,
+        local_pk,
+        slashing_db,
+        handle,
+        run,
+        runner,
+        boundary,
+        processed,
+    }
 }
 
 /// The `timeout` is a hang guard on paused time, never an assertion.
 async fn shutdown_startup_fee_run(started: StartupFeeRun) {
     started.handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_millis(500), started.run).await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), started.runner).await;
 }
 
 /// Most 1 ms steps a startup wait takes: 2,000 ms of paused time.
@@ -2115,7 +2132,7 @@ async fn park_until(mut done: impl FnMut() -> bool) -> bool {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_prepare_and_register_payloads_at_startup() {
+async fn runner_prepares_and_registers_in_the_boot_epoch() {
     use tracing_subscriber::layer::SubscriberExt;
 
     let _metrics = m2_metric_lock().await;
@@ -2125,10 +2142,9 @@ async fn test_prepare_and_register_payloads_at_startup() {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
     clock.advance_time(9);
-    let mut started =
-        spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), true)
+    let started =
+        spawn_startup_runner(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), true)
             .await;
-    spawn_boundary_runner(&mut started);
 
     let ready = advance_until(None, || {
         let produced = started.log.lock().expect("order log").contains(&"produce");
@@ -2160,75 +2176,68 @@ async fn test_prepare_and_register_payloads_at_startup() {
     assert!(boundary_done, "the runner's boot-epoch pass must finish every step");
     assert_eq!(
         register_calls,
-        [None, Some(2)],
-        "one register_validators call from the startup future, and one from the runner's \
-         slot-2 pass"
+        [Some(2)],
+        "The runner's slot-2 pass must make the only register_validators call."
     );
     let fee = fee_hex(&[0xff; 20]);
     assert_eq!(prepares[0].len(), 1);
     assert_eq!(prepares[0][0].validator_index, "7");
     assert_eq!(prepares[0][0].fee_recipient, fee);
-    assert_eq!(
-        registers.len(),
-        1,
-        "the startup future and the runner's boot-epoch step register once: \
-         the second register_validators call is a cache hit"
-    );
+    assert_eq!(registers.len(), 1, "The runner's boot-epoch step must send one registration POST.");
     assert_eq!(
         signatures, 1,
-        "The two completed register_validators calls must sign one registration. \
-         The cache hit must add no signature."
+        "The boot-epoch register_validators call must sign one registration."
     );
     assert_eq!(registers[0][0].message.fee_recipient, [0xff; 20]);
 }
 
-/// The startup future and the epoch-boundary runner both run. Boot is in
-/// slot 2, with 100 ms left in the slot. The mock fails the first prepare
-/// POST of the startup task and accepts each other POST. The mock tags each
-/// POST with the task that sends it and the slot of the clock. These
+/// The epoch-boundary runner runs beside `run`. Boot is in slot 2, with
+/// 100 ms left in the slot. The mock fails the first prepare POST of the
+/// runner task and accepts each other POST. The mock tags each POST with the
+/// task that sends it and the slot of the clock. The runner retries at the
+/// next processed slot, and the slot loop processes slot 3 when the phases of
+/// slot 3 end. Thus the wait follows the clock to the end of slot 3. These
 /// results must occur:
 ///
-/// - The startup future sends its failed prepare in slot 2 and its retry in
-///   slot 3.
-/// - The runner's boot-epoch pass sends one prepare and finishes each step.
+/// - The runner sends its failed prepare in slot 2 and its retry in slot 3.
+/// - The runner's boot-epoch pass finishes each step.
 /// - No other task sends a prepare.
 /// - Shutdown ends both tasks.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
+async fn runner_retries_a_failed_boot_prepare_at_the_next_slot() {
     let _metrics = m2_metric_lock().await;
     use beacon::BeaconError;
 
     // 100 ms left in slot 2, so the per-slot retry is short.
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot_with_offset_ms(2, 11_900);
-    let startup_task = Arc::new(std::sync::OnceLock::<tokio::task::Id>::new());
+    let runner_task = Arc::new(std::sync::OnceLock::<tokio::task::Id>::new());
     let posts: Captured<(Option<tokio::task::Id>, Option<Slot>)> = Captured::default();
     let mock = retirement_beacon_base().with_prepare_beacon_proposer({
-        let (startup_task, posts, clock) =
-            (Arc::clone(&startup_task), Arc::clone(&posts), Arc::clone(&clock));
+        let (runner_task, posts, clock) =
+            (Arc::clone(&runner_task), Arc::clone(&posts), Arc::clone(&clock));
         move |_preparations| {
             let writer = tokio::task::try_id();
             let mut posts = posts.lock();
-            let first_from_startup = writer.is_some()
-                && writer == startup_task.get().copied()
+            let first_from_runner = writer.is_some()
+                && writer == runner_task.get().copied()
                 && !posts.iter().any(|(earlier, _)| *earlier == writer);
             posts.push((writer, clock.current_slot().ok()));
-            if first_from_startup {
+            if first_from_runner {
                 Err(BeaconError::ApiError { status: 500, message: "unavailable".into() })
             } else {
                 Ok(())
             }
         }
     });
-    let mut started = spawn_startup_fee_run(mock, Arc::clone(&clock), fast_timeouts(), false).await;
-    let startup = started.run.id();
-    startup_task.set(startup).expect("the startup task is set once");
-    let runner = spawn_boundary_runner(&mut started);
-    let runner_task = runner.id();
+    let started = spawn_startup_runner(mock, Arc::clone(&clock), fast_timeouts(), false).await;
+    let runner = started.runner.id();
+    runner_task.set(runner).expect("The runner task must be set one time.");
     let slots_of = |task: tokio::task::Id| -> Vec<Option<Slot>> {
         let posts = posts.lock();
         posts.iter().filter(|(writer, _)| *writer == Some(task)).map(|(_, slot)| *slot).collect()
     };
+    let ready = || slots_of(runner).len() >= 2 && !started.boundary.has_pending(2);
 
     // The clock follows paused time. Step 1 ms at a time to the end of slot 2.
     while clock.current_slot().ok() == Some(2) {
@@ -2236,39 +2245,32 @@ async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
         tokio::time::advance(Duration::from_millis(1)).await;
     }
     // Slot 3, where the retry is due.
-    let ready = advance_until(Some(&*clock), || {
-        slots_of(startup).len() >= 2
-            && !slots_of(runner_task).is_empty()
-            && !started.boundary.has_pending(2)
-    })
-    .await;
-    let startup_posts = slots_of(startup);
-    let runner_posts = slots_of(runner_task);
+    while !ready() && clock.current_slot().ok() == Some(3) {
+        clock.advance_ms(1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    let ready = ready();
+    let runner_posts = slots_of(runner);
     let all_posts = posts.lock().len();
     let boundary_done = !started.boundary.has_pending(2);
-    shut_down_both(started, runner).await;
+    shut_down_both(started).await;
 
     assert!(
         ready,
-        "The startup retry and the runner's prepare must occur within 2,000 virtual ms. \
-         Startup POST slots: {startup_posts:?}. Runner POST slots: {runner_posts:?}."
+        "The runner's prepare and its retry must occur before slot 3 ends. \
+         Runner POST slots: {runner_posts:?}."
     );
     assert_eq!(
-        startup_posts,
+        runner_posts,
         [Some(2), Some(3)],
-        "The startup future must send its failed prepare in slot 2, and its retry in slot 3."
+        "The runner must send its failed prepare in slot 2, and its retry in slot 3."
     );
-    assert_eq!(runner_posts.len(), 1, "The runner's boot-epoch pass must send one prepare.");
-    assert_eq!(
-        all_posts,
-        startup_posts.len() + runner_posts.len(),
-        "Each prepare POST must come from the startup task or the runner task."
-    );
+    assert_eq!(all_posts, runner_posts.len(), "Each prepare POST must come from the runner task.");
     assert!(boundary_done, "The runner's boot-epoch pass must finish each step.");
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
+async fn runner_prepares_epoch_zero_before_genesis_from_run() {
     let _metrics = m2_metric_lock().await;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     let genesis_ms = TEST_GENESIS_TIME.saturating_mul(1000);
@@ -2277,10 +2279,9 @@ async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
         matches!(clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. })),
         "fixture must still be before genesis"
     );
-    let mut started =
-        spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), false)
+    let started =
+        spawn_startup_runner(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), false)
             .await;
-    spawn_boundary_runner(&mut started);
 
     let ready =
         advance_until(None, || !started.mock.prepare_beacon_proposer_calls().is_empty()).await;
@@ -2296,7 +2297,7 @@ async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn test_startup_preparation_does_not_block_the_proposer_duty() {
+async fn runner_prepare_does_not_block_the_proposer_duty() {
     let _metrics = m2_metric_lock().await;
     use bn_manager::MockMethod;
 
@@ -2309,8 +2310,7 @@ async fn test_startup_preparation_does_not_block_the_proposer_duty() {
     // Longer than the wait below, so the timed wrapper does not cancel the
     // in-flight prepare and hide a blocked slot loop.
     timeouts.preparation = Duration::from_secs(5);
-    let mut started = spawn_startup_fee_run(mock, clock, timeouts, true).await;
-    spawn_boundary_runner(&mut started);
+    let started = spawn_startup_runner(mock, clock, timeouts, true).await;
 
     let ready = advance_until(None, || {
         let produced = started.log.lock().expect("order log").contains(&"produce");
@@ -2341,13 +2341,12 @@ async fn test_startup_preparation_does_not_block_the_proposer_duty() {
 /// on this move.
 ///
 /// The epoch-boundary runner runs beside `run`. The clock is 9 s into slot 2,
-/// so the runner's slot-2 pass starts at once and sends a prepare too. The
-/// mock holds that prepare as well. The test tags each prepare call with
-/// its writer: the startup future has no pass slot, and the runner has
-/// pass slot 2. Shutdown must end both tasks. The two held prepares must
-/// not finish, and the two writers must not send a prepare again.
+/// so the runner's slot-2 pass starts at once and sends the prepare. The
+/// test tags each prepare call with the pass slot of its writer. Shutdown
+/// must end both tasks. The held prepare must not finish, and the runner
+/// must not send a prepare again.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn startup_preparation_ends_when_run_returns() {
+async fn runner_drops_an_in_flight_step_when_run_returns() {
     use tracing_subscriber::layer::SubscriberExt;
 
     let _metrics = m2_metric_lock().await;
@@ -2363,8 +2362,7 @@ async fn startup_preparation_ends_when_run_returns() {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
     clock.advance_time(9);
-    let mut started = spawn_startup_fee_run(mock, clock, timeouts, false).await;
-    let runner = spawn_boundary_runner(&mut started);
+    let started = spawn_startup_runner(mock, clock, timeouts, false).await;
     let mock = Arc::clone(&started.mock);
     let boundary = Arc::clone(&started.boundary);
     let arrivals = || {
@@ -2384,31 +2382,26 @@ async fn startup_preparation_ends_when_run_returns() {
 
     let mut waited_ms = 0u64;
     loop {
-        if arrivals() >= 2 {
+        if arrivals() >= 1 {
             break;
         }
         assert!(!started.run.is_finished(), "run returned before prepare_beacon_proposer");
         waited_ms += 1;
         assert!(
             waited_ms <= 5_000,
-            "The startup future and the runner must each start a prepare within 5,000 virtual ms. \
-             Prepare arrivals: {}.",
+            "The runner must start a prepare within 5,000 virtual ms. Prepare arrivals: {}.",
             arrivals()
         );
         tokio::time::advance(Duration::from_millis(1)).await;
     }
-    assert_eq!(
-        writers(),
-        [None, Some(2)],
-        "One prepare call must come from the startup future, and one from the runner's slot-2 pass."
-    );
+    assert_eq!(writers(), [Some(2)], "The prepare call must come from the runner's slot-2 pass.");
     assert!(
         mock.prepare_beacon_proposer_calls().is_empty(),
         "the hold must still be inside the mock when run is stopped"
     );
-    assert!(!runner.is_finished(), "The runner task must be active before shutdown.");
+    assert!(!started.runner.is_finished(), "The runner task must be active before shutdown.");
 
-    shut_down_both(started, runner).await;
+    shut_down_both(started).await;
     assert!(
         mock.prepare_beacon_proposer_calls().is_empty(),
         "prepare must still be in flight when run returns"
@@ -2425,29 +2418,26 @@ async fn startup_preparation_ends_when_run_returns() {
         mock.prepare_beacon_proposer_calls().is_empty(),
         "startup preparation must not finish after run returns; virtual seconds moved: {moved_s}"
     );
-    assert_eq!(
-        arrivals(),
-        2,
-        "The startup future and the runner must not send a prepare again after shutdown."
-    );
-    assert_eq!(writers(), [None, Some(2)], "A prepare call must not start after shutdown.");
+    assert_eq!(arrivals(), 1, "The runner must not send a prepare again after shutdown.");
+    assert_eq!(writers(), [Some(2)], "A prepare call must not start after shutdown.");
     assert!(
         boundary.has_pending(2),
         "Shutdown dropped the runner's prepare, so PrepareProposers must stay pending in epoch 0."
     );
 }
 
-/// Startup preparation is allowed to finish. `run` keeps polling the slot loop
-/// afterwards. A completed future must not be polled again.
+/// The runner's boot-epoch pass sends its prepare and finishes. After that,
+/// `run` must keep the slot loop active.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn startup_preparation_finishes_while_the_slot_loop_continues() {
+async fn runner_keeps_serving_slots_after_the_boot_epoch_completes() {
     let _metrics = m2_metric_lock().await;
     let mut timeouts = fast_timeouts();
     timeouts.preparation = Duration::from_secs(7200);
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
-    let mut started = spawn_startup_fee_run(retirement_beacon_base(), clock, timeouts, false).await;
-    spawn_boundary_runner(&mut started);
+    // The clock is 9 s into slot 2, so the runner's slot-2 pass starts at once.
+    clock.advance_time(9);
+    let started = spawn_startup_runner(retirement_beacon_base(), clock, timeouts, false).await;
 
     let mut waited_ms = 0u64;
     while started.mock.prepare_beacon_proposer_calls().is_empty() && waited_ms < 5_000 {
@@ -2465,6 +2455,113 @@ async fn startup_preparation_finishes_while_the_slot_loop_continues() {
         );
         tokio::time::advance(Duration::from_millis(1)).await;
     }
+}
+
+/// 653-AC8, the registration half. At boot, the index registry is empty and
+/// the local key is builder-enabled. Each registration POST answers 503, and
+/// the builder service does not cache a failed batch. `run` and the runner
+/// task run from the start of slot 2 to the last millisecond of slot 20. The
+/// mock slot clock moves 1 ms with each 1 ms paused sleep. These results
+/// must occur:
+///
+/// - The runner's slot-2 pass sends the only registration POST, with one
+///   signature. `register_validators` reports `Ok` for the failed batch, so
+///   the boot-epoch step finishes after one attempt. W4-E6a changes this.
+/// - No `prepare_beacon_proposer` POST reaches the beacon node.
+/// - The slot loop processes each slot from 2 to 20.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_zero_indices_at_boot_do_not_re_register_every_slot() {
+    use bn_manager::MockMethod;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let _metrics = m2_metric_lock().await;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    let posts: Captured<Option<Slot>> = Captured::default();
+    let mock = retirement_beacon_base().with_register_validators({
+        let (posts, clock) = (Arc::clone(&posts), Arc::clone(&clock));
+        move |_registrations| {
+            posts.lock().push(clock.current_slot().ok());
+            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+        }
+    });
+    let started =
+        spawn_startup_runner_with(mock, Arc::clone(&clock), fast_timeouts(), false, None, |log| {
+            StartupOrderBlockBeacon { log }
+        })
+        .await;
+
+    // Slot 21 starts 19 slots after boot. The drive stops 1 ms before it.
+    for _ in 0..(19 * 12_000 - 1) {
+        clock.advance_ms(1);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let slot_at_end = clock.current_slot().ok();
+    let last_processed = *started.processed.borrow();
+    let register_slots = posts.lock().clone();
+    let prepares = started
+        .mock
+        .call_stamps()
+        .iter()
+        .filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer)
+        .count();
+    shut_down_both(started).await;
+    let signatures = capture
+        .spans
+        .lock()
+        .iter()
+        .filter(|(name, _)| *name == "sign.builder_registration")
+        .count();
+
+    assert_eq!(slot_at_end, Some(20), "The drive must stop in slot 20.");
+    assert_eq!(last_processed, Some(20), "The slot loop must process each slot from 2 to 20.");
+    assert_eq!(
+        register_slots,
+        [Some(2)],
+        "The runner's slot-2 pass must send the only registration POST in slots 2 to 20. \
+         Slot of each registration POST: {register_slots:?}."
+    );
+    assert_eq!(
+        signatures, 1,
+        "Slots 2 to 20 must sign one registration. Signatures: {signatures}."
+    );
+    assert_eq!(
+        prepares, 0,
+        "With no validator index, no prepare_beacon_proposer POST must reach the beacon node."
+    );
+}
+
+/// W4-E4c: startup preparation is the boot epoch of the epoch-boundary
+/// runner. The scan reads the production part of `coordinator/mod.rs`, up to
+/// the declaration of the test module. That part must not contain a helper
+/// of the old startup future.
+#[test]
+fn startup_prep_lives_only_in_the_runner() {
+    const TEST_MODULE: &str = "#[cfg(test)]\npub(crate) mod tests;";
+    const STARTUP_FUTURE_HELPERS: [&str; 4] = [
+        "run_startup_proposer_preparation",
+        "startup_retry_delay",
+        "startup_register_validators",
+        "sleep_or_shutdown",
+    ];
+
+    let (production, _tests) = include_str!("../mod.rs")
+        .split_once(TEST_MODULE)
+        .expect("coordinator/mod.rs must declare its test module.");
+    assert!(
+        production.contains("pub async fn run(&mut self)"),
+        "The scan must include `DutyOrchestrator::run`."
+    );
+    let found: Vec<&str> =
+        STARTUP_FUTURE_HELPERS.into_iter().filter(|helper| production.contains(helper)).collect();
+    assert!(
+        found.is_empty(),
+        "The production part of coordinator/mod.rs must not contain a startup-future helper. \
+         Found: {found:?}."
+    );
 }
 
 const PENALTY_WARN: &str = "signing block with fee-recipient mismatch";
@@ -2512,9 +2609,12 @@ async fn boot_with_held_startup_prepare(default_fee: [u8; 20]) -> HeldPrepareBoo
     timeouts.preparation = 2 * HOLD;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(2);
+    // The clock is 9 s into slot 2, so the runner's slot-2 pass starts at once.
+    clock.advance_time(9);
     let published = SignedBlocks::default();
     let blocks = DefaultFeeBlockBeacon { default_fee, published: Arc::clone(&published) };
-    let started = spawn_startup_fee_run_with(mock, clock, timeouts, true, |_log| blocks).await;
+    let started =
+        spawn_startup_runner_with(mock, clock, timeouts, true, Some("7"), |_log| blocks).await;
 
     let proposed = park_until(|| {
         let signed = !published.lock().expect("published blocks").is_empty();
@@ -2903,15 +3003,14 @@ async fn drive_boundary_keys(
 /// 653-AC1: the slot-32 pass's prepare POST answers 503, so PrepareProposers
 /// runs again in the slot-33 pass, and the steps already done in epoch 1 do
 /// not: ReorgCheck's proposer requests for E and E+1 are made once, and
-/// slot 34 has nothing pending. The startup preparation's own prepare at
-/// boot, outside any pass, is answered `Ok`.
+/// slot 34 has nothing pending.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
     let _metrics = m2_metric_lock().await;
     let attempts = AtomicUsize::new(0);
     let mock = retirement_beacon().with_prepare_beacon_proposer(move |_preparations| {
-        // Attempt 0 is the startup preparation's, at boot; 1 is the slot-32 pass's.
-        if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+        // Attempt 0 is the slot-32 pass's.
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
         } else {
             Ok(())
@@ -2922,10 +3021,10 @@ async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
 
     assert_eq!(
         run.pass_slots("orchestrator.prepare_proposers"),
-        [None, Some(32), Some(33)],
-        "startup preparation at boot, the slot-32 pass, then its retry in the slot-33 pass"
+        [Some(32), Some(33)],
+        "The slot-32 pass must send the prepare, and the slot-33 pass must send its retry."
     );
-    assert_eq!(run.mock.prepare_beacon_proposer_calls().len(), 3, "one POST per attempt");
+    assert_eq!(run.mock.prepare_beacon_proposer_calls().len(), 2, "one POST per attempt");
     let in_passes: Vec<&(Option<Slot>, String)> =
         run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
     assert!(
@@ -3032,8 +3131,8 @@ async fn test_step_timeout_leaves_step_pending() {
     );
     assert_eq!(
         run.pass_slots("orchestrator.prepare_proposers"),
-        [None, Some(32)],
-        "startup preparation at boot, then the slot-32 pass: the 3 s POST is inside its bound"
+        [Some(32)],
+        "The slot-32 pass must send the only prepare. The 3 s POST is inside its bound."
     );
 }
 
@@ -3081,27 +3180,22 @@ async fn test_step_timeout_retry_succeeds_then_stops() {
 
 /// 653-AC3: an epoch whose prepare never succeeds warns once, in the first
 /// pass of the next epoch, naming the step and its last outcome. Every
-/// prepare after the startup preparation's answers 503. A control run in
-/// which every step of epoch 1 is done warns nothing.
+/// prepare answers 503. A control run in which every step of epoch 1 is
+/// done warns nothing.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_abandoned_steps_warn_at_epoch_end() {
     let _metrics = m2_metric_lock().await;
-    let attempts = AtomicUsize::new(0);
-    let mock = retirement_beacon().with_prepare_beacon_proposer(move |_preparations| {
-        // Attempt 0 is the startup preparation's, at boot.
-        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            Ok(())
-        } else {
-            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
-        }
+    let mock = retirement_beacon().with_prepare_beacon_proposer(|_preparations| {
+        Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
     });
 
     let run = drive_boundary(mock, 32, 64).await;
 
     assert_eq!(
         run.pass_slots("orchestrator.prepare_proposers").len(),
-        34,
-        "startup, one attempt in each of the 32 passes of epoch 1, then epoch 2's"
+        33,
+        "Each of the 32 passes of epoch 1 must make one attempt, and the first pass of epoch 2 \
+         must make one."
     );
     assert_eq!(
         abandoned_warns(&run),
@@ -3139,9 +3233,9 @@ fn prepared_indices(mock: &bn_manager::MockBeaconNodeClient) -> Vec<Vec<String>>
 /// 653-AC7, through `run`: a key whose index resolves a few slots into the
 /// epoch gets its fee recipient to the beacon node in that epoch. Three
 /// signing-enabled local keys; validators 42 and 43 have an index at boot,
-/// and 44's is inserted before slot 34. The startup preparation at boot and
-/// the slot-32 pass each POST the two, the slot-33 pass sends nothing, and
-/// the slot-34 pass POSTs all three. That finishes the step: no pass at 35.
+/// and 44's is inserted before slot 34. The slot-32 pass POSTs the two, the
+/// slot-33 pass sends nothing, and the slot-34 pass POSTs all three. That
+/// finishes the step: no pass at 35.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_late_index_gets_its_fee_recipient_within_the_epoch() {
     let _metrics = m2_metric_lock().await;
@@ -3163,13 +3257,13 @@ async fn test_late_index_gets_its_fee_recipient_within_the_epoch() {
 
     assert_eq!(
         prepared_indices(&run.mock),
-        [vec!["42", "43"], vec!["42", "43"], vec!["42", "43", "44"]],
-        "boot and slot 32 send the two resolved keys; slot 34 sends all three"
+        [vec!["42", "43"], vec!["42", "43", "44"]],
+        "The slot-32 pass must send the two resolved keys, and the slot-34 pass must send all three."
     );
     assert_eq!(
         run.pass_slots("orchestrator.prepare_proposers"),
-        [None, Some(32), Some(34)],
-        "startup at boot, the slot-32 pass, then slot 34's; slot 33's reads the registry only"
+        [Some(32), Some(34)],
+        "The slot-32 and slot-34 passes must send a prepare. The slot-33 pass only reads the registry."
     );
     assert_eq!(
         run.pass_slots("epoch.boundary"),
@@ -3232,32 +3326,4 @@ async fn test_subscription_post_500_is_retried_at_the_next_slot() {
         [Some(32), Some(33)],
         "the retry at slot 33 finishes the step: no pass at slot 34"
     );
-}
-
-/// Baseline guard until W4-E4c deletes the startup preparation: it treats a
-/// partial set as prepared, and no index at all as not prepared. Two local
-/// keys, only validator 42 with an index, for the whole drive: the startup
-/// preparation POSTs 42 once at boot and does not repeat at any later slot.
-/// With no index at boot it sends nothing, and runs again at each slot.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn startup_preparation_treats_partial_as_prepared() {
-    let _metrics = m2_metric_lock().await;
-    let timeouts = create_test_config().timeouts;
-    let startup_runs = |run: &BoundaryRun| {
-        let prepares = run.pass_slots("orchestrator.prepare_proposers");
-        prepares.iter().filter(|pass| pass.is_none()).count()
-    };
-
-    let keys = vec![(SecretKey::generate(), Some("42")), (SecretKey::generate(), None)];
-    let run =
-        drive_boundary_keys(retirement_beacon(), keys, timeouts.clone(), 32, 35, no_hook).await;
-
-    assert_eq!(startup_runs(&run), 1, "partial: one startup preparation, at boot");
-    assert_eq!(prepared_indices(&run.mock)[0], ["42"], "the boot POST sends the resolved key");
-
-    let keys = vec![(SecretKey::generate(), None)];
-    let run = drive_boundary_keys(retirement_beacon(), keys, timeouts, 32, 35, no_hook).await;
-
-    assert_eq!(startup_runs(&run), 4, "no index: it runs at boot and at slots 33, 34 and 35");
-    assert!(run.mock.prepare_beacon_proposer_calls().is_empty(), "no index: no POST");
 }

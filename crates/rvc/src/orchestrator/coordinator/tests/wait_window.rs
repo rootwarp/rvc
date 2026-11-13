@@ -3,7 +3,7 @@
 use super::*;
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use timing::{DeadlineBps, DeadlineSchedule};
+use timing::{DeadlineBps, DeadlineSchedule, TimingError};
 use tracing::span::Id;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -622,8 +622,8 @@ async fn test_cold_start_with_zero_post_duty_window_subscribes_for_the_boot_epoc
     );
     assert_eq!(
         run.prepares(),
-        [Duration::ZERO, end_of_slot_10],
-        "startup preparation at boot, then the runner's epoch-0 pass"
+        [end_of_slot_10],
+        "The runner's epoch-0 pass must send the only prepare."
     );
     run.assert_no_warm_up();
 }
@@ -651,8 +651,8 @@ async fn test_zero_post_duty_window_at_slot_0_still_runs_boundary_steps() {
     );
     assert_eq!(
         run.prepares(),
-        [Duration::ZERO, end_of_slot_31, end_of_slot_32],
-        "startup preparation at boot, then the epoch-0 and epoch-1 passes"
+        [end_of_slot_31, end_of_slot_32],
+        "The epoch-0 pass and the epoch-1 pass must each send one prepare."
     );
     run.assert_no_warm_up();
 }

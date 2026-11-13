@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
-
 use tokio::sync::watch;
 use tracing::{debug, error, field, info, info_span, warn, Instrument};
 
@@ -29,12 +27,12 @@ use crate::metrics::{
     RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
 use signer::{CircuitBreakerState, SignerService, ValidatorSigner};
-use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, TimingError, SLOTS_PER_EPOCH};
+use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
-use super::duty_management::{DutyManagementService, PrepareOutcome};
+use super::duty_management::DutyManagementService;
 use super::epoch_boundary::{
     EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster, BUILDER_REGISTRATION_TIMEOUT,
 };
@@ -223,90 +221,6 @@ pub enum AttestationOutcome {
         /// Rejection message from that beacon node.
         message: String,
     },
-}
-
-async fn run_startup_proposer_preparation<C: SlotClock>(
-    duty: Arc<DutyManagementService>,
-    builder: Option<Arc<BuilderService>>,
-    clock: Arc<C>,
-    shutdown: &mut watch::Receiver<bool>,
-) {
-    loop {
-        if *shutdown.borrow() {
-            return;
-        }
-        let epoch = match clock.current_slot() {
-            Ok(slot) => slot / SLOTS_PER_EPOCH,
-            Err(TimingError::BeforeGenesis { .. }) => 0,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "startup proposer preparation: current slot is unavailable"
-                );
-                if sleep_or_shutdown(shutdown, Duration::from_secs(1)).await {
-                    return;
-                }
-                continue;
-            }
-        };
-        let prepared = matches!(
-            duty.prepare_proposers(epoch).await,
-            Ok(PrepareOutcome::Complete | PrepareOutcome::Partial { .. })
-        );
-        let registered = startup_register_validators(builder.as_ref(), epoch).await;
-        if prepared && registered {
-            info!(epoch, "startup proposer preparation completed");
-            return;
-        }
-        warn!(
-            epoch,
-            prepared, registered, "startup proposer preparation failed; retrying next slot"
-        );
-        if sleep_or_shutdown(shutdown, startup_retry_delay(clock.as_ref())).await {
-            return;
-        }
-    }
-}
-
-async fn startup_register_validators(builder: Option<&Arc<BuilderService>>, epoch: u64) -> bool {
-    let Some(bs) = builder else {
-        return true;
-    };
-    match tokio::time::timeout(BUILDER_REGISTRATION_TIMEOUT, bs.register_validators(epoch)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            warn!(epoch, error = %e, "startup register_validator failed (non-fatal)");
-            false
-        }
-        Err(_) => {
-            warn!(
-                epoch,
-                "startup register_validator timed out after {}s (non-fatal)",
-                BUILDER_REGISTRATION_TIMEOUT.as_secs()
-            );
-            false
-        }
-    }
-}
-
-fn startup_retry_delay(clock: &impl SlotClock) -> Duration {
-    let delay = match clock.current_slot() {
-        Ok(slot) => clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO),
-        Err(_) => clock.time_until_slot(0).unwrap_or(Duration::ZERO),
-    };
-    if delay.is_zero() {
-        clock.slot_duration()
-    } else {
-        delay
-    }
-}
-
-/// `true` when shutdown was requested.
-async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => false,
-        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
-    }
 }
 
 impl AttestationOutcome {
@@ -723,31 +637,13 @@ where
     /// fetches the duties its steps need itself, so it never waits on the
     /// post-duty window.
     ///
-    /// Startup proposer preparation is polled beside the slot loop and dropped
-    /// when this function returns, including on shutdown.
+    /// This function is the slot loop alone. Startup preparation is the
+    /// runner's boot epoch: its passes prepare proposers and send the builder
+    /// registration, retried at each processed slot of that epoch, and a
+    /// start before genesis prepares epoch 0 before slot 0.
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
-        // Epoch-boundary prep runs after that slot's proposal. Poll the fee
-        // recipient beside the slot loop so epoch 0–1 proposals are not built
-        // against a junk address, and so a slow beacon node cannot hold the
-        // slot loop. Dropping this function drops that future. Before genesis
-        // the epoch is 0. A failure retries once per slot until both calls
-        // succeed or this function returns.
-        let duty = Arc::clone(&self.duty_management);
-        let builder = self.builder_service.clone();
-        let clock = Arc::clone(&self.clock);
-        let mut shutdown = self.shutdown_rx.clone();
-        let startup = run_startup_proposer_preparation(duty, builder, clock, &mut shutdown).fuse();
-        tokio::pin!(startup);
-        let slots = self.run_slot_loop().fuse();
-        tokio::pin!(slots);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut slots => return result,
-                _ = &mut startup => {}
-            }
-        }
+        self.run_slot_loop().await
     }
 
     /// The epoch boundary runner task, `Some` on the first call only.

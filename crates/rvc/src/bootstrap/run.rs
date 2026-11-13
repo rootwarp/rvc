@@ -1141,13 +1141,13 @@ mod tests {
             orchestrator.run().await
         });
 
-        // Startup preparation's prepare and the runner's, both held.
+        // The mock holds the runner's prepare.
         let prepares = || {
             let stamps = mock.call_stamps();
             stamps.iter().filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer).count()
         };
         let mut waited_ms = 0u64;
-        while prepares() < 2 {
+        while prepares() < 1 {
             waited_ms += 1;
             assert!(waited_ms <= 5_000, "the runner's prepare did not start: {}", prepares());
             tokio::time::advance(Duration::from_millis(1)).await;
