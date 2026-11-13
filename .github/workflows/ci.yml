@@ -18,9 +18,12 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
+  # Each job that runs Rust tests sets timeout-minutes, so a wedged test fails
+  # the job instead of holding the runner for the 6-hour default (#789-6).
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |
@@ -198,6 +201,7 @@ jobs:
   test-all-features:
     name: Test (all features)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Free disk space
         run: |
@@ -233,10 +237,15 @@ jobs:
       - name: Run workspace tests (all features)
         run: cargo nextest run --workspace --all-features --locked
 
+      # nextest does not run doctests (#789-12).
+      - name: Run doctests (all features)
+        run: cargo test --workspace --all-features --doc --locked
+
   # Runs on pull requests and on pushes to develop and main.
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       # fetch-depth: 0 so the git-mode scan can read the pull request or push range.
       - uses: actions/checkout@v4
@@ -346,6 +355,7 @@ jobs:
     name: Coverage
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       pull-requests: write
     steps:
@@ -422,6 +432,7 @@ jobs:
     name: Architecture Gates
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Free disk space
         run: |
@@ -481,6 +492,7 @@ jobs:
     name: Spec Vectors
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RVC_SPEC_VECTORS_REQUIRED: "1"
       PRESET: minimal
