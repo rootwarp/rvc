@@ -69,6 +69,37 @@ pub async fn run(
     executor: TaskExecutor,
     shutdown_rx: mpsc::Receiver<ShutdownReason>,
 ) -> Result<(), BootstrapError> {
+    run_with_clock(config, options, executor, shutdown_rx, |system| system).await
+}
+
+/// [`run`] with `clock` in place of the system slot clock.
+///
+/// Only the slot clock changes. `run` still builds everything else,
+/// including every beacon-node client.
+///
+/// # Errors
+///
+/// The same as [`run`].
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_with_slot_clock<C: SlotClock + 'static>(
+    config: Config,
+    options: RunOptions,
+    executor: TaskExecutor,
+    shutdown_rx: mpsc::Receiver<ShutdownReason>,
+    clock: Arc<C>,
+) -> Result<(), BootstrapError> {
+    run_with_clock(config, options, executor, shutdown_rx, |_system| clock).await
+}
+
+/// The body of [`run`]. `pick_clock` maps the system slot clock from
+/// `build_services` to the clock that every later reader gets.
+async fn run_with_clock<C: SlotClock + 'static>(
+    config: Config,
+    options: RunOptions,
+    executor: TaskExecutor,
+    shutdown_rx: mpsc::Receiver<ShutdownReason>,
+    pick_clock: impl FnOnce(Arc<timing::SystemSlotClock>) -> Arc<C>,
+) -> Result<(), BootstrapError> {
     let startup_time = std::time::Instant::now();
     let shutdown_token = executor.token();
 
@@ -220,6 +251,7 @@ pub async fn run(
         builder_service,
         attesting_enabled,
     } = services;
+    let slot_clock = pick_clock(slot_clock);
 
     // RF1-06/07: single key-generation watch channel shared by keymanager
     // adapters (tx), the index resolver, and DutyOrchestrator (rx).
@@ -1496,7 +1528,8 @@ mod tests {
         let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let src = include_str!("run.rs");
         let prod = src.split("#[cfg(test)]").next().expect("production body before tests");
-        let start = prod.find("pub async fn run(").expect("fn run");
+        let start =
+            prod.find("async fn run_with_clock<").expect("run.rs must define run_with_clock.");
         let rest = &prod[start..];
         let end = rest.find("pub(crate) struct ShutdownInputs").expect("end of run");
         let run_fn = squash(&rest[..end]);
@@ -1521,6 +1554,32 @@ mod tests {
         assert_eq!(run_fn.matches("boundary.run()").count(), 1, "one runner spawn");
         assert!(take_at < spawn_at, "take the runner before spawning it");
         assert!(spawn_at < orch_at, "spawn the runner before the duty_orchestrator task");
+    }
+
+    /// W4-E4d: `run` is one call to the shared body with the identity clock
+    /// picker. The build compiles the test entry point only for tests and
+    /// `test-utils`, so the test path cannot drift from production.
+    #[test]
+    fn run_delegates_to_the_shared_body() {
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("The production code must come first.");
+        let rest = &prod[prod.find("pub async fn run(").expect("run.rs must define run.")..];
+        let open = rest.find('{').expect("run must have a body.");
+        let close = rest.find("\n}\n").expect("run must end with a closing brace line.");
+        assert_eq!(
+            squash(&rest[open + 1..close]),
+            "run_with_clock(config, options, executor, shutdown_rx, |system| system).await",
+            "The body of run must be one run_with_clock call with the identity clock picker."
+        );
+        let entry = prod
+            .find("pub async fn run_with_slot_clock<")
+            .expect("run.rs must define run_with_slot_clock.");
+        assert_eq!(
+            prod[..entry].trim_end().lines().last().map(str::trim),
+            Some("#[cfg(any(test, feature = \"test-utils\"))]"),
+            "The build must compile run_with_slot_clock only for tests and the test-utils feature."
+        );
     }
 
     /// ARCH-2i: production body of run.rs must not hard-exit the process.

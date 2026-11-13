@@ -23,6 +23,8 @@ pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 pub use keys::{load_signing_keys, LoadedKeys};
+#[cfg(any(test, feature = "test-utils"))]
+pub use run::run_with_slot_clock;
 #[cfg(test)]
 pub(crate) use run::{await_shutdown_and_drain_with_signal, DetectionShutdown, ShutdownInputs};
 pub use run::{run, RunOptions};

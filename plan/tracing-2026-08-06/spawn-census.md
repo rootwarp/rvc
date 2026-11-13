@@ -15,8 +15,8 @@ Production sites are `(file, enclosing item, task, call)`. Shape B loops are `(l
 | File | Item | Task | Call | Bucket | Reason |
 |---|---|---|---|---|---|
 | `bin/rvc/src/logging.rs` | `spawn_log_reload_handler` | `log_reload` | spawn | detached | SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit. |
-| `crates/rvc/src/bootstrap/run.rs` | `run` | `epoch.boundary.runner` | spawn | B | Iteration loop in `EpochBoundaryTask::run`. Each pass is a root `epoch.boundary` span that follows from the loop span. |
-| `crates/rvc/src/bootstrap/run.rs` | `run` | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. The call is `executor.spawn_result`; this column is the pin kind `spawn`. |
+| `crates/rvc/src/bootstrap/run.rs` | `run_with_clock` | `epoch.boundary.runner` | spawn | B | Iteration loop in `EpochBoundaryTask::run`. Each pass is a root `epoch.boundary` span that follows from the loop span. |
+| `crates/rvc/src/bootstrap/run.rs` | `run_with_clock` | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. The call is `executor.spawn_result`; this column is the pin kind `spawn`. |
 | `crates/rvc/src/bootstrap/run.rs` | `spawn_secret_provider_refresh` | `secret_provider_refresh` | spawn | detached | `RefreshService::run` in `crates/secret-provider`; loop body is out of scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | `spawn_background_tasks` | `metrics_server` | spawn | detached | Metrics server; serve loop is `serve_metrics_with_health` in `crates/metrics`, out of P1-1 scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | `spawn_background_tasks` | `monitoring_push` | spawn | B | Iteration loop in `start_monitoring_push`. TRC-6b owns the per-iteration root. |
@@ -43,7 +43,7 @@ Shape A = 0. None of the 17 inherit a caller trace as a shape A root.
 | `liveness_loop` | `crates/rvc/src/liveness_loop.rs` | `spawn_liveness_loop` | `crates/rvc/src/liveness_loop.rs` | `LivenessObservationLoop::run` |
 | `slashing_monitor` | `crates/rvc/src/slashing_monitor.rs` | `spawn_with_interval` | `crates/rvc/src/slashing_monitor.rs` | `spawn_with_interval` |
 | `index.resolve` | `crates/rvc/src/index_resolver.rs` | `spawn_index_resolver` | `crates/rvc/src/index_resolver.rs` | `IndexResolver::run` |
-| `epoch.boundary.runner` | `crates/rvc/src/bootstrap/run.rs` | `run` | `crates/rvc/src/orchestrator/epoch_boundary.rs` | `EpochBoundaryTask::run` |
+| `epoch.boundary.runner` | `crates/rvc/src/bootstrap/run.rs` | `run_with_clock` | `crates/rvc/src/orchestrator/epoch_boundary.rs` | `EpochBoundaryTask::run` |
 
 ## Not sites — `register_opt(..., None)`
 
