@@ -2397,6 +2397,11 @@ mod tests {
     /// same-poll tie never takes `select!`'s random first arm. The tie test
     /// above catches an unbiased select only when the random draw picks the
     /// pass.
+    ///
+    /// RSA F2: the pre-genesis method `run_before_genesis` has two selects,
+    /// the pass select and then the wait select. Each one must open with
+    /// `biased;` and then the shutdown arm. The test reads the source, so it
+    /// pins the syntax of these selects and no runtime behavior.
     #[test]
     fn the_in_flight_select_is_biased_with_the_shutdown_arm_first() {
         use std::ops::Range;
@@ -2476,6 +2481,52 @@ mod tests {
             shutdown < pass,
             "the in-flight select lists the shutdown arm before the pass arm: {inner}"
         );
+
+        let helpers = blocks(
+            &code,
+            tasks[0].clone(),
+            "asyncfnrun_before_genesis(&mutself,loop_span:&Span)->bool{",
+        );
+        assert_eq!(helpers.len(), 1, "There must be one `run_before_genesis` method.");
+        let helper = &code[helpers[0].clone()];
+        assert_eq!(
+            helper.matches("select!").count(),
+            2,
+            "`run_before_genesis` must have the pass select and the wait select: {helper}"
+        );
+        let selects = blocks(&code, helpers[0].clone(), "tokio::select!{");
+        let [pass_select, wait_select] = selects.as_slice() else {
+            panic!("Both selects in `run_before_genesis` must be `tokio::select!`: {helper}");
+        };
+        assert!(
+            pass_select.end < wait_select.start,
+            "The pass select must come before the wait select, and must not contain it: {helper}"
+        );
+        let shutdown_first = "biased;()=shutdown_requested(&mutself.shutdown)=>";
+        for (name, select, arms, work) in [
+            ("pass", pass_select, 2, "()=self.runner.run_pending_for_epoch(0)"),
+            ("wait", wait_select, 3, "changed=self.slots.changed()=>"),
+        ] {
+            let body = &code[select.clone()];
+            assert_eq!(
+                body.matches("=>").count(),
+                arms,
+                "The pre-genesis {name} select must have {arms} arms: {body}"
+            );
+            assert_eq!(
+                body.matches(work).count(),
+                1,
+                "The pre-genesis {name} select must have one `{work}` arm: {body}"
+            );
+            assert!(
+                body.starts_with("biased;"),
+                "The pre-genesis {name} select must open with `biased;`: {body}"
+            );
+            assert!(
+                body.starts_with(shutdown_first),
+                "The pre-genesis {name} select must put the shutdown arm first: {body}"
+            );
+        }
     }
 
     const ABANDONED: &str = "epoch-boundary steps did not finish before the epoch ended";
@@ -3350,8 +3401,11 @@ mod tests {
 
     /// W4-E4b AC1: 50 ms before genesis, with no slot processed, the runner
     /// task prepares epoch 0 on its own: validator 7's prepare POST goes out
-    /// while the clock still reads before genesis. Shutdown ends the task
-    /// within the tier budget with a pre-genesis prepare held.
+    /// while the clock still reads before genesis.
+    ///
+    /// Then the mock holds a pre-genesis prepare. The test polls the runner
+    /// itself, sets shutdown, and polls one more time. That poll must end
+    /// the runner, and the held prepare must not finish.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn runner_prepares_epoch_zero_before_genesis() {
         let local = SecretKey::generate();
@@ -3381,10 +3435,125 @@ mod tests {
         // shutdown, as a pass at a processed slot is.
         let f = held_fixture(MockMethod::PrepareBeaconProposer, &[]).await;
         f.clock.set_current_time_ms(GENESIS_MS - 50);
-        let runner = spawn_runner(&f);
-        await_arrivals(&f.mock, MockMethod::PrepareBeaconProposer, 1).await;
-        shut_down_within_budget(runner, "a pre-genesis prepare in flight").await;
+        let mut runner = LocalRunner::new(&f, f.clock.clone());
+        runner.poll_until_prepare(&f.mock, 1).await;
+        assert!(
+            matches!(f.clock.current_slot(), Err(TimingError::BeforeGenesis { .. })),
+            "The held prepare must start before genesis."
+        );
+        runner.shutdown.send_replace(true);
+        // The test task yields, so the next poll starts with a full tokio
+        // coop budget. Nothing else polls the runner.
+        tokio::task::yield_now().await;
+        let after_shutdown = futures::poll!(runner.run.as_mut());
+        assert!(
+            after_shutdown.is_ready(),
+            "The first poll after shutdown must end the runner while the pre-genesis prepare is held."
+        );
         assert!(f.mock.prepare_beacon_proposer_calls().is_empty(), "dropped, not finished");
+        drop(runner);
+        tokio::time::advance(HOLD).await;
+        assert!(
+            f.mock.prepare_beacon_proposer_calls().is_empty(),
+            "The dropped prepare must not finish when the hold ends."
+        );
+        assert!(!prepare_done(&f.runner), "PrepareProposers must not be done in epoch 0.");
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::PrepareBeaconProposer),
+            1,
+            "The runner must send no other prepare."
+        );
+    }
+
+    /// RSA F2: shutdown has priority over the pre-genesis pass. Before
+    /// genesis, epoch 0 has pending steps, and the mock answers at once.
+    /// The test sets shutdown before it polls the runner for the first time.
+    /// Each round must show these results:
+    ///
+    /// - The first poll ends the runner.
+    /// - The runner starts no epoch-0 progress.
+    /// - The runner sends no request.
+    ///
+    /// An unbiased select takes a random first arm, so the test has 32
+    /// rounds. The source contract
+    /// `the_in_flight_select_is_biased_with_the_shutdown_arm_first` pins the
+    /// arm order with no random draw. In the control part, the test does not
+    /// set shutdown, and the first polls prepare epoch 0.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_before_the_first_poll_starts_no_pre_genesis_pass() {
+        let prep = MockMethod::PrepareBeaconProposer;
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        f.clock.set_current_time_ms(GENESIS_MS - 50);
+        let calls = f.mock.call_stamps().len();
+        assert!(f.runner.has_pending(0), "Epoch 0 must have pending steps before the first poll.");
+
+        for round in 1..=32 {
+            // Each first poll starts with a full tokio coop budget.
+            tokio::task::yield_now().await;
+            let mut runner = LocalRunner::new(&f, f.clock.clone());
+            runner.shutdown.send_replace(true);
+            let first = futures::poll!(runner.run.as_mut());
+            assert!(
+                f.runner.progress.lock().is_none(),
+                "Round {round}: shutdown must win, so the runner must start no epoch-0 progress."
+            );
+            assert_eq!(
+                f.mock.call_stamps().len(),
+                calls,
+                "Round {round}: shutdown must win, so the runner must send no request."
+            );
+            assert!(first.is_ready(), "Round {round}: the first poll must end the runner.");
+        }
+
+        let mut control = LocalRunner::new(&f, f.clock.clone());
+        control.poll_until_prepare(&f.mock, 1).await;
+        assert_eq!(
+            arrivals(&f.mock, prep),
+            1,
+            "Control: with no shutdown, the runner must prepare."
+        );
+        let epoch = f.runner.progress.lock().as_ref().map(|progress| progress.epoch);
+        assert_eq!(epoch, Some(0), "Control: with no shutdown, the runner must start epoch 0.");
+        control.shutdown.send_replace(true);
+        tokio::task::yield_now().await;
+        assert!(
+            futures::poll!(control.run.as_mut()).is_ready(),
+            "Control: shutdown must end the runner while it waits for the next tick."
+        );
+    }
+
+    /// W4-E4b AC3: this test checks the floor of the tick with no runner. It
+    /// reads the tick directly, because a zero tick makes the runner loop
+    /// with no wait.
+    /// The tick is the time left to genesis, and one slot at most. When the
+    /// clock reads no time left, the tick is one slot, not zero.
+    #[test]
+    fn pre_genesis_tick_is_one_slot_when_no_time_is_left() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, SLOT, SLOTS_PER_EPOCH);
+        clock.set_current_time_ms(GENESIS_MS - 50);
+        assert_eq!(
+            pre_genesis_tick(&clock),
+            Duration::from_millis(50),
+            "With 50 ms to genesis, the tick must be 50 ms."
+        );
+        clock.set_current_time_ms(GENESIS_MS - 30_000);
+        assert_eq!(
+            pre_genesis_tick(&clock),
+            SLOT,
+            "With 30 s to genesis, the tick must be one slot."
+        );
+
+        let no_time_left = ScriptedClock::new(before_genesis);
+        assert_eq!(
+            no_time_left.time_until_slot(0).expect("time to genesis"),
+            Duration::ZERO,
+            "The scripted clock must read no time left to genesis."
+        );
+        assert_eq!(
+            pre_genesis_tick(&*no_time_left),
+            SLOT,
+            "With no time left to genesis, the tick must be one slot, not zero."
+        );
     }
 
     /// W4-E4b AC2: the epoch-0 progress made before genesis carries into
@@ -3636,5 +3805,99 @@ mod tests {
             );
             assert_eq!(registrations(&spans), want_calls, "{arm}: no call after the boot epoch");
         }
+    }
+
+    /// Harper B2: the boot-epoch registration needs no duties. The fixture
+    /// has a builder service, and boot epoch 2 is before Gloas. Each attester
+    /// and proposer request for epochs 2 and 3 fails, so the tracker caches
+    /// no duty epoch. The registration step must call `register_validators`
+    /// and be `Done`, and must not be `NotReady`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn boot_registration_does_not_wait_for_duties() {
+        use BoundaryStep::{BuilderRegistration, DutyFetch};
+        let failing_proposer = FailPlan::default();
+        failing_proposer.lock().extend([(2, usize::MAX), (3, usize::MAX)]);
+        let mock = proposer_duties_failing(Arc::clone(&failing_proposer))
+            .with_register_validators(|_registrations| Ok(()));
+        let f = fixture_seeded(mock, SecretKey::generate(), true, &[]).await;
+        f.failing_attester.lock().extend([(2, usize::MAX), (3, usize::MAX)]);
+        assert!(
+            create_test_fork_schedule().gloas_fork_epoch > 2,
+            "Boot epoch 2 must be before Gloas."
+        );
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        f.runner.run_pending(2 * SLOTS_PER_EPOCH).await;
+
+        assert_eq!(
+            step_state(&f.runner, DutyFetch),
+            (Some(StepOutcome::Failed), false),
+            "DutyFetch must fail, because each duty request fails."
+        );
+        for epoch in [2, 3] {
+            assert!(
+                !f.duty_tracker.is_epoch_cached(epoch).await,
+                "The attester duties of epoch {epoch} must not be cached."
+            );
+            assert!(
+                !f.duty_tracker.is_proposer_epoch_cached(epoch).await,
+                "The proposer duties of epoch {epoch} must not be cached."
+            );
+        }
+        assert_eq!(
+            registrations(&spans),
+            1,
+            "With no cached duties, the registration step must call register_validators one time."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::RegisterValidators),
+            1,
+            "The registration step must send one registration POST."
+        );
+        assert_eq!(
+            step_state(&f.runner, BuilderRegistration),
+            (Some(StepOutcome::Done), true),
+            "The registration step must be Done, and must not wait for duties."
+        );
+    }
+
+    /// RSA F1: a cache hit adds no signature and no POST. The test calls
+    /// `register_validators` and waits until it returns. Then the boot
+    /// epoch's pass calls it again for the same key and settings. The second
+    /// call must sign nothing and send nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_boot_registration_cache_hit_adds_no_signature_and_no_post() {
+        use BoundaryStep::BuilderRegistration;
+        let register = MockMethod::RegisterValidators;
+        let mock = proposer_duties_at(ROOT_A).with_register_validators(|_registrations| Ok(()));
+        let f = fixture_seeded(mock, SecretKey::generate(), true, &[]).await;
+        let builder = f.runner.builder_service.clone().expect("a builder service");
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let signed =
+            || spans.0.lock().iter().filter(|name| **name == "sign.builder_registration").count();
+
+        builder.register_validators(2).await.expect("the first registration");
+
+        assert_eq!(
+            (registrations(&spans), signed(), arrivals(&f.mock, register)),
+            (1, 1, 1),
+            "The first call must sign one registration and send one POST."
+        );
+        assert_eq!(f.mock.register_validators_calls().len(), 1, "The mock must answer the POST.");
+
+        f.runner.run_pending(2 * SLOTS_PER_EPOCH).await;
+
+        assert_eq!(
+            step_state(&f.runner, BuilderRegistration),
+            (Some(StepOutcome::Done), true),
+            "The second call must return Ok, so the step must be Done."
+        );
+        assert_eq!(registrations(&spans), 2, "The pass must call register_validators again.");
+        assert_eq!(signed(), 1, "The cache hit must add no signature.");
+        assert_eq!(arrivals(&f.mock, register), 1, "The cache hit must add no POST.");
     }
 }
