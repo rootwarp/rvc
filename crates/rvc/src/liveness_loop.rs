@@ -24,8 +24,9 @@
 //! saw activity). A not-live answer counts only when a synced witness reported
 //! it. Errors and non-responses contribute nothing (they are not treated as
 //! "not live"). If every BN fails the call returns `Err` and this loop still
-//! fail-closes on errors/incomplete samples. The epoch is read again after the
-//! queries; if it moved, live answers still detect and the decrement is skipped.
+//! fail-closes on errors/incomplete samples. The epoch is read again under the
+//! machine lock; if it moved since the queries, live answers still detect and
+//! the decrement is skipped.
 //! A closed epoch older than the previous one is not queried again.
 
 use std::collections::{HashMap, HashSet};
@@ -302,12 +303,9 @@ impl LivenessObservationLoop {
                 // Network observation may store the latch. The marker write is
                 // the only disk step before the exit request, and that request
                 // waits until the write succeeds. Sidecar file I/O stays after it.
-                let observation = self.observe_adjacent(epoch_at_query, slot_at_query).await;
-                let current_epoch = self.clock_epoch();
-                let slot_in_epoch = self.clock_slot();
-                let skip_decrement = current_epoch != epoch_at_query;
-                self.record_liveness(&observation, epoch_at_query, slot_at_query, skip_decrement);
-                let statuses = self.machine.statuses(current_epoch, slot_in_epoch);
+                let TickOutcome { statuses, current_epoch, slot_in_epoch } = self
+                    .tick(epoch_at_query, slot_at_query, &|| self.clock_epoch() == epoch_at_query)
+                    .await;
                 let detected =
                     statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
                 let pending =
@@ -422,20 +420,27 @@ impl LivenessObservationLoop {
         refresh_indices_from_pubkey_map_impl!(self, validators);
     }
 
-    /// Query the previous epoch and the current epoch, then report status.
+    /// Query the previous epoch and the current epoch, apply the answers, then
+    /// report status. [`Self::run`] and the test driver both call this.
     ///
     /// An empty index registry makes no beacon-node call. A not-live answer
-    /// decrements only for the previous epoch at slot >= [`doppelganger::CLOSED_EPOCH_SLOT`].
-    async fn tick_once(
+    /// decrements only for the previous epoch at slot >= [`doppelganger::CLOSED_EPOCH_SLOT`],
+    /// and only if `epoch_unchanged` returns `true`. That closure runs under
+    /// the machine lock, so it must be a clock read that does not block.
+    /// After the queries the clock is read again for the logs and the marker
+    /// epoch. Sidecar cleanup is the caller's step.
+    async fn tick(
         &self,
-        current_epoch: Epoch,
-        slot_in_epoch: u64,
-    ) -> Vec<ForwardWindowStatus> {
-        let observation = self.observe_adjacent(current_epoch, slot_in_epoch).await;
-        self.record_liveness(&observation, current_epoch, slot_in_epoch, false);
+        epoch_at_query: Epoch,
+        slot_at_query: u64,
+        epoch_unchanged: &(dyn Fn() -> bool + Sync),
+    ) -> TickOutcome {
+        let observation = self.observe_adjacent(epoch_at_query, slot_at_query).await;
+        let current_epoch = self.clock_epoch();
+        let slot_in_epoch = self.clock_slot();
+        self.record_liveness(&observation, epoch_at_query, slot_at_query, epoch_unchanged);
         let statuses = self.machine.statuses(current_epoch, slot_in_epoch);
-        self.record_completed_imports();
-        statuses
+        TickOutcome { statuses, current_epoch, slot_in_epoch }
     }
 
     /// Fetch epochs `current - 1` and `current`.
@@ -444,8 +449,8 @@ impl LivenessObservationLoop {
     /// closed window is not queried again, and the remaining decrements are
     /// still required, so a miss never closes the window early.
     ///
-    /// The caller applies the answers after reading the epoch again. A live
-    /// answer at or after `next_check_epoch` is `Detected` before any
+    /// The caller applies the answers with an epoch check under the machine
+    /// lock. A live answer at or after `next_check_epoch` is `Detected` before any
     /// decrement, so signing stays closed until both answers of this tick are
     /// applied. A failed or partial current-epoch query does not let the
     /// previous epoch's decrement open the gate.
@@ -551,6 +556,9 @@ impl LivenessObservationLoop {
     /// dropped: nothing from it counts, opens the gate or detects. One that
     /// arrives while the lock is held waits until the state is written.
     ///
+    /// After the token check, `epoch_unchanged` runs under the same state
+    /// mutex. `false` skips every not-live decrement of the tick.
+    ///
     /// A key with no validator index is logged once at info. An omitted or
     /// failed answer for a key that has an index is warned once per
     /// `(pubkey, epoch)`.
@@ -559,7 +567,7 @@ impl LivenessObservationLoop {
         observation: &Observation,
         current_epoch: Epoch,
         slot_in_epoch: u64,
-        skip_decrement: bool,
+        epoch_unchanged: &dyn Fn() -> bool,
     ) {
         #[cfg(test)]
         tests::before_admission();
@@ -571,7 +579,7 @@ impl LivenessObservationLoop {
             &observation.answers,
             current_epoch,
             slot_in_epoch,
-            skip_decrement,
+            epoch_unchanged,
             || {
                 let fresh = self.indices_unchanged_since(observation.freshness);
                 #[cfg(test)]
@@ -663,8 +671,13 @@ impl LivenessObservationLoop {
 
     /// Single-cycle driver for tests (no sleep / cancel).
     ///
-    /// Queries the previous and current epochs at `(epoch, slot_in_epoch)`,
-    /// the same pair [`Self::run`] queries from the clock.
+    /// The driver queries the previous and current epochs at `(epoch, slot_in_epoch)`.
+    /// It uses the same tick as [`Self::run`]. It then removes sidecars for Safe keys.
+    ///
+    /// With a [`ClockSeam`], the check compares the current seam epoch with its
+    /// value at the start of the tick. The driven epoch does not affect this
+    /// comparison. A seam that moves during the queries skips the not-live
+    /// decrement. A still seam does not. With no seam, the check passes.
     ///
     /// Compiled only for this crate's tests or when the `test-utils` feature
     /// is enabled. Integration tests see it through the self dev-dependency.
@@ -674,7 +687,14 @@ impl LivenessObservationLoop {
         epoch: Epoch,
         slot_in_epoch: u64,
     ) -> Vec<ForwardWindowStatus> {
-        self.tick_once(epoch, slot_in_epoch).await
+        let outcome = if self.clock_seam.is_some() {
+            let seam_at_start = self.clock_epoch();
+            self.tick(epoch, slot_in_epoch, &|| self.clock_epoch() == seam_at_start).await
+        } else {
+            self.tick(epoch, slot_in_epoch, &|| true).await
+        };
+        self.record_completed_imports();
+        outcome.statuses
     }
 
     /// Drop import sidecars for loaded keys that are Safe.
@@ -829,6 +849,15 @@ pub fn spawn_liveness_loop(
 struct Observation {
     answers: Vec<EpochLiveness>,
     freshness: RegistryFreshness,
+}
+
+/// What one liveness tick gives back to `run` or the test driver.
+struct TickOutcome {
+    statuses: Vec<ForwardWindowStatus>,
+    /// Epoch read after the queries. `run` logs it and writes it to the marker.
+    current_epoch: Epoch,
+    /// Slot in the epoch read after the queries, for the logs.
+    slot_in_epoch: u64,
 }
 
 #[cfg(test)]
@@ -3103,6 +3132,130 @@ mod tests {
             ForwardWindowStatus::Pending,
             "A seam that moves during the driven queries must skip the last decrement."
         );
+    }
+
+    /// The seam stays at epoch 13 while the driver drives epochs 11, 12 and 13.
+    /// The driver compares the seam with itself, so each decrement runs.
+    #[tokio::test]
+    async fn drive_once_for_test_with_a_still_seam_still_decrements() {
+        let (status, seam_epoch) = drive_three_closed_epochs(false).await;
+        assert_eq!(seam_epoch, 13, "The seam must not move.");
+        assert_eq!(
+            status,
+            ForwardWindowStatus::Safe,
+            "A still seam must let the driven not-live answers finish the window."
+        );
+    }
+
+    /// The script changes the epoch under the machine lock, and the key is
+    /// live. The live answer must still detect.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rollover_keeps_a_live_answer() {
+        let tick = run_one_scripted_tick(&[13, 13, 14], true).await;
+        assert_eq!(
+            tick.status,
+            ForwardWindowStatus::Detected,
+            "An epoch change under the machine lock must not drop a live answer."
+        );
+        assert!(tick.latched, "The live answer must set the detection latch.");
+    }
+
+    /// The script keeps epoch 13 for the three reads of the tick. The last
+    /// not-live decrement must run through `run`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_with_a_still_epoch_applies_the_last_decrement() {
+        let tick = run_one_scripted_tick(&[13, 13, 13], false).await;
+        assert_eq!(
+            tick.status,
+            ForwardWindowStatus::Safe,
+            "An unchanged epoch under the machine lock must apply the last decrement."
+        );
+        assert_eq!(tick.script_left, 0, "The tick must take the three scripted epochs.");
+    }
+
+    /// The recorder keeps one value for each exit request. The value is true
+    /// if the sidecar exists at that time.
+    struct SidecarAtExit {
+        sidecar: std::path::PathBuf,
+        present: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl ExitRequest for SidecarAtExit {
+        fn request(&self, _exit_code: i32) {
+            let mut present = self.present.lock().expect("The record lock must not be poisoned.");
+            present.push(self.sidecar.exists());
+        }
+    }
+
+    /// One run tick has these results:
+    /// - The not-live key becomes Safe.
+    /// - The live key becomes Detected.
+    /// - The loop writes the marker before it requests the exit.
+    /// - The loop requests the exit before it removes the Safe key's sidecar.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_removes_a_safe_sidecar_only_after_the_exit_request() {
+        let dir = tempfile::tempdir().expect("The test must create a directory.");
+        let m = machine();
+        let (safe_pk, live_pk) = (new_pk(), new_pk());
+        m.register(&safe_pk, 10);
+        let name = format!("0x{}.import_meta.json", hex::encode(safe_pk.to_bytes()));
+        let sidecar = dir.path().join(name);
+        std::fs::write(&sidecar, "{\"imported_unix_seconds\":1}")
+            .expect("The test must write the sidecar.");
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(safe_pk.to_bytes(), "1".to_string());
+        reg.write().insert(live_pk.to_bytes(), "2".to_string());
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            safe_pk.to_bytes(),
+            safe_pk.clone(),
+        )])));
+        let exit =
+            Arc::new(SidecarAtExit { sidecar: sidecar.clone(), present: Default::default() });
+        let cancel = CancellationToken::new();
+        let bn = Arc::new(with_live(&[("1", false), ("2", true)]).0);
+        let loop_ =
+            LivenessObservationLoop::new(Arc::clone(&m), bn, reg, test_clock(), cancel.clone())
+                .with_slot_duration(Duration::from_secs(12))
+                .with_clock_seam(ClockSeam::new(13, CLOSED_EPOCH_SLOT))
+                .with_pubkey_map(pubkey_map)
+                .with_import_sidecar_dir(
+                    dir.path().to_path_buf(),
+                    Arc::new(crate::quiesce::TrackedKeys::new()),
+                )
+                .with_detection_marker_dir(dir.path().to_path_buf())
+                .with_exit_request(exit.clone() as Arc<dyn ExitRequest>);
+        loop_.drive_once_for_test(11, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(12, CLOSED_EPOCH_SLOT).await;
+        assert!(sidecar.exists(), "A Pending key must keep its sidecar.");
+        m.register(&live_pk, 13);
+
+        let task = tokio::spawn(loop_.run());
+        for _ in 0..256 {
+            if !sidecar.exists() {
+                break;
+            }
+            assert!(!task.is_finished(), "The loop must not stop before the sidecar removal.");
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        task.await.expect("The liveness loop must stop without a panic.");
+        assert_eq!(
+            m.status(&safe_pk),
+            ForwardWindowStatus::Safe,
+            "The tick must finish the window of the safe key."
+        );
+        assert_eq!(
+            m.status(&live_pk),
+            ForwardWindowStatus::Detected,
+            "The tick must detect the live key."
+        );
+        assert_eq!(
+            *exit.present.lock().expect("The record lock must not be poisoned."),
+            vec![true],
+            "The loop must request the exit one time, before it removes the sidecar."
+        );
+        assert!(!sidecar.exists(), "The same tick must remove the sidecar after the exit request.");
     }
 
     async fn poll_until_parked(task: &tokio::task::JoinHandle<()>) {
