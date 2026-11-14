@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bn_manager::{BeaconNodeClient, BnManager, LivenessApi};
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
+use eth_types::Epoch;
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
 
@@ -84,6 +85,33 @@ pub async fn wire_signing_enablement(
     slashing_db: Arc<SlashingDb>,
     executor: &TaskExecutor,
 ) -> Result<EnablementHandles, BootstrapError> {
+    wire_signing_enablement_body(config, keys, beacon, slashing_db, executor, None).await
+}
+
+/// [`wire_signing_enablement`] with the boot epoch read from `boot_epoch`.
+#[cfg(test)]
+pub(crate) async fn wire_signing_enablement_with_boot_epoch(
+    config: &Config,
+    keys: &LoadedKeys,
+    beacon: &BeaconHandles,
+    slashing_db: Arc<SlashingDb>,
+    executor: &TaskExecutor,
+    boot_epoch: Arc<dyn Fn() -> Epoch + Send + Sync>,
+) -> Result<EnablementHandles, BootstrapError> {
+    wire_signing_enablement_body(config, keys, beacon, slashing_db, executor, Some(boot_epoch))
+        .await
+}
+
+/// Body of [`wire_signing_enablement`]. Production passes `None` for
+/// `boot_epoch` and reads [`MonotonicEpochClock::current_epoch`] on the shared clock.
+async fn wire_signing_enablement_body(
+    config: &Config,
+    keys: &LoadedKeys,
+    beacon: &BeaconHandles,
+    slashing_db: Arc<SlashingDb>,
+    executor: &TaskExecutor,
+    boot_epoch: Option<Arc<dyn Fn() -> Epoch + Send + Sync>>,
+) -> Result<EnablementHandles, BootstrapError> {
     let builder = ServiceBuilder::new(config.clone());
     let doppelganger_enabled = config.doppelganger_detection;
 
@@ -91,7 +119,9 @@ pub async fn wire_signing_enablement(
     // so NTP cannot compress the window and wall-clock alone cannot force epoch 0.
     let epoch_clock =
         Arc::new(MonotonicEpochClock::new(beacon.genesis_time, beacon.slot_duration_ms));
-    let enablement_epoch = epoch_clock.current_epoch();
+    let read_boot_epoch =
+        || boot_epoch.as_ref().map_or_else(|| epoch_clock.current_epoch(), |read| read());
+    let enablement_epoch = read_boot_epoch();
     // Named-network confirmation is not enough: a clock still before genesis
     // saturates to epoch 0 and must not take the Safe bypass. A head outside
     // epoch 0, or a head that cannot be read, closes it too.
@@ -1076,6 +1106,94 @@ mod tests {
         assert_eq!(registry.read().index_of(&pk.to_bytes()), Some("9"));
         assert_eq!(registry.read().freshness(), RegistryFreshness::Fresh(1));
         executor.token().cancel();
+    }
+
+    /// Boots one key with detection on and genesis time 0. The beacon head is slot 31.
+    ///
+    /// The boot reads its epoch from a `ClockSeam` that starts at epoch 0.
+    /// The test holds the `validators` answer until the coordinator releases it.
+    /// Before the release, the coordinator sets the seam to `epoch_at_release`
+    /// when it is `Some`.
+    async fn boot_across_held_validators(
+        epoch_at_release: Option<Epoch>,
+    ) -> (Arc<ForwardWindowMachine>, crypto::PublicKey) {
+        use crate::liveness_loop::ClockSeam;
+
+        let servers = [(MockServer::start().await, Some(syncing_body("31")))];
+        let beacon = beacon_with_syncing(0, &servers).await;
+        let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = ReleaseOnDrop(release_tx);
+        Mock::given(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(HeldValidators {
+                arrived: arrived_tx,
+                release: std::sync::Mutex::new(release_rx),
+                body: serde_json::json!({ "data": [] }),
+            })
+            .with_priority(1)
+            .mount(&servers[0].0)
+            .await;
+        let seam = ClockSeam::new(0, 0);
+        let reader = Arc::clone(&seam);
+        let pk = SecretKey::generate().public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let config = base_config(true);
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let boot = wire_signing_enablement_with_boot_epoch(
+            &config,
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open.")),
+            &executor,
+            Arc::new(move || reader.epoch()),
+        );
+        let coordinator = async {
+            arrived.recv().await.expect("The boot must send the validators request.");
+            if let Some(epoch) = epoch_at_release {
+                seam.set_epoch(epoch);
+            }
+            drop(release);
+        };
+        // Hang guard only. The channels set the order, not this timeout.
+        let (handles, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(boot, coordinator)
+        })
+        .await
+        .expect("The boot must not stop at the held validators answer.");
+        let machine = handles
+            .expect("The boot must succeed.")
+            .forward_window_machine
+            .expect("Detection on must give a forward-window machine.");
+        executor.token().cancel();
+        (machine, pk)
+    }
+
+    /// The boot moves from epoch 0 into epoch 1 while the test holds the
+    /// `validators` answer.
+    ///
+    /// The epoch read after the last boot await is 1. Thus the boot must close
+    /// the epoch-0 bypass and register the key Pending at epoch 1.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn epoch0_bypass_closes_when_boot_crosses_into_epoch_one() {
+        let (machine, pk) = boot_across_held_validators(Some(1)).await;
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Pending,
+            "A boot that moves into epoch 1 must not mark the key Safe."
+        );
+        assert_eq!(
+            machine.pending_keys(),
+            vec![doppelganger::PendingKey {
+                pubkey_hex: hex::encode(pk.to_bytes()),
+                next_check_epoch: 1,
+            }],
+            "The key must register with the epoch that the boot reads after the last await."
+        );
+        assert!(
+            !logs_contain("pre-genesis (epoch 0) startup"),
+            "A boot that moves into epoch 1 must not log the pre-genesis line."
+        );
     }
 
     /// Every boot mode that goes on, by doppelganger detection on or off. The
