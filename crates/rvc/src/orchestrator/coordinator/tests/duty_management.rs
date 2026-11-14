@@ -1,7 +1,9 @@
 //! Coordinator tests: proposer preparation, committee subscriptions, epoch reorg.
 
 use super::*;
-use crate::orchestrator::duty_management::PrepareOutcome;
+use crate::orchestrator::duty_management::{
+    arm_prepare_hook, DutyManagementService, PrepareOutcome, PreparePoint,
+};
 
 // --- B-05: Proposer preparation tests ---
 
@@ -2891,8 +2893,9 @@ fn no_hook(_: Slot, _: &crate::pubkey_index::SharedPubkeyIndexRegistry) {}
 
 /// [`drive_boundary_with`] over `keys`, each signing-enabled and in the
 /// index registry at boot with its index when it has one. The tracker asks
-/// for validator 42's duties. `before_slot(slot, registry)` runs after the
-/// previous slot's pass, before the clock moves to `slot`.
+/// for validator 42's duties. The hook `before_slot(slot, registry)` runs
+/// one time for `from_slot` before boot. Then it runs after the pass of the
+/// previous slot, before the clock moves to `slot`.
 async fn drive_boundary_keys(
     mock: bn_manager::MockBeaconNodeClient,
     keys: Vec<(SecretKey, Option<&'static str>)>,
@@ -2967,6 +2970,7 @@ async fn drive_boundary_keys(
         deps.pubkey_index.write().insert(pk_bytes, index);
     }
     let registry = Arc::clone(&deps.pubkey_index);
+    before_slot(from_slot, &registry);
     let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
     let mut processed = orchestrator.processed_slot_tx.subscribe();
 
@@ -3325,5 +3329,529 @@ async fn test_subscription_post_500_is_retried_at_the_next_slot() {
         run.pass_slots("epoch.boundary"),
         [Some(32), Some(33)],
         "the retry at slot 33 finishes the step: no pass at slot 34"
+    );
+}
+
+// --- W4-E7e: no prepare POST from an index registry that is stale after a revocation ---
+
+/// The helper sets each index from `indices`. It stamps `registry` with the
+/// current value of `generation`. The index resolver does the same under
+/// its write lock.
+fn revalidate(
+    registry: &crate::pubkey_index::SharedPubkeyIndexRegistry,
+    generation: &Arc<std::sync::atomic::AtomicU64>,
+    indices: &[([u8; 48], &str)],
+) {
+    let mut registry = registry.write();
+    for (pubkey, index) in indices {
+        registry.insert(*pubkey, (*index).to_string());
+    }
+    registry.attach_revocation(Arc::clone(generation), generation.load(Ordering::Acquire));
+}
+
+/// The helper increments `generation`, as a beacon node revocation does.
+fn revoke(generation: &std::sync::atomic::AtomicU64) {
+    generation.fetch_add(1, Ordering::AcqRel);
+}
+
+/// W4-E7e: proposer preparation must use validated indices.
+///
+/// 1. The local key has index 4 under generation 0.
+/// 2. A revocation makes the registry stale. The call must send no POST and
+///    must report `Stale`.
+/// 3. Revalidation gives the key index 9. The next call must send index 9
+///    and report `Complete`.
+#[tokio::test]
+async fn test_prepare_proposers_sends_no_index_from_a_registry_revoked_since_validation() {
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_prepare_beacon_proposer(|_| Ok(()));
+    let generation = mock.track_admission();
+    let (deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    revoke(&generation);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        mock.prepare_beacon_proposer_calls().len(),
+        0,
+        "The stale registry must not give index 4 to a prepare POST."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Stale)),
+        "A call on a stale registry must report Stale: {outcome:?}"
+    );
+
+    revalidate(&registry, &generation, &[(local_pk, "9")]);
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Complete)),
+        "The POST covers the one local key, so the call must report Complete: {outcome:?}"
+    );
+}
+
+/// W4-E7e R1: the token check before the POST must stop a POST of indices
+/// that a revocation made stale after the index snapshot.
+///
+/// 1. The local key has index 4 under generation 0.
+/// 2. The prepare hook runs after the read lock of the index snapshot ends.
+///    It revokes the registry and revalidates the key to index 9.
+/// 3. The call must send no POST and must report `Stale`.
+/// 4. The next call must send index 9 and report `Complete`.
+#[tokio::test]
+async fn test_prepare_proposers_sends_no_post_after_a_revocation_after_the_index_snapshot() {
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_prepare_beacon_proposer(|_| Ok(()));
+    let generation = mock.track_admission();
+    let (deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+    let mut change = Some((Arc::clone(&registry), Arc::clone(&generation)));
+    let _armed = arm_prepare_hook(move |point| {
+        if point != PreparePoint::AfterSnapshot {
+            return;
+        }
+        if let Some((registry, generation)) = change.take() {
+            revoke(&generation);
+            revalidate(&registry, &generation, &[(local_pk, "9")]);
+        }
+    });
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        mock.prepare_beacon_proposer_calls().len(),
+        0,
+        "A revocation after the index snapshot must stop the POST of index 4."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Stale)),
+        "A revocation after the index snapshot must make the call report Stale: {outcome:?}"
+    );
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Complete)),
+        "The POST covers the one local key, so the call must report Complete: {outcome:?}"
+    );
+}
+
+/// The mock holds the prepare POST for 3,600 seconds.
+const PREPARE_HOLD: Duration = Duration::from_secs(3_600);
+
+/// The preparation timeout is 7,200 seconds. The held POST ends before it.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(7_200);
+
+/// The helper calls `prepare_proposers(3)` on a new task while the mock
+/// holds the POST. When the POST arrives, the helper increments
+/// `generation`. Then the hold ends. The result is `None` if the task
+/// panics or the hang guard stops the wait.
+async fn prepare_with_a_revocation_during_the_post(
+    duty_management: &Arc<DutyManagementService>,
+    mock: &bn_manager::MockBeaconNodeClient,
+    generation: &std::sync::atomic::AtomicU64,
+) -> Option<Result<PrepareOutcome, OrchestratorError>> {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let arrivals = || mock.call_stamps().iter().filter(|stamp| stamp.method == prep).count();
+    let before = arrivals();
+    let duty_management = Arc::clone(duty_management);
+    let prepare = tokio::spawn(async move { duty_management.prepare_proposers(3).await });
+
+    let mut rounds = 0;
+    while arrivals() == before {
+        assert!(rounds < 1_000, "The mock must record the prepare POST.");
+        rounds += 1;
+        tokio::task::yield_now().await;
+    }
+    revoke(generation);
+    tokio::time::advance(PREPARE_HOLD).await;
+    tokio::time::timeout(PREPARE_HOLD, prepare).await.ok()?.ok()
+}
+
+/// W4-E7e: a revocation during the prepare POST makes the call report
+/// `Stale`, because the POST can carry an index from before the
+/// revocation. The mock holds the POST, and the test increments the
+/// generation before the mock answers.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revocation_during_the_prepare_post_reports_stale() {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new()
+        .with_prepare_beacon_proposer(|_| Ok(()))
+        .with_method_delay(prep, PREPARE_HOLD);
+    let generation = mock.track_admission();
+    let (mut deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    let preparation = PREPARE_TIMEOUT;
+    deps.config = deps
+        .config
+        .with_timeouts(OperationTimeouts { preparation, ..OperationTimeouts::default() });
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = prepare_with_a_revocation_during_the_post(
+        &orchestrator.duty_management,
+        &mock,
+        &generation,
+    )
+    .await;
+
+    assert_eq!(prepared_indices(&mock), [["4"]], "The mock must answer the held POST of index 4.");
+    assert!(
+        matches!(outcome, Some(Ok(PrepareOutcome::Stale))),
+        "A revocation during the POST must make the call report Stale: {outcome:?}"
+    );
+}
+
+/// W4-E7e R1: a revocation during the prepare POST of a partial set also
+/// makes the call report `Stale`.
+///
+/// 1. The first local key has index 4. The second local key has no index.
+/// 2. The mock holds the POST of index 4. A revocation occurs before the
+///    mock answers. The call must report `Stale`.
+/// 3. Revalidation gives the first key index 9. The next call must send
+///    index 9 and report `Partial` with one unresolved key.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revocation_during_a_partial_prepare_post_reports_stale() {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new()
+        .with_prepare_beacon_proposer(|_| Ok(()))
+        .with_call_delays(prep, [PREPARE_HOLD]);
+    let generation = mock.track_admission();
+    let no_index = vec![(SecretKey::generate(), true)];
+    let (mut deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), no_index, vec![]);
+    let preparation = PREPARE_TIMEOUT;
+    deps.config = deps
+        .config
+        .with_timeouts(OperationTimeouts { preparation, ..OperationTimeouts::default() });
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = prepare_with_a_revocation_during_the_post(
+        &orchestrator.duty_management,
+        &mock,
+        &generation,
+    )
+    .await;
+
+    assert_eq!(prepared_indices(&mock), [["4"]], "The mock must answer the held POST of index 4.");
+    assert!(
+        matches!(outcome, Some(Ok(PrepareOutcome::Stale))),
+        "A revocation during the POST of a partial set must make the call report Stale: \
+         {outcome:?}"
+    );
+
+    revalidate(&registry, &generation, &[(local_pk, "9")]);
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["4"], ["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Partial { unresolved: 1 })),
+        "The second local key has no index, so the call must report Partial: {outcome:?}"
+    );
+}
+
+/// The recorder stores each prepare POST with the slot of its pass.
+#[derive(Clone, Default)]
+struct PassPosts {
+    /// The `before_slot` hook sets the slot for the next pass.
+    slot: Arc<std::sync::atomic::AtomicU64>,
+    /// Each line contains the slot and sorted indices for one POST.
+    lines: Captured<String>,
+}
+
+impl PassPosts {
+    /// This method returns a [`retirement_beacon`] that records each prepare
+    /// POST.
+    fn beacon(&self) -> bn_manager::MockBeaconNodeClient {
+        let posts = self.clone();
+        retirement_beacon().with_prepare_beacon_proposer(move |preparations| {
+            let mut indices: Vec<String> =
+                preparations.into_iter().map(|p| p.validator_index).collect();
+            indices.sort();
+            let slot = posts.slot.load(Ordering::Acquire);
+            posts.lines.lock().push(format!("{slot}: {}", indices.join(",")));
+            Ok(())
+        })
+    }
+
+    /// This method sets the slot for the next pass.
+    fn enter(&self, slot: Slot) {
+        self.slot.store(slot, Ordering::Release);
+    }
+
+    /// This method returns the recorded lines in POST order.
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().clone()
+    }
+}
+
+/// W4-E7e, through `run`: the runner sends no prepare POST while the
+/// registry is stale. It sends each revalidated index in the same epoch.
+/// The one local key has index 4 under generation 0.
+/// 1. Before slot 32, a revocation makes the registry stale. Slot 32 sends
+///    no POST.
+/// 2. Before slot 33, a revalidation gives index 9. Slot 33 sends 9, and
+///    the step is done.
+/// 3. Before slot 34, a revocation and a revalidation give index 11. The
+///    step opens again, and slot 34 sends 11.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_prepare_waits_for_revalidated_indices_and_resends_after_each_revalidation() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(local_pk, "4")]);
+            revoke(&generation);
+        } else if slot == 33 {
+            revalidate(registry, &generation, &[(local_pk, "9")]);
+        } else if slot == 34 {
+            revoke(&generation);
+            revalidate(registry, &generation, &[(local_pk, "11")]);
+        }
+    };
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, vec![(local, None)], timeouts, 32, 35, edit).await;
+
+    assert_eq!(
+        posts.lines(),
+        ["33: 9", "34: 11"],
+        "Slot 32 must send no POST. Slots 33 and 34 must each send the index of the last \
+         revalidation."
+    );
+}
+
+/// W4-E7e (NM-7), through `run`: a revocation and a revalidation between
+/// passes clear the partial suppression. The rule also applies when the
+/// resolved count does not change. There are three local keys, and the
+/// third key has no index.
+/// 1. Before slot 32, the first two keys get indices 4 and 5. Slot 32 sends
+///    4 and 5.
+/// 2. Before slot 33, a revocation and a revalidation give indices 14 and
+///    15. No pass sees the stale registry. Slot 33 sends 14 and 15.
+/// 3. Slots 34 and 35 send no POST, because the count and the registry
+///    token do not change.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_partial_prepare_resends_corrected_indices_after_a_revalidation_between_passes() {
+    let _metrics = m2_metric_lock().await;
+    let (first, second) = (SecretKey::generate(), SecretKey::generate());
+    let (first_pk, second_pk) = (first.public_key().to_bytes(), second.public_key().to_bytes());
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(first_pk, "4"), (second_pk, "5")]);
+        } else if slot == 33 {
+            revoke(&generation);
+            revalidate(registry, &generation, &[(first_pk, "14"), (second_pk, "15")]);
+        }
+    };
+    let keys = vec![(first, None), (second, None), (SecretKey::generate(), None)];
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, keys, timeouts, 32, 35, edit).await;
+
+    assert_eq!(
+        posts.lines(),
+        ["32: 4,5", "33: 14,15"],
+        "Slot 33 must send the corrected indices 14 and 15. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// The helper runs [`drive_boundary_keys`] over `keys` from slot 32 to slot
+/// 35, and returns the [`PassPosts`] lines.
+///
+/// 1. Before boot, the keys in `first` get their indices under generation 0.
+/// 2. The prepare hook runs after the token check that follows the first
+///    successful POST. It revokes the registry and gives the keys in
+///    `second` their indices. No pass runs between the two changes.
+async fn drive_with_a_revalidation_after_the_post_check(
+    keys: Vec<(SecretKey, Option<&'static str>)>,
+    first: &[([u8; 48], &'static str)],
+    second: Vec<([u8; 48], &'static str)>,
+) -> Vec<String> {
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let mut second = Some(second);
+    let mut armed = None;
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot != 32 {
+            return;
+        }
+        revalidate(registry, &generation, first);
+        let (registry, generation) = (Arc::clone(registry), Arc::clone(&generation));
+        let mut second = second.take();
+        armed = Some(arm_prepare_hook(move |point| {
+            if point != PreparePoint::AfterPostCheck {
+                return;
+            }
+            if let Some(second) = second.take() {
+                revoke(&generation);
+                revalidate(&registry, &generation, &second);
+            }
+        }));
+    };
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, keys, timeouts, 32, 35, edit).await;
+    drop(armed);
+    posts.lines()
+}
+
+/// W4-E7e R1, through `run`: the runner must keep the registry token that
+/// it reads before the prepare POST. There is one local key.
+///
+/// 1. Before boot, the key gets index 4 under generation 0. Slot 32 sends 4.
+/// 2. After the token check that follows that POST, a revocation and a
+///    revalidation give index 9. The resolved count does not change.
+/// 3. Slot 33 must send 9. Slots 34 and 35 must send no POST.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revalidation_after_a_complete_prepare_post_resends_at_the_next_pass() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+
+    let lines = drive_with_a_revalidation_after_the_post_check(
+        vec![(local, None)],
+        &[(local_pk, "4")],
+        vec![(local_pk, "9")],
+    )
+    .await;
+
+    assert_eq!(
+        lines,
+        ["32: 4", "33: 9"],
+        "Slot 33 must send the revalidated index 9. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// W4-E7e R1, through `run`: the runner must keep the registry token that
+/// it reads before a partial prepare POST. There are three local keys, and
+/// the third key has no index.
+///
+/// 1. Before boot, the first two keys get indices 4 and 5 under generation
+///    0. Slot 32 sends 4 and 5.
+/// 2. After the token check that follows that POST, a revocation and a
+///    revalidation give indices 14 and 15. The resolved count does not
+///    change.
+/// 3. Slot 33 must send 14 and 15. Slots 34 and 35 must send no POST.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revalidation_after_a_partial_prepare_post_resends_at_the_next_pass() {
+    let _metrics = m2_metric_lock().await;
+    let (first, second) = (SecretKey::generate(), SecretKey::generate());
+    let (first_pk, second_pk) = (first.public_key().to_bytes(), second.public_key().to_bytes());
+    let keys = vec![(first, None), (second, None), (SecretKey::generate(), None)];
+
+    let lines = drive_with_a_revalidation_after_the_post_check(
+        keys,
+        &[(first_pk, "4"), (second_pk, "5")],
+        vec![(first_pk, "14"), (second_pk, "15")],
+    )
+    .await;
+
+    assert_eq!(
+        lines,
+        ["32: 4,5", "33: 14,15"],
+        "Slot 33 must send the corrected indices 14 and 15. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// W4-E7e R1 (Harper B1), through `run`: a POST after a `Stale` sample must
+/// not hide a registry that stays stale until the epoch ends. There is one
+/// local key.
+///
+/// 1. Before boot, the key gets index 4 under generation 0. Slot 32 sends 4.
+/// 2. Before slot 33, a revocation makes the registry stale. The slot-33
+///    pass reads the stale token.
+/// 3. The prepare hook runs before the index snapshot of that pass. It
+///    gives the key index 9. Slot 33 sends 9.
+/// 4. Before slot 34, a revocation makes the registry stale until the end
+///    of epoch 1. Slots 34 to 64 must send no POST.
+/// 5. The slot-64 pass must warn that PrepareProposers did not finish in
+///    epoch 1.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_stale_registry_after_a_stale_sample_post_names_prepare_at_the_epoch_end() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let mut armed = None;
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(local_pk, "4")]);
+        } else if slot == 33 {
+            revoke(&generation);
+            let mut change = Some((Arc::clone(registry), Arc::clone(&generation)));
+            armed = Some(arm_prepare_hook(move |point| {
+                if point != PreparePoint::BeforeSnapshot {
+                    return;
+                }
+                if let Some((registry, generation)) = change.take() {
+                    revalidate(&registry, &generation, &[(local_pk, "9")]);
+                }
+            }));
+        } else if slot == 34 {
+            revoke(&generation);
+        }
+    };
+    let timeouts = create_test_config().timeouts;
+
+    let run = drive_boundary_keys(mock, vec![(local, None)], timeouts, 32, 64, edit).await;
+    drop(armed);
+
+    assert_eq!(
+        posts.lines(),
+        ["32: 4", "33: 9"],
+        "Slots 32 and 33 must send indices 4 and 9. Slots 34 to 64 must send no POST."
+    );
+    assert_eq!(
+        abandoned_warns(&run),
+        [(
+            Some(64),
+            "epoch=1 abandoned_steps=[PrepareProposers] \
+             last_outcomes={PrepareProposers: NotReady}"
+        )],
+        "The slot-64 pass must warn one time that PrepareProposers did not finish in epoch 1."
     );
 }

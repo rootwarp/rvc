@@ -11,7 +11,11 @@
 //! `NotReady` one still run in that pass. `DutyFetch` has no done mark: it
 //! runs in every pass while a step that needs duties is pending.
 //! `PrepareProposers` is `NotReady` while a local key has no validator index,
-//! and sends again only once more keys have one. `CommitteeSubscriptions` is
+//! and sends again only once more keys have one. It is also `NotReady`, with
+//! no POST, while the index registry is stale after a revocation, and a pass
+//! that finds the registry token moved since the step's last POST re-opens
+//! the step, done or not, so the re-checked indices are sent in the same
+//! epoch. `CommitteeSubscriptions` is
 //! `NotReady` until the attester duties of E and E+1 are cached.
 //! `BuilderRegistration` runs only in the boot epoch, the first epoch the
 //! runner ran, and needs no duties. Each step with beacon-node work runs
@@ -74,6 +78,7 @@ use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
 use super::duty_management::{DutyManagementService, PrepareOutcome, SelectionProofs};
 use super::utils;
+use crate::pubkey_index::RegistryFreshness;
 
 /// Executor task name. The runner's loop span has the same name.
 pub const TASK_NAME: &str = "epoch.boundary.runner";
@@ -253,9 +258,13 @@ pub(crate) struct EpochProgress {
     last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
     /// The duty epochs whose committee subscriptions went out.
     subscribed: BTreeSet<u64>,
-    /// The keys with a validator index when the last `Partial` prepare POST
-    /// went out.
+    /// The keys with a validator index when the last `Complete` or `Partial`
+    /// prepare POST went out.
     prepared_count: Option<usize>,
+    /// The registry token sampled before that POST. Set and reset together
+    /// with `prepared_count`. It is `None` with a count when the sample was
+    /// `Stale`, because a `Stale` sample does not identify the POST.
+    prepared_under: Option<RegistryFreshness>,
     /// The first epoch the runner ran, epoch 0 for a start before genesis.
     /// Set once, and kept by each later epoch's progress.
     boot_epoch: u64,
@@ -269,8 +278,31 @@ impl EpochProgress {
             last_outcome: BTreeMap::new(),
             subscribed: BTreeSet::new(),
             prepared_count: None,
+            prepared_under: None,
             boot_epoch,
         }
+    }
+
+    /// Keeps the count and the registry token of a `Complete` or `Partial`
+    /// prepare POST. Each stale interval gives the same `Stale` value, so the
+    /// step does not keep a `Stale` token.
+    fn set_prepared(&mut self, resolved: usize, under: RegistryFreshness) {
+        self.prepared_count = Some(resolved);
+        self.prepared_under = Some(under).filter(|under| *under != RegistryFreshness::Stale);
+    }
+
+    /// Whether a prepare POST is kept and its token is not `freshness`. A
+    /// kept POST with no token always counts as moved.
+    fn prepare_moved(&self, freshness: RegistryFreshness) -> bool {
+        self.prepared_count.is_some() && self.prepared_under != Some(freshness)
+    }
+
+    /// Forgets the last prepare POST: PrepareProposers is pending again, and
+    /// its next attempt POSTs whatever count it reads.
+    fn forget_prepared(&mut self) {
+        self.done.remove(&BoundaryStep::PrepareProposers);
+        self.prepared_count = None;
+        self.prepared_under = None;
     }
 
     /// DutyFetch is never marked done: it is pending while a step that needs
@@ -402,6 +434,7 @@ impl EpochBoundaryRunner {
 
     async fn run_epoch_steps(&self, epoch: u64, slot: Slot) {
         let first_pass = self.begin_epoch(epoch);
+        self.reopen_moved_prepare(epoch);
         for step in BoundaryStep::ALL {
             if !self.is_pending(epoch, step) {
                 continue;
@@ -444,15 +477,18 @@ impl EpochBoundaryRunner {
         }
     }
 
-    /// Whether a step of `slot`'s epoch is still pending.
+    /// Whether a step of `slot`'s epoch is still pending, or the next pass
+    /// re-opens PrepareProposers ([`Self::reopen_moved_prepare`]).
     ///
     /// An epoch before the progress epoch has nothing pending.
     pub(crate) fn has_pending(&self, slot: Slot) -> bool {
         let epoch = slot / SLOTS_PER_EPOCH;
+        let freshness = self.duty_management.index_freshness();
         match self.progress.lock().as_ref() {
             Some(current) if current.epoch > epoch => false,
             Some(current) if current.epoch == epoch => {
-                BoundaryStep::ALL.into_iter().any(|step| current.is_pending(step))
+                current.prepare_moved(freshness)
+                    || BoundaryStep::ALL.into_iter().any(|step| current.is_pending(step))
             }
             _ => true,
         }
@@ -563,27 +599,47 @@ impl EpochBoundaryRunner {
 
     /// `Done` once a POST covered every local key, and `Failed` on a failed
     /// or timed-out POST. `NotReady` while a local key has no validator
-    /// index. After a `Partial` POST the step reads the registry and sends
-    /// again only when more keys have an index. The count is read before the
-    /// POST is built, so an index that lands after the read is sent at the
-    /// next pass, whether or not that POST had it.
+    /// index, and, with no POST, while the registry is stale. After a
+    /// `Partial` POST the step reads the registry and sends again only when
+    /// more keys have an index. The count is read before the POST is built,
+    /// so an index that lands after the read is sent at the next pass,
+    /// whether or not that POST had it.
+    ///
+    /// The registry token is sampled before the count, and kept with it
+    /// after a `Complete` or `Partial` POST. The service captures its own
+    /// token under the lock it reads the indices under, so a move between
+    /// the two makes the sample older than the POST: the next pass re-opens
+    /// the step and sends one extra, idempotent POST. A kept `Fresh` or
+    /// `Untracked` sample can equal a later token only if the POST was read
+    /// under that token. A `Stale` sample is not kept, because two stale
+    /// intervals give the same value. The next pass then re-opens the step.
+    /// So a needed re-send is never suppressed. Before Gloas, a registry that
+    /// stays stale keeps the step pending until the epoch ends.
     async fn prepare_proposers(&self, epoch: u64) -> StepOutcome {
+        let under = self.duty_management.index_freshness();
         let resolved = self.duty_management.resolved_proposer_count();
         if self.prepared_count(epoch) == Some(resolved) {
             debug!(epoch, resolved, "Proposer preparations wait for more validator indices");
             return StepOutcome::NotReady;
         }
         match self.duty_management.prepare_proposers(epoch).await {
-            Ok(PrepareOutcome::Complete) => StepOutcome::Done,
+            Ok(PrepareOutcome::Complete) => {
+                self.update_progress(epoch, |current| current.set_prepared(resolved, under));
+                StepOutcome::Done
+            }
             Ok(PrepareOutcome::Partial { unresolved }) => {
                 debug!(
                     epoch,
                     resolved, unresolved, "Proposer preparations sent for part of the keys"
                 );
-                self.set_prepared_count(epoch, resolved);
+                self.update_progress(epoch, |current| current.set_prepared(resolved, under));
                 StepOutcome::NotReady
             }
             Ok(PrepareOutcome::NoIndices) => StepOutcome::NotReady,
+            Ok(PrepareOutcome::Stale) => {
+                self.update_progress(epoch, EpochProgress::forget_prepared);
+                StepOutcome::NotReady
+            }
             Err(_) => StepOutcome::Failed,
         }
     }
@@ -594,9 +650,25 @@ impl EpochBoundaryRunner {
         progress.as_ref().filter(|p| p.epoch == epoch).and_then(|p| p.prepared_count)
     }
 
-    fn set_prepared_count(&self, epoch: u64, resolved: usize) {
+    /// Re-opens PrepareProposers, and clears its `Partial` suppression, when
+    /// the registry token moved since the step's last POST, whether or not a
+    /// pass saw the registry stale: a revalidation can change the indices
+    /// and keep their count. An `Untracked` registry never moves.
+    fn reopen_moved_prepare(&self, epoch: u64) {
+        let freshness = self.duty_management.index_freshness();
+        self.update_progress(epoch, |current| {
+            if current.prepare_moved(freshness) {
+                debug!(epoch, ?freshness, "Validator indices moved since the last preparation");
+                current.forget_prepared();
+            }
+        });
+    }
+
+    /// Applies `change` to the progress of `epoch`, while that is the
+    /// progress epoch.
+    fn update_progress(&self, epoch: u64, change: impl FnOnce(&mut EpochProgress)) {
         if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
-            current.prepared_count = Some(resolved);
+            change(current);
         }
     }
 

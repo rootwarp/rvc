@@ -20,7 +20,7 @@ use timing::SLOTS_PER_EPOCH;
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::error::OrchestratorError;
 use super::utils::{self, TimedOutcome};
-use crate::pubkey_index::{parse_pubkey_bytes, SharedPubkeyIndexRegistry};
+use crate::pubkey_index::{parse_pubkey_bytes, RegistryFreshness, SharedPubkeyIndexRegistry};
 
 /// Number of epochs in a single sync committee period.
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
@@ -44,6 +44,19 @@ pub(crate) enum PrepareOutcome {
     Partial { unresolved: usize },
     /// No local key has a validator index yet, so nothing was sent.
     NoIndices,
+    /// The registry was stale, or its token moved while preparing; no POST
+    /// was made, or the POST may have carried indices from before a
+    /// revocation.
+    Stale,
+}
+
+/// [`PrepareOutcome::Stale`] with no POST: the indices wait for a re-check.
+fn deferred_preparation(epoch: u64) -> PrepareOutcome {
+    info!(
+        epoch,
+        "Deferring proposer preparation: validator indices are being re-checked after a beacon-node revocation"
+    );
+    PrepareOutcome::Stale
 }
 
 pub(crate) struct DutyManagementService {
@@ -414,6 +427,12 @@ impl DutyManagementService {
     /// and `NoIndices`, with no POST, while no key has one. A failed POST is
     /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
     /// is [`OrchestratorError::OperationTimedOut`].
+    ///
+    /// The registry token is captured under the read lock the indices are
+    /// read under. [`PrepareOutcome::Stale`], with no POST, while the
+    /// registry is stale or once the token moved before the POST, and
+    /// `Stale` after a POST during which it moved: that POST may carry an
+    /// index from before a revocation.
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn prepare_proposers(
         &self,
@@ -427,9 +446,16 @@ impl DutyManagementService {
 
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
-        let (preparations, unresolved): (Vec<ProposerPreparation>, usize) = {
+        let (token, preparations, unresolved) = {
+            #[cfg(test)]
+            reach_prepare_point(PreparePoint::BeforeSnapshot);
             let pubkey_snapshot = self.pubkey_map.read().clone();
             let index_registry = self.pubkey_index.read();
+            let token = index_registry.freshness();
+            if token == RegistryFreshness::Stale {
+                drop(index_registry);
+                return Ok(deferred_preparation(epoch));
+            }
             let mut out = Vec::with_capacity(pubkey_snapshot.len());
             let mut unresolved = 0;
             for (pubkey_bytes, pubkey) in &pubkey_snapshot {
@@ -453,7 +479,10 @@ impl DutyManagementService {
                     }
                 }
             }
-            (out, unresolved)
+            drop(index_registry);
+            #[cfg(test)]
+            reach_prepare_point(PreparePoint::AfterSnapshot);
+            (token, out, unresolved)
         };
 
         if preparations.is_empty() {
@@ -464,6 +493,9 @@ impl DutyManagementService {
             });
         }
 
+        if self.index_freshness() != token {
+            return Ok(deferred_preparation(epoch));
+        }
         let count = preparations.len();
         match utils::timed(
             PROPOSER_PREPARATION,
@@ -473,6 +505,16 @@ impl DutyManagementService {
         .await
         {
             TimedOutcome::Ok(()) => {
+                if self.index_freshness() != token {
+                    info!(
+                        epoch,
+                        count,
+                        "Proposer preparations sent while a beacon-node revocation moved the validator indices; sending again once they are re-checked"
+                    );
+                    return Ok(PrepareOutcome::Stale);
+                }
+                #[cfg(test)]
+                reach_prepare_point(PreparePoint::AfterPostCheck);
                 info!(count, "Sent proposer preparations");
                 Ok(if unresolved == 0 {
                     PrepareOutcome::Complete
@@ -492,6 +534,12 @@ impl DutyManagementService {
                 Err(OrchestratorError::OperationTimedOut { operation: PROPOSER_PREPARATION })
             }
         }
+    }
+
+    /// The registry token [`Self::prepare_proposers`] captures. The read
+    /// lock is held only for this call.
+    pub(crate) fn index_freshness(&self) -> RegistryFreshness {
+        self.pubkey_index.read().freshness()
     }
 
     /// The local keys whose validator index is known: the size of the POST
@@ -682,6 +730,56 @@ impl DutyManagementService {
         }
         let sync_count = self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
         (attester_count, proposer_count, sync_count)
+    }
+}
+
+/// A point in [`DutyManagementService::prepare_proposers`] where a test can
+/// change the index registry.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparePoint {
+    /// Before the read lock that captures the token and the indices.
+    BeforeSnapshot,
+    /// After that read lock ends, before the token check before the POST.
+    AfterSnapshot,
+    /// After the token check that follows a successful POST.
+    AfterPostCheck,
+}
+
+#[cfg(test)]
+type PrepareHook = Box<dyn FnMut(PreparePoint)>;
+
+#[cfg(test)]
+thread_local! {
+    static PREPARE_HOOK: std::cell::RefCell<Option<PrepareHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the hook that [`arm_prepare_hook`] set on this thread, if one is set.
+#[cfg(test)]
+fn reach_prepare_point(point: PreparePoint) {
+    PREPARE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
+/// Runs `hook` at each [`PreparePoint`] on this thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn arm_prepare_hook(hook: impl FnMut(PreparePoint) + 'static) -> PrepareHookGuard {
+    PREPARE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    PrepareHookGuard
+}
+
+/// Removes the prepare hook when it drops, also after a failed assertion.
+#[cfg(test)]
+pub(crate) struct PrepareHookGuard;
+
+#[cfg(test)]
+impl Drop for PrepareHookGuard {
+    fn drop(&mut self) {
+        PREPARE_HOOK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
