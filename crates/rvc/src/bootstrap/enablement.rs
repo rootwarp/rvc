@@ -59,6 +59,8 @@ pub struct EnablementHandles {
 /// - Operator opt-out yields [`doppelganger::DoppelgangerDisabledByOperator`].
 /// - Epoch-0 boot register marks normally registered keys Safe only after the
 ///   clock has reached genesis. A reading before genesis is not a counted epoch.
+/// - The epoch is read again after the boot beacon reads. The epoch-0 bypass
+///   holds only if that read is still 0, and the keys register with that epoch.
 /// - Restart-aware safe-skip on **boot** `register` only, and only for keys
 ///   with no open import hold and no remaining import sidecar (local slashing
 ///   history under this GVR). Do **not** copy a live slashing DB to a second VC.
@@ -121,14 +123,16 @@ async fn wire_signing_enablement_body(
         Arc::new(MonotonicEpochClock::new(beacon.genesis_time, beacon.slot_duration_ms));
     let read_boot_epoch =
         || boot_epoch.as_ref().map_or_else(|| epoch_clock.current_epoch(), |read| read());
-    let enablement_epoch = read_boot_epoch();
+    // This read only decides whether to ask for heads. The bypass and the
+    // register epoch use the read after the last boot await, below.
+    let epoch_before_reads = read_boot_epoch();
     // Named-network confirmation is not enough: a clock still before genesis
     // saturates to epoch 0 and must not take the Safe bypass. A head outside
     // epoch 0, or a head that cannot be read, closes it too.
-    let epoch0_bypass = if doppelganger_enabled
+    let heads_in_epoch_zero = if doppelganger_enabled
         && beacon.genesis_confirmed
         && !epoch_clock.before_genesis()
-        && enablement_epoch == 0
+        && epoch_before_reads == 0
     {
         admitted_heads_in_epoch_zero(beacon.bn_manager.as_ref()).await
     } else {
@@ -178,6 +182,11 @@ async fn wire_signing_enablement_body(
     if let Some(commit) = beacon_for_resolve.revocation_commit() {
         pubkey_index.write().attach_commit(commit);
     }
+
+    // The boot awaits can cross into epoch 1. Read the epoch again: the bypass
+    // holds only while it is still 0, and the keys register with this epoch.
+    let enablement_epoch = read_boot_epoch();
+    let epoch0_bypass = heads_in_epoch_zero && enablement_epoch == 0;
 
     if epoch0_bypass && doppelganger_enabled {
         info!(
@@ -1194,6 +1203,139 @@ mod tests {
             !logs_contain("pre-genesis (epoch 0) startup"),
             "A boot that moves into epoch 1 must not log the pre-genesis line."
         );
+    }
+
+    /// The boot stays in epoch 0 while the test holds the `validators` answer.
+    ///
+    /// The epoch read after the last boot await is still 0. Thus the boot must
+    /// keep the epoch-0 bypass and mark the key Safe.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn epoch0_bypass_holds_when_boot_stays_in_epoch_zero() {
+        let (machine, pk) = boot_across_held_validators(None).await;
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Safe,
+            "A boot that stays in epoch 0 must mark the key Safe."
+        );
+        assert!(
+            logs_contain("pre-genesis (epoch 0) startup"),
+            "A boot that stays in epoch 0 must log the pre-genesis line."
+        );
+    }
+
+    /// A boot that starts in epoch 1 does not ask the beacon node for heads.
+    ///
+    /// The read before the boot awaits decides if the boot sends a
+    /// `/eth/v1/node/syncing` request.
+    #[tokio::test]
+    async fn boot_outside_epoch_zero_sends_no_syncing_request() {
+        let (server, beacon) = mock_beacon(0).await;
+        let pk = SecretKey::generate().public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let handles = wire_signing_enablement_with_boot_epoch(
+            &base_config(true),
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open.")),
+            &executor,
+            Arc::new(|| 1),
+        )
+        .await
+        .expect("The boot must succeed.");
+        executor.token().cancel();
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("The mock beacon must record the requests.")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path == "/eth/v1/beacon/states/head/validators"),
+            "The boot must send the validators request: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| path != "/eth/v1/node/syncing"),
+            "A boot that starts in epoch 1 must not send a syncing request: {paths:?}"
+        );
+        let machine = handles
+            .forward_window_machine
+            .expect("Detection on must give a forward-window machine.");
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Pending);
+    }
+
+    /// The epoch-0 bypass needs a confirmed genesis.
+    ///
+    /// The boot stays in epoch 0 and the beacon head is slot 0 in both rows.
+    /// Only the row with a confirmed genesis gets Safe.
+    #[tokio::test]
+    async fn epoch0_bypass_needs_confirmed_genesis() {
+        for (confirmed, expected) in
+            [(true, ForwardWindowStatus::Safe), (false, ForwardWindowStatus::Pending)]
+        {
+            let (_server, mut beacon) = mock_beacon(0).await;
+            beacon.genesis_confirmed = confirmed;
+            let pk = SecretKey::generate().public_key();
+            let keys = loaded_keys_with_pubkey(pk.clone());
+            let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+            let handles = wire_signing_enablement_with_boot_epoch(
+                &base_config(true),
+                &keys,
+                &beacon,
+                Arc::new(
+                    SlashingDb::open_in_memory().expect("The in-memory slashing DB must open."),
+                ),
+                &executor,
+                Arc::new(|| 0),
+            )
+            .await
+            .expect("The boot must succeed.");
+            executor.token().cancel();
+            let machine = handles
+                .forward_window_machine
+                .expect("Detection on must give a forward-window machine.");
+            assert_eq!(
+                machine.status(&pk),
+                expected,
+                "With genesis_confirmed {confirmed}, the epoch-0 boot key must be {expected:?}."
+            );
+        }
+    }
+
+    /// With detection on, an empty index answer gives the pending-activation WARN.
+    /// Only a boot with detection off gives the disabled-detection WARN.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn boot_warnings_follow_the_detection_setting() {
+        let (_server, beacon) = mock_beacon(0).await;
+        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let db = || {
+            Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open."))
+        };
+
+        wire_signing_enablement(&base_config(true), &keys, &beacon, db(), &executor)
+            .await
+            .expect("The boot with detection on must succeed.");
+        assert!(
+            logs_contain("No validator indices resolved"),
+            "An empty index answer with detection on must give the pending-activation WARN."
+        );
+        assert!(
+            !logs_contain("Doppelganger detection is disabled"),
+            "A boot with detection on must not give the disabled-detection WARN."
+        );
+
+        wire_signing_enablement(&base_config(false), &keys, &beacon, db(), &executor)
+            .await
+            .expect("The boot with detection off must succeed.");
+        assert!(
+            logs_contain("Doppelganger detection is disabled"),
+            "A boot with detection off must give the disabled-detection WARN."
+        );
+        executor.token().cancel();
     }
 
     /// Every boot mode that goes on, by doppelganger detection on or off. The
