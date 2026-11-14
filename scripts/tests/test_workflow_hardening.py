@@ -15,10 +15,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
-# These first-party refs keep a major tag until a review gives their commit SHAs.
-# Each entry must still occur in a workflow, so the list can only get shorter.
-TAG_PINNED_REFS = frozenset({"actions/download-artifact@v4", "actions/setup-python@v5"})
-
 _SHA_AT_END = re.compile(r"@[0-9a-f]{40}$")
 # A version comment is `# v` and a number, for example `# v3.7.0`. `# vulnerable` is not.
 _VERSION_COMMENT_RE = re.compile(r"#\s+v\d+(\.\d+)*\b")
@@ -46,7 +42,7 @@ SCAN_PATHS = {
 TARGET_EXPR = "${{ matrix.target }}"
 SCAN_REF = f"{TARGET_EXPR}:scan"
 
-# The only Trivy ignore file. Both Trivy workflows pass it as `trivyignores`.
+# This constant names the only Trivy ignore file. Both Trivy workflows pass it as `trivyignores`.
 IGNORE_FILE = ".trivyignore.yaml"
 
 # Each entry contains a reviewed CVE and its expiry option. On that date Trivy stops
@@ -55,11 +51,30 @@ IGNORE_FILE = ".trivyignore.yaml"
 ALLOWED_IGNORED_CVES = [
     ("CVE-2023-45853", ("pkg:deb/debian/zlib1g",), datetime.date(2027, 1, 18)),
 ]
-# The keys that an ignore entry can have. A different key needs a review.
+# This set lists the keys that an ignore entry can have. A different key needs a review.
 _IGNORE_ENTRY_KEYS = frozenset({"id", "purls", "expired_at", "statement"})
 
-# A HIGH or CRITICAL finding fails the scan. Each Trivy step uses this value.
+# The table report and the docker.yml gate use this severity filter.
 TRIVY_SEVERITY = "HIGH,CRITICAL"
+
+# Each Trivy step has one of these severity policies. A policy gives the format, the
+# severity, the exit code and the ignore-unfixed value of the step.
+#
+# The table report shows each HIGH and CRITICAL finding. This includes a finding without a fix.
+TABLE_REPORT = ("table", TRIVY_SEVERITY, "0", False)
+# Gate A fails the job for each CRITICAL finding. This includes a finding without a fix.
+GATE_A = ("sarif", "CRITICAL", "1", False)
+# Gate B fails the job for a HIGH finding only when a fixed version exists.
+GATE_B = ("sarif", "HIGH", "1", True)
+# The docker.yml gate fails the job for each HIGH and CRITICAL finding.
+RELEASE_GATE = ("sarif", TRIVY_SEVERITY, "1", False)
+
+# This map gives the reviewed Trivy steps of each workflow, in step order.
+TRIVY_STEP_PLAN = {
+    "docker-scan.yml": (TABLE_REPORT, GATE_A, GATE_B),
+    "docker.yml": (RELEASE_GATE,),
+}
+_REVIEWED_POLICIES = tuple(dict.fromkeys(p for plan in TRIVY_STEP_PLAN.values() for p in plan))
 
 # The only inputs that a Trivy step can set. A new input needs a review of this set.
 TRIVY_ALLOWED_INPUTS = frozenset(
@@ -69,6 +84,7 @@ TRIVY_ALLOWED_INPUTS = frozenset(
         "output",
         "severity",
         "exit-code",
+        "ignore-unfixed",
         "limit-severities-for-sarif",
         "trivyignores",
     }
@@ -234,13 +250,29 @@ def _is_trivy_step(step: dict) -> bool:
     return action_name(step.get("uses", "")).startswith("aquasecurity/trivy-action")
 
 
-def _ignore_unfixed_enabled(with_: dict) -> bool:
-    if "ignore-unfixed" not in with_:
-        return False
-    value = with_["ignore-unfixed"]
-    if value is False:
-        return False
-    return not (isinstance(value, str) and value.strip().lower() == "false")
+def _ignore_unfixed(inputs: dict) -> object:
+    """Return the ignore-unfixed value of a step as a bool. The action default is False.
+
+    For a value other than a bool, `'true'` or `'false'`, the function returns a
+    string. No reviewed policy matches a string.
+    """
+    value = inputs.get("ignore-unfixed", False)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "false"):
+        return text == "true"
+    return str(value)
+
+
+def trivy_policy(inputs: dict) -> tuple:
+    """Return the format, the severity, the exit code and the ignore-unfixed value."""
+    return (
+        inputs.get("format"),
+        inputs.get("severity"),
+        str(inputs.get("exit-code")),
+        _ignore_unfixed(inputs),
+    )
 
 
 def trivy_env_problems(label: str, env) -> list[str]:
@@ -279,15 +311,24 @@ def _is_sarif_gate(inputs: dict) -> bool:
     return inputs.get("format") == "sarif" and str(inputs.get("exit-code")) == "1"
 
 
-def scan_fails_for(inputs: dict, severity: str) -> bool:
-    """Return True when the Trivy step fails the job for one finding of `severity`.
+def trivy_reports(inputs: dict, severity: str, fixed: bool) -> bool:
+    """Return True when the Trivy step reports one finding of `severity`.
 
-    The step must set `exit-code: '1'` and name the severity in `severity`. This
-    model applies to a step with `limit-severities-for-sarif: true`. The gate check
-    requires that flag.
+    `fixed` is True when a fixed version of the package exists. The step reports a
+    finding only when its `severity` input names the level of the finding. With
+    `ignore-unfixed: true`, the step does not report a finding without a fixed version.
     """
     levels = {item.strip().upper() for item in str(inputs.get("severity", "")).split(",")}
-    return str(inputs.get("exit-code")) == "1" and severity in levels
+    return severity in levels and (fixed or _ignore_unfixed(inputs) is not True)
+
+
+def scan_fails_for(inputs: dict, severity: str, fixed: bool) -> bool:
+    """Return True when the Trivy step fails the job for one finding of `severity`.
+
+    The step must set `exit-code: '1'` and report the finding. This model applies to a
+    step with `limit-severities-for-sarif: true`. The gate check requires that flag.
+    """
+    return str(inputs.get("exit-code")) == "1" and trivy_reports(inputs, severity, fixed)
 
 
 def _run_step_problems(where: str, step: dict) -> list[str]:
@@ -315,10 +356,9 @@ def _trivy_step_problems(where: str, step: dict) -> tuple[list[str], dict[str, o
         problems.append(f"{where}: limit-severities-for-sarif")
     if inputs.get("trivyignores") != IGNORE_FILE:
         problems.append(f"{where}: trivyignores")
-    if inputs.get("severity") != TRIVY_SEVERITY:
-        problems.append(f"{where}: severity")
-    if _ignore_unfixed_enabled(inputs):
-        problems.append(f"{where}: ignore-unfixed")
+    policy = trivy_policy(inputs)
+    if policy not in _REVIEWED_POLICIES:
+        problems.append(f"{where}: severity policy {policy!r}")
     return problems, inputs
 
 
@@ -378,7 +418,9 @@ def trivy_gate_problems(doc, workflow: str = "") -> list[str]:
     """Return problems in the Trivy jobs of this workflow. YAML comments do not count.
 
     `workflow` is the workflow file name. It selects the reviewed job `if`. The
-    Trivy inputs, the image, and the steps before the gate are allow-lists.
+    Trivy inputs, the severity policies, the image, and the steps before the last
+    gate are allow-lists. `test_trivy_steps_follow_the_reviewed_plan` checks the
+    policy of each step in each workflow.
     """
     problems: list[str] = []
     jobs = doc.get("jobs") or {}
@@ -756,7 +798,6 @@ _NARROWING_INPUTS = [
     ("version", "v0.50.0"),
     ("Skip-Dirs", "usr/lib"),
     ("SCANNERS", "secret"),
-    ("Ignore-Unfixed", "true"),
 ]
 
 
@@ -817,6 +858,67 @@ def test_trivy_step_accepts_only_allow_listed_inputs(text, expected):
     """The Trivy step and its build step can have only the reviewed inputs and values."""
     problems = trivy_gate_problems(load_workflow(text))
     assert expected in problems, f"The gate must report {expected!r}. It reported {problems}."
+
+
+def _gate_with(severity: str, extra: str) -> str:
+    """Return the reviewed Trivy job with a different gate severity and more gate inputs."""
+    text = _reviewed_trivy_step(extra)
+    old = f"          severity: {TRIVY_SEVERITY}\n"
+    assert text.count(old) == 1, "The fixture must contain one severity input."
+    return text.replace(old, f"          severity: {severity}\n")
+
+
+_IGNORE_UNFIXED_TRUE = "          ignore-unfixed: true\n"
+_IGNORE_UNFIXED_FALSE = "          ignore-unfixed: false\n"
+
+
+@pytest.mark.parametrize(
+    ("severity", "extra", "policy"),
+    [
+        pytest.param(TRIVY_SEVERITY, "", None, id="release-gate"),
+        pytest.param("CRITICAL", _IGNORE_UNFIXED_FALSE, None, id="gate-a"),
+        pytest.param("HIGH", _IGNORE_UNFIXED_TRUE, None, id="gate-b"),
+        pytest.param("HIGH", "          Ignore-Unfixed: 'true'\n", None, id="gate-b-string"),
+        pytest.param(
+            TRIVY_SEVERITY,
+            _IGNORE_UNFIXED_TRUE,
+            ("sarif", TRIVY_SEVERITY, "1", True),
+            id="release-gate-hides-unfixed",
+        ),
+        pytest.param(
+            "CRITICAL",
+            _IGNORE_UNFIXED_TRUE,
+            ("sarif", "CRITICAL", "1", True),
+            id="gate-a-hides-unfixed",
+        ),
+        pytest.param(
+            "HIGH", _IGNORE_UNFIXED_FALSE, ("sarif", "HIGH", "1", False), id="gate-b-shows-unfixed"
+        ),
+        pytest.param("HIGH", "", ("sarif", "HIGH", "1", False), id="gate-b-default"),
+        pytest.param(
+            "HIGH", "          ignore-unfixed: yes\n", ("sarif", "HIGH", "1", "yes"), id="word"
+        ),
+        pytest.param(
+            "HIGH", "          ignore-unfixed: 1\n", ("sarif", "HIGH", "1", "1"), id="number"
+        ),
+        pytest.param(
+            "MEDIUM,HIGH,CRITICAL",
+            "",
+            ("sarif", "MEDIUM,HIGH,CRITICAL", "1", False),
+            id="other-severity",
+        ),
+    ],
+)
+def test_trivy_step_accepts_only_reviewed_severity_policies(severity, extra, policy):
+    """A Trivy step can have only a reviewed severity policy.
+
+    The gate check reports each other combination of severity and ignore-unfixed.
+    """
+    problems = trivy_gate_problems(load_workflow(_gate_with(severity, extra)))
+    expected = (
+        [] if policy is None else [f"scan: {_TRIVY_FIXTURE_USES}: severity policy {policy!r}"]
+    )
+    assert problems == expected, f"The gate must report {expected}. It reported {problems}."
 
 
 def test_trivy_config_files_are_rejected():
@@ -928,7 +1030,7 @@ def test_trivy_ignore_is_purl_scoped_and_expires():
     assert entries == expected, f"The {IGNORE_FILE} entries must be {expected}, not {entries}."
 
 
-# An example zlib1g package URL in the Trivy form for Debian 12.
+# This example uses the Trivy package URL format for Debian 12.
 _ZLIB1G = "pkg:deb/debian/zlib1g@1.2.13.dfsg-1?arch=amd64&distro=debian-12.12&epoch=1"
 _MINIZIP = "pkg:deb/debian/minizip@1.1-8%2Bb1?arch=amd64&distro=debian-12.12"
 
@@ -980,60 +1082,129 @@ def test_trivy_ignore_model_follows_the_trivy_purl_rules(purls, purl, hidden):
     assert result is hidden, f"For the entry purls {purls}, the model must give {hidden} for {purl}."
 
 
-_SEVERITY_GATE_WORKFLOWS = ("docker.yml", "docker-scan.yml")
+def _trivy_inputs(workflow: str) -> list[dict]:
+    """Return the inputs of each Trivy step of the workflow, in step order."""
+    doc = load_workflow((WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    return [_step_inputs(workflow, step)[0] for step in iter_use_steps(doc) if _is_trivy_step(step)]
 
 
 def _sarif_gate_inputs(workflow: str) -> list[dict]:
-    doc = load_workflow((WORKFLOWS / workflow).read_text(encoding="utf-8"))
-    gates = []
-    for step in iter_use_steps(doc):
-        if _is_trivy_step(step):
-            inputs, _ = _step_inputs(workflow, step)
-            if _is_sarif_gate(inputs):
-                gates.append(inputs)
-    return gates
+    return [inputs for inputs in _trivy_inputs(workflow) if _is_sarif_gate(inputs)]
 
 
-@pytest.mark.parametrize("workflow", _SEVERITY_GATE_WORKFLOWS)
-def test_scan_fails_for_a_high_finding(workflow):
-    """The scan must fail for a HIGH finding."""
-    gates = _sarif_gate_inputs(workflow)
-    assert gates, f"{workflow} must have a SARIF gate."
-    for inputs in gates:
-        severity = inputs.get("severity")
-        assert scan_fails_for(inputs, "HIGH"), (
-            f"The {workflow} scan must fail for a HIGH finding. The severity is {severity!r}."
+def _fix_state(fixed: bool) -> str:
+    return "with a fix" if fixed else "without a fix"
+
+
+@pytest.mark.parametrize("workflow", sorted(TRIVY_STEP_PLAN))
+def test_trivy_steps_follow_the_reviewed_plan(workflow):
+    """The Trivy steps of each workflow must have the reviewed severity policies, in order.
+
+    In docker-scan.yml, the table report is the first Trivy step. Thus the job summary
+    shows the findings also when a gate fails.
+    """
+    plan = [trivy_policy(inputs) for inputs in _trivy_inputs(workflow)]
+    expected = list(TRIVY_STEP_PLAN[workflow])
+    assert plan == expected, f"The {workflow} Trivy steps must be {expected}, not {plan}."
+
+
+def test_each_pr_scan_trivy_step_sets_ignore_unfixed():
+    """Each Trivy step in docker-scan.yml must set ignore-unfixed.
+
+    Thus the workflow file states the policy of each step.
+    """
+    for inputs in _trivy_inputs("docker-scan.yml"):
+        assert "ignore-unfixed" in inputs, (
+            f"The Trivy step that writes {inputs.get('output')!r} must set ignore-unfixed."
         )
 
 
-@pytest.mark.parametrize("workflow", _SEVERITY_GATE_WORKFLOWS)
-def test_scan_fails_for_a_critical_finding(workflow):
-    """The scan must fail for a CRITICAL finding."""
-    gates = _sarif_gate_inputs(workflow)
-    assert gates, f"{workflow} must have a SARIF gate."
-    for inputs in gates:
-        severity = inputs.get("severity")
-        assert scan_fails_for(inputs, "CRITICAL"), (
-            f"The {workflow} scan must fail for a CRITICAL finding. The severity is {severity!r}."
-        )
+# Each case gives a workflow, the severity of one finding, the fix state and the result.
+# A finding has a fix when a fixed version of the package exists. The ignore file does
+# not hide the finding.
+_GATE_POLICY_CASES = [
+    ("docker-scan.yml", "CRITICAL", True, True),
+    ("docker-scan.yml", "CRITICAL", False, True),
+    ("docker-scan.yml", "HIGH", True, True),
+    ("docker-scan.yml", "HIGH", False, False),
+    ("docker-scan.yml", "MEDIUM", True, False),
+    ("docker.yml", "CRITICAL", True, True),
+    ("docker.yml", "CRITICAL", False, True),
+    ("docker.yml", "HIGH", True, True),
+    ("docker.yml", "HIGH", False, True),
+    ("docker.yml", "MEDIUM", True, False),
+]
 
 
 @pytest.mark.parametrize(
-    ("severity", "exit_code", "finding", "fails"),
+    ("workflow", "severity", "fixed", "fails"),
     [
-        pytest.param("HIGH,CRITICAL", "1", "HIGH", True, id="high-gated"),
-        pytest.param("HIGH,CRITICAL", "1", "CRITICAL", True, id="critical-gated"),
-        pytest.param("HIGH,CRITICAL", "1", "MEDIUM", False, id="medium-not-gated"),
-        pytest.param("CRITICAL", "1", "HIGH", False, id="critical-only"),
-        pytest.param("HIGH", "1", "CRITICAL", False, id="high-only"),
-        pytest.param("HIGH,CRITICAL", "0", "CRITICAL", False, id="exit-code-0"),
+        pytest.param(*case, id=f"{case[0]}-{case[1].lower()}-{'fixed' if case[2] else 'unfixed'}")
+        for case in _GATE_POLICY_CASES
     ],
 )
-def test_scan_failure_model_reads_severity_and_exit_code(severity, exit_code, finding, fails):
-    """The failure model must give the Trivy result for each severity and exit code."""
+def test_scan_result_follows_the_gate_policy(workflow, severity, fixed, fails):
+    """The scan result for one finding must follow the gate policy of the workflow.
+
+    - In docker-scan.yml, each CRITICAL finding fails the scan.
+    - In docker-scan.yml, a HIGH finding fails the scan only when it has a fix.
+    - In docker.yml, each HIGH and CRITICAL finding fails the scan.
+    """
+    gates = _sarif_gate_inputs(workflow)
+    assert gates, f"{workflow} must have a SARIF gate."
+    result = any(scan_fails_for(inputs, severity, fixed) for inputs in gates)
+    verdict = "must fail" if fails else "must not fail"
+    assert result is fails, (
+        f"The {workflow} scan {verdict} for a {severity} finding {_fix_state(fixed)}."
+    )
+
+
+@pytest.mark.parametrize("fixed", [True, False], ids=["fixed", "unfixed"])
+@pytest.mark.parametrize("severity", ["HIGH", "CRITICAL"])
+def test_table_report_shows_each_high_and_critical_finding(severity, fixed):
+    """The docker-scan.yml table report must show each HIGH and CRITICAL finding.
+
+    This includes a finding without a fix. The table report must not gate the job.
+    """
+    tables = [item for item in _trivy_inputs("docker-scan.yml") if item.get("format") == "table"]
+    assert len(tables) == 1, "docker-scan.yml must have one Trivy table report."
+    assert trivy_reports(tables[0], severity, fixed), (
+        f"The table report must show a {severity} finding {_fix_state(fixed)}."
+    )
+    assert str(tables[0].get("exit-code")) == "0", "The table report must not gate the job."
+
+
+@pytest.mark.parametrize(
+    ("severity", "exit_code", "ignore_unfixed", "finding", "fixed", "fails"),
+    [
+        pytest.param("HIGH,CRITICAL", "1", None, "HIGH", True, True, id="high-gated"),
+        pytest.param("HIGH,CRITICAL", "1", None, "CRITICAL", True, True, id="critical-gated"),
+        pytest.param("HIGH,CRITICAL", "1", None, "MEDIUM", True, False, id="medium-not-gated"),
+        pytest.param("CRITICAL", "1", None, "HIGH", True, False, id="critical-only"),
+        pytest.param("HIGH", "1", None, "CRITICAL", True, False, id="high-only"),
+        pytest.param("HIGH,CRITICAL", "0", None, "CRITICAL", True, False, id="exit-code-0"),
+        pytest.param("HIGH", "1", None, "HIGH", False, True, id="default-reports-unfixed"),
+        pytest.param("CRITICAL", "1", False, "CRITICAL", False, True, id="unfixed-critical-gated"),
+        pytest.param("HIGH", "1", True, "HIGH", True, True, id="fixed-high-gated"),
+        pytest.param("HIGH", "1", True, "HIGH", False, False, id="unfixed-high-hidden"),
+        pytest.param("HIGH", "1", "true", "HIGH", False, False, id="unfixed-high-hidden-string"),
+        pytest.param("CRITICAL", "1", True, "CRITICAL", False, False, id="unfixed-critical-hidden"),
+    ],
+)
+def test_scan_failure_model_reads_severity_exit_code_and_ignore_unfixed(
+    severity, exit_code, ignore_unfixed, finding, fixed, fails
+):
+    """The failure model must give the Trivy result for each combination of inputs.
+
+    The model reads the severity, the exit code and the ignore-unfixed value.
+    """
     inputs = {"severity": severity, "exit-code": exit_code}
-    result = scan_fails_for(inputs, finding)
-    assert result is fails, f"For {inputs}, a {finding} finding must give {fails}."
+    if ignore_unfixed is not None:
+        inputs["ignore-unfixed"] = ignore_unfixed
+    result = scan_fails_for(inputs, finding, fixed)
+    assert result is fails, (
+        f"For {inputs}, a {finding} finding {_fix_state(fixed)} must give {fails}."
+    )
 
 
 @pytest.mark.parametrize(
@@ -1126,22 +1297,15 @@ def _workflow_uses() -> list[tuple[Path, str, str]]:
 def test_every_action_is_sha_pinned():
     """Each `uses:` must have a commit SHA and a version comment.
 
-    First-party actions are not exempt. Only the refs in TAG_PINNED_REFS keep a tag.
+    No action is exempt. A tag ref, for example `@v4`, fails this test.
     """
     failures: list[str] = []
     for path, text, uses in _workflow_uses():
         if uses.startswith("./"):
             failures.extend(local_action_problems(ROOT, uses))
-        elif uses not in TAG_PINNED_REFS:
+        else:
             failures.extend(_pin_problem(path.name, text, uses))
     assert failures == [], f"{len(failures)} actions have no SHA pin:\n" + "\n".join(failures)
-
-
-def test_tag_pinned_refs_only_get_shorter():
-    """Each ref in TAG_PINNED_REFS must still occur in a workflow."""
-    used = {uses for _path, _text, uses in _workflow_uses()}
-    stale = sorted(TAG_PINNED_REFS - used)
-    assert stale == [], f"No workflow uses these refs. Remove them from TAG_PINNED_REFS: {stale}"
 
 
 def test_every_workflow_has_top_level_permissions():

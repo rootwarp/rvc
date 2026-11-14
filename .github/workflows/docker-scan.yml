@@ -7,11 +7,21 @@ name: Docker scan
 # not collide with docker.yml's `scan (<target>)`. This workflow cannot push
 # images.
 #
-# SARIF drops `severity` unless `limit-severities-for-sarif` is true. Both
-# Trivy steps set that flag, so exit-code 1 applies to HIGH and CRITICAL
-# findings. `.trivyignore.yaml` allows only CVE-2023-45853 in the Debian
-# zlib1g package. The table step prints the same filter into the job log and
-# the job summary. It does not gate the job. Do not set ignore-unfixed.
+# Gate policy:
+# - Gate A fails the job for each CRITICAL finding. It sets ignore-unfixed to
+#   false, so a CRITICAL finding without a fix also fails the job.
+# - Gate B fails the job for a HIGH finding only when a fixed version exists.
+#   It sets ignore-unfixed to true.
+# - The table report shows each HIGH and CRITICAL finding. This includes a
+#   finding without a fix. It sets ignore-unfixed to false and exit-code to 0,
+#   so it does not gate the job.
+# The table report is the first Trivy step, and the last step writes it to
+# the job summary. Thus the job summary shows the findings also when a gate
+# fails.
+# SARIF drops `severity` unless `limit-severities-for-sarif` is true. Each
+# Trivy step sets that flag. Each Trivy step reads `.trivyignore.yaml`. That
+# file allows only CVE-2023-45853 in the Debian zlib1g package, and the entry
+# expires on 2027-01-18.
 
 on:
   pull_request:
@@ -72,17 +82,31 @@ jobs:
           output: trivy-${{ matrix.target }}.txt
           severity: HIGH,CRITICAL
           exit-code: '0'
+          ignore-unfixed: false
           limit-severities-for-sarif: true
           trivyignores: .trivyignore.yaml
 
-      - name: Run Trivy vulnerability scanner
+      - name: Gate A (each CRITICAL finding)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ matrix.target }}:scan
           format: sarif
-          output: trivy-${{ matrix.target }}.sarif
-          severity: HIGH,CRITICAL
+          output: trivy-${{ matrix.target }}-critical.sarif
+          severity: CRITICAL
           exit-code: '1'
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          trivyignores: .trivyignore.yaml
+
+      - name: Gate B (HIGH findings with a fix)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.target }}:scan
+          format: sarif
+          output: trivy-${{ matrix.target }}-high.sarif
+          severity: HIGH
+          exit-code: '1'
+          ignore-unfixed: true
           limit-severities-for-sarif: true
           trivyignores: .trivyignore.yaml
 

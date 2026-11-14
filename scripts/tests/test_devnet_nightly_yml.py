@@ -125,7 +125,10 @@ def test_build_matches_ci_check_cache_and_pins():
 
 def test_soak_downloads_to_run_sh_path_and_chmod():
     soak = _jobs(NIGHTLY.read_text(encoding="utf-8"))["soak"]
-    assert "actions/download-artifact@v4" in soak
+    download = _sha_pin(soak, "actions/download-artifact")
+    assert download.split("#")[-1].strip().startswith("v4."), (
+        f"The soak job must pin a v4 release of actions/download-artifact, not {download!r}."
+    )
     assert "name: rvc-bin" in soak
     assert "path: target/release" in soak
     assert "chmod +x target/release/rvc" in soak
