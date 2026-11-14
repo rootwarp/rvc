@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import fnmatch
 import os
 import re
 import subprocess
@@ -25,19 +26,16 @@ BINFMT_IMAGE = (
     "400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
 )
 
-SCAN_PATHS = {
-    "Dockerfile",
-    ".dockerignore",
-    ".github/workflows/docker*.yml",
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/**",
-    "bin/**",
-    "proto/**",
-    ".trivyignore.yaml",
-    "scripts/docker-cargo-features.sh",
-    ".cargo/config.toml",
+# docker-scan.yml runs only for a release. These are its triggers: a pull
+# request into main, a push of a `v*` tag, and a manual run.
+RELEASE_SCAN_TRIGGERS = {
+    "pull_request": {"branches": ["main"]},
+    "push": {"tags": ["v*"]},
+    "workflow_dispatch": None,
 }
+
+# These events start a workflow for a pull request.
+_PULL_REQUEST_EVENTS = ("pull_request", "pull_request_target")
 
 TARGET_EXPR = "${{ matrix.target }}"
 SCAN_REF = f"{TARGET_EXPR}:scan"
@@ -1441,10 +1439,65 @@ def test_trivy_uses_line_is_identical_and_gate_holds():
     assert build["with"]["platforms"] == "linux/amd64"
     assert build["with"]["load"] is True
     triggers = scan["on"]
-    assert "workflow_dispatch" in triggers
-    assert triggers["pull_request"]["branches"] == ["develop", "main"]
-    assert set(triggers["pull_request"]["paths"]) == SCAN_PATHS
-    assert triggers["schedule"] == [{"cron": "0 6 * * 1"}]
+    assert triggers == RELEASE_SCAN_TRIGGERS, (
+        f"The docker-scan.yml triggers must be {RELEASE_SCAN_TRIGGERS!r}, not {triggers!r}."
+    )
+
+
+def pull_request_can_target(on: object, branch: str) -> bool:
+    """Return True when a pull request into `branch` can start the workflow.
+
+    The check is conservative. A pull request event without a `branches` list
+    counts as a match. This includes an event that has only `branches-ignore`.
+    """
+    if isinstance(on, str):
+        on = [on]
+    if isinstance(on, list):
+        return any(event in _PULL_REQUEST_EVENTS for event in on)
+    for event in _PULL_REQUEST_EVENTS:
+        if event not in on:
+            continue
+        branches = (on[event] or {}).get("branches")
+        if branches is None:
+            return True
+        if any(fnmatch.fnmatchcase(branch, str(pattern)) for pattern in branches):
+            return True
+    return False
+
+
+@pytest.mark.parametrize(
+    ("on", "expected"),
+    [
+        pytest.param({"pull_request": {"branches": ["main"]}}, False, id="main-only"),
+        pytest.param({"push": {"branches": ["develop"]}}, False, id="push-only"),
+        pytest.param(["push", "workflow_dispatch"], False, id="list-without-pull-request"),
+        pytest.param({"pull_request": {"branches": ["develop", "main"]}}, True, id="develop-listed"),
+        pytest.param({"pull_request": {"branches": ["dev*"]}}, True, id="wildcard"),
+        pytest.param({"pull_request": None}, True, id="no-filter"),
+        pytest.param({"pull_request": {"paths": ["Dockerfile"]}}, True, id="paths-only"),
+        pytest.param({"pull_request": {"branches-ignore": ["main"]}}, True, id="branches-ignore"),
+        pytest.param({"pull_request_target": {"branches": ["develop"]}}, True, id="target-event"),
+        pytest.param("pull_request", True, id="string-form"),
+        pytest.param(["push", "pull_request"], True, id="list-form"),
+    ],
+)
+def test_pull_request_can_target_reads_each_trigger_form(on, expected):
+    """A pull request into develop starts the workflow for some trigger forms.
+
+    The helper must return True for these trigger forms and False for the other forms.
+    """
+    actual = pull_request_can_target(on, "develop")
+    assert actual is expected, (
+        f"pull_request_can_target({on!r}, 'develop') must be {expected}, not {actual}."
+    )
+
+
+def test_docker_scan_does_not_run_on_pull_requests_into_develop():
+    """docker-scan.yml must not run on pull requests into develop."""
+    scan = load_workflow((WORKFLOWS / "docker-scan.yml").read_text(encoding="utf-8"))
+    assert not pull_request_can_target(scan["on"], "develop"), (
+        "docker-scan.yml must not run on pull requests into develop."
+    )
 
 
 def _publish_findings_script() -> str:

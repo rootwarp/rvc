@@ -1,11 +1,15 @@
 name: Docker scan
 
-# PR lane for the image scan. docker.yml does not run on pull requests into
-# develop, and its scan job is skipped for every pull_request, so a missing
-# action ref is invisible until a tag push. Keep the trivy `uses:` line
-# identical to docker.yml. The check name is `pr-scan (<target>)` so it does
-# not collide with docker.yml's `scan (<target>)`. This workflow cannot push
-# images.
+# This workflow scans the images for a release. It runs only on these events:
+# - a pull request into main
+# - a push of a `v*` tag
+# - a manual run (workflow_dispatch)
+# It does not run on pull requests into develop, and it has no schedule.
+# docker.yml skips its scan job for each pull_request. Thus this workflow finds
+# a missing action ref in a release pull request before the tag push. Keep the
+# trivy `uses:` line identical to docker.yml. The check name is
+# `pr-scan (<target>)` so it does not collide with docker.yml's
+# `scan (<target>)`. This workflow cannot push images.
 #
 # Gate policy:
 # - Gate A fails the job for each CRITICAL finding. It sets ignore-unfixed to
@@ -25,23 +29,9 @@ name: Docker scan
 
 on:
   pull_request:
-    branches: [develop, main]
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - .github/workflows/docker*.yml
-      - Cargo.toml
-      - Cargo.lock
-      - crates/**
-      - bin/**
-      - proto/**
-      - .trivyignore.yaml
-      - scripts/docker-cargo-features.sh
-      - .cargo/config.toml
-  schedule:
-    # Monday 06:00 UTC. GitHub only fires schedule on the default branch (main).
-    # Path filters do not apply to schedule or workflow_dispatch.
-    - cron: "0 6 * * 1"
+    branches: [main]
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
