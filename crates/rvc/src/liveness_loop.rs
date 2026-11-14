@@ -51,34 +51,6 @@ use crate::pubkey_index::{RegistryFreshness, SharedPubkeyIndexRegistry};
 use crate::quiesce::TrackedKeys;
 use crate::startup::EXIT_DOPPELGANGER_DETECTED;
 
-/// Test clock. Production reads [`MonotonicEpochClock`].
-#[cfg(any(test, feature = "test-utils"))]
-pub struct ClockSeam {
-    epoch: std::sync::atomic::AtomicU64,
-    slot_in_epoch: std::sync::atomic::AtomicU64,
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl ClockSeam {
-    /// Epoch and slot the liveness loop reads while this seam is installed.
-    pub fn new(epoch: u64, slot_in_epoch: u64) -> Arc<Self> {
-        Arc::new(Self {
-            epoch: std::sync::atomic::AtomicU64::new(epoch),
-            slot_in_epoch: std::sync::atomic::AtomicU64::new(slot_in_epoch),
-        })
-    }
-
-    /// Move the epoch the next clock read returns.
-    pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Epoch stored by [`Self::set_epoch`].
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
 /// Merge `pubkey-hex → numeric index` entries into the shared registry.
 ///
 /// [`crate::index_resolver::IndexResolver`] is the only production caller (ADR-R05).
@@ -236,7 +208,7 @@ impl LivenessObservationLoop {
     fn clock_epoch(&self) -> Epoch {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(seam) = &self.clock_seam {
-            return seam.epoch.load(std::sync::atomic::Ordering::SeqCst);
+            return seam.read_epoch();
         }
         self.epoch_clock.current_epoch()
     }
@@ -744,6 +716,64 @@ impl LivenessObservationLoop {
         {
             refresh_indices_from_pubkey_map_impl!(self, validators);
         }
+    }
+}
+
+/// Test clock. Production reads [`MonotonicEpochClock`].
+///
+/// The epoch script is `#[cfg(test)]`. Builds without `cfg(test)` do not
+/// include it, also when the `test-utils` feature is on. In those builds, a
+/// loop epoch read is one atomic load of the stored epoch.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct ClockSeam {
+    epoch: std::sync::atomic::AtomicU64,
+    slot_in_epoch: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    script: parking_lot::Mutex<std::collections::VecDeque<Epoch>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ClockSeam {
+    /// Epoch and slot the liveness loop reads while this seam is installed.
+    pub fn new(epoch: u64, slot_in_epoch: u64) -> Arc<Self> {
+        Arc::new(Self {
+            epoch: std::sync::atomic::AtomicU64::new(epoch),
+            slot_in_epoch: std::sync::atomic::AtomicU64::new(slot_in_epoch),
+            #[cfg(test)]
+            script: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    /// Replace the script. Each loop epoch read takes the next scripted epoch.
+    ///
+    /// When the script is empty, a read returns the stored epoch.
+    #[cfg(test)]
+    pub fn script_epochs(&self, epochs: &[Epoch]) {
+        *self.script.lock() = epochs.iter().copied().collect();
+    }
+
+    /// Return the number of scripted epochs that the loop has not read.
+    #[cfg(test)]
+    pub fn script_remaining(&self) -> usize {
+        self.script.lock().len()
+    }
+
+    fn read_epoch(&self) -> Epoch {
+        #[cfg(test)]
+        if let Some(epoch) = self.script.lock().pop_front() {
+            return epoch;
+        }
+        self.epoch()
+    }
+
+    /// Move the stored epoch. Loop reads return it when the script is empty.
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Epoch stored by [`Self::set_epoch`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -2927,6 +2957,152 @@ mod tests {
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
         task.await.expect("liveness loop");
+    }
+
+    /// This structure stores the result of one `run` tick with a scripted seam.
+    struct ScriptedTick {
+        status: ForwardWindowStatus,
+        latched: bool,
+        script_left: usize,
+        /// This field records the number of scripted epochs left at admission
+        /// under the machine lock.
+        left_at_admission: Option<usize>,
+        /// This field records the number of scripted epochs left after the state write.
+        left_after_write: Option<usize>,
+    }
+
+    /// The helper runs one tick of `run` with these conditions:
+    /// - The key has one not-live decrement left.
+    /// - The seam stores epoch 13 and slot `CLOSED_EPOCH_SLOT`.
+    /// - The epoch reads of the tick take the epochs in `script`, in order.
+    /// - The beacon answers `is_live` for the key in epochs 12 and 13.
+    ///
+    /// `INSIDE_COMMIT` fires in the admission check, under the machine lock.
+    /// `AFTER_COMMIT` fires after the state write. The cancel token stops the
+    /// loop after that write.
+    async fn run_one_scripted_tick(script: &[Epoch], is_live: bool) -> ScriptedTick {
+        let m = machine();
+        let pk = new_pk();
+        m.register(&pk, 10);
+        let (bn, state) = all_not_live(&["1"]);
+        let seam = ClockSeam::new(13, CLOSED_EPOCH_SLOT);
+        let loop_ = loop_with(Arc::clone(&m), Arc::new(bn), "1", &pk)
+            .with_slot_duration(Duration::from_secs(12))
+            .with_clock_seam(Arc::clone(&seam));
+        loop_.drive_once_for_test(11, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(12, CLOSED_EPOCH_SLOT).await;
+        assert_eq!(
+            m.pending_keys().iter().map(|key| key.next_check_epoch).collect::<Vec<_>>(),
+            vec![12],
+            "The two driven ticks must count epochs 10 and 11 before run starts."
+        );
+        state.live.write().insert("1".to_string(), is_live);
+        seam.script_epochs(script);
+
+        type Left = std::rc::Rc<std::cell::Cell<Option<usize>>>;
+        let left_at_admission = Left::default();
+        let left_after_write = Left::default();
+        let record = |left: &Left| {
+            let (seam, left) = (Arc::clone(&seam), std::rc::Rc::clone(left));
+            move || left.set(Some(seam.script_remaining()))
+        };
+        let _inside = arm(&INSIDE_COMMIT, record(&left_at_admission));
+        let _after = arm(&AFTER_COMMIT, record(&left_after_write));
+        let cancel = loop_.cancel.clone();
+        let task = tokio::spawn(loop_.run());
+        for _ in 0..256 {
+            if left_after_write.get().is_some() {
+                break;
+            }
+            assert!(!task.is_finished(), "The loop must not stop before the first state write.");
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        task.await.expect("The liveness loop must stop without a panic.");
+        ScriptedTick {
+            status: m.status(&pk),
+            latched: m.detected_latch(),
+            script_left: seam.script_remaining(),
+            left_at_admission: left_at_admission.get(),
+            left_after_write: left_after_write.get(),
+        }
+    }
+
+    /// The test uses these conditions:
+    /// - The two reads before the machine lock return epoch 13.
+    /// - The read under the lock returns epoch 14.
+    /// - The key has one not-live decrement left.
+    ///
+    /// The key must stay Pending. The tick must consume the script.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rollover_between_reread_and_apply_skips_the_decrement() {
+        let tick = run_one_scripted_tick(&[13, 13, 14], false).await;
+        assert_eq!(
+            tick.status,
+            ForwardWindowStatus::Pending,
+            "An epoch change under the machine lock must skip the last decrement."
+        );
+        assert!(!tick.latched, "A not-live answer must not set the detection latch.");
+        assert_eq!(tick.script_left, 0, "The tick must take the three scripted epochs.");
+        assert_eq!(
+            tick.left_at_admission,
+            Some(1),
+            "The tick must read the epoch for the third time after the admission check starts."
+        );
+        assert_eq!(
+            tick.left_after_write,
+            Some(0),
+            "The tick must read the epoch for the third time before the state write ends."
+        );
+    }
+
+    /// The helper drives a key registered at epoch 10 through epochs 11, 12
+    /// and 13. These conditions apply:
+    /// - Each driven tick uses slot `CLOSED_EPOCH_SLOT`.
+    /// - The beacon answers not live to each query.
+    /// - The seam stores epoch 13.
+    /// - If `move_on_last` is true, each query of the last tick sets the seam to epoch 14.
+    ///
+    /// The helper returns the key status and the stored seam epoch.
+    async fn drive_three_closed_epochs(move_on_last: bool) -> (ForwardWindowStatus, Epoch) {
+        let m = machine();
+        let pk = new_pk();
+        m.register(&pk, 10);
+        let seam = ClockSeam::new(13, CLOSED_EPOCH_SLOT);
+        let armed = Arc::new(AtomicBool::new(false));
+        let (armed_for_mock, seam_for_mock) = (Arc::clone(&armed), Arc::clone(&seam));
+        let beacon =
+            MockBeaconNodeClient::new().with_post_validator_liveness(move |_epoch, indices| {
+                if armed_for_mock.load(Ordering::SeqCst) {
+                    seam_for_mock.set_epoch(14);
+                }
+                let data = indices
+                    .iter()
+                    .map(|idx| ValidatorLiveness { index: idx.clone(), is_live: false })
+                    .collect();
+                Ok(ValidatorLivenessResponse { data })
+            });
+        let loop_ = loop_with(Arc::clone(&m), Arc::new(beacon), "1", &pk)
+            .with_clock_seam(Arc::clone(&seam));
+        loop_.drive_once_for_test(11, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(12, CLOSED_EPOCH_SLOT).await;
+        armed.store(move_on_last, Ordering::SeqCst);
+        loop_.drive_once_for_test(13, CLOSED_EPOCH_SLOT).await;
+        (m.status(&pk), seam.epoch())
+    }
+
+    /// The beacon moves the seam from epoch 13 to epoch 14 during the driven
+    /// queries for epoch 13. The last not-live decrement must not run.
+    #[tokio::test]
+    async fn drive_once_for_test_skips_the_decrement_when_the_epoch_changes() {
+        let (status, seam_epoch) = drive_three_closed_epochs(true).await;
+        assert_eq!(seam_epoch, 14, "The beacon must move the seam during the last driven tick.");
+        assert_eq!(
+            status,
+            ForwardWindowStatus::Pending,
+            "A seam that moves during the driven queries must skip the last decrement."
+        );
     }
 
     async fn poll_until_parked(task: &tokio::task::JoinHandle<()>) {
