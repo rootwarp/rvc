@@ -6,12 +6,23 @@
 //! `fstat` on that fd. A FIFO or symlink swapped in after the type check cannot
 //! block the open or be followed. The read is bounded.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 
 /// A larger payload is not a marker this process wrote.
 pub const MAX_MARKER_BYTES: u64 = 1024 * 1024;
+
+#[cfg(test)]
+type AfterLstatHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// The hook runs between `symlink_metadata` and the open in [`read_marker_file`].
+    static AFTER_LSTAT: RefCell<Option<AfterLstatHook>> = const { RefCell::new(None) };
+}
 
 /// Result of reading one marker path.
 #[derive(Debug)]
@@ -40,6 +51,12 @@ pub fn read_marker_file(path: &Path) -> MarkerFile {
         }
         Ok(_) => {}
     }
+    #[cfg(test)]
+    AFTER_LSTAT.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
 
     let file = match open_nofollow(path) {
         Ok(file) => file,
@@ -109,6 +126,108 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reading a FIFO marker blocked");
         assert!(matches!(result, MarkerFile::Unreadable(_)), "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Return the file status flags of `file` from `fcntl(F_GETFL)`.
+    /// A failed call returns -1.
+    // The libc fcntl call is unsafe. This allow applies to this test helper only.
+    #[allow(unsafe_code)]
+    fn status_flags(file: &File) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` keeps the descriptor open during the call. F_GETFL takes
+        // no third argument.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) }
+    }
+
+    /// The guard clears this thread's [`AFTER_LSTAT`] hook when it drops.
+    struct AfterLstatGuard;
+
+    impl Drop for AfterLstatGuard {
+        fn drop(&mut self) {
+            AFTER_LSTAT.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    /// Set the [`AFTER_LSTAT`] hook of this thread until the guard drops.
+    fn arm_after_lstat(hook: impl Fn(&Path) + 'static) -> AfterLstatGuard {
+        AFTER_LSTAT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        AfterLstatGuard
+    }
+
+    /// The hook replaces the regular marker with a FIFO after `lstat`.
+    /// The test requires these results:
+    ///
+    /// - `open_nofollow` must set `O_NONBLOCK` on the regular marker before the swap.
+    /// - The open must not block.
+    /// - The read must return `Unreadable` for the FIFO.
+    /// - The same thread must read a regular marker as bytes after the guard drops.
+    #[test]
+    fn marker_swapped_to_fifo_after_lstat_is_unreadable() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = std::env::temp_dir().join(format!(
+            "rvc-dg-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("The system clock must be after the UNIX epoch.")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("The test must create the temporary directory.");
+        let path = dir.join("marker");
+        std::fs::write(&path, b"{}").expect("The test must write a regular marker file.");
+
+        // The marker is a regular file before the swap, so this open cannot block.
+        let opened = open_nofollow(&path).expect("open_nofollow must open the regular marker.");
+        let flags = status_flags(&opened);
+        assert_ne!(
+            flags,
+            -1,
+            "The fcntl F_GETFL call must succeed. The error is {}.",
+            io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "open_nofollow must set O_NONBLOCK. The status flags are {flags:#o}."
+        );
+        drop(opened);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The hook is thread-local, so arm it on the reader thread.
+            let hook = arm_after_lstat(|path| {
+                std::fs::remove_file(path).expect("The hook must remove the regular marker file.");
+                let status = std::process::Command::new("mkfifo")
+                    .arg(path)
+                    .status()
+                    .expect("The hook must start mkfifo.");
+                assert!(
+                    status.success(),
+                    "The mkfifo command must succeed. The status is {status}."
+                );
+            });
+            let swapped = read_marker_file(&path);
+            drop(hook);
+            let fifo =
+                std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_fifo());
+            std::fs::remove_file(&path).expect("The test must remove the FIFO.");
+            std::fs::write(&path, b"{}").expect("The test must write a regular marker file.");
+            let _ = tx.send((swapped, fifo, read_marker_file(&path)));
+        });
+        // The timeout gives protection from a hang only.
+        let (swapped, fifo, after_drop) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("The marker reads must return before the 10-second timeout.");
+        assert!(
+            matches!(swapped, MarkerFile::Unreadable(_)),
+            "A FIFO in place of the marker after lstat must be Unreadable. The result is {swapped:?}."
+        );
+        assert!(fifo, "The hook must replace the marker with a FIFO.");
+        assert!(
+            matches!(after_drop, MarkerFile::Bytes(_)),
+            "The hook must not run after its guard drops. The result is {after_drop:?}."
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

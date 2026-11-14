@@ -269,13 +269,6 @@ pub enum RecordInspect {
     Unreadable { path: PathBuf, reason: String },
 }
 
-/// `true` when the record is `detected` or cannot be trusted as `not-detected`.
-///
-/// A missing file and a clear pre-allocated file are not a durable latch.
-pub fn record_blocks_restart(data_dir: &Path) -> bool {
-    !matches!(inspect_record(data_dir), RecordInspect::Absent | RecordInspect::Clear)
-}
-
 /// Path of the pre-allocated record in `data_dir`.
 pub fn record_path(data_dir: &Path) -> PathBuf {
     data_dir.join(RECORD_FILENAME)
@@ -527,7 +520,9 @@ fn write_record_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 thread_local! {
     static MARKER_WRITE_FAILS_LEFT: Cell<u32> = const { Cell::new(0) };
     static PREALLOCATE_FAILS: Cell<bool> = const { Cell::new(false) };
+    static FSYNC_SKIPS_LEFT: Cell<u32> = const { Cell::new(0) };
     static FSYNC_FAILS_LEFT: Cell<u32> = const { Cell::new(0) };
+    static FSYNC_CALLS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Fail the next `count` [`write_marker`] calls on this thread.
@@ -546,8 +541,25 @@ pub(crate) fn arm_marker_write_failures(count: u32) -> MarkerWriteFailGuard {
 /// page cache, so a later read can show `detected` with nothing durable.
 #[cfg(test)]
 pub(crate) fn arm_fsync_failures(count: u32) -> FsyncFailGuard {
-    FSYNC_FAILS_LEFT.with(|left| left.set(count));
+    arm_fsync_failures_after(0, count)
+}
+
+/// Let the next `skip` fsyncs on this thread pass, then fail the next `fail`.
+///
+/// If `fail == u32::MAX`, the injector fails all fsync calls after the skipped
+/// calls. The guard stops these failures when it drops.
+#[cfg(test)]
+pub(crate) fn arm_fsync_failures_after(skip: u32, fail: u32) -> FsyncFailGuard {
+    FSYNC_SKIPS_LEFT.with(|left| left.set(skip));
+    FSYNC_FAILS_LEFT.with(|left| left.set(fail));
     FsyncFailGuard
+}
+
+/// The function returns this thread's fsync call count. The count includes
+/// calls that return an injected error.
+#[cfg(test)]
+pub(crate) fn fsync_calls() -> u32 {
+    FSYNC_CALLS.with(Cell::get)
 }
 
 /// Fail the next [`preallocate_detection_record`] call on this thread.
@@ -574,6 +586,14 @@ fn take_marker_write_failure() -> bool {
 
 #[cfg(test)]
 fn take_fsync_failure() -> bool {
+    let skipped = FSYNC_SKIPS_LEFT.with(|left| {
+        let remaining = left.get();
+        left.set(remaining.saturating_sub(1));
+        remaining > 0
+    });
+    if skipped {
+        return false;
+    }
     FSYNC_FAILS_LEFT.with(|left| {
         let remaining = left.get();
         if remaining == 0 {
@@ -616,6 +636,7 @@ pub(crate) struct FsyncFailGuard;
 #[cfg(test)]
 impl Drop for FsyncFailGuard {
     fn drop(&mut self) {
+        FSYNC_SKIPS_LEFT.with(|left| left.set(0));
         FSYNC_FAILS_LEFT.with(|left| left.set(0));
     }
 }
@@ -632,6 +653,8 @@ impl Drop for PreallocateFailGuard {
 }
 
 fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    FSYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
     if take_fsync_failure() {
         return Err(io::Error::from_raw_os_error(libc::EIO));
@@ -840,7 +863,7 @@ mod tests {
         assert!(meta.is_file());
         assert_eq!(meta.len(), RECORD_LEN as u64);
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Clear));
-        assert!(!record_blocks_restart(dir.path()));
+        assert!(matches!(inspect_record(dir.path()), RecordInspect::Absent | RecordInspect::Clear));
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -857,7 +880,10 @@ mod tests {
             inspect_record(dir.path()),
             RecordInspect::Detected { epoch: 9, unix_secs: 1_700 }
         );
-        assert!(record_blocks_restart(dir.path()));
+        assert!(!matches!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent | RecordInspect::Clear
+        ));
         let bytes = fs::read(&path).expect("bytes");
         assert_eq!(bytes.len(), RECORD_LEN);
         assert!(bytes.iter().skip(80).all(|byte| *byte == 0));
@@ -878,7 +904,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         fs::write(record_path(dir.path()), b"short").expect("short");
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Unreadable { .. }));
-        assert!(record_blocks_restart(dir.path()));
+        assert!(!matches!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent | RecordInspect::Clear
+        ));
         assert!(preallocate_detection_record(dir.path()).is_err());
         assert!(reset_detection_record(dir.path()).is_err());
         assert_eq!(fs::read(record_path(dir.path())).expect("untouched"), b"short");
@@ -906,5 +935,121 @@ mod tests {
         persist_detection(dir.path(), &marker).expect("record is enough");
         assert!(matches!(inspect(dir.path()), MarkerInspect::Absent));
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Detected { .. }));
+    }
+
+    /// Return `header` followed by zero bytes, to a total of `len` bytes.
+    fn padded_record(header: &[u8], len: usize) -> Vec<u8> {
+        let mut bytes = header.to_vec();
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    /// Each malformed record is `Unreadable`. The two valid headers are
+    /// `Clear` and `Detected`, so each row tests the parser.
+    #[test]
+    fn parse_record_rejects_malformed_headers() {
+        const CLEAR: &[u8] = b"version=1\nstate=not-detected\nepoch=0\nunix_secs=0\n";
+        const DETECTED: &[u8] = b"version=1\nstate=detected\nepoch=9\nunix_secs=1700\n";
+        let mut tail = padded_record(CLEAR, RECORD_LEN);
+        tail[4000] = b'x';
+        // The tear is at the middle of the header. The state line becomes
+        // `state=detectedcted`.
+        let half = DETECTED.len() / 2;
+        let torn = [&DETECTED[..half], &CLEAR[half..]].concat();
+        let malformed = [
+            ("4096 zero bytes", vec![0; RECORD_LEN]),
+            ("0 bytes", Vec::new()),
+            ("4097 bytes", padded_record(CLEAR, RECORD_LEN + 1)),
+            ("a non-zero byte at offset 4000", tail),
+            (
+                "version=2",
+                padded_record(b"version=2\nstate=not-detected\nepoch=0\nunix_secs=0\n", RECORD_LEN),
+            ),
+            (
+                "state=maybe",
+                padded_record(b"version=1\nstate=maybe\nepoch=0\nunix_secs=0\n", RECORD_LEN),
+            ),
+            (
+                "no unix_secs line",
+                padded_record(b"version=1\nstate=not-detected\nepoch=0\n", RECORD_LEN),
+            ),
+            (
+                "an extra line",
+                padded_record(
+                    b"version=1\nstate=not-detected\nepoch=0\nunix_secs=0\nextra=1\n",
+                    RECORD_LEN,
+                ),
+            ),
+            (
+                "epoch=18446744073709551616",
+                padded_record(
+                    b"version=1\nstate=not-detected\nepoch=18446744073709551616\nunix_secs=0\n",
+                    RECORD_LEN,
+                ),
+            ),
+            (
+                "epoch=+5",
+                padded_record(
+                    b"version=1\nstate=not-detected\nepoch=+5\nunix_secs=0\n",
+                    RECORD_LEN,
+                ),
+            ),
+            ("a torn header", padded_record(&torn, RECORD_LEN)),
+        ];
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let write = |bytes: Vec<u8>| {
+            fs::write(record_path(dir.path()), bytes)
+                .expect("The test must write the record file.");
+        };
+        for (case, bytes) in malformed {
+            write(bytes);
+            let inspected = inspect_record(dir.path());
+            assert!(
+                matches!(inspected, RecordInspect::Unreadable { .. }),
+                "The record with {case} must be Unreadable. The result is {inspected:?}."
+            );
+        }
+        write(padded_record(CLEAR, RECORD_LEN));
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "A valid not-detected header must be Clear."
+        );
+        write(padded_record(DETECTED, RECORD_LEN));
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Detected { epoch: 9, unix_secs: 1700 },
+            "A valid detected header must be Detected."
+        );
+    }
+
+    /// No record exists, so `persist_detection` writes only the marker. The
+    /// temp-file fsync passes and the directory fsync after the rename fails.
+    #[test]
+    fn dir_fsync_failure_after_rename_is_not_durable() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent,
+            "The directory must not contain a record."
+        );
+        let marker = DetectionMarker { epoch: 5, unix_secs: 6, pubkeys: vec![pubkey()] };
+        let before = fsync_calls();
+        let guard = arm_fsync_failures_after(1, 1);
+        let result = persist_detection(dir.path(), &marker);
+        drop(guard);
+        assert!(
+            result.is_err(),
+            "persist_detection must return Err when the directory fsync fails."
+        );
+        assert_eq!(
+            fsync_calls() - before,
+            2,
+            "The marker write must fsync the temp file and then the directory."
+        );
+        assert!(
+            matches!(inspect(dir.path()), MarkerInspect::Present(_)),
+            "The marker must be at its final path before the directory fsync fails."
+        );
     }
 }

@@ -1272,6 +1272,45 @@ mod tests {
         assert_eq!(err.exit_code(), 12);
     }
 
+    /// Boot reads the record also when detection is off. A record that the
+    /// parser cannot trust must stop boot with exit 12.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_unparseable_detection_records() {
+        use crate::detection_marker::{record_path, RECORD_LEN};
+        let padded = |header: &[u8]| {
+            let mut bytes = header.to_vec();
+            bytes.resize(RECORD_LEN, 0);
+            bytes
+        };
+        let mut tail = padded(b"version=1\nstate=not-detected\nepoch=0\nunix_secs=0\n");
+        tail[4000] = b'x';
+        let records = [
+            ("state=maybe", padded(b"version=1\nstate=maybe\nepoch=0\nunix_secs=0\n")),
+            ("a non-zero byte at offset 4000", tail),
+            ("version=2", padded(b"version=2\nstate=not-detected\nepoch=0\nunix_secs=0\n")),
+        ];
+        for (case, bytes) in records {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            std::fs::write(record_path(dir.path()), bytes)
+                .expect("The test must write the record file.");
+            let err = boot_with_keystore(dir.path()).await;
+            assert_eq!(
+                err.exit_code(),
+                EXIT_DOPPELGANGER_DETECTED,
+                "Boot must exit 12 for a record with {case}. The error is: {err}"
+            );
+        }
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        std::fs::create_dir(record_path(dir.path()))
+            .expect("The test must create a directory at the record path.");
+        let err = boot_with_keystore(dir.path()).await;
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "Boot must exit 12 when the record path is a directory. The error is: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn detection_enabled_refuses_a_keystore_dir_that_cannot_hold_the_marker() {
         let missing = std::env::temp_dir().join(format!(
