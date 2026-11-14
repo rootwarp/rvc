@@ -3,6 +3,17 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## The runtime images use Alpine
+
+The `rvc`, `rvc-signer` and `rvc-keygen` images now start from a pinned `alpine:3.24` image, not from `debian:bookworm-slim`. The binaries are musl binaries: `x86_64-unknown-linux-musl` for `linux/amd64` and `aarch64-unknown-linux-musl` for `linux/arm64`. The amd64 binaries are static. The arm64 binaries use the musl C library and `libgcc_s` of the image. All binaries are position-independent executables. The binaries use the baseline CPU of the platform (`x86-64` or generic ARMv8-A), not the CPU of the build host. Each image installs only `ca-certificates`. The arm64 images also install `libgcc`. The binaries use the musl memory allocator, not the glibc allocator.
+
+The user `rvc` (uid 10001, gid 10001), the volumes, the ports, the entrypoints, the health checks and the labels do not change.
+
+### Check your container scripts
+
+1. The images do not contain `bash`, `apt-get` or the GNU core utilities. A script that runs in a container must use `/bin/sh` (BusyBox). To add a package in a derived image, use `apk`.
+2. The login shell of `rvc` is `/sbin/nologin`. It was `/usr/sbin/nologin`.
+
 ## Dependency advisories: tokio and rand updates, and a cargo-deny check
 
 `Cargo.lock` now has tokio 1.53.3 (RUSTSEC-2026-0386, `AsyncFd` I/O safety) and rand 0.8.6 and 0.9.3 (RUSTSEC-2026-0097). The workspace now requires tokio 1.53.3 and rand 0.8.6 or later. rvc does not call the `AsyncFd` constructors, and no dependency calls them. The tokio update also updates mio, libc, and tokio-macros.
