@@ -113,7 +113,10 @@ def test_build_matches_ci_check_cache_and_pins():
     assert _sha_pin(check, "arduino/setup-protoc") == _sha_pin(build, "arduino/setup-protoc")
     assert 'version: "27.x"' in build
     assert "cargo build --release --locked -p rvc-bin" in build
-    assert "actions/upload-artifact@v4" in build
+    upload = _sha_pin(build, "actions/upload-artifact")
+    assert upload.split("#")[-1].strip().startswith("v4."), (
+        f"The build job must pin a v4 release of actions/upload-artifact, not {upload!r}."
+    )
     assert "path: target/release/rvc" in build
     assert "name: rvc-bin" in build
     assert "rustfmt" not in build

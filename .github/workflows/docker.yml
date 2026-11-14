@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -85,7 +85,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -103,21 +103,22 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
 
       # SARIF drops the severity filter unless limit-severities-for-sarif is
-      # true, so exit-code 1 applies to CRITICAL only. .trivyignore allows
-      # only CVE-2023-45853. Do not set ignore-unfixed.
+      # true. With that flag, exit-code 1 applies to HIGH and CRITICAL
+      # findings. .trivyignore.yaml allows only CVE-2023-45853 in the Debian
+      # zlib1g package. Do not set ignore-unfixed.
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ matrix.target }}:scan
           format: sarif
           output: trivy-${{ matrix.target }}.sarif
-          severity: CRITICAL
+          severity: HIGH,CRITICAL
           exit-code: '1'
           limit-severities-for-sarif: true
-          trivyignores: .trivyignore
+          trivyignores: .trivyignore.yaml
 
       - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         if: success() || failure()
         with:
           sarif_file: trivy-${{ matrix.target }}.sarif
@@ -137,7 +138,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 

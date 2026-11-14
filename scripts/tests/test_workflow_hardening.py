@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import subprocess
@@ -14,10 +15,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
-# First-party actions stay on major tags. Pinning them is a follow-up; the
-# predicate below still rejects an unpinned first-party `uses:` so a fixture
-# can prove the rule. The repo scan exempts these prefixes.
-_FIRST_PARTY = ("actions/", "github/")
+# These first-party refs keep a major tag until a review gives their commit SHAs.
+# Each entry must still occur in a workflow, so the list can only get shorter.
+TAG_PINNED_REFS = frozenset({"actions/download-artifact@v4", "actions/setup-python@v5"})
 
 _SHA_AT_END = re.compile(r"@[0-9a-f]{40}$")
 # A version comment is `# v` and a number, for example `# v3.7.0`. `# vulnerable` is not.
@@ -38,7 +38,7 @@ SCAN_PATHS = {
     "crates/**",
     "bin/**",
     "proto/**",
-    ".trivyignore",
+    ".trivyignore.yaml",
     "scripts/docker-cargo-features.sh",
     ".cargo/config.toml",
 }
@@ -46,9 +46,20 @@ SCAN_PATHS = {
 TARGET_EXPR = "${{ matrix.target }}"
 SCAN_REF = f"{TARGET_EXPR}:scan"
 
-# Each reviewed exception with its Trivy expiry option. On that date Trivy stops
+# The only Trivy ignore file. Both Trivy workflows pass it as `trivyignores`.
+IGNORE_FILE = ".trivyignore.yaml"
+
+# Each entry contains a reviewed CVE and its expiry option. On that date Trivy stops
 # ignoring the CVE, and the image scan turns red until a review renews the entry.
-ALLOWED_IGNORED_CVES = [("CVE-2023-45853", "exp:2027-01-18")]
+# The package URLs (purls) limit the entry to the reviewed packages.
+ALLOWED_IGNORED_CVES = [
+    ("CVE-2023-45853", ("pkg:deb/debian/zlib1g",), datetime.date(2027, 1, 18)),
+]
+# The keys that an ignore entry can have. A different key needs a review.
+_IGNORE_ENTRY_KEYS = frozenset({"id", "purls", "expired_at", "statement"})
+
+# A HIGH or CRITICAL finding fails the scan. Each Trivy step uses this value.
+TRIVY_SEVERITY = "HIGH,CRITICAL"
 
 # The only inputs that a Trivy step can set. A new input needs a review of this set.
 TRIVY_ALLOWED_INPUTS = frozenset(
@@ -159,27 +170,34 @@ def _workflow_texts() -> list[tuple[Path, str]]:
     return [(path, path.read_text(encoding="utf-8")) for path in paths]
 
 
-def _version_comment_ok(text: str, uses: str) -> bool:
-    sha = uses.rsplit("@", 1)[-1]
+def _pinned_version(text: str, uses: str) -> tuple[int, ...] | None:
+    """Return the version in the comment on the line of the `uses:` ref, or None."""
+    ref = uses.rsplit("@", 1)[-1]
     for line in text.splitlines():
-        if line.lstrip().startswith("#"):
+        if line.lstrip().startswith("#") or ref not in line:
             continue
-        if sha in line and _VERSION_COMMENT_RE.search(line):
-            return True
-    return False
+        match = _VERSION_COMMENT_RE.search(line)
+        if match:
+            return tuple(int(part) for part in match.group(0).split("v", 1)[1].split("."))
+    return None
+
+
+def _version_comment_ok(text: str, uses: str) -> bool:
+    return _pinned_version(text, uses) is not None
 
 
 def _pin_problem(label: str, text: str, uses: str) -> list[str]:
-    """Return a problem when a third-party `uses:` has no SHA pin or no version comment."""
-    if action_name(uses).startswith(_FIRST_PARTY):
-        return []
+    """Return a problem when a `uses:` has no SHA pin or no version comment.
+
+    First-party actions are not exempt.
+    """
     if uses_is_sha_pinned(uses) and _version_comment_ok(text, uses):
         return []
     return [f"{label}: {uses}"]
 
 
 def local_action_problems(root: Path, ref: str, seen: frozenset[str] = frozenset()) -> list[str]:
-    """Pin problems in the local composite action at `ref` and in the local actions it uses."""
+    """Return pin errors for this local action and each local action that it uses."""
     folder = root / ref.removeprefix("./")
     paths = [folder / name for name in ("action.yml", "action.yaml") if (folder / name).is_file()]
     if not paths:
@@ -261,6 +279,17 @@ def _is_sarif_gate(inputs: dict) -> bool:
     return inputs.get("format") == "sarif" and str(inputs.get("exit-code")) == "1"
 
 
+def scan_fails_for(inputs: dict, severity: str) -> bool:
+    """Return True when the Trivy step fails the job for one finding of `severity`.
+
+    The step must set `exit-code: '1'` and name the severity in `severity`. This
+    model applies to a step with `limit-severities-for-sarif: true`. The gate check
+    requires that flag.
+    """
+    levels = {item.strip().upper() for item in str(inputs.get("severity", "")).split(",")}
+    return str(inputs.get("exit-code")) == "1" and severity in levels
+
+
 def _run_step_problems(where: str, step: dict) -> list[str]:
     run = step.get("run")
     if not isinstance(run, str):
@@ -284,9 +313,9 @@ def _trivy_step_problems(where: str, step: dict) -> tuple[list[str], dict[str, o
         problems.append(f"{where}: image-ref {image_ref!r}")
     if inputs.get("limit-severities-for-sarif") is not True:
         problems.append(f"{where}: limit-severities-for-sarif")
-    if inputs.get("trivyignores") != ".trivyignore":
+    if inputs.get("trivyignores") != IGNORE_FILE:
         problems.append(f"{where}: trivyignores")
-    if inputs.get("severity") != "CRITICAL":
+    if inputs.get("severity") != TRIVY_SEVERITY:
         problems.append(f"{where}: severity")
     if _ignore_unfixed_enabled(inputs):
         problems.append(f"{where}: ignore-unfixed")
@@ -346,7 +375,7 @@ def _trivy_job_problems(workflow: str, job_name: str, job: dict, steps: list[dic
 
 
 def trivy_gate_problems(doc, workflow: str = "") -> list[str]:
-    """Problems in the Trivy jobs of one parsed workflow. YAML comments do not count.
+    """Return problems in the Trivy jobs of this workflow. YAML comments do not count.
 
     `workflow` is the workflow file name. It selects the reviewed job `if`. The
     Trivy inputs, the image, and the steps before the gate are allow-lists.
@@ -382,23 +411,74 @@ def trivy_table_steps(doc) -> list[dict]:
     return found
 
 
-def trivyignore_entries(text: str) -> list[tuple[str, str]]:
-    """Read the id and the options, for example `exp:2027-01-18`, of each entry."""
-    entries: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        fields = line.split("#", 1)[0].split()
-        if fields:
-            entries.append((fields[0], " ".join(fields[1:])))
+def _ignore_vulnerabilities(text: str) -> list | None:
+    """Return the `vulnerabilities` list of a YAML ignore file, or None for another shape."""
+    doc = yaml.safe_load(text)
+    if not isinstance(doc, dict) or set(doc) != {"vulnerabilities"}:
+        return None
+    entries = doc["vulnerabilities"]
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        return None
     return entries
+
+
+def trivyignore_entries(text: str) -> list[tuple[object, tuple[str, ...], object]]:
+    """Read the id, the purls and the `expired_at` date of each vulnerability entry."""
+    return [
+        (entry.get("id"), tuple(entry.get("purls") or ()), entry.get("expired_at"))
+        for entry in _ignore_vulnerabilities(text) or []
+    ]
 
 
 def ignore_file_problems(files: dict[str, str]) -> list[str]:
     problems: list[str] = []
-    if sorted(files) != [".trivyignore"]:
+    if sorted(files) != [IGNORE_FILE]:
         problems.append(f"unexpected ignore files: {sorted(files)}")
-    if trivyignore_entries(files.get(".trivyignore", "")) != ALLOWED_IGNORED_CVES:
+    entries = _ignore_vulnerabilities(files.get(IGNORE_FILE, ""))
+    if entries is None:
+        return [*problems, "ignore file shape"]
+    for entry in entries:
+        if set(entry) != _IGNORE_ENTRY_KEYS:
+            problems.append(f"ignore entry keys {sorted(entry)}")
+        elif not str(entry["statement"] or "").strip():
+            problems.append(f"ignore entry {entry['id']} has no statement")
+    if trivyignore_entries(files.get(IGNORE_FILE, "")) != ALLOWED_IGNORED_CVES:
         problems.append("ignore entries")
     return problems
+
+
+def _purl_parts(purl: str) -> tuple[tuple[str, str, str], str, dict[str, str]]:
+    """Split a package URL into (type, namespace, name), the version and the qualifiers."""
+    body = purl.removeprefix("pkg:").split("#", 1)[0]
+    body, _, query = body.partition("?")
+    path, _, version = body.partition("@")
+    kind, *namespace, name = path.split("/")
+    qualifiers = dict(item.split("=", 1) for item in query.split("&") if item)
+    return (kind, "/".join(namespace), name), version, qualifiers
+
+
+def trivy_ignores(entries, cve: str, purl: str) -> bool:
+    """Return True when an ignore entry hides the finding `cve` in the package `purl`.
+
+    This model follows the purl match in Trivy `pkg/result/ignore.go`:
+
+    - An entry without purls matches each package.
+    - The type, the namespace and the name must be equal.
+    - A purl without a version matches each version.
+    - Each qualifier of the entry purl must occur in the package purl.
+    """
+    target, target_version, target_qualifiers = _purl_parts(purl)
+    for entry_id, purls, _expired_at in entries:
+        if entry_id != cve:
+            continue
+        if not purls:
+            return True
+        for package, version, qualifiers in map(_purl_parts, purls):
+            if package != target or version not in ("", target_version):
+                continue
+            if all(target_qualifiers.get(key) == value for key, value in qualifiers.items()):
+                return True
+    return False
 
 
 def trivy_config_file_problems(paths: list[str]) -> list[str]:
@@ -468,10 +548,10 @@ jobs:
 
 def test_trivy_gate_parses_mappings_not_comments():
     text = """
-# severity: CRITICAL
+# severity: HIGH,CRITICAL
 # exit-code: '1'
 # limit-severities-for-sarif: true
-# trivyignores: .trivyignore
+# trivyignores: .trivyignore.yaml
 name: fixture
 on: push
 jobs:
@@ -520,10 +600,10 @@ on: push
           image-ref: {SCAN_REF}
           format: sarif
           output: trivy.sarif
-          severity: CRITICAL
+          severity: {TRIVY_SEVERITY}
           exit-code: '1'
           limit-severities-for-sarif: true
-          trivyignores: .trivyignore
+          trivyignores: {IGNORE_FILE}
 {trivy_extra}{post_steps}"""
 
 
@@ -648,13 +728,15 @@ def test_trivy_step_rejects_case_only_duplicate_inputs():
     One spelling in a different case is not a problem.
     """
     text = _reviewed_trivy_step("").replace(
-        "          severity: CRITICAL\n",
-        "          severity: LOW\n          Severity: CRITICAL\n",
+        f"          severity: {TRIVY_SEVERITY}\n",
+        f"          severity: LOW\n          Severity: {TRIVY_SEVERITY}\n",
     )
     problems = trivy_gate_problems(load_workflow(text))
     expected = f"scan: {_TRIVY_FIXTURE_USES}: case-only duplicate input Severity"
     assert expected in problems, f"The gate must report {expected!r}. It reported {problems}."
-    mixed = _reviewed_trivy_step("").replace("severity: CRITICAL", "Severity: CRITICAL")
+    mixed = _reviewed_trivy_step("").replace(
+        f"severity: {TRIVY_SEVERITY}", f"Severity: {TRIVY_SEVERITY}"
+    )
     problems = trivy_gate_problems(load_workflow(mixed))
     assert problems == [], (
         f"One Severity input must not be a problem. The gate reported {problems}."
@@ -744,35 +826,214 @@ def test_trivy_config_files_are_rejected():
     assert trivy_config_file_problems(discover_trivy_config_files()) == []
 
 
-def test_ignore_file_problems_reject_extra_entries_and_files():
-    reviewed = "# note\n" + "".join(f"{cve} {options}\n" for cve, options in ALLOWED_IGNORED_CVES)
-    assert ignore_file_problems({".trivyignore": reviewed}) == []
-    for entry in ("CVE-2023-45853\n", "CVE-2023-45853 exp:2099-01-01\n"):
-        problems = ignore_file_problems({".trivyignore": "# note\n" + entry})
-        assert problems == ["ignore entries"], (
-            f"The entry {entry!r} must not pass without a review."
+_REVIEWED_IGNORE = """\
+# note
+vulnerabilities:
+  - id: CVE-2023-45853
+    purls:
+      - pkg:deb/debian/zlib1g
+    expired_at: 2027-01-18
+    statement: zlib1g does not contain minizip.
+"""
+_EXTRA_ENTRY = "  - id: {}\n    purls: ['{}']\n    expired_at: 2026-12-31\n    statement: x\n"
+
+
+def _reviewed_ignore_with(old: str, new: str) -> dict[str, str]:
+    assert _REVIEWED_IGNORE.count(old) == 1, f"The fixture must contain {old!r} one time."
+    return {IGNORE_FILE: _REVIEWED_IGNORE.replace(old, new)}
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        pytest.param({IGNORE_FILE: _REVIEWED_IGNORE}, [], id="reviewed"),
+        pytest.param(
+            _reviewed_ignore_with("    purls:\n      - pkg:deb/debian/zlib1g\n", ""),
+            ["ignore entry keys ['expired_at', 'id', 'statement']", "ignore entries"],
+            id="no-purls",
+        ),
+        pytest.param(
+            _reviewed_ignore_with("debian/zlib1g", "debian/minizip"),
+            ["ignore entries"],
+            id="other-purl",
+        ),
+        pytest.param(
+            _reviewed_ignore_with("2027-01-18", "2099-01-01"), ["ignore entries"], id="other-expiry"
+        ),
+        pytest.param(
+            _reviewed_ignore_with("    expired_at: 2027-01-18\n", ""),
+            ["ignore entry keys ['id', 'purls', 'statement']", "ignore entries"],
+            id="no-expiry",
+        ),
+        pytest.param(
+            _reviewed_ignore_with("zlib1g does not contain minizip.", "''"),
+            ["ignore entry CVE-2023-45853 has no statement"],
+            id="empty-statement",
+        ),
+        pytest.param(
+            {IGNORE_FILE: _REVIEWED_IGNORE + "    paths: [usr/lib]\n"},
+            ["ignore entry keys ['expired_at', 'id', 'paths', 'purls', 'statement']"],
+            id="extra-key",
+        ),
+        pytest.param(
+            {IGNORE_FILE: _REVIEWED_IGNORE + _EXTRA_ENTRY.format("CVE-2099-0001", "pkg:deb/x/y")},
+            ["ignore entries"],
+            id="extra-cve",
+        ),
+        pytest.param(
+            {
+                IGNORE_FILE: _REVIEWED_IGNORE
+                + _EXTRA_ENTRY.format("CVE-2026-111497", "pkg:deb/debian/libbrotli1")
+            },
+            ["ignore entries"],
+            id="retired-cve",
+        ),
+        pytest.param(
+            {IGNORE_FILE: _REVIEWED_IGNORE + "misconfigurations:\n  - id: AVD-DS-0002\n"},
+            ["ignore file shape"],
+            id="extra-section",
+        ),
+        pytest.param(
+            {IGNORE_FILE: "CVE-2023-45853 exp:2027-01-18\n"}, ["ignore file shape"], id="plain-form"
+        ),
+        pytest.param(
+            {IGNORE_FILE: _REVIEWED_IGNORE, ".trivyignore": "CVE-2023-45853\n"},
+            [f"unexpected ignore files: ['.trivyignore', '{IGNORE_FILE}']"],
+            id="plain-file-kept",
+        ),
+        pytest.param(
+            {IGNORE_FILE: _REVIEWED_IGNORE, "nested/.trivyignore.yaml": _REVIEWED_IGNORE},
+            [f"unexpected ignore files: ['{IGNORE_FILE}', 'nested/.trivyignore.yaml']"],
+            id="nested-file",
+        ),
+    ],
+)
+def test_ignore_file_problems_reject_extra_entries_and_files(files, expected):
+    """The ignore check accepts only the reviewed entry in the one reviewed file."""
+    problems = ignore_file_problems(files)
+    assert problems == expected, f"The ignore check must report {expected}. It reported {problems}."
+
+
+def _real_ignore_entries():
+    return trivyignore_entries((ROOT / IGNORE_FILE).read_text(encoding="utf-8"))
+
+
+def test_trivy_ignore_is_purl_scoped_and_expires():
+    """The real entry names the zlib1g purl and the date 2027-01-18.
+
+    On the `expired_at` date, Trivy reports the CVE again, so the exception expires by itself.
+    """
+    entries = _real_ignore_entries()
+    expected = [("CVE-2023-45853", ("pkg:deb/debian/zlib1g",), datetime.date(2027, 1, 18))]
+    assert entries == expected, f"The {IGNORE_FILE} entries must be {expected}, not {entries}."
+
+
+# An example zlib1g package URL in the Trivy form for Debian 12.
+_ZLIB1G = "pkg:deb/debian/zlib1g@1.2.13.dfsg-1?arch=amd64&distro=debian-12.12&epoch=1"
+_MINIZIP = "pkg:deb/debian/minizip@1.1-8%2Bb1?arch=amd64&distro=debian-12.12"
+
+
+def test_trivy_ignore_hides_the_reviewed_zlib1g_finding():
+    """The real entry must hide CVE-2023-45853 in the Debian zlib1g package."""
+    hidden = trivy_ignores(_real_ignore_entries(), "CVE-2023-45853", _ZLIB1G)
+    assert hidden, f"The {IGNORE_FILE} entry must hide CVE-2023-45853 in {_ZLIB1G}."
+
+
+@pytest.mark.parametrize(
+    ("cve", "purl"),
+    [
+        pytest.param("CVE-2023-45853", _MINIZIP, id="minizip"),
+        pytest.param(
+            "CVE-2023-45853",
+            "pkg:deb/debian/libminizip1@1.1-8%2Bb1?arch=amd64&distro=debian-12.12",
+            id="libminizip1",
+        ),
+        pytest.param(
+            "CVE-2023-45853", _ZLIB1G.replace("/zlib1g@", "/zlib1g-dev@"), id="zlib1g-dev"
+        ),
+        pytest.param(
+            "CVE-2023-45853", _ZLIB1G.replace("/debian/", "/ubuntu/"), id="other-namespace"
+        ),
+        pytest.param("CVE-2023-45853", "pkg:cargo/libz-sys@1.1.20", id="other-type"),
+        pytest.param("CVE-2099-0001", _ZLIB1G, id="other-cve"),
+    ],
+)
+def test_trivy_ignore_keeps_findings_outside_the_scope_visible(cve, purl):
+    """A finding outside the reviewed package scope must remain visible in the scan."""
+    hidden = trivy_ignores(_real_ignore_entries(), cve, purl)
+    assert not hidden, f"The {IGNORE_FILE} entry must not hide {cve} in {purl}."
+
+
+@pytest.mark.parametrize(
+    ("purls", "purl", "hidden"),
+    [
+        pytest.param((), _MINIZIP, True, id="no-purls-hide-each-package"),
+        pytest.param(("pkg:deb/debian/zlib1g@1.2.11",), _ZLIB1G, False, id="other-version"),
+        pytest.param(("pkg:deb/debian/zlib1g@1.2.13.dfsg-1",), _ZLIB1G, True, id="same-version"),
+        pytest.param(("pkg:deb/debian/zlib1g?arch=arm64",), _ZLIB1G, False, id="other-arch"),
+        pytest.param(("pkg:deb/debian/zlib1g?arch=amd64",), _ZLIB1G, True, id="same-arch"),
+    ],
+)
+def test_trivy_ignore_model_follows_the_trivy_purl_rules(purls, purl, hidden):
+    """The scope model must give the Trivy result for each purl rule."""
+    result = trivy_ignores([("CVE-2023-45853", purls, None)], "CVE-2023-45853", purl)
+    assert result is hidden, f"For the entry purls {purls}, the model must give {hidden} for {purl}."
+
+
+_SEVERITY_GATE_WORKFLOWS = ("docker.yml", "docker-scan.yml")
+
+
+def _sarif_gate_inputs(workflow: str) -> list[dict]:
+    doc = load_workflow((WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    gates = []
+    for step in iter_use_steps(doc):
+        if _is_trivy_step(step):
+            inputs, _ = _step_inputs(workflow, step)
+            if _is_sarif_gate(inputs):
+                gates.append(inputs)
+    return gates
+
+
+@pytest.mark.parametrize("workflow", _SEVERITY_GATE_WORKFLOWS)
+def test_scan_fails_for_a_high_finding(workflow):
+    """The scan must fail for a HIGH finding."""
+    gates = _sarif_gate_inputs(workflow)
+    assert gates, f"{workflow} must have a SARIF gate."
+    for inputs in gates:
+        severity = inputs.get("severity")
+        assert scan_fails_for(inputs, "HIGH"), (
+            f"The {workflow} scan must fail for a HIGH finding. The severity is {severity!r}."
         )
-    extra = ignore_file_problems({".trivyignore": reviewed + "CVE-2099-0001\n"})
-    assert extra == ["ignore entries"]
-    retired = ignore_file_problems(
-        {".trivyignore": reviewed + "CVE-2026-111497 exp:2026-12-31\n"}
-    )
-    assert retired == ["ignore entries"]
-    other = ignore_file_problems(
-        {
-            ".trivyignore": reviewed,
-            "nested/extra.trivyignore": reviewed,
-        }
-    )
-    assert any("unexpected ignore files" in item for item in other)
 
 
-def test_trivyignore_entry_expires_on_the_review_date():
-    """Trivy stops ignoring the CVE on its `exp:` date, so the exception expires by itself."""
-    text = (ROOT / ".trivyignore").read_text(encoding="utf-8")
-    entries = trivyignore_entries(text)
-    expected = [("CVE-2023-45853", "exp:2027-01-18")]
-    assert entries == expected, f"The .trivyignore entries must be {expected}, not {entries}."
+@pytest.mark.parametrize("workflow", _SEVERITY_GATE_WORKFLOWS)
+def test_scan_fails_for_a_critical_finding(workflow):
+    """The scan must fail for a CRITICAL finding."""
+    gates = _sarif_gate_inputs(workflow)
+    assert gates, f"{workflow} must have a SARIF gate."
+    for inputs in gates:
+        severity = inputs.get("severity")
+        assert scan_fails_for(inputs, "CRITICAL"), (
+            f"The {workflow} scan must fail for a CRITICAL finding. The severity is {severity!r}."
+        )
+
+
+@pytest.mark.parametrize(
+    ("severity", "exit_code", "finding", "fails"),
+    [
+        pytest.param("HIGH,CRITICAL", "1", "HIGH", True, id="high-gated"),
+        pytest.param("HIGH,CRITICAL", "1", "CRITICAL", True, id="critical-gated"),
+        pytest.param("HIGH,CRITICAL", "1", "MEDIUM", False, id="medium-not-gated"),
+        pytest.param("CRITICAL", "1", "HIGH", False, id="critical-only"),
+        pytest.param("HIGH", "1", "CRITICAL", False, id="high-only"),
+        pytest.param("HIGH,CRITICAL", "0", "CRITICAL", False, id="exit-code-0"),
+    ],
+)
+def test_scan_failure_model_reads_severity_and_exit_code(severity, exit_code, finding, fails):
+    """The failure model must give the Trivy result for each severity and exit code."""
+    inputs = {"severity": severity, "exit-code": exit_code}
+    result = scan_fails_for(inputs, finding)
+    assert result is fails, f"For {inputs}, a {finding} finding must give {fails}."
 
 
 @pytest.mark.parametrize(
@@ -823,7 +1084,7 @@ _PINNED = f"third/party@{'a' * 40}"
         ),
         pytest.param(
             {_LOCAL_REF: "    - uses: actions/cache@v4\n"},
-            [],
+            [f"{_LOCAL_REF}: actions/cache@v4"],
             id="first-party",
         ),
         pytest.param({}, [f"{_LOCAL_REF}: action.yml is missing"], id="missing"),
@@ -854,18 +1115,33 @@ def test_pin_check_reads_action_yaml(tmp_path):
     assert problems == expected, f"The pin check must report {expected}. It reported {problems}."
 
 
-def test_every_third_party_action_is_sha_pinned():
+def _workflow_uses() -> list[tuple[Path, str, str]]:
+    return [
+        (path, text, normalize_uses(step["uses"]))
+        for path, text in _workflow_texts()
+        for step in iter_use_steps(load_workflow(text))
+    ]
+
+
+def test_every_action_is_sha_pinned():
+    """Each `uses:` must have a commit SHA and a version comment.
+
+    First-party actions are not exempt. Only the refs in TAG_PINNED_REFS keep a tag.
+    """
     failures: list[str] = []
-    for path, text in _workflow_texts():
-        for step in iter_use_steps(load_workflow(text)):
-            uses = normalize_uses(step["uses"])
-            if uses.startswith("./"):
-                failures.extend(local_action_problems(ROOT, uses))
-                continue
+    for path, text, uses in _workflow_uses():
+        if uses.startswith("./"):
+            failures.extend(local_action_problems(ROOT, uses))
+        elif uses not in TAG_PINNED_REFS:
             failures.extend(_pin_problem(path.name, text, uses))
-    assert failures == [], f"{len(failures)} unpinned third-party actions:\n" + "\n".join(
-        failures
-    )
+    assert failures == [], f"{len(failures)} actions have no SHA pin:\n" + "\n".join(failures)
+
+
+def test_tag_pinned_refs_only_get_shorter():
+    """Each ref in TAG_PINNED_REFS must still occur in a workflow."""
+    used = {uses for _path, _text, uses in _workflow_uses()}
+    stale = sorted(TAG_PINNED_REFS - used)
+    assert stale == [], f"No workflow uses these refs. Remove them from TAG_PINNED_REFS: {stale}"
 
 
 def test_every_workflow_has_top_level_permissions():
@@ -912,41 +1188,37 @@ def test_rust_toolchain_and_install_action_keep_their_inputs():
     assert failures == [], "\n".join(failures)
 
 
-def test_checkouts_do_not_persist_credentials_except_claude():
-    """Each checkout must set `persist-credentials: false`. claude.yml is the one exception.
+def test_checkouts_do_not_persist_credentials():
+    """Each checkout must set `persist-credentials: false`. No workflow is an exception.
 
-    Decision 4 (#868) removes the exception only after a review confirms that the
-    pinned `anthropics/claude-code-action` does not use the checkout credential.
-    The action runs git commands on the checkout. The W4-T1 change could not read
-    the action source, so the exception stays. The claude.yml job must not let a
-    user without write access start the action.
+    The pinned `anthropics/claude-code-action` gets its own GitHub token through
+    OIDC. It does not use the checkout credential. The claude.yml job must not let
+    a user without write access start the action.
     """
     for path, text in _workflow_texts():
-        doc = load_workflow(text)
         steps = [
             step
-            for step in iter_use_steps(doc)
+            for step in iter_use_steps(load_workflow(text))
             if action_name(step.get("uses")) == "actions/checkout"
         ]
-        if path.name == "claude.yml":
-            for step in steps:
-                assert "persist-credentials" not in (step.get("with") or {})
-            claude_steps = [
-                step
-                for step in iter_use_steps(doc)
-                if action_name(step.get("uses")) == "anthropics/claude-code-action"
-            ]
-            assert claude_steps, "claude.yml must run anthropics/claude-code-action."
-            for step in claude_steps:
-                keys = {str(key).lower() for key in step.get("with") or {}}
-                assert "allowed_non_write_users" not in keys, (
-                    "claude.yml must not set allowed_non_write_users."
-                )
-            continue
         assert steps, path.name
         for step in steps:
             with_ = step.get("with") or {}
-            assert with_.get("persist-credentials") is False, path.name
+            assert with_.get("persist-credentials") is False, (
+                f"Each checkout in {path.name} must set persist-credentials: false."
+            )
+    claude = load_workflow((WORKFLOWS / "claude.yml").read_text(encoding="utf-8"))
+    claude_steps = [
+        step
+        for step in iter_use_steps(claude)
+        if action_name(step.get("uses")) == "anthropics/claude-code-action"
+    ]
+    assert claude_steps, "claude.yml must run anthropics/claude-code-action."
+    for step in claude_steps:
+        keys = {str(key).lower() for key in step.get("with") or {}}
+        assert "allowed_non_write_users" not in keys, (
+            "claude.yml must not set allowed_non_write_users."
+        )
 
 
 def test_trivy_uses_line_is_identical_and_gate_holds():
@@ -983,8 +1255,11 @@ def test_trivy_uses_line_is_identical_and_gate_holds():
     ]
     assert sarif_uploads, "docker.yml must upload the SARIF report."
     for uses in sarif_uploads:
-        major = int(uses.rsplit("@v", 1)[-1].split(".")[0])
-        assert major >= 4, f"docker.yml must use upload-sarif v4 or later, not {uses}."
+        assert uses_is_sha_pinned(uses), f"docker.yml must pin upload-sarif to a SHA, not {uses}."
+        version = _pinned_version(docker_text, uses)
+        assert version is not None and version[0] >= 4, (
+            f"The upload-sarif SHA must have a v4 or later version comment, not {version}."
+        )
 
     assert scan["jobs"]["scan"]["name"] == "pr-scan (${{ matrix.target }})"
     scan_uses = [normalize_uses(step["uses"]) for step in iter_use_steps(scan)]
@@ -1038,7 +1313,7 @@ def test_trivy_summary_fence_cannot_be_closed_by_the_report(tmp_path, report, fe
     summary = tmp_path / "summary.md"
     env = {"PATH": os.environ["PATH"], "TARGET": "rvc", "GITHUB_STEP_SUMMARY": str(summary)}
     subprocess.run(["bash", "-e", str(script)], cwd=tmp_path, env=env, check=True, timeout=60)
-    expected = f"### Trivy CRITICAL findings (rvc)\n\n{fence}\n{report}{fence}\n"
+    expected = f"### Trivy HIGH and CRITICAL findings (rvc)\n\n{fence}\n{report}{fence}\n"
     actual = summary.read_text(encoding="utf-8")
     assert actual == expected, f"The summary must be {expected!r}, not {actual!r}."
 
@@ -1059,8 +1334,9 @@ def test_qemu_binfmt_is_digest_pinned():
 
 def test_reviewed_trivyignore_is_the_only_ignore_file():
     files = discover_ignore_files()
-    assert ignore_file_problems(files) == []
-    text = files[".trivyignore"]
+    problems = ignore_file_problems(files)
+    assert problems == [], f"The ignore files must have no problems. They have {problems}."
+    text = files[IGNORE_FILE]
     assert "https://security-tracker.debian.org/tracker/CVE-2023-45853" in text
     assert "2027-01-18" in text
     assert "minizip" in text

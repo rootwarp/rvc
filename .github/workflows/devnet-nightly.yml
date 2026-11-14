@@ -43,7 +43,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           docker image prune -af
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -71,7 +71,7 @@ jobs:
       # upload-artifact@v4 strips common leading directories, so the
       # artifact contains the file "rvc" (not target/release/rvc).
       - name: Upload rvc
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rvc-bin
           path: target/release/rvc
@@ -89,7 +89,7 @@ jobs:
       PROFILE: ${{ github.event.inputs.profile || 'safe' }}
       EPOCHS: ${{ github.event.inputs.epochs || '8' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -114,7 +114,7 @@ jobs:
 
       - name: Upload run dir
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: devnet-run-${{ github.run_id }}
           path: scripts/devnet/runs/${{ github.run_id }}

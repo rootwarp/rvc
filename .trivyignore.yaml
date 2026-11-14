@@ -1,0 +1,13 @@
+# CVE-2023-45853 is in minizip. The Debian zlib1g binary package does not contain minizip.
+# Debian marks the bug will_not_fix: https://security-tracker.debian.org/tracker/CVE-2023-45853
+# The purl limits this exception to the Debian zlib1g package. The CVE in a different
+# package remains visible. On the expired_at date, Trivy reports the CVE again, and the
+# scan fails until a new review changes the date.
+vulnerabilities:
+  - id: CVE-2023-45853
+    purls:
+      - pkg:deb/debian/zlib1g
+    expired_at: 2027-01-18
+    statement: >-
+      CVE-2023-45853 is in minizip. The Debian zlib1g binary package does not contain
+      minizip. Debian marks the bug will_not_fix.

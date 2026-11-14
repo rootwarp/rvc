@@ -33,7 +33,7 @@ jobs:
       RVC_SPEC_VECTORS_REQUIRED: "1"
       PRESET: mainnet
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -43,7 +43,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -61,7 +61,7 @@ jobs:
       # No restore-keys: a lock change must miss, not restore a stale archive.
       - name: Cache spec-vector archives
         id: spec-vector-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
           key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
