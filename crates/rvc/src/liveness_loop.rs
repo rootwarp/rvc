@@ -2704,9 +2704,12 @@ mod tests {
         assert!(!m.is_signing_enabled(&pk));
     }
 
-    /// While no beacon node is admitted, each tick has two failed queries.
-    /// The loop logs "liveness query failed" at warn one time in each epoch.
-    /// The other failures in that epoch log the same text at debug.
+    /// When the pool admits no beacon node:
+    /// - Each tick makes two queries that fail.
+    /// - Three ticks in epoch 11 produce one warning and five debug messages.
+    /// - One tick in epoch 12 adds one warning and one debug message.
+    /// - Each failure event has its level, its queried epoch and the error.
+    /// - The key stays Pending.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn liveness_query_failure_warns_once_per_epoch_while_halted() {
@@ -2742,10 +2745,269 @@ mod tests {
         assert_eq!(queries, 8, "The tick in epoch 12 must send two queries.");
         assert_eq!(count(" WARN "), 2, "The first failure in epoch 12 must log a second warning.");
         assert_eq!(count("DEBUG "), 6, "The second failure in epoch 12 must log at debug.");
+
+        let events = failure_events_in(|f| logs_assert(f));
+        // One row for each tick: the previous-epoch query, then the current-epoch query.
+        let expected = [
+            (halted_event("WARN", 10), halted_event("DEBUG", 11)),
+            (halted_event("DEBUG", 10), halted_event("DEBUG", 11)),
+            (halted_event("DEBUG", 10), halted_event("DEBUG", 11)),
+            (halted_event("WARN", 11), halted_event("DEBUG", 12)),
+        ];
+        assert_eq!(events.len(), 2 * expected.len(), "Each tick must log two failure events.");
+        for (tick, (previous, current)) in expected.iter().enumerate() {
+            assert_eq!(
+                &events[2 * tick],
+                previous,
+                "The previous-epoch failure in tick {} must have this level, epoch and error.",
+                tick + 1
+            );
+            assert_eq!(
+                &events[2 * tick + 1],
+                current,
+                "The current-epoch failure in tick {} must have this level, epoch and error.",
+                tick + 1
+            );
+        }
         assert_eq!(
             m.status(&pk),
             ForwardWindowStatus::Pending,
             "A failed query must not decrement."
+        );
+    }
+
+    /// The message of each failed liveness query event.
+    const QUERY_FAILED: &str = "liveness query failed; will retry next slot (fail-closed)";
+
+    /// The message of each per-key unobserved warning.
+    const UNOBSERVED: &str = "doppelganger liveness unobserved";
+
+    /// Return one entry for each failed-query line, in log order.
+    ///
+    /// An entry is the level and then the fields, for example
+    /// "WARN epoch=10 error=no admitted beacon node; duties halted".
+    fn query_failure_events(lines: &[&str]) -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let (head, fields) = line.split_once(QUERY_FAILED)?;
+                let level = head
+                    .split_whitespace()
+                    .find(|word| ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].contains(word))
+                    .unwrap_or("NO-LEVEL");
+                Some(format!("{level}{fields}"))
+            })
+            .collect()
+    }
+
+    /// Read the failed-query entries of a `traced_test`.
+    ///
+    /// `logs_assert` must give its argument to the `logs_assert` of that test.
+    fn failure_events_in(
+        logs_assert: impl Fn(&dyn Fn(&[&str]) -> Result<(), String>),
+    ) -> Vec<String> {
+        let found = RefCell::new(Vec::new());
+        logs_assert(&|lines| {
+            *found.borrow_mut() = query_failure_events(lines);
+            Ok(())
+        });
+        found.into_inner()
+    }
+
+    /// The entry of [`query_failure_events`] for a query of `epoch` that fails
+    /// with `NoAdmittedNode` and logs at `level`.
+    fn halted_event(level: &str, epoch: Epoch) -> String {
+        format!("{level} epoch={epoch} error={}", BeaconError::NoAdmittedNode)
+    }
+
+    /// One reply of [`scripted_liveness`].
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// The query fails with `NoAdmittedNode`.
+        Halted,
+        /// The query answers not live for each index.
+        NotLive,
+    }
+
+    /// A liveness mock that uses the next reply in `replies` for each query.
+    ///
+    /// After the last reply in the script, each query answers not live.
+    fn scripted_liveness(replies: &[Reply]) -> Arc<MockBeaconNodeClient> {
+        let replies: std::collections::VecDeque<Reply> = replies.iter().copied().collect();
+        let replies = parking_lot::Mutex::new(replies);
+        Arc::new(MockBeaconNodeClient::new().with_post_validator_liveness(move |_, indices| {
+            match replies.lock().pop_front() {
+                Some(Reply::Halted) => Err(BeaconError::NoAdmittedNode),
+                Some(Reply::NotLive) | None => Ok(ValidatorLivenessResponse {
+                    data: indices
+                        .into_iter()
+                        .map(|index| ValidatorLiveness { index, is_live: false })
+                        .collect(),
+                }),
+            }
+        }))
+    }
+
+    /// When the pool admits no beacon node, each failed query still gives an answer:
+    /// - Three calls of `observe_adjacent` in epoch 11 each give two answers with `samples: None`.
+    /// - Five of these six failures log at debug, after the first warning.
+    /// - A tick in epoch 11 after these calls logs its two failures at debug.
+    /// - That tick gives the indexed key one unobserved warning for epoch 10 and one for epoch 11.
+    /// - After the failures, the key is Safe only after three closed epochs that are not live.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn liveness_query_failures_keep_none_answers_and_the_full_window() {
+        let m = machine();
+        let pk = new_pk();
+        let start = 10u64;
+        m.register(&pk, start);
+        let prefix = hex::encode(pk.to_bytes());
+        let prefix = &prefix[..10];
+        let bn = scripted_liveness(&[Reply::Halted; 8]);
+        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&bn) as Arc<dyn LivenessApi>, "7", &pk);
+        let unobserved = |epoch: Epoch| {
+            let field = format!(" epoch={epoch}");
+            let hits = std::cell::Cell::new(0);
+            logs_assert(|lines| {
+                hits.set(
+                    lines
+                        .iter()
+                        .filter(|l| l.contains(UNOBSERVED) && l.contains(prefix))
+                        .filter(|l| l.ends_with(&field))
+                        .count(),
+                );
+                Ok(())
+            });
+            hits.get()
+        };
+
+        for call in 1..=3 {
+            let observation = loop_.observe_adjacent(start + 1).await;
+            let answers: Vec<(Epoch, Option<usize>)> = observation
+                .answers
+                .iter()
+                .map(|answer| (answer.epoch, answer.samples.as_ref().map(Vec::len)))
+                .collect();
+            assert_eq!(
+                answers,
+                vec![(start, None), (start + 1, None)],
+                "Call {call} in epoch 11 must give an answer with no samples for each failed query."
+            );
+        }
+        let mut expected = vec![
+            halted_event("WARN", start),
+            halted_event("DEBUG", start + 1),
+            halted_event("DEBUG", start),
+            halted_event("DEBUG", start + 1),
+            halted_event("DEBUG", start),
+            halted_event("DEBUG", start + 1),
+        ];
+        assert_eq!(
+            failure_events_in(|f| logs_assert(f)),
+            expected,
+            "Five of the six failures in epoch 11 must log at debug after the first warning."
+        );
+
+        loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+        assert_eq!(
+            bn.post_validator_liveness_calls().len(),
+            8,
+            "The three calls and the tick in epoch 11 must send eight queries."
+        );
+        expected.extend([halted_event("DEBUG", start), halted_event("DEBUG", start + 1)]);
+        assert_eq!(
+            failure_events_in(|f| logs_assert(f)),
+            expected,
+            "The tick in epoch 11 must log its two failures at debug."
+        );
+        assert_eq!(
+            unobserved(start),
+            1,
+            "A debug failure in epoch 11 must give one unobserved warning for epoch 10."
+        );
+        assert_eq!(
+            unobserved(start + 1),
+            1,
+            "A debug failure in epoch 11 must give one unobserved warning for epoch 11."
+        );
+        assert_eq!(
+            m.status(&pk),
+            ForwardWindowStatus::Pending,
+            "The failed queries must not decrement."
+        );
+
+        let closed = DEFAULT_MONITORING_EPOCHS + 1;
+        for counted in 1..closed {
+            loop_.drive_once_for_test(start + 1 + counted, CLOSED_EPOCH_SLOT).await;
+            assert_eq!(
+                m.status(&pk),
+                ForwardWindowStatus::Pending,
+                "The key must stay Pending after {counted} closed epochs that are not live."
+            );
+        }
+        loop_.drive_once_for_test(start + 1 + closed, CLOSED_EPOCH_SLOT).await;
+        assert_eq!(
+            m.status(&pk),
+            ForwardWindowStatus::Safe,
+            "The key must be Safe after three closed epochs that are not live."
+        );
+    }
+
+    /// A query that succeeds does not move the warning marker.
+    ///
+    /// Each tick uses slot 0, so a not-live answer does not decrement:
+    /// - Tick 1 in epoch 11 has a success and then the first failure. That failure logs at warn.
+    /// - Tick 2 in epoch 11 has a success and then a failure. That failure logs at debug.
+    /// - Tick 3 in epoch 12 has two failures. The first logs at warn. The second logs at debug.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn liveness_success_does_not_move_the_warning_marker() {
+        use Reply::{Halted, NotLive};
+        let m = machine();
+        let pk = new_pk();
+        m.register(&pk, 10);
+        let bn = scripted_liveness(&[NotLive, Halted, NotLive, Halted, Halted, Halted]);
+        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&bn) as Arc<dyn LivenessApi>, "7", &pk);
+        let counts = || {
+            let events = failure_events_in(|f| logs_assert(f));
+            let warns = events.iter().filter(|e| e.starts_with("WARN ")).count();
+            let debugs = events.iter().filter(|e| e.starts_with("DEBUG ")).count();
+            (warns, debugs)
+        };
+
+        loop_.drive_once_for_test(11, 0).await;
+        assert_eq!(
+            counts(),
+            (1, 0),
+            "A success before the first failure in epoch 11 must not stop its warning."
+        );
+        loop_.drive_once_for_test(11, 0).await;
+        assert_eq!(
+            counts(),
+            (1, 1),
+            "A failure after a success in epoch 11 must log at debug, not at warn."
+        );
+        loop_.drive_once_for_test(12, 0).await;
+        assert_eq!(counts(), (2, 2), "Epoch 12 must add one warning and one debug message.");
+        assert_eq!(
+            failure_events_in(|f| logs_assert(f)),
+            vec![
+                halted_event("WARN", 11),
+                halted_event("DEBUG", 11),
+                halted_event("WARN", 11),
+                halted_event("DEBUG", 12),
+            ],
+            "Only the first failure in each tick epoch must log at warn."
+        );
+        assert_eq!(
+            bn.post_validator_liveness_calls().len(),
+            6,
+            "The three ticks must send six queries."
+        );
+        assert_eq!(
+            m.status(&pk),
+            ForwardWindowStatus::Pending,
+            "A not-live answer at slot 0 must not decrement."
         );
     }
 
