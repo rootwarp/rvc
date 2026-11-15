@@ -651,6 +651,17 @@ thread_local! {
     static BEFORE_SECOND_RECORD_READ: RefCell<Option<RecordPathHook>> =
         const { RefCell::new(None) };
     static RECORD_LINK_FAILURE: Cell<Option<io::ErrorKind>> = const { Cell::new(None) };
+    static OWNER_UID_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Make the owner check compare the file owner with `uid` on this thread.
+/// The check must use `uid` instead of the effective user ID.
+///
+/// The guard removes the override when it drops.
+#[cfg(test)]
+pub(crate) fn arm_owner_uid_override(uid: u32) -> OwnerUidGuard {
+    OWNER_UID_OVERRIDE.with(|slot| slot.set(Some(uid)));
+    OwnerUidGuard
 }
 
 /// Run `hook` one time on this thread, before the exclusive open of the temp
@@ -914,6 +925,17 @@ pub(crate) struct RecordLinkFailGuard;
 impl Drop for RecordLinkFailGuard {
     fn drop(&mut self) {
         RECORD_LINK_FAILURE.with(|failure| failure.set(None));
+    }
+}
+
+/// The guard removes the owner uid override when it drops.
+#[cfg(test)]
+pub(crate) struct OwnerUidGuard;
+
+#[cfg(test)]
+impl Drop for OwnerUidGuard {
+    fn drop(&mut self) {
+        OWNER_UID_OVERRIDE.with(|slot| slot.set(None));
     }
 }
 
@@ -1404,7 +1426,9 @@ mod tests {
     }
 
     /// A hook writes a full record at the final name after the fsync of the
-    /// new record and before the link. Each row requires these results:
+    /// new record and before the link. The hook sets mode `0o600` on that
+    /// record, because the boot refuses a reused record with group or other
+    /// mode bits. Each row requires these results:
     ///
     /// - The hook runs.
     /// - `preallocate_detection_record` returns the error kind of the row, or `Ok`.
@@ -1429,6 +1453,12 @@ mod tests {
             let hook_ran = std::rc::Rc::clone(&ran);
             let guard = arm_before_record_link(move || {
                 fs::write(&final_path, bytes).expect("The hook must write the record.");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&final_path, fs::Permissions::from_mode(0o600))
+                        .expect("The hook must set mode 0o600 on the record.");
+                }
                 hook_ran.set(true);
             });
             let result = preallocate_detection_record(dir.path());
@@ -1873,6 +1903,109 @@ mod tests {
             fs::read(&record).ok(),
             Some(bytes),
             "The record opens must not change the bytes of the record."
+        );
+    }
+
+    /// The first call is the record step of a boot. The temp-file fsync
+    /// passes, and the directory fsync after the link fails. The second call
+    /// is the record step of the next boot. The test requires these results:
+    ///
+    /// - The first call returns an error, and the `Clear` record is at the
+    ///   final name.
+    /// - The second call returns `Ok`.
+    /// - The second call fsyncs the record and the directory.
+    #[test]
+    fn failed_dir_fsync_after_create_is_resynced_on_the_next_boot() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let guard = arm_fsync_failures_after(1, 1);
+        let first = preallocate_detection_record(dir.path());
+        drop(guard);
+        assert!(
+            first.is_err(),
+            "The first call must fail when the directory fsync fails. The result is {first:?}."
+        );
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "The first call must leave the Clear record at the final name."
+        );
+        let before = fsync_calls();
+        let second = preallocate_detection_record(dir.path());
+        let fsyncs = fsync_calls() - before;
+        assert!(second.is_ok(), "The next boot must accept the record. The result is {second:?}.");
+        assert!(
+            fsyncs >= 2,
+            "The next boot must fsync the record and the directory. The fsync count is {fsyncs}."
+        );
+    }
+
+    /// The record is `Clear`, and the owner check expects a uid that is not
+    /// the uid of the record owner. The test requires these results:
+    ///
+    /// - `preallocate_detection_record` returns `InvalidData`.
+    /// - The error names the uid of the record owner.
+    #[cfg(unix)]
+    #[test]
+    fn reused_clear_record_owned_by_another_uid_is_rejected() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        preallocate_detection_record(dir.path()).expect("The test must preallocate the record.");
+        let uid = fs::metadata(record_path(dir.path()))
+            .expect("The test must read the record metadata.")
+            .uid();
+        let guard = arm_owner_uid_override(uid + 1);
+        let result = preallocate_detection_record(dir.path());
+        drop(guard);
+        assert_eq!(
+            result.as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData),
+            "A record of another uid must give InvalidData. The result is {result:?}."
+        );
+        let text = result.err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(
+            text.contains(&format!("uid {uid}")),
+            "The error must name the uid {uid} of the record owner. The error is: {text}"
+        );
+    }
+
+    /// The record is a `not-detected` header with `epoch=7` and
+    /// `unix_secs=9`. It has mode `0o600`, and the test user owns it. The
+    /// test requires these results:
+    ///
+    /// - `preallocate_detection_record` returns `Ok`.
+    /// - The bytes of the record do not change.
+    /// - The inode of the record does not change.
+    #[cfg(unix)]
+    #[test]
+    fn reused_clear_record_with_mode_0600_is_accepted_and_unchanged() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let path = record_path(dir.path());
+        let bytes =
+            padded_record(b"version=1\nstate=not-detected\nepoch=7\nunix_secs=9\n", RECORD_LEN);
+        fs::write(&path, &bytes).expect("The test must write the record.");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("The test must set mode 0o600 on the record.");
+        let inode = fs::metadata(&path).expect("The test must read the record metadata.").ino();
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "The test record must be a Clear record."
+        );
+        let result = preallocate_detection_record(dir.path());
+        assert!(
+            result.is_ok(),
+            "The check must accept a Clear record with mode 0o600. The result is {result:?}."
+        );
+        assert_eq!(
+            fs::read(&path).ok(),
+            Some(bytes),
+            "The check must not change the bytes of the record."
+        );
+        assert_eq!(
+            fs::metadata(&path).ok().map(|meta| meta.ino()),
+            Some(inode),
+            "The check must not replace the record file."
         );
     }
 }

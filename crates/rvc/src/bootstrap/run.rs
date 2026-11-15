@@ -1837,6 +1837,44 @@ mod tests {
         }
     }
 
+    /// The keystore holds a `Clear` record with mode `0o644`. The test
+    /// requires these results:
+    ///
+    /// - The boot with detection on exits 1.
+    /// - The error text names the detection record and the mode `0o644`.
+    /// - The boot does not change the mode of the record.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_a_reused_record_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        crate::detection_marker::preallocate_detection_record(dir.path())
+            .expect("The test must preallocate the record.");
+        let path = crate::detection_marker::record_path(dir.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("The test must set mode 0o644 on the record.");
+        let err = boot_with_detection_on(dir.path()).await;
+        assert_eq!(err.exit_code(), 1, "The boot must exit 1. The error is: {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("detection record"),
+            "The boot error must name the detection record. The error is: {text}"
+        );
+        assert!(
+            text.contains("mode 0o644"),
+            "The boot error must name the mode 0o644. The error is: {text}"
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("The test must read the record metadata.")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "The boot must not change the mode of the record. The mode is 0o{mode:o}."
+        );
+    }
+
     /// ARCH-2i: production body of run.rs must not hard-exit the process.
     #[test]
     fn test_run_rs_has_no_process_exit_call() {
