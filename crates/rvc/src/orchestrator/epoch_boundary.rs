@@ -17,12 +17,17 @@
 //! the step, done or not, so the re-checked indices are sent in the same
 //! epoch. `CommitteeSubscriptions` is
 //! `NotReady` until the attester duties of E and E+1 are cached.
-//! `BuilderRegistration` runs only in the boot epoch, the first epoch the
-//! runner ran, and needs no duties. Each step with beacon-node work runs
-//! under its own bound, `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
+//! `BuilderRegistration` runs in every epoch and needs no duties: it re-sends
+//! each builder key's registration and signs only the new or changed ones.
+//! `ProposerPreferences` makes one preferences attempt per epoch. The full
+//! attempt, with its signature calls, runs under `PREFERENCES_STEP_TIMEOUT`,
+//! and the step is `Done` when the attempt returns or reaches that bound.
+//! Each other step with beacon-node work runs under its own bound,
+//! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
 //! CommitteeSubscriptions, `timeouts.preparation` for PrepareProposers and
-//! [`BUILDER_REGISTRATION_TIMEOUT`] for BuilderRegistration: a step that
-//! reaches it is dropped and `Failed`. The first pass of a later epoch logs
+//! the builder service's `registration_step_timeout()` for
+//! BuilderRegistration: a step that reaches it is dropped and `Failed`.
+//! The first pass of a later epoch logs
 //! one warn for the steps the old epoch did not finish, with each one's last
 //! outcome. The epoch summary is logged once per epoch, at the end of the
 //! epoch's first pass. [`EpochBoundaryTask::run`] calls it on its own task
@@ -44,8 +49,9 @@
 //! 4. `PrepareProposers`
 //! 5. `CommitteeSubscriptions` (epoch E, then E+1)
 //! 6. `SyncCommitteeSubscriptions` (reserved, W4-E9b)
-//! 7. `BuilderRegistration` (the boot epoch only; every epoch from W4-E6a)
-//! 8. `ProposerPreferences` (reserved, W4-E6a interim, W4-E6b1)
+//! 7. `BuilderRegistration` (every epoch)
+//! 8. `ProposerPreferences` (interim: one attempt per epoch, bounded by
+//!    `PREFERENCES_STEP_TIMEOUT`, until W4-E6b1)
 //!
 //! # Lock rule
 //!
@@ -83,8 +89,10 @@ use crate::pubkey_index::RegistryFreshness;
 /// Executor task name. The runner's loop span has the same name.
 pub const TASK_NAME: &str = "epoch.boundary.runner";
 
-/// Timeout for builder registration API calls.
-pub(crate) const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// This bound limits one ProposerPreferences attempt, with its signature
+/// calls. The deleted slot-0 builder block had the same 10 s bound. A
+/// stalled signer thus stops the runner for 10 s at most.
+const PREFERENCES_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The wait before the next read of a clock that fails for a reason other
 /// than genesis.
@@ -218,18 +226,20 @@ pub(crate) enum BoundaryStep {
     DutyFetch,
     PrepareProposers,
     CommitteeSubscriptions,
-    /// The boot epoch only.
     BuilderRegistration,
+    /// Interim until W4-E6b1: one broadcast per epoch.
+    ProposerPreferences,
 }
 
 impl BoundaryStep {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::BreakerReset,
         Self::ReorgCheck,
         Self::DutyFetch,
         Self::PrepareProposers,
         Self::CommitteeSubscriptions,
         Self::BuilderRegistration,
+        Self::ProposerPreferences,
     ];
 
     /// Reads E and E+1 duties from the cache, so DutyFetch runs before it.
@@ -265,13 +275,10 @@ pub(crate) struct EpochProgress {
     /// with `prepared_count`. It is `None` with a count when the sample was
     /// `Stale`, because a `Stale` sample does not identify the POST.
     prepared_under: Option<RegistryFreshness>,
-    /// The first epoch the runner ran, epoch 0 for a start before genesis.
-    /// Set once, and kept by each later epoch's progress.
-    boot_epoch: u64,
 }
 
 impl EpochProgress {
-    fn new(epoch: u64, boot_epoch: u64) -> Self {
+    fn new(epoch: u64) -> Self {
         Self {
             epoch,
             done: BTreeSet::new(),
@@ -279,7 +286,6 @@ impl EpochProgress {
             subscribed: BTreeSet::new(),
             prepared_count: None,
             prepared_under: None,
-            boot_epoch,
         }
     }
 
@@ -306,15 +312,12 @@ impl EpochProgress {
     }
 
     /// DutyFetch is never marked done: it is pending while a step that needs
-    /// duties is. BuilderRegistration is pending in the boot epoch only.
+    /// duties is.
     fn is_pending(&self, step: BoundaryStep) -> bool {
         match step {
             BoundaryStep::DutyFetch => BoundaryStep::ALL
                 .into_iter()
                 .any(|step| step.needs_duties() && !self.done.contains(&step)),
-            BoundaryStep::BuilderRegistration => {
-                self.epoch == self.boot_epoch && !self.done.contains(&step)
-            }
             _ => !self.done.contains(&step),
         }
     }
@@ -359,7 +362,7 @@ pub(crate) struct EpochBoundaryRunner {
     preferences: Arc<PreferenceBroadcaster>,
     duty_tracker: Arc<DutyTracker>,
     timeouts: OperationTimeouts,
-    /// The boot epoch's registration; none without a builder service.
+    /// Registers the builder keys; none without a builder service.
     builder_service: Option<Arc<BuilderService>>,
     /// Gloas retired the registration.
     fork_schedule: Arc<ForkSchedule>,
@@ -465,10 +468,8 @@ impl EpochBoundaryRunner {
                     let subscriptions = self.committee_subscriptions(epoch);
                     bounded(epoch, step, self.timeouts.duty_fetch, subscriptions).await
                 }
-                BoundaryStep::BuilderRegistration => {
-                    let registration = self.builder_registration(epoch);
-                    bounded(epoch, step, BUILDER_REGISTRATION_TIMEOUT, registration).await
-                }
+                BoundaryStep::BuilderRegistration => self.builder_registration(epoch).await,
+                BoundaryStep::ProposerPreferences => self.proposer_preferences(epoch).await,
             };
             self.record(epoch, step, outcome);
         }
@@ -501,8 +502,7 @@ impl EpochBoundaryRunner {
         if progress.as_ref().is_some_and(|current| current.epoch >= epoch) {
             return false;
         }
-        let boot_epoch = progress.as_ref().map_or(epoch, |current| current.boot_epoch);
-        let old = progress.replace(EpochProgress::new(epoch, boot_epoch));
+        let old = progress.replace(EpochProgress::new(epoch));
         drop(progress);
         self.selection_proofs.lock().clear();
         if let Some(old) = old {
@@ -711,10 +711,11 @@ impl EpochBoundaryRunner {
         }
     }
 
-    /// Registers through the cached `register_validators`, which signs and
-    /// sends only new or changed registrations: `Done` once it returns `Ok`,
-    /// `Failed` on an error. With no builder service, or from Gloas on,
-    /// `Done` with no call.
+    /// Re-sends every builder key's registration through
+    /// `submit_epoch_registrations`, which signs only new or changed keys,
+    /// under the builder service's `registration_step_timeout()`. `Done` once
+    /// it returns `Ok`, and `Failed` on an error or at the bound. With no
+    /// builder service, or from Gloas on, `Done` with no call.
     async fn builder_registration(&self, epoch: u64) -> StepOutcome {
         let Some(builder) = &self.builder_service else {
             return StepOutcome::Done;
@@ -722,16 +723,38 @@ impl EpochBoundaryRunner {
         if legacy_proposer_ops_retired(ForkName::from_epoch(epoch, &self.fork_schedule)) {
             return StepOutcome::Done;
         }
-        match builder.register_validators(epoch).await {
-            Ok(()) => {
-                info!(epoch, "Boot-epoch builder registration completed");
-                StepOutcome::Done
+        let registration = async {
+            match builder.submit_epoch_registrations(epoch).await {
+                Ok(()) => {
+                    info!(epoch, "Epoch builder registration completed");
+                    StepOutcome::Done
+                }
+                Err(e) => {
+                    warn!(epoch, error = %e, "Epoch builder registration failed");
+                    StepOutcome::Failed
+                }
             }
-            Err(e) => {
-                warn!(epoch, error = %e, "Boot-epoch builder registration failed");
-                StepOutcome::Failed
-            }
+        };
+        let bound = builder.registration_step_timeout();
+        bounded(epoch, BoundaryStep::BuilderRegistration, bound, registration).await
+    }
+
+    /// Interim until W4-E6b1: one preferences broadcast per epoch. The full
+    /// broadcast, with its signature calls, runs under
+    /// `PREFERENCES_STEP_TIMEOUT`. The step is `Done` when the broadcast
+    /// returns or reaches the bound, so it makes one attempt per epoch. The
+    /// broadcast logs its own errors.
+    async fn proposer_preferences(&self, epoch: u64) -> StepOutcome {
+        let broadcast = self.preferences.broadcast_preferences(epoch);
+        if tokio::time::timeout(PREFERENCES_STEP_TIMEOUT, broadcast).await.is_err() {
+            warn!(
+                epoch,
+                step = ?BoundaryStep::ProposerPreferences,
+                timeout = ?PREFERENCES_STEP_TIMEOUT,
+                "Epoch boundary step timed out"
+            );
         }
+        StepOutcome::Done
     }
 }
 
@@ -750,9 +773,8 @@ async fn bounded(
 
 /// Picks local proposals and broadcasts proposer and builder preferences for them.
 ///
-/// One instance is shared by the runner's ReorgCheck and the slot-0 builder
-/// block. They run on different tasks, so two broadcasts can overlap. The
-/// broadcaster holds no mutable state; two overlapping broadcasts may each
+/// One instance is shared by the runner's ReorgCheck and ProposerPreferences
+/// steps. The broadcaster holds no mutable state; two broadcasts may each
 /// sign the same `(pubkey, slot)` once, and a duplicate POST is harmless.
 pub(crate) struct PreferenceBroadcaster {
     builder_service: Option<Arc<BuilderService>>,
@@ -1359,6 +1381,7 @@ mod tests {
             let mock = proposer_duties_then(local_hex, epoch, ROOT_A, then);
             let f = fixture_with(mock, local, with_builder).await;
             f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
+            skip_interim_preferences(&f.runner, epoch);
 
             f.runner.run_pending(epoch * SLOTS_PER_EPOCH).await;
 
@@ -1402,6 +1425,13 @@ mod tests {
                 "seed, ReorgCheck E and E+1, re-broadcast, then subscriptions"
             );
         }
+    }
+
+    /// Marks the ProposerPreferences step of `epoch` done, so that a test
+    /// sees only the broadcasts of ReorgCheck.
+    fn skip_interim_preferences(runner: &EpochBoundaryRunner, epoch: u64) {
+        runner.begin_epoch(epoch);
+        runner.record(epoch, BoundaryStep::ProposerPreferences, StepOutcome::Done);
     }
 
     fn methods_since(mock: &MockBeaconNodeClient, from: usize) -> Vec<MockMethod> {
@@ -2701,12 +2731,20 @@ mod tests {
         })
     }
 
-    /// The step bounds, as source: `duty_fetch` for ReorgCheck and
-    /// CommitteeSubscriptions, `preparation` for PrepareProposers,
-    /// `BUILDER_REGISTRATION_TIMEOUT` for BuilderRegistration, DutyFetch's
-    /// inside the step, and none for BreakerReset (no I/O). PrepareProposers'
-    /// bound has the length of its POST's own `preparation` bound but starts
-    /// earlier: `the_prepare_step_bound_starts_before_the_map_read` sees it.
+    /// The source check requires these bounds:
+    ///
+    /// - ReorgCheck and CommitteeSubscriptions use `duty_fetch`.
+    /// - PrepareProposers uses `preparation`.
+    /// - DutyFetch applies its own bound inside the step.
+    /// - BuilderRegistration uses `registration_step_timeout()` inside the
+    ///   step.
+    /// - ProposerPreferences uses `PREFERENCES_STEP_TIMEOUT` inside the step,
+    ///   for the full broadcast.
+    /// - BreakerReset has no bound, because it has no I/O.
+    ///
+    /// The PrepareProposers bound has the length of the `preparation` bound
+    /// of its POST, but it starts earlier.
+    /// `the_prepare_step_bound_starts_before_the_map_read` checks this.
     #[test]
     fn each_step_with_beacon_node_work_has_its_own_bound() {
         let source = include_str!("epoch_boundary.rs");
@@ -2721,7 +2759,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("pub(crate)fnhas_pending(").next())
             .expect("`run_pending`, then `has_pending`");
-        assert_eq!(run.matches("bounded(").count(), 4, "four steps run under a bound: {run}");
+        assert_eq!(run.matches("bounded(").count(), 3, "Three steps must run under a bound: {run}");
         for arm in [
             "BoundaryStep::BreakerReset=>self.breaker_reset(epoch),",
             "BoundaryStep::ReorgCheck=>{bounded(epoch,step,self.timeouts.duty_fetch,\
@@ -2732,12 +2770,33 @@ mod tests {
             "BoundaryStep::CommitteeSubscriptions=>{letsubscriptions=\
              self.committee_subscriptions(epoch);\
              bounded(epoch,step,self.timeouts.duty_fetch,subscriptions).await}",
-            "BoundaryStep::BuilderRegistration=>{letregistration=\
-             self.builder_registration(epoch);\
-             bounded(epoch,step,BUILDER_REGISTRATION_TIMEOUT,registration).await}",
+            "BoundaryStep::BuilderRegistration=>self.builder_registration(epoch).await,",
+            "BoundaryStep::ProposerPreferences=>self.proposer_preferences(epoch).await,",
         ] {
             assert!(run.contains(arm), "`run_pending` has the arm `{arm}`: {run}");
         }
+        let registration = code
+            .split("asyncfnbuilder_registration(")
+            .nth(1)
+            .and_then(|rest| rest.split("asyncfnproposer_preferences(").next())
+            .expect("`builder_registration`, then `proposer_preferences`");
+        let bound = "letbound=builder.registration_step_timeout();\
+                     bounded(epoch,BoundaryStep::BuilderRegistration,bound,registration).await";
+        assert!(
+            registration.contains(bound),
+            "The registration step must run under the builder service's bound: {registration}"
+        );
+        let preferences = code
+            .split("asyncfnproposer_preferences(")
+            .nth(1)
+            .and_then(|rest| rest.split("asyncfnbounded(").next())
+            .expect("`proposer_preferences`, then `bounded`");
+        let bound = "letbroadcast=self.preferences.broadcast_preferences(epoch);\
+                     iftokio::time::timeout(PREFERENCES_STEP_TIMEOUT,broadcast).await.is_err()";
+        assert!(
+            preferences.contains(bound),
+            "The full preferences broadcast must run under PREFERENCES_STEP_TIMEOUT: {preferences}"
+        );
     }
 
     /// With the default timeouts and no time passing before the POST, the
@@ -2894,8 +2953,8 @@ mod tests {
 
         assert_eq!(
             warns.abandoned(),
-            ["epoch=2 abandoned_steps=[ReorgCheck, PrepareProposers, CommitteeSubscriptions] \
-                 last_outcomes={}"],
+            ["epoch=2 abandoned_steps=[ReorgCheck, PrepareProposers, CommitteeSubscriptions, \
+              BuilderRegistration, ProposerPreferences] last_outcomes={}"],
             "epoch 2's unattempted steps, with no outcome from epoch 1"
         );
     }
@@ -3032,6 +3091,7 @@ mod tests {
             let seed = [epoch, epoch + 1];
             let f = fixture_config(mock, local, true, &seed, short_duty_fetch()).await;
             f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
+            skip_interim_preferences(&f.runner, epoch);
 
             let mut posts = Vec::new();
             for slot in first..first + 3 {
@@ -3073,6 +3133,7 @@ mod tests {
             .with_call_delays(MockMethod::PostPtcDuties, [Duration::ZERO, HOLD]);
         let f = fixture_config(mock, local, true, &[epoch, next], short_duty_fetch()).await;
         f.duty_tracker.fetch_proposer_duties(next).await.expect("seed root A");
+        skip_interim_preferences(&f.runner, epoch);
 
         f.runner.run_pending(next * SLOTS_PER_EPOCH - 1).await;
 
@@ -3802,8 +3863,7 @@ mod tests {
         assert!(futures::poll!(runner.run.as_mut()).is_ready(), "shutdown ends the waiting runner");
     }
 
-    /// The `register_validators` calls: one `builder.register` span each,
-    /// cache hits included.
+    /// The registration calls: one `builder.register` span each.
     fn registrations(spans: &OpenedSpans) -> usize {
         spans.0.lock().iter().filter(|name| **name == "builder.register").count()
     }
@@ -3848,14 +3908,17 @@ mod tests {
         assert_eq!(arrivals(&f.mock, MockMethod::RegisterValidators), 1, "one registration POST");
     }
 
-    /// W4-E4b AC6: the registration step runs in the boot epoch only. Boot
-    /// at epoch 2: it runs there, and in epoch 3 it is not pending and makes
-    /// no call. When epoch 2's first POST is held past
-    /// `BUILDER_REGISTRATION_TIMEOUT`, the step is `Failed` at that bound and
-    /// the slot-65 pass retries it. With no builder service, or at a Gloas
-    /// boot epoch, it is `Done` with no call.
+    /// W4-E6a: the registration step runs in every epoch. The first pass is
+    /// in epoch 2. These conditions must hold:
+    ///
+    /// - The step must run in epochs 2 and 3.
+    /// - In the held arm, the first POST must reach
+    ///   `registration_step_timeout()`, and the step must be `Failed`.
+    /// - The slot-65 pass must retry the failed step.
+    /// - Without a builder service, the step must finish without a call.
+    /// - From Gloas, the step must finish without a call.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn registration_runs_only_in_the_boot_epoch() {
+    async fn registration_runs_every_epoch() {
         use BoundaryStep::BuilderRegistration;
         let gloas = create_test_fork_schedule().gloas_fork_epoch;
         let register = MockMethod::RegisterValidators;
@@ -3880,9 +3943,14 @@ mod tests {
             f.runner.run_pending(first).await;
 
             if held {
+                let builder = f
+                    .runner
+                    .builder_service
+                    .clone()
+                    .expect("The fixture must have a builder service.");
                 assert_eq!(
                     start.elapsed(),
-                    BUILDER_REGISTRATION_TIMEOUT,
+                    builder.registration_step_timeout(),
                     "{arm}: cut at the bound"
                 );
                 assert_eq!(
@@ -3908,10 +3976,15 @@ mod tests {
 
             assert_eq!(
                 step_state(&f.runner, BuilderRegistration),
-                (None, false),
-                "{arm}: not pending after the boot epoch"
+                (Some(StepOutcome::Done), true),
+                "{arm}: The next epoch must finish the step again."
             );
-            assert_eq!(registrations(&spans), want_calls, "{arm}: no call after the boot epoch");
+            let next = usize::from(want_posts > 0);
+            assert_eq!(
+                (registrations(&spans), f.mock.register_validators_calls().len()),
+                (want_calls + next, want_posts + next),
+                "For arm {arm}, the call and POST counts must match the next-epoch expectations."
+            );
         }
     }
 
@@ -3969,44 +4042,6 @@ mod tests {
             (Some(StepOutcome::Done), true),
             "The registration step must be Done, and must not wait for duties."
         );
-    }
-
-    /// RSA F1: a cache hit adds no signature and no POST. The test calls
-    /// `register_validators` and waits until it returns. Then the boot
-    /// epoch's pass calls it again for the same key and settings. The second
-    /// call must sign nothing and send nothing.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_boot_registration_cache_hit_adds_no_signature_and_no_post() {
-        use BoundaryStep::BuilderRegistration;
-        let register = MockMethod::RegisterValidators;
-        let mock = proposer_duties_at(ROOT_A).with_register_validators(|_registrations| Ok(()));
-        let f = fixture_seeded(mock, SecretKey::generate(), true, &[]).await;
-        let builder = f.runner.builder_service.clone().expect("a builder service");
-        let spans = OpenedSpans::default();
-        let _default =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
-        let signed =
-            || spans.0.lock().iter().filter(|name| **name == "sign.builder_registration").count();
-
-        builder.register_validators(2).await.expect("the first registration");
-
-        assert_eq!(
-            (registrations(&spans), signed(), arrivals(&f.mock, register)),
-            (1, 1, 1),
-            "The first call must sign one registration and send one POST."
-        );
-        assert_eq!(f.mock.register_validators_calls().len(), 1, "The mock must answer the POST.");
-
-        f.runner.run_pending(2 * SLOTS_PER_EPOCH).await;
-
-        assert_eq!(
-            step_state(&f.runner, BuilderRegistration),
-            (Some(StepOutcome::Done), true),
-            "The second call must return Ok, so the step must be Done."
-        );
-        assert_eq!(registrations(&spans), 2, "The pass must call register_validators again.");
-        assert_eq!(signed(), 1, "The cache hit must add no signature.");
-        assert_eq!(arrivals(&f.mock, register), 1, "The cache hit must add no POST.");
     }
 
     // --- W4-E6a: the registration step runs every epoch ---
@@ -4234,5 +4269,104 @@ mod tests {
             [proposal(gloas), proposal(gloas + 1), proposal(gloas + 2)],
             "Each epoch must send the preferences of the next epoch's proposal."
         );
+    }
+
+    /// Harper B1 and RSA B1: a stalled signer must not hold the runner in
+    /// the epoch of a preferences attempt. The test has this setup:
+    ///
+    /// - The local key proposes at slot 5 of each epoch from Gloas onward.
+    /// - The signer of the builder service waits `HOLD` (1 h) before each
+    ///   preferences signature.
+    /// - The runner task processes slots 0 and 1 of Gloas.
+    /// - One epoch later, the task processes slots 0 and 1 of Gloas+1.
+    ///
+    /// These conditions must hold:
+    ///
+    /// - At slot 0 of Gloas+1, ReorgCheck and CommitteeSubscriptions of
+    ///   Gloas+1 must finish.
+    /// - The 10 s bound must stop each held attempt, and the step must then
+    ///   be `Done`.
+    /// - Each epoch must start one preferences signature.
+    /// - No preferences POST must reach the beacon node.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stalled_preferences_signer_does_not_hold_the_next_epoch() {
+        use BoundaryStep::{CommitteeSubscriptions, ProposerPreferences, ReorgCheck};
+        let gloas = create_test_fork_schedule().gloas_fork_epoch;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let f = fixture_seeded(proposals_from(local_hex, gloas), local, true, &[]).await;
+        f.registrations.delay_preferences(HOLD);
+        let runner = spawn_runner(&f);
+        let bound = Duration::from_secs(10);
+        let second = Duration::from_secs(1);
+        let first = gloas * SLOTS_PER_EPOCH;
+        let next = first + SLOTS_PER_EPOCH;
+        let start = tokio::time::Instant::now();
+
+        runner.slots.send_replace(Some(first));
+        tokio::time::sleep(bound + second).await;
+        runner.slots.send_replace(Some(first + 1));
+        tokio::time::sleep(second).await;
+        assert_eq!(
+            f.registrations.preferences_calls(),
+            1,
+            "Epoch {gloas} must start one preferences signature."
+        );
+
+        let epoch_length = Duration::from_secs(SLOT.as_secs() * SLOTS_PER_EPOCH);
+        tokio::time::sleep_until(start + epoch_length).await;
+        let at_next = tokio::time::Instant::now();
+        runner.slots.send_replace(Some(next));
+        tokio::time::sleep(second).await;
+
+        let later = f.runner.progress.lock().as_ref().map(|progress| {
+            let done = |step| progress.done.contains(&step);
+            (progress.epoch, done(ReorgCheck), done(CommitteeSubscriptions))
+        });
+        assert_eq!(
+            later,
+            Some((gloas + 1, true, true)),
+            "At slot 0 of epoch {}, ReorgCheck and CommitteeSubscriptions of that epoch must \
+             finish.",
+            gloas + 1
+        );
+        let duty_slot = |epoch: u64| vec![(epoch * SLOTS_PER_EPOCH + 1).to_string()];
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            [duty_slot(gloas), duty_slot(gloas + 1), duty_slot(gloas + 1), duty_slot(gloas + 2)],
+            "Each of the two epochs must send the subscriptions of that epoch and the next epoch."
+        );
+        assert_eq!(
+            f.registrations.preferences_calls(),
+            2,
+            "Epoch {} must start one preferences signature.",
+            gloas + 1
+        );
+
+        tokio::time::sleep_until(at_next + bound - second).await;
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (None, false),
+            "The held attempt must still run 1 s before the bound."
+        );
+        tokio::time::sleep_until(at_next + bound + second).await;
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The bound must stop the held attempt, and the step must be done."
+        );
+        runner.slots.send_replace(Some(next + 1));
+        tokio::time::sleep(second).await;
+        assert_eq!(
+            f.registrations.preferences_calls(),
+            2,
+            "Slot 1 of epoch {} must not start a second preferences signature.",
+            gloas + 1
+        );
+        assert!(
+            f.mock.submit_proposer_preferences_calls().is_empty(),
+            "No preferences POST must reach the beacon node."
+        );
+        shut_down_within_budget(runner, "stalled preferences signer").await;
     }
 }

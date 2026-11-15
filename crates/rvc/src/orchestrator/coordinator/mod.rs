@@ -12,7 +12,7 @@ use tracing::{debug, error, field, info, info_span, warn, Instrument};
 use async_trait::async_trait;
 use block_service::{BeaconBlockClient, BlockService, BuilderConfig, BuilderConfigProvider};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator};
-use builder::{legacy_proposer_ops_retired, BuilderService};
+use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
@@ -33,9 +33,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
-use super::epoch_boundary::{
-    EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster, BUILDER_REGISTRATION_TIMEOUT,
-};
+use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
@@ -364,6 +362,8 @@ where
     pub(crate) beacon: Arc<dyn BeaconNodeClient>,
     pub(crate) duty_tracker: Arc<DutyTracker>,
     pub(crate) block_service: BlockService<SignerService, B>,
+    /// For tests that reach the builder service directly.
+    #[cfg(test)]
     pub(crate) builder_service: Option<Arc<BuilderService>>,
     pub(crate) circuit_breaker: Arc<CircuitBreakerState>,
     pub(crate) config: OrchestratorConfig,
@@ -379,7 +379,8 @@ where
     /// The runner [`EpochBoundaryTask`] owns, for tests that drive one pass.
     #[cfg(test)]
     pub(crate) epoch_boundary: Arc<EpochBoundaryRunner>,
-    /// Shared with the runner's ReorgCheck, for the slot-0 builder block.
+    /// The runner's broadcaster, for tests that broadcast directly.
+    #[cfg(test)]
     preferences: Arc<PreferenceBroadcaster>,
     /// Each processed slot, for [`EpochBoundaryTask`].
     processed_slot_tx: watch::Sender<Option<Slot>>,
@@ -590,6 +591,7 @@ where
             beacon,
             duty_tracker,
             block_service,
+            #[cfg(test)]
             builder_service,
             circuit_breaker,
             config,
@@ -602,6 +604,7 @@ where
             duty_management,
             #[cfg(test)]
             epoch_boundary,
+            #[cfg(test)]
             preferences,
             processed_slot_tx,
             epoch_boundary_task: Some(epoch_boundary_task),
@@ -630,17 +633,18 @@ where
     /// - aggregate due: aggregation starts then. Contributions wait for the
     ///   in-flight phase-2 head, bounded by the contribution signing deadline.
     /// - payload attestation due (Gloas+): payload attestations
-    /// - post-duty: epoch duty fetches, builder registration
+    /// - post-duty: epoch duty fetches
     ///
     /// Each processed slot is then sent to the epoch boundary runner, which
     /// runs on its own task (see [`Self::take_epoch_boundary_runner`]) and
     /// fetches the duties its steps need itself, so it never waits on the
-    /// post-duty window.
+    /// post-duty window. The runner also sends each epoch's builder
+    /// registration and preferences broadcast.
     ///
     /// This function is the slot loop alone. Startup preparation is the
-    /// runner's boot epoch: its passes prepare proposers and send the builder
-    /// registration, retried at each processed slot of that epoch, and a
-    /// start before genesis prepares epoch 0 before slot 0.
+    /// runner's boot epoch: its passes prepare proposers, retried at each
+    /// processed slot of that epoch, and a start before genesis prepares
+    /// epoch 0 before slot 0.
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
         self.run_slot_loop().await
@@ -845,7 +849,6 @@ where
             // Inter-slot wait stays wall-based. Architecture §10.11: a backward slew
             // on a monotonic next-slot wait would re-process slot S.
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
-            let should_register = current_slot % SLOTS_PER_EPOCH == 0;
             let post_duty_work = async {
                 self.duty_management
                     .fetch_epoch_duties(current_epoch)
@@ -855,27 +858,6 @@ where
                     .fetch_epoch_duties(current_epoch + 1)
                     .instrument(slot_span.clone())
                     .await;
-
-                if should_register && self.builder_service.is_some() {
-                    let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-                    debug!(
-                        jitter_secs = jitter.as_secs(),
-                        "Delaying builder epoch-boundary work with jitter"
-                    );
-                    tokio::time::sleep(jitter).await;
-                    match tokio::time::timeout(
-                        BUILDER_REGISTRATION_TIMEOUT,
-                        self.run_builder_epoch_boundary(current_epoch),
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(_) => warn!(
-                            "Builder epoch-boundary work timed out after {}s (non-fatal)",
-                            BUILDER_REGISTRATION_TIMEOUT.as_secs()
-                        ),
-                    }
-                }
 
                 // Why: fetches return immediately on a warm cache. Completing
                 // this future would take the ready work arm and busy-spin.
@@ -902,24 +884,6 @@ where
         let remaining =
             self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO);
         tokio::time::Instant::now().checked_add(remaining).unwrap_or_else(tokio::time::Instant::now)
-    }
-
-    /// Legacy register (pre-Gloas) and preferences for Gloas+ proposal slots.
-    ///
-    /// Both may run at Gloas-1: register is still live, and next-epoch Gloas
-    /// slots are advertised one epoch early.
-    pub(crate) async fn run_builder_epoch_boundary(&self, current_epoch: u64) {
-        let Some(bs) = &self.builder_service else {
-            return;
-        };
-        let current_fork = ForkName::from_epoch(current_epoch, &self.config.fork_schedule);
-        if !legacy_proposer_ops_retired(current_fork) {
-            match bs.register_validators(current_epoch).await {
-                Ok(_) => info!("Builder registration completed"),
-                Err(e) => warn!(error = %e, "Builder registration failed (non-fatal)"),
-            }
-        }
-        self.preferences.broadcast_preferences(current_epoch).await;
     }
 
     /// Re-broadcast preferences after a proposer `dependent_root` change.

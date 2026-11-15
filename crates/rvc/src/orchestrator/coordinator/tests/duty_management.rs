@@ -1137,7 +1137,6 @@ async fn drive_prepare_and_register(
     let (orchestrator, _handle, mock) =
         retirement_orchestrator(epoch, schedule, mock, local, extra_locals, foreign_keys).await;
     orchestrator.epoch_boundary.run_pending(epoch * ::timing::SLOTS_PER_EPOCH).await;
-    orchestrator.run_builder_epoch_boundary(epoch).await;
     RetirementDrive { mock }
 }
 
@@ -1387,9 +1386,8 @@ async fn test_legacy_404_or_501_does_not_retire_prepare_or_register() {
     );
     assert_eq!(
         driven.mock.register_validators_calls().len(),
-        2,
-        "BN 501 must not skip register_validators: the runner's boot-epoch step and the \
-         slot-0 block each send it, as a refused registration is not cached"
+        1,
+        "A BN 501 must not stop the runner's registration step from sending register_validators."
     );
 }
 
@@ -1417,7 +1415,16 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     let local = SecretKey::generate();
     let local_pk = local.public_key().to_bytes();
     let local_hex = pubkey_hex(&local_pk);
-    let mock = Arc::new(retirement_beacon());
+    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
+    let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
+    let answer = duties.clone();
+    let mock = Arc::new(retirement_beacon_base().with_get_proposer_duties(move |epoch| {
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ROOT_A.to_string(),
+            execution_optimistic: false,
+            data: if epoch == gloas_epoch { answer.clone() } else { Vec::new() },
+        })
+    }));
     mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
@@ -1470,11 +1477,8 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     deps.pubkey_index.write().insert(local_pk, "42".to_string());
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
-    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
-    let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
-
     assert!(!duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_A.into(), &duties).await);
-    orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
+    orchestrator.epoch_boundary.run_pending(slot).await;
     {
         let calls = mock.submit_proposer_preferences_calls();
         assert_eq!(calls.len(), 1);
@@ -1528,8 +1532,8 @@ impl SpanChains {
 /// `epoch.boundary` span, and a proposer `dependent_root` change seen by the
 /// reorg check re-broadcasts preferences from that pass.
 ///
-/// `register_validators` is held in the mock, so the jitter block never
-/// reaches its own broadcast: the only preferences POST is the root-change one.
+/// The mock holds `register_validators`, so the pass does not reach its
+/// ProposerPreferences step: the only preferences POST is the root-change one.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_change() {
     let _metrics = m2_metric_lock().await;
@@ -2460,15 +2464,13 @@ async fn runner_keeps_serving_slots_after_the_boot_epoch_completes() {
 }
 
 /// 653-AC8, the registration half. At boot, the index registry is empty and
-/// the local key is builder-enabled. Each registration POST answers 503, and
-/// the builder service does not cache a failed batch. `run` and the runner
-/// task run from the start of slot 2 to the last millisecond of slot 20. The
-/// mock slot clock moves 1 ms with each 1 ms paused sleep. These results
-/// must occur:
+/// the local key is builder-enabled. Each registration POST answers 200.
+/// `run` and the runner task run from the start of slot 2 to the last
+/// millisecond of slot 20. The mock slot clock moves 1 ms with each 1 ms
+/// paused sleep. These results must occur:
 ///
 /// - The runner's slot-2 pass sends the only registration POST, with one
-///   signature. `register_validators` reports `Ok` for the failed batch, so
-///   the boot-epoch step finishes after one attempt. W4-E6a changes this.
+///   signature. The registration step needs no validator index.
 /// - No `prepare_beacon_proposer` POST reaches the beacon node.
 /// - The slot loop processes each slot from 2 to 20.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2487,7 +2489,7 @@ async fn test_zero_indices_at_boot_do_not_re_register_every_slot() {
         let (posts, clock) = (Arc::clone(&posts), Arc::clone(&clock));
         move |_registrations| {
             posts.lock().push(clock.current_slot().ok());
-            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+            Ok(())
         }
     });
     let started =

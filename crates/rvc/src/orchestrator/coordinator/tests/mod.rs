@@ -536,15 +536,37 @@ pub(crate) fn create_mock_validator_store() -> Arc<ValidatorStore> {
 }
 
 /// This `RegistrationSigner` records the key of each builder registration it
-/// signs. The real `SignerService` makes each signature.
+/// signs. The real `SignerService` makes each signature. A test can also
+/// make each preferences signature wait.
 pub(crate) struct CountingRegistrationSigner {
     inner: Arc<dyn ValidatorSigner>,
     signed: parking_lot::Mutex<Vec<[u8; 48]>>,
+    /// This field holds the wait before each preferences signature. The
+    /// wait is zero by default.
+    preferences_delay: parking_lot::Mutex<Duration>,
+    /// This field counts the `sign_proposer_preferences` calls.
+    preferences_calls: parking_lot::Mutex<usize>,
 }
 
 impl CountingRegistrationSigner {
     pub(crate) fn new(inner: Arc<dyn ValidatorSigner>) -> Arc<Self> {
-        Arc::new(Self { inner, signed: parking_lot::Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            inner,
+            signed: parking_lot::Mutex::new(Vec::new()),
+            preferences_delay: parking_lot::Mutex::new(Duration::ZERO),
+            preferences_calls: parking_lot::Mutex::new(0),
+        })
+    }
+
+    /// Makes each later preferences signature wait for `delay` before the
+    /// real signer starts it.
+    pub(crate) fn delay_preferences(&self, delay: Duration) {
+        *self.preferences_delay.lock() = delay;
+    }
+
+    /// Returns the number of `sign_proposer_preferences` calls.
+    pub(crate) fn preferences_calls(&self) -> usize {
+        *self.preferences_calls.lock()
     }
 
     /// Returns the number of builder registrations that the signer signs for
@@ -580,6 +602,11 @@ impl ::builder::RegistrationSigner for CountingRegistrationSigner {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        *self.preferences_calls.lock() += 1;
+        let delay = *self.preferences_delay.lock();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         ValidatorSigner::sign_proposer_preferences(
             &*self.inner,
             prefs,

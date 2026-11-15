@@ -135,12 +135,6 @@ fn test_preparation_timeout_is_reasonable() {
 }
 
 #[test]
-fn test_builder_registration_timeout_is_reasonable() {
-    assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() >= 5);
-    assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
-}
-
-#[test]
 fn test_pre_proposal_deadline_default_is_one_second() {
     assert_eq!(DEFAULT_PRE_PROPOSAL_DEADLINE, Duration::from_millis(1000));
     let config = create_test_config();
