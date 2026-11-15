@@ -105,6 +105,9 @@ pub struct LivenessObservationLoop {
     unobserved_warned: parking_lot::Mutex<HashSet<(String, Epoch)>>,
     /// Pubkeys already logged once because they have no validator index.
     no_index_noted: parking_lot::Mutex<HashSet<String>>,
+    /// Tick epoch of the last failed query. Only the first failure in a
+    /// tick epoch logs at warn.
+    last_query_failure_warned: parking_lot::Mutex<Option<Epoch>>,
     /// Drain request. Production [`spawn_liveness_loop`] always sets this.
     exit_request: Option<Arc<dyn ExitRequest>>,
     /// Validator data directory for the detection marker. Production sets this
@@ -192,6 +195,7 @@ impl LivenessObservationLoop {
             tracked_keys: None,
             unobserved_warned: parking_lot::Mutex::new(HashSet::new()),
             no_index_noted: parking_lot::Mutex::new(HashSet::new()),
+            last_query_failure_warned: parking_lot::Mutex::new(None),
             exit_request: None,
             detection_marker_dir: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -435,7 +439,7 @@ impl LivenessObservationLoop {
         slot_at_query: u64,
         epoch_unchanged: &(dyn Fn() -> bool + Sync),
     ) -> TickOutcome {
-        let observation = self.observe_adjacent(epoch_at_query, slot_at_query).await;
+        let observation = self.observe_adjacent(epoch_at_query).await;
         let current_epoch = self.clock_epoch();
         let slot_in_epoch = self.clock_slot();
         self.record_liveness(&observation, epoch_at_query, slot_at_query, epoch_unchanged);
@@ -460,7 +464,10 @@ impl LivenessObservationLoop {
     /// The token is read again before each query. Once it has moved (a
     /// revocation or a revalidation), the rest of the tick asks about no index.
     /// [`Self::record_liveness`] applies the answers only under that token.
-    async fn observe_adjacent(&self, current_epoch: Epoch, _slot_in_epoch: u64) -> Observation {
+    ///
+    /// A failed query gives `samples: None`. The first failure in a tick epoch
+    /// logs at warn. The other failures in that epoch log at debug.
+    async fn observe_adjacent(&self, current_epoch: Epoch) -> Observation {
         let pending = self.machine.pending_keys();
         if pending.is_empty() {
             let freshness = self.pubkey_index.read().freshness();
@@ -526,17 +533,34 @@ impl LivenessObservationLoop {
                     answers.push(EpochLiveness { epoch, samples: Some(samples) });
                 }
                 Err(e) => {
-                    warn!(
-                        epoch,
-                        error = %e,
-                        "liveness query failed; will retry next slot (fail-closed)"
-                    );
+                    if self.first_query_failure_in(current_epoch) {
+                        warn!(
+                            epoch,
+                            error = %e,
+                            "liveness query failed; will retry next slot (fail-closed)"
+                        );
+                    } else {
+                        debug!(
+                            epoch,
+                            error = %e,
+                            "liveness query failed; will retry next slot (fail-closed)"
+                        );
+                    }
                     answers.push(EpochLiveness { epoch, samples: None });
                 }
             }
         }
 
         Observation { answers, freshness }
+    }
+
+    /// Record a failed query in the tick epoch `current_epoch`. Return `true`
+    /// for the first failure in that epoch.
+    ///
+    /// Only a failure moves the marker. A failure after a recovery in the
+    /// same epoch returns `false`.
+    fn first_query_failure_in(&self, current_epoch: Epoch) -> bool {
+        self.last_query_failure_warned.lock().replace(current_epoch) != Some(current_epoch)
     }
 
     /// Whether the index registry still has the freshness token `snapshot`.

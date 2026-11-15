@@ -433,8 +433,8 @@ impl ForwardWindowMachine {
     /// Snapshot every registered validator's status. Does not open the gate.
     ///
     /// Both arguments are ignored. Safe happens only inside
-    /// [`Self::observe_liveness`] or [`Self::apply_liveness_tick`] when
-    /// `remaining` hits 0. A call past any epoch, including one far ahead,
+    /// [`Self::apply_liveness_tick`] or [`Self::apply_liveness_tick_checked`]
+    /// when `remaining` hits 0. A call past any epoch, including one far ahead,
     /// leaves `Pending` keys `Pending`.
     pub fn statuses(&self, _current_epoch: Epoch, _slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
         let states = self.states.lock();
