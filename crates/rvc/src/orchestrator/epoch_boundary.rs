@@ -935,6 +935,8 @@ mod tests {
         clock: Arc<MockSlotClock>,
         /// The builder service's signer. It counts the registrations it signs.
         registrations: Arc<CountingRegistrationSigner>,
+        /// The store that the builder service reads the builder URLs from.
+        validator_store: Arc<ValidatorStore>,
     }
 
     impl Fixture {
@@ -1206,7 +1208,7 @@ mod tests {
             signer,
             beacon,
             Arc::clone(&duty_tracker),
-            validator_store,
+            Arc::clone(&validator_store),
             pubkey_map,
             pubkey_index,
             config,
@@ -1234,6 +1236,7 @@ mod tests {
             index_source,
             clock,
             registrations,
+            validator_store,
         }
     }
 
@@ -4201,8 +4204,17 @@ mod tests {
     /// Proposer duties at root A in which validator 42 (`local_hex`)
     /// proposes at slot 5 of each epoch from `from`.
     fn proposals_from(local_hex: String, from: u64) -> MockBeaconNodeClient {
+        proposals_failing(local_hex, from, FailPlan::default())
+    }
+
+    /// [`proposals_from`], with a 503 for each proposer-duties request that
+    /// `plan` arms. The mock also accepts each registration POST.
+    fn proposals_failing(local_hex: String, from: u64, plan: FailPlan) -> MockBeaconNodeClient {
         MockBeaconNodeClient::new()
             .with_get_proposer_duties(move |epoch| {
+                if take_failure(&plan, epoch) {
+                    return Err(unavailable());
+                }
                 let duty = beacon::ProposerDuty {
                     pubkey: local_hex.clone(),
                     validator_index: "42".to_string(),
@@ -4222,6 +4234,7 @@ mod tests {
                 })
             })
             .with_submit_proposer_preferences(|_preferences| Ok(()))
+            .with_register_validators(|_registrations| Ok(()))
     }
 
     /// The runner broadcasts the preferences one time per epoch, as the
@@ -4368,5 +4381,255 @@ mod tests {
             "No preferences POST must reach the beacon node."
         );
         shut_down_within_budget(runner, "stalled preferences signer").await;
+    }
+
+    // --- W4-E6b1: the preferences step retries each slot from Gloas-1 ---
+
+    /// The URL of the builder in the builder-preferences tests.
+    const BUILDER_URL: &str = "https://builder.example.com";
+
+    /// The first slot of the epoch before Gloas. The test schedule has Gloas
+    /// at epoch 70.
+    fn gloas_minus_one_slot() -> Slot {
+        (create_test_fork_schedule().gloas_fork_epoch - 1) * SLOTS_PER_EPOCH
+    }
+
+    /// The proposal slots of each proposer-preferences POST, in POST order.
+    fn preference_slots(mock: &MockBeaconNodeClient) -> Vec<Vec<Slot>> {
+        let posts = mock.submit_proposer_preferences_calls();
+        posts.iter().map(|post| post.iter().map(|p| p.message.proposal_slot).collect()).collect()
+    }
+
+    /// The slots of each builder-preferences POST, in POST order.
+    fn builder_preference_slots(mock: &MockBeaconNodeClient) -> Vec<Vec<Slot>> {
+        let posts = mock.submit_builder_preferences_calls();
+        posts.iter().map(|post| post.iter().map(|e| e.auth.message.slot).collect()).collect()
+    }
+
+    /// 654-AC6: the step uses the proposer duties that the runner fetches. The
+    /// tracker starts empty, and no slot loop or warm-up runs. The epoch E is
+    /// Gloas-1, and the local key proposes at slot 5 of E+1. The proposer
+    /// requests of ReorgCheck for E and E+1 answer 503.
+    ///
+    /// 1. DutyFetch must request the proposer duties of E and E+1. The step
+    ///    must send the preferences in the same pass.
+    /// 2. The E+1 request of DutyFetch also answers 503. The step must be
+    ///    `NotReady` and must send no POST. The next pass must fetch E+1 and
+    ///    send one POST.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_from_a_cold_cache_use_runner_fetched_duties() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let (epoch, next) = (first / SLOTS_PER_EPOCH, first / SLOTS_PER_EPOCH + 1);
+        let proposal = vec![next * SLOTS_PER_EPOCH + 5];
+        for (arm, next_failures) in [("DutyFetch fills E+1", 1), ("DutyFetch fails for E+1", 2)] {
+            let local = SecretKey::generate();
+            let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+            let plan = FailPlan::default();
+            plan.lock().extend([(epoch, 1), (next, next_failures)]);
+            let f =
+                fixture_seeded(proposals_failing(local_hex, next, plan), local, true, &[]).await;
+
+            f.runner.run_pending(first).await;
+
+            assert_eq!(
+                f.mock.get_proposer_duties_calls(),
+                [epoch, next, epoch, next],
+                "{arm}: ReorgCheck and then DutyFetch must each request E and E+1."
+            );
+            if next_failures == 1 {
+                assert_eq!(
+                    preference_slots(&f.mock),
+                    [proposal.clone()],
+                    "{arm}: The same pass must send the preferences."
+                );
+                assert_eq!(
+                    step_state(&f.runner, ProposerPreferences),
+                    (Some(StepOutcome::Done), true),
+                    "{arm}: The accepted POST must finish the step."
+                );
+                continue;
+            }
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::NotReady), false),
+                "{arm}: With E+1 uncached, the step must not be ready and must stay pending."
+            );
+            assert_eq!(
+                arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+                0,
+                "{arm}: The step must not send a POST."
+            );
+
+            f.runner.run_pending(first + 1).await;
+
+            assert_eq!(
+                f.mock.get_proposer_duties_calls()[4..],
+                [next],
+                "{arm}: The next pass must request E+1 again."
+            );
+            assert_eq!(
+                preference_slots(&f.mock),
+                [proposal.clone()],
+                "{arm}: The next pass must send one POST."
+            );
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::Done), true),
+                "{arm}: The accepted POST must finish the step."
+            );
+        }
+    }
+
+    /// 654-AC6: before Gloas-1, the step finishes with no call. The epoch E is
+    /// Gloas-2, so E+1 is still Fulu. The local key proposes in each epoch.
+    /// In the cold arm, each proposer request for E+1 answers 503. In the two
+    /// arms, the step must be `Done`, and it must not call the builder service.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_skip_before_gloas_minus_one() {
+        let first = gloas_minus_one_slot() - SLOTS_PER_EPOCH;
+        let next = first / SLOTS_PER_EPOCH + 1;
+        for (arm, next_failures) in [("warm E+1", 0), ("cold E+1", usize::MAX)] {
+            let local = SecretKey::generate();
+            let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+            let plan = FailPlan::default();
+            plan.lock().insert(next, next_failures);
+            let f = fixture_seeded(proposals_failing(local_hex, 0, plan), local, true, &[]).await;
+            let spans = OpenedSpans::default();
+            let _default = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(spans.clone()),
+            );
+
+            f.runner.run_pending(first).await;
+
+            assert_eq!(
+                f.duty_tracker.is_proposer_epoch_cached(next).await,
+                next_failures == 0,
+                "{arm}: Only the warm arm must have the E+1 proposer duties in the cache."
+            );
+            assert_eq!(
+                step_state(&f.runner, BoundaryStep::ProposerPreferences),
+                (Some(StepOutcome::Done), true),
+                "{arm}: The step must finish before Gloas-1."
+            );
+            let calls =
+                spans.0.lock().iter().filter(|name| name.starts_with("builder.broadcast_")).count();
+            assert_eq!(calls, 0, "{arm}: The step must not call the builder service.");
+        }
+    }
+
+    /// 654-AC6: the step is `Done` only when the two broadcasts succeed. The
+    /// epoch is Gloas-1, and the local key has one builder URL. The proposer
+    /// POST answers 200, and the first builder POST answers 503.
+    ///
+    /// - The first pass must leave the step `Failed` and pending.
+    /// - The retry must send the builder entry again.
+    /// - The retry must not send or sign the proposer entry again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn builder_preferences_failure_keeps_the_step_pending() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let next = first / SLOTS_PER_EPOCH + 1;
+        let proposal = vec![next * SLOTS_PER_EPOCH + 5];
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let failures = parking_lot::Mutex::new(1_usize);
+        let mock =
+            proposals_from(local_hex, next).with_submit_builder_preferences(move |_entries| {
+                let mut left = failures.lock();
+                if *left == 0 {
+                    return Ok(beacon::SubmitBuilderPreferencesResult::Success);
+                }
+                *left -= 1;
+                Err(unavailable())
+            });
+        let f = fixture_seeded(mock, local, true, &[]).await;
+        f.validator_store
+            .set_global_builders(vec![BUILDER_URL.to_string()])
+            .expect("The builder URL must be valid.");
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "The builder POST failed, so the step must be failed and pending."
+        );
+        assert_eq!(
+            preference_slots(&f.mock),
+            [proposal.clone()],
+            "The first pass must send the proposer POST."
+        );
+        assert_eq!(
+            builder_preference_slots(&f.mock),
+            [proposal.clone()],
+            "The first builder POST must carry the Gloas proposal."
+        );
+
+        f.runner.run_pending(first + 1).await;
+
+        assert_eq!(
+            builder_preference_slots(&f.mock),
+            [proposal.clone(), proposal.clone()],
+            "The retry must send the builder entry again."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+            1,
+            "The retry must not send the proposer entry again."
+        );
+        assert_eq!(
+            f.registrations.preferences_calls(),
+            1,
+            "The retry must not sign the proposer preferences again."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The accepted builder POST must finish the step."
+        );
+    }
+
+    /// 654-AC6: the preferences step fails in each pass of the epoch. The
+    /// first pass of the next epoch must issue one abandoned-step warning.
+    /// That warning must name ProposerPreferences. The epoch is Gloas-1, and
+    /// each proposer-preferences POST answers 503.
+    ///
+    /// - Each of the 32 passes of the epoch must make one attempt.
+    /// - No abandoned-steps warn must occur inside the epoch.
+    /// - The first pass of Gloas must warn one time and name the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_abandoned_warn() {
+        let first = gloas_minus_one_slot();
+        let epoch = first / SLOTS_PER_EPOCH;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let mock = proposals_from(local_hex, epoch + 1)
+            .with_submit_proposer_preferences(|_preferences| Err(unavailable()));
+        let f = fixture_seeded(mock, local, true, &[]).await;
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        for slot in first..first + SLOTS_PER_EPOCH {
+            f.runner.run_pending(slot).await;
+        }
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+            32,
+            "Each of the 32 passes of epoch {epoch} must make one attempt."
+        );
+        assert_eq!(warns.abandoned(), Vec::<String>::new(), "No warn must occur inside the epoch.");
+
+        f.runner.run_pending(first + SLOTS_PER_EPOCH).await;
+
+        assert_eq!(
+            warns.abandoned(),
+            [format!(
+                "epoch={epoch} abandoned_steps=[ProposerPreferences] \
+                 last_outcomes={{ProposerPreferences: Failed}}"
+            )],
+            "The first pass of epoch {} must warn one time for epoch {epoch}.",
+            epoch + 1
+        );
     }
 }

@@ -1402,8 +1402,18 @@ fn test_retirement_gate_reads_only_fork_name_from_epoch() {
     assert!(::builder::legacy_proposer_ops_retired(ForkName::from_epoch(gloas_epoch, &schedule)));
 }
 
-#[tokio::test]
+/// 654-AC6: a proposer root change re-opens the preferences step through
+/// `run_pending`. The epoch is Gloas, and root A is in the cache for it. The
+/// first attester request takes 1 s. The mock holds the first PTC request.
+/// Thus the 10 s step bound stops the first ReorgCheck, and the next pass
+/// runs ReorgCheck again. These results must occur:
+///
+/// 1. The first pass must send the preferences, signed with root A.
+/// 2. The beacon node then answers root B. The next pass must send the
+///    preferences again, signed with root B.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_proposer_root_change_rebroadcasts_preferences() {
+    use bn_manager::MockMethod;
     use signer::ValidatorSigner;
     use validator_store::ValidatorConfig;
 
@@ -1418,13 +1428,19 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
     let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
     let answer = duties.clone();
-    let mock = Arc::new(retirement_beacon_base().with_get_proposer_duties(move |epoch| {
-        Ok(beacon::DependentRootResponse {
-            dependent_root: ROOT_A.to_string(),
-            execution_optimistic: false,
-            data: if epoch == gloas_epoch { answer.clone() } else { Vec::new() },
+    let root = Arc::new(parking_lot::Mutex::new(ROOT_A));
+    let answered = Arc::clone(&root);
+    let mock = retirement_beacon_base()
+        .with_get_proposer_duties(move |epoch| {
+            Ok(beacon::DependentRootResponse {
+                dependent_root: answered.lock().to_string(),
+                execution_optimistic: false,
+                data: if epoch == gloas_epoch { answer.clone() } else { Vec::new() },
+            })
         })
-    }));
+        .with_call_delays(MockMethod::GetAttesterDuties, [Duration::from_secs(1)])
+        .with_call_delays(MockMethod::PostPtcDuties, [Duration::from_secs(3_600)]);
+    let mock = Arc::new(mock);
     mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
@@ -1478,28 +1494,33 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
     assert!(!duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_A.into(), &duties).await);
+    let parse = |hex: &str| {
+        eth_types::canonical::gvr_hex::parse_gvr_hex(hex).expect("The test root must be valid.")
+    };
     orchestrator.epoch_boundary.run_pending(slot).await;
     {
         let calls = mock.submit_proposer_preferences_calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 1, "The first pass must send one preferences POST.");
         assert_eq!(calls[0].len(), 1);
-        assert_eq!(
-            calls[0][0].message.dependent_root,
-            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_A).unwrap()
-        );
+        assert_eq!(calls[0][0].message.proposal_slot, proposal_slot);
+        assert_eq!(calls[0][0].message.dependent_root, parse(ROOT_A));
     }
+    assert!(
+        orchestrator.epoch_boundary.has_pending(slot + 1),
+        "The step bound stopped ReorgCheck, so the next pass must run it again."
+    );
 
-    assert!(duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_B.into(), &duties).await);
-    orchestrator.on_proposer_dependent_root_changed(gloas_epoch).await;
+    *root.lock() = ROOT_B;
+    orchestrator.epoch_boundary.run_pending(slot + 1).await;
     {
         let calls = mock.submit_proposer_preferences_calls();
-        assert_eq!(calls.len(), 2, "root change must invoke one more preferences POST");
+        assert_eq!(calls.len(), 2, "The root change must cause one more preferences POST.");
         assert_eq!(calls[1].len(), 1);
-        assert_eq!(
-            calls[1][0].message.dependent_root,
-            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
-        );
+        assert_eq!(calls[1][0].message.proposal_slot, proposal_slot);
+        assert_eq!(calls[1][0].message.dependent_root, parse(ROOT_B));
     }
+    let root_b = duty_tracker.get_cached_proposer_dependent_root(gloas_epoch).await;
+    assert_eq!(root_b.as_deref(), Some(ROOT_B), "ReorgCheck must put root B in the cache.");
 }
 
 /// Span names from each new span up through its ancestors, read at creation.
@@ -1532,12 +1553,11 @@ impl SpanChains {
 /// `epoch.boundary` span, and a proposer `dependent_root` change seen by the
 /// reorg check re-broadcasts preferences from that pass.
 ///
-/// The mock holds `register_validators`, so the pass does not reach its
-/// ProposerPreferences step: the only preferences POST is the root-change one.
+/// The pass sends one preferences POST. That POST must carry root B, the
+/// root that the reorg check puts in the cache.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_change() {
     let _metrics = m2_metric_lock().await;
-    use bn_manager::MockMethod;
     use tracing_subscriber::layer::SubscriberExt;
 
     const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1548,20 +1568,18 @@ async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_
     let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
     let local = SecretKey::generate();
     let local_hex = pubkey_hex(&local.public_key().to_bytes());
-    let mock = retirement_beacon_base()
-        .with_get_proposer_duties(move |e| {
-            let data = if e == gloas_epoch {
-                vec![proposer_duty(&local_hex, "42", proposal_slot)]
-            } else {
-                Vec::new()
-            };
-            Ok(beacon::DependentRootResponse {
-                dependent_root: ROOT_B.to_string(),
-                execution_optimistic: false,
-                data,
-            })
+    let mock = retirement_beacon_base().with_get_proposer_duties(move |e| {
+        let data = if e == gloas_epoch {
+            vec![proposer_duty(&local_hex, "42", proposal_slot)]
+        } else {
+            Vec::new()
+        };
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ROOT_B.to_string(),
+            execution_optimistic: false,
+            data,
         })
-        .with_method_delay(MockMethod::RegisterValidators, Duration::from_secs(3600));
+    });
     let (mut orchestrator, handle, mock) = retirement_orchestrator(
         epoch,
         near_gloas_schedule(gloas_epoch),
@@ -3144,6 +3162,76 @@ async fn boundary_registration_failure_is_retried_next_slot_without_resigning() 
         registrations.signatures(&local_pk),
         1,
         "The counting signer must record one registration signature for the key."
+    );
+}
+
+/// 654-AC6: through `run()`, the preferences step retries at the next
+/// processed slot from Gloas-1. The drive has a builder service, and it
+/// starts at the first slot of epoch 69. The test schedule has Gloas at
+/// epoch 70: it is `near_gloas_schedule(70)`. The local key proposes at slot
+/// 5 of each epoch from Gloas. The first preferences POST answers 503, and
+/// the later POSTs answer 200. These results must occur:
+///
+/// - The first two passes each call the proposer broadcast one time.
+/// - Each of the two POSTs carries the Gloas proposal of epoch 70.
+/// - No pass runs at the third slot, because no step is pending.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_preferences_retry_each_slot_from_gloas_minus_one() {
+    let _metrics = m2_metric_lock().await;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let gloas = create_test_fork_schedule().gloas_fork_epoch;
+    assert_eq!(
+        near_gloas_schedule(gloas),
+        create_test_fork_schedule(),
+        "The drive schedule must have Gloas at epoch {gloas}."
+    );
+    let first = (gloas - 1) * slots;
+    let proposal = gloas * slots + 5;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let attempts = AtomicUsize::new(0);
+    let mock = retirement_beacon_base()
+        .with_get_proposer_duties(move |epoch| {
+            let duty = proposer_duty(&local_hex, BOUNDARY_INDEX, epoch * slots + 5);
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                execution_optimistic: false,
+                data: if epoch < gloas { Vec::new() } else { vec![duty] },
+            })
+        })
+        .with_submit_proposer_preferences(move |_preferences| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(beacon::BeaconError::ApiError {
+                    status: 503,
+                    message: "unavailable".into(),
+                });
+            }
+            Ok(())
+        });
+
+    let run = drive_boundary_builder(mock, local, first, first + 2).await;
+
+    assert_eq!(
+        run.pass_slots("builder.broadcast_proposer_preferences"),
+        [Some(first), Some(first + 1)],
+        "The first pass must make the failed attempt, and the second pass must make the retry."
+    );
+    let posted: Vec<Vec<Slot>> = run
+        .mock
+        .submit_proposer_preferences_calls()
+        .iter()
+        .map(|post| post.iter().map(|signed| signed.message.proposal_slot).collect())
+        .collect();
+    assert_eq!(
+        posted,
+        [vec![proposal], vec![proposal]],
+        "Each of the two POSTs must carry the Gloas proposal at slot {proposal}."
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(first), Some(first + 1)],
+        "No step must be pending at slot {}.",
+        first + 2
     );
 }
 

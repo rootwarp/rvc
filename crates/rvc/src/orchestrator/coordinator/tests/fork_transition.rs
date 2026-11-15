@@ -2726,6 +2726,19 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         "v2",
     )
     .await;
+    // The preferences step waits for the proposer duties of E and E+1.
+    // Epochs 69 and 71 have no proposal.
+    for (epoch, version) in [(fulu_epoch, "v1"), (gloas_epoch + 1, "v2")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/{version}/validator/duties/proposer/{epoch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+    }
 
     Mock::given(method("POST"))
         .and(path("/eth/v1/validator/prepare_beacon_proposer"))
