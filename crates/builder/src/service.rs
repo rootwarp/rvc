@@ -871,7 +871,8 @@ mod tests {
         fail_preferences: bool,
         /// Fail only on these 0-based call indices (e.g. [1] fails the second call).
         fail_register_on_calls: Vec<usize>,
-        indexed_fail_on: Option<Vec<bn_manager::IndexedFailure>>,
+        /// The first builder-preferences POST rejects these entries.
+        indexed_fail_on: Mutex<Option<Vec<bn_manager::IndexedFailure>>>,
     }
 
     impl MockBn {
@@ -885,7 +886,7 @@ mod tests {
                 fail_prepare: false,
                 fail_preferences: false,
                 fail_register_on_calls: Vec::new(),
-                indexed_fail_on: None,
+                indexed_fail_on: Mutex::new(None),
             }
         }
 
@@ -904,8 +905,8 @@ mod tests {
             self
         }
 
-        fn with_indexed_failures(mut self, failures: Vec<bn_manager::IndexedFailure>) -> Self {
-            self.indexed_fail_on = Some(failures);
+        fn with_indexed_failures(self, failures: Vec<bn_manager::IndexedFailure>) -> Self {
+            *self.indexed_fail_on.lock() = Some(failures);
             self
         }
     }
@@ -954,10 +955,8 @@ mod tests {
             entries: &[BuilderPreferencesEntry],
         ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
             self.builder_pref_calls.lock().push(entries.to_vec());
-            if let Some(failures) = &self.indexed_fail_on {
-                return Ok(SubmitBuilderPreferencesResult::PartialFailure {
-                    failures: failures.clone(),
-                });
+            if let Some(failures) = self.indexed_fail_on.lock().take() {
+                return Ok(SubmitBuilderPreferencesResult::PartialFailure { failures });
             }
             Ok(SubmitBuilderPreferencesResult::Success)
         }
@@ -973,6 +972,8 @@ mod tests {
         fail_sign: bool,
         /// Builder registrations for these keys fail until [`Self::heal`].
         fail_for: Mutex<HashSet<[u8; 48]>>,
+        /// The number of next preferences and auth signatures that fail.
+        failures_left: Mutex<usize>,
         sign_calls: Mutex<Vec<[u8; 48]>>,
         /// Fixed valid BLS signature for wire-boundary assertions.
         sig: crypto::Signature,
@@ -984,6 +985,7 @@ mod tests {
             Self {
                 fail_sign: false,
                 fail_for: Mutex::new(HashSet::new()),
+                failures_left: Mutex::new(0),
                 sign_calls: Mutex::new(Vec::new()),
                 sig: crypto::SecretKey::generate().sign(b"mock-builder-reg"),
                 auth_sk: None,
@@ -1002,6 +1004,19 @@ mod tests {
 
         fn heal(&self) {
             self.fail_for.lock().clear();
+        }
+
+        /// Makes the next `count` preferences and auth signatures fail.
+        fn fail_next(&self, count: usize) {
+            *self.failures_left.lock() = count;
+        }
+
+        /// Spends one failure that [`Self::fail_next`] armed.
+        fn take_failure(&self) -> bool {
+            let mut left = self.failures_left.lock();
+            let fail = *left > 0;
+            *left = left.saturating_sub(1);
+            fail
         }
 
         fn with_auth_key(mut self, sk: crypto::SecretKey) -> Self {
@@ -1036,7 +1051,7 @@ mod tests {
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
         ) -> Result<crypto::Signature, SignerError> {
-            if self.fail_sign {
+            if self.fail_sign || self.take_failure() {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
@@ -1049,7 +1064,7 @@ mod tests {
             pubkey: &PublicKey,
             genesis_fork_version: [u8; 4],
         ) -> Result<crypto::Signature, SignerError> {
-            if self.fail_sign {
+            if self.fail_sign || self.take_failure() {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
@@ -2713,6 +2728,9 @@ mod tests {
         assert!(signer.sign_calls.lock().is_empty());
     }
 
+    /// RSA B1: the first POST rejects the entry at index 1. The broadcast
+    /// must keep the accepted entry and return an error. The retry must send
+    /// only the rejected entry.
     #[tokio::test]
     async fn test_broadcast_builder_preferences_400_keeps_accepted_entries() {
         let pk = gen_pubkey_bytes();
@@ -2730,16 +2748,152 @@ mod tests {
             gloas_at(gloas_epoch),
         );
         let proposal = upcoming_for(pk, gloas_epoch, 1);
-        service
+        let result = service
             .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
-            .await
-            .unwrap();
+            .await;
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Err("the beacon node rejected 1 of 2 builder preferences entries".to_string()),
+            "The rejected entry must give an error."
+        );
         assert_eq!(bn.builder_pref_calls.lock().len(), 1);
         assert_eq!(bn.builder_pref_calls.lock()[0].len(), 2);
 
         let config = service.builder_config_for(&pk, proposal.proposal_slot).await;
         assert_eq!(config.builders.len(), 1);
         assert_eq!(config.builders[0].url, "https://a.example");
+
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .expect("The retry must succeed.");
+        let retry: Vec<String> =
+            bn.builder_pref_calls.lock()[1].iter().map(|e| e.url.clone()).collect();
+        assert_eq!(retry, ["https://b.example"], "The retry must send only the rejected entry.");
+    }
+
+    /// Two proposals of `pk`, at slot 0 and slot 3 of `epoch + 1`.
+    fn two_proposals(pk: [u8; 48], epoch: u64) -> [UpcomingProposal; 2] {
+        let first = upcoming_for(pk, epoch, 1);
+        let second = UpcomingProposal { proposal_slot: first.proposal_slot + 3, ..first.clone() };
+        [first, second]
+    }
+
+    /// One arm of a signature-error test: the failed signatures, the error
+    /// text, the slots of the first broadcast and the slots after the retry.
+    type SignatureErrorArm = (usize, String, Vec<Vec<Slot>>, Vec<Vec<Slot>>);
+
+    /// The arms of the signature-error tests. The arms are "every signature
+    /// fails" and "the first of two signatures fails".
+    fn signature_error_arms(kind: &str, a: Slot, b: Slot) -> [SignatureErrorArm; 2] {
+        [
+            (2, format!("2 of 2 {kind} failed"), vec![], vec![vec![a, b]]),
+            (1, format!("1 of 2 {kind} failed"), vec![vec![b]], vec![vec![b], vec![a]]),
+        ]
+    }
+
+    /// RSA B2: a proposer-preferences signature error must give an error
+    /// and keep the unsigned entry pending. The POST must carry only the
+    /// signed entries. The retry must sign and send only the unsigned entries.
+    #[tokio::test]
+    async fn test_broadcast_proposer_preferences_signature_error_keeps_the_entry_pending() {
+        let pk = gen_pubkey_bytes();
+        let gloas_epoch = 10;
+        let proposals = two_proposals(pk, gloas_epoch);
+        let (a, b) = (proposals[0].proposal_slot, proposals[1].proposal_slot);
+        let kind = "proposer preferences signatures";
+        for (failures, error, first, retry) in signature_error_arms(kind, a, b) {
+            let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+            let bn = Arc::new(MockBn::new());
+            let signer = Arc::new(MockSigner::new());
+            signer.fail_next(failures);
+            let service = BuilderService::new(
+                signer,
+                bn.clone(),
+                Arc::new(store),
+                GENESIS_FORK,
+                gloas_at(gloas_epoch),
+            );
+            let slots = || -> Vec<Vec<Slot>> {
+                let calls = bn.preference_calls.lock();
+                calls.iter().map(|c| c.iter().map(|p| p.message.proposal_slot).collect()).collect()
+            };
+
+            let result =
+                service.broadcast_proposer_preferences(gloas_epoch, &proposals, &TEST_GVR).await;
+
+            assert_eq!(
+                result.map_err(|e| e.to_string()),
+                Err(error),
+                "With {failures} failed signatures, the broadcast must return this error."
+            );
+            assert_eq!(
+                slots(),
+                first,
+                "With {failures} failed signatures, the POST must carry only the signed entries."
+            );
+            service
+                .broadcast_proposer_preferences(gloas_epoch, &proposals, &TEST_GVR)
+                .await
+                .expect("The retry must succeed.");
+            assert_eq!(
+                slots(),
+                retry,
+                "With {failures} failed signatures, the retry must send only the unsigned entries."
+            );
+        }
+    }
+
+    /// RSA B2: a builder-request-auth signature error must give an error and
+    /// keep the unsigned entry pending. The key has one builder URL. The
+    /// POST must carry only the signed entries. The retry must sign and send
+    /// only the unsigned entries.
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_signature_error_keeps_the_entry_pending() {
+        let pk = gen_pubkey_bytes();
+        let gloas_epoch = 10;
+        let proposals = two_proposals(pk, gloas_epoch);
+        let (a, b) = (proposals[0].proposal_slot, proposals[1].proposal_slot);
+        let kind = "builder request auth signatures";
+        for (failures, error, first, retry) in signature_error_arms(kind, a, b) {
+            let store = store_with_builders(pk, &["https://a.example"]);
+            let bn = Arc::new(MockBn::new());
+            let signer = Arc::new(MockSigner::new());
+            signer.fail_next(failures);
+            let service = BuilderService::new(
+                signer,
+                bn.clone(),
+                Arc::new(store),
+                GENESIS_FORK,
+                gloas_at(gloas_epoch),
+            );
+            let slots = || -> Vec<Vec<Slot>> {
+                let calls = bn.builder_pref_calls.lock();
+                calls.iter().map(|c| c.iter().map(|e| e.auth.message.slot).collect()).collect()
+            };
+
+            let result = service.broadcast_builder_preferences(gloas_epoch, &proposals).await;
+
+            assert_eq!(
+                result.map_err(|e| e.to_string()),
+                Err(error),
+                "With {failures} failed signatures, the broadcast must return this error."
+            );
+            assert_eq!(
+                slots(),
+                first,
+                "With {failures} failed signatures, the POST must carry only the signed entries."
+            );
+            service
+                .broadcast_builder_preferences(gloas_epoch, &proposals)
+                .await
+                .expect("The retry must succeed.");
+            assert_eq!(
+                slots(),
+                retry,
+                "With {failures} failed signatures, the retry must send only the unsigned entries."
+            );
+        }
     }
 
     #[tokio::test]

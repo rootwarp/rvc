@@ -4647,4 +4647,280 @@ mod tests {
             epoch + 1
         );
     }
+
+    // --- W4-E6b1 R1: only complete work finishes the preferences step ---
+
+    /// The second builder URL in the builder-preferences tests.
+    const SECOND_BUILDER_URL: &str = "https://second-builder.example.com";
+
+    /// Returns a check that is `true` for its first `count` calls.
+    fn fails_first(count: usize) -> impl Fn() -> bool + Send + Sync + 'static {
+        let left = parking_lot::Mutex::new(count);
+        move || {
+            let mut left = left.lock();
+            let fail = *left > 0;
+            *left = left.saturating_sub(1);
+            fail
+        }
+    }
+
+    /// The URLs of each builder-preferences POST, in POST order.
+    fn builder_preference_urls(mock: &MockBeaconNodeClient) -> Vec<Vec<String>> {
+        let posts = mock.submit_builder_preferences_calls();
+        posts.iter().map(|post| post.iter().map(|e| e.url.clone()).collect()).collect()
+    }
+
+    /// Harper B1 and RSA B3: the step waits for the proposer duties of E.
+    /// The epoch E is Gloas, and the local key proposes at slot 5 of E and
+    /// E+1. The first two proposer requests for E answer 503. Thus
+    /// ReorgCheck caches only E+1, and DutyFetch fails for E.
+    ///
+    /// - The first pass must be `NotReady`, and it must send no POST.
+    /// - The next pass must fetch E and send the preferences of E and E+1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_wait_for_the_proposer_duties_of_e() {
+        use BoundaryStep::ProposerPreferences;
+        let epoch = create_test_fork_schedule().gloas_fork_epoch;
+        let first = epoch * SLOTS_PER_EPOCH;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let plan = FailPlan::default();
+        plan.lock().insert(epoch, 2);
+        let f = fixture_seeded(proposals_failing(local_hex, epoch, plan), local, true, &[]).await;
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            f.mock.get_proposer_duties_calls(),
+            [epoch, epoch + 1, epoch],
+            "ReorgCheck must request E and E+1, and DutyFetch must request E only."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::NotReady), false),
+            "With E uncached, the step must not be ready and must stay pending."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+            0,
+            "With E uncached, the step must not send a POST."
+        );
+
+        f.runner.run_pending(first + 1).await;
+
+        assert_eq!(
+            preference_slots(&f.mock),
+            [vec![first + 5, first + SLOTS_PER_EPOCH + 5]],
+            "The next pass must send the preferences of E and E+1."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
+        );
+    }
+
+    /// Harper B2 and RSA B4: a failed proposer POST does not stop the
+    /// builder broadcast of the same pass. The epoch is Gloas-1, and the
+    /// local key has one builder URL. The first proposer POST answers 503.
+    ///
+    /// 1. The builder POST answers 200. The step must be `Failed` and
+    ///    pending. The retry must send the proposer entry again. It must
+    ///    not send or sign the builder entry again.
+    /// 2. The first builder POST answers 500. The runner must report the
+    ///    error of the proposer POST.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proposer_failure_still_sends_the_builder_preferences() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let epoch = first / SLOTS_PER_EPOCH;
+        let proposal = (epoch + 1) * SLOTS_PER_EPOCH + 5;
+        for (arm, builder_failures) in [("builder POST accepted", 0), ("builder POST fails", 1)] {
+            let local = SecretKey::generate();
+            let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+            let (proposer_fails, builder_fails) = (fails_first(1), fails_first(builder_failures));
+            let mock = proposals_from(local_hex, epoch + 1)
+                .with_submit_proposer_preferences(move |_preferences| {
+                    if proposer_fails() {
+                        return Err(unavailable());
+                    }
+                    Ok(())
+                })
+                .with_submit_builder_preferences(move |_entries| {
+                    if builder_fails() {
+                        let message = "builder down".to_string();
+                        return Err(beacon::BeaconError::ApiError { status: 500, message });
+                    }
+                    Ok(beacon::SubmitBuilderPreferencesResult::Success)
+                });
+            let f = fixture_seeded(mock, local, true, &[]).await;
+            f.validator_store
+                .set_global_builders(vec![BUILDER_URL.to_string()])
+                .expect("The builder URL must be valid.");
+            let warns = Warns::default();
+            let _default = warns.install();
+
+            f.runner.run_pending(first).await;
+
+            assert_eq!(
+                builder_preference_slots(&f.mock),
+                [vec![proposal]],
+                "{arm}: The pass must send the builder entry after the failed proposer POST."
+            );
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::Failed), false),
+                "{arm}: The proposer POST failed, so the step must be failed and pending."
+            );
+            if builder_failures == 1 {
+                let failed = "Epoch preferences broadcast failed";
+                let reported: Vec<String> =
+                    warns.lines().into_iter().filter(|line| line.starts_with(failed)).collect();
+                let proposer_error = "Beacon node returned error: 503 - unavailable";
+                assert_eq!(
+                    reported,
+                    [format!("{failed} epoch={epoch} error=beacon node error: {proposer_error}")],
+                    "{arm}: The runner must report the error of the proposer POST."
+                );
+                continue;
+            }
+
+            f.runner.run_pending(first + 1).await;
+
+            assert_eq!(
+                preference_slots(&f.mock),
+                [vec![proposal], vec![proposal]],
+                "{arm}: The retry must send the proposer entry again."
+            );
+            assert_eq!(
+                arrivals(&f.mock, MockMethod::SubmitBuilderPreferences),
+                1,
+                "{arm}: The retry must not send the builder entry again."
+            );
+            assert_eq!(
+                f.registrations.auth_calls(),
+                1,
+                "{arm}: The retry must not sign the builder entry again."
+            );
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::Done), true),
+                "{arm}: The accepted proposer POST must finish the step."
+            );
+        }
+    }
+
+    /// RSA B1: a rejected builder entry keeps the step pending. The epoch is
+    /// Gloas-1, and the local key has two builder URLs. The first builder
+    /// POST answers 200, but it rejects the entry at index 1.
+    ///
+    /// - The first pass must leave the step `Failed` and pending.
+    /// - The retry must send only the rejected entry.
+    /// - The accepted retry must finish the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_builder_entry_keeps_the_step_pending() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let rejects = fails_first(1);
+        let mock = proposals_from(local_hex, first / SLOTS_PER_EPOCH + 1)
+            .with_submit_builder_preferences(move |_entries| {
+                if !rejects() {
+                    return Ok(beacon::SubmitBuilderPreferencesResult::Success);
+                }
+                let message = "The builder rejects the entry.".to_string();
+                let failures = vec![bn_manager::IndexedFailure { index: 1, message }];
+                Ok(beacon::SubmitBuilderPreferencesResult::PartialFailure { failures })
+            });
+        let f = fixture_seeded(mock, local, true, &[]).await;
+        let urls = vec![BUILDER_URL.to_string(), SECOND_BUILDER_URL.to_string()];
+        f.validator_store.set_global_builders(urls.clone()).expect("The URLs must be valid.");
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            builder_preference_urls(&f.mock),
+            std::slice::from_ref(&urls),
+            "The first builder POST must carry the two entries."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "The beacon node rejected an entry, so the step must be failed and pending."
+        );
+
+        f.runner.run_pending(first + 1).await;
+
+        assert_eq!(
+            builder_preference_urls(&f.mock),
+            [urls.clone(), vec![urls[1].clone()]],
+            "The retry must send only the rejected entry."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The accepted retry must finish the step."
+        );
+    }
+
+    /// RSA B2: a preferences signature error keeps the step pending. The
+    /// epoch E is Gloas, and the local key proposes at slot 5 of E and E+1.
+    /// The signer refuses the first signatures of the first pass:
+    ///
+    /// 1. Every signature fails, so the first pass sends no POST.
+    /// 2. The first of the two signatures fails, so the first pass sends
+    ///    the E+1 entry only.
+    ///
+    /// In each arm, the step must be `Failed` and pending after the first
+    /// pass. The retry must sign and send only the unsigned entries, and it
+    /// must finish the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_preferences_signature_error_keeps_the_step_pending() {
+        use BoundaryStep::ProposerPreferences;
+        let epoch = create_test_fork_schedule().gloas_fork_epoch;
+        let first = epoch * SLOTS_PER_EPOCH;
+        let (own, next) = (first + 5, first + SLOTS_PER_EPOCH + 5);
+        let arms = [
+            ("every signature fails", 2, vec![], vec![vec![own, next]]),
+            ("the first signature fails", 1, vec![vec![next]], vec![vec![next], vec![own]]),
+        ];
+        for (arm, failures, after_first, after_retry) in arms {
+            let local = SecretKey::generate();
+            let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+            let f = fixture_seeded(proposals_from(local_hex, epoch), local, true, &[]).await;
+            f.registrations.fail_preferences(failures);
+
+            f.runner.run_pending(first).await;
+
+            assert_eq!(
+                preference_slots(&f.mock),
+                after_first,
+                "{arm}: The first pass must send only the signed entries."
+            );
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::Failed), false),
+                "{arm}: A signature failed, so the step must be failed and pending."
+            );
+
+            f.runner.run_pending(first + 1).await;
+
+            assert_eq!(
+                preference_slots(&f.mock),
+                after_retry,
+                "{arm}: The retry must send only the unsigned entries."
+            );
+            assert_eq!(
+                f.registrations.preferences_calls(),
+                2 + failures,
+                "{arm}: The retry must sign only the unsigned entries."
+            );
+            assert_eq!(
+                step_state(&f.runner, ProposerPreferences),
+                (Some(StepOutcome::Done), true),
+                "{arm}: The accepted retry must finish the step."
+            );
+        }
+    }
 }

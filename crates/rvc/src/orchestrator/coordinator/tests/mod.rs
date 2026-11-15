@@ -546,6 +546,10 @@ pub(crate) struct CountingRegistrationSigner {
     preferences_delay: parking_lot::Mutex<Duration>,
     /// This field counts the `sign_proposer_preferences` calls.
     preferences_calls: parking_lot::Mutex<usize>,
+    /// This field holds the number of next preferences signatures that fail.
+    preferences_failures: parking_lot::Mutex<usize>,
+    /// This field counts the `sign_builder_request_auth` calls.
+    auth_calls: parking_lot::Mutex<usize>,
 }
 
 impl CountingRegistrationSigner {
@@ -555,7 +559,19 @@ impl CountingRegistrationSigner {
             signed: parking_lot::Mutex::new(Vec::new()),
             preferences_delay: parking_lot::Mutex::new(Duration::ZERO),
             preferences_calls: parking_lot::Mutex::new(0),
+            preferences_failures: parking_lot::Mutex::new(0),
+            auth_calls: parking_lot::Mutex::new(0),
         })
+    }
+
+    /// Makes the next `count` preferences signatures return a signer error.
+    pub(crate) fn fail_preferences(&self, count: usize) {
+        *self.preferences_failures.lock() = count;
+    }
+
+    /// Returns the number of `sign_builder_request_auth` calls.
+    pub(crate) fn auth_calls(&self) -> usize {
+        *self.auth_calls.lock()
     }
 
     /// Makes each later preferences signature wait for `delay` before the
@@ -603,6 +619,14 @@ impl ::builder::RegistrationSigner for CountingRegistrationSigner {
         genesis_validators_root: &Root,
     ) -> Result<::crypto::Signature, ::signer::SignerError> {
         *self.preferences_calls.lock() += 1;
+        {
+            let mut failures = self.preferences_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                let error = "The test signer refuses this signature.".to_string();
+                return Err(::signer::SignerError::SigningFailed(error));
+            }
+        }
         let delay = *self.preferences_delay.lock();
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -623,6 +647,7 @@ impl ::builder::RegistrationSigner for CountingRegistrationSigner {
         pubkey: &PublicKey,
         genesis_fork_version: [u8; 4],
     ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        *self.auth_calls.lock() += 1;
         ValidatorSigner::sign_builder_request_auth(&*self.inner, auth, pubkey, genesis_fork_version)
             .await
     }
