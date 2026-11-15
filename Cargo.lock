@@ -4373,7 +4373,6 @@ dependencies = [
  "async-trait",
  "hex",
  "parking_lot",
- "rand 0.8.6",
  "rvc-bn-manager",
  "rvc-crypto",
  "rvc-eth-types",

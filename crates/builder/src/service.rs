@@ -171,72 +171,13 @@ impl BuilderService {
         }
     }
 
-    /// Drop cached registrations so the next [`Self::register_validators`] re-submits.
+    /// Drops the cached registrations, so the next
+    /// [`Self::submit_epoch_registrations`] signs every key again.
     ///
     /// Preference caches are left intact. Used by boundary tests so a missing
     /// Gloas gate cannot hide behind `CachedRegistration`.
     pub async fn clear_cached_registrations(&self) {
         self.cache.write().await.clear();
-    }
-
-    /// Old path: signs and sends only new or changed keys; a cached key is never re-sent.
-    ///
-    /// Kept for the startup future and the slot-0 boundary until W4-E6a moves
-    /// them to [`Self::submit_epoch_registrations`] and deletes this method.
-    #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size, epoch = epoch))]
-    pub async fn register_validators(&self, epoch: u64) -> Result<(), BuilderServiceError> {
-        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
-        if legacy_proposer_ops_retired(fork) {
-            info!(epoch, fork = fork.as_ref(), "Skipping register_validators at Gloas");
-            return Ok(());
-        }
-        let builder_pubkeys = self.builder_keys();
-
-        if builder_pubkeys.is_empty() {
-            debug!("no builder-enabled validators to register");
-            return Ok(());
-        }
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_secs();
-
-        // Collect candidates that need (re-)registration by checking
-        // the cache under a read lock, then release the lock before
-        // performing any async signing.
-        let candidates: Vec<([u8; 48], [u8; 20], u64)> = {
-            let cache = self.cache.read().await;
-            builder_pubkeys
-                .iter()
-                .filter_map(|pubkey| {
-                    let fee_recipient = self.validator_store.effective_fee_recipient(pubkey);
-                    let gas_limit = self.validator_store.effective_gas_limit(pubkey);
-                    if cache.get(pubkey).is_some_and(|c| c.signed_for(fee_recipient, gas_limit)) {
-                        None
-                    } else {
-                        Some((*pubkey, fee_recipient, gas_limit))
-                    }
-                })
-                .collect()
-        };
-
-        let mut registrations = Vec::new();
-        for &(pubkey, fee_recipient, gas_limit) in &candidates {
-            let registration =
-                ValidatorRegistrationV1 { fee_recipient, gas_limit, timestamp, pubkey };
-            if let Some(signed) = self.sign_registration(registration).await {
-                registrations.push(signed);
-            }
-        }
-
-        if registrations.is_empty() {
-            debug!("no new registrations to submit");
-            return Ok(());
-        }
-
-        self.send_batches(&registrations).await;
-        Ok(())
     }
 
     /// Re-send every builder key's registration; sign only keys that are new or changed.
@@ -247,7 +188,8 @@ impl BuilderService {
     /// signed timestamp. Each signature is cached before any send; a changed
     /// key whose re-sign fails loses its old entry. Every cached builder key is
     /// then sent in the configured batches, and every batch is tried. From
-    /// Gloas on this is a no-op. W4-E6a's epoch-boundary step calls it.
+    /// Gloas on this is a no-op. The runner's BuilderRegistration step calls
+    /// it in each epoch.
     ///
     /// # Errors
     ///
@@ -864,11 +806,6 @@ impl BuilderService {
             builders: self.cached_builder_entries(pubkey, slot).await,
         }
     }
-
-    pub fn jitter_seconds() -> u64 {
-        use rand::Rng;
-        rand::thread_rng().gen_range(0..30)
-    }
 }
 
 fn capped_unique_builder_urls(urls: Vec<String>) -> Vec<String> {
@@ -1195,7 +1132,7 @@ mod tests {
         let service =
             BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         let mut indices = HashMap::new();
@@ -1204,7 +1141,7 @@ mod tests {
         assert_eq!(bn.prepare_calls.lock().len(), 1);
     }
 
-    // --- register_validators tests ---
+    // --- registration tests ---
 
     #[tokio::test]
     async fn test_register_validators_no_builder_enabled() {
@@ -1219,7 +1156,7 @@ mod tests {
             unscheduled(),
         );
 
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
         assert!(result.is_ok());
 
         let calls = bn.register_calls.lock();
@@ -1231,7 +1168,7 @@ mod tests {
         let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
         let service = build_service(MockSigner::new(), MockBn::new(), store);
 
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
         assert!(result.is_ok());
     }
 
@@ -1255,7 +1192,7 @@ mod tests {
             unscheduled(),
         );
 
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
         assert!(result.is_ok());
 
         let calls = bn.register_calls.lock();
@@ -1284,7 +1221,7 @@ mod tests {
         let service =
             BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
 
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
         assert!(result.is_ok());
 
         let calls = bn.register_calls.lock();
@@ -1308,7 +1245,7 @@ mod tests {
         let service =
             BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
 
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
+        let result = service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await;
         assert!(result.is_ok());
 
         let calls = bn.register_calls.lock();
@@ -1319,69 +1256,6 @@ mod tests {
         assert!(pubkeys.contains(&pk1));
         assert!(pubkeys.contains(&pk2));
         assert!(!pubkeys.contains(&pk3));
-    }
-
-    /// Old-path guard until W4-E6a: a failed batch still returns `Ok` and caches nothing.
-    #[tokio::test]
-    async fn test_register_validators_beacon_error_continues() {
-        let pk = gen_pubkey_bytes();
-        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
-
-        let bn = Arc::new(MockBn::new().with_register_error());
-        let signer = Arc::new(MockSigner::new());
-        let service = BuilderService::new(signer, bn, Arc::new(store), GENESIS_FORK, unscheduled());
-
-        // With batching, failed batches are logged but don't abort — returns Ok
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
-        assert!(result.is_ok());
-
-        // Cache should not be updated for failed registrations
-        let cache = service.cache.read().await;
-        assert!(cache.is_empty());
-    }
-
-    /// Old-path guard until W4-E6a: every signature failing still returns `Ok`, no POST.
-    #[tokio::test]
-    async fn test_register_validators_sign_error_skips_validator() {
-        let pk1 = gen_pubkey_bytes();
-        let pk2 = gen_pubkey_bytes();
-        let store =
-            test_store_with_builder_validators(&[(pk1, true, None, None), (pk2, true, None, None)]);
-
-        let bn = Arc::new(MockBn::new());
-        let signer = Arc::new(MockSigner::new().with_sign_error());
-        let service =
-            BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
-
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
-        assert!(result.is_ok());
-
-        // No registrations submitted since signing failed
-        let calls = bn.register_calls.lock();
-        assert!(calls.is_empty());
-    }
-
-    /// Old-path guard until W4-E6a: an unchanged cached key is not re-sent.
-    #[tokio::test]
-    async fn test_register_validators_caches_and_skips_unchanged() {
-        let pk = gen_pubkey_bytes();
-        let fr = test_fee_recipient(0xab);
-        let store = test_store_with_builder_validators(&[(pk, true, Some(fr), Some(35_000_000))]);
-
-        let bn = Arc::new(MockBn::new());
-        let signer = Arc::new(MockSigner::new());
-        let service =
-            BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
-
-        // First call should register
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
-        assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().len(), 1);
-
-        // Second call should skip (cached)
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
-        assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().len(), 1); // Still 1, no new call
     }
 
     #[tokio::test]
@@ -1403,7 +1277,7 @@ mod tests {
             BuilderService::new(signer, bn.clone(), store.clone(), GENESIS_FORK, unscheduled());
 
         // First registration
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change fee_recipient
@@ -1418,7 +1292,7 @@ mod tests {
             .unwrap();
 
         // Should re-register
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.fee_recipient, fr2);
@@ -1441,7 +1315,7 @@ mod tests {
         let service =
             BuilderService::new(signer, bn.clone(), store.clone(), GENESIS_FORK, unscheduled());
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change gas_limit
@@ -1455,7 +1329,7 @@ mod tests {
             )
             .unwrap();
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.gas_limit, 50_000_000);
@@ -1472,7 +1346,7 @@ mod tests {
             BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
 
         let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         let calls = bn.register_calls.lock();
@@ -1599,16 +1473,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("beacon node error"));
     }
 
-    // --- jitter tests ---
-
-    #[test]
-    fn test_jitter_is_in_range() {
-        for _ in 0..100 {
-            let jitter = BuilderService::jitter_seconds();
-            assert!(jitter < 30);
-        }
-    }
-
     // --- Error display tests ---
 
     #[test]
@@ -1651,7 +1515,7 @@ mod tests {
         let signer = Arc::new(MockSigner::new());
         let service = build_service_with_batching(signer, bn.clone(), store, 2, 0);
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
 
         let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 3);
@@ -1672,38 +1536,11 @@ mod tests {
         let signer = Arc::new(MockSigner::new());
         let service = build_service_with_batching(signer, bn.clone(), store, 0, 0);
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
 
         let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 5);
-    }
-
-    /// Old-path guard until W4-E6a: a failed batch still returns `Ok`; only accepted batches are cached.
-    #[tokio::test]
-    async fn test_batching_partial_failure_continues_remaining() {
-        // Fail batch index 1 (second batch). Batches 0 and 2 should succeed.
-        let pks: Vec<[u8; 48]> = (0..5).map(|_| gen_pubkey_bytes()).collect();
-        let validators: Vec<ValidatorEntry> =
-            pks.iter().map(|pk| (*pk, true, None, None)).collect();
-        let store = Arc::new(test_store_with_builder_validators(&validators));
-
-        let bn = Arc::new(MockBn::new().with_register_error_on_calls(vec![1]));
-        let signer = Arc::new(MockSigner::new());
-        let service = build_service_with_batching(signer, bn.clone(), store, 2, 0);
-
-        let result = service.register_validators(PRE_GLOAS_EPOCH).await;
-        assert!(result.is_ok());
-
-        // All 3 batches should have been attempted
-        {
-            let calls = bn.register_calls.lock();
-            assert_eq!(calls.len(), 3);
-        }
-
-        // Cache should only contain validators from successful batches (0 and 2)
-        let cache = service.cache.read().await;
-        assert_eq!(cache.len(), 3); // 2 from batch 0 + 1 from batch 2
     }
 
     #[tokio::test]
@@ -1734,7 +1571,7 @@ mod tests {
         let service = build_service_with_batching(signer, bn.clone(), store, 10, 50);
 
         let start = std::time::Instant::now();
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap();
         let elapsed = start.elapsed();
 
         let calls = bn.register_calls.lock();
@@ -2238,7 +2075,7 @@ mod tests {
             gloas_at(gloas_epoch),
         );
 
-        service.register_validators(gloas_epoch).await.unwrap();
+        service.submit_epoch_registrations(gloas_epoch).await.unwrap();
         let mut indices = HashMap::new();
         indices.insert(pk, 1u64);
         service.prepare_proposers(gloas_epoch, &indices).await.unwrap();
@@ -2260,10 +2097,10 @@ mod tests {
             unscheduled(),
         );
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap_err();
         assert_eq!(bn.register_calls.lock().len(), 1);
 
-        service.register_validators(PRE_GLOAS_EPOCH).await.unwrap();
+        service.submit_epoch_registrations(PRE_GLOAS_EPOCH).await.unwrap_err();
         assert_eq!(bn.register_calls.lock().len(), 2);
     }
 
@@ -2647,7 +2484,7 @@ mod tests {
             schedule,
         );
 
-        service.register_validators(epoch).await.unwrap();
+        service.submit_epoch_registrations(epoch).await.unwrap();
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         let proposals = vec![upcoming_for(pk, epoch, 1)];
@@ -3022,7 +2859,7 @@ mod tests {
         let bn = Arc::new(MockBn::new());
         let builder =
             BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
-        signer::require_beacon_admission_scope(builder.register_validators(PRE_GLOAS_EPOCH))
+        signer::require_beacon_admission_scope(builder.submit_epoch_registrations(PRE_GLOAS_EPOCH))
             .await
             .unwrap();
         {

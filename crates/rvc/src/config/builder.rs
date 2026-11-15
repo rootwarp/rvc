@@ -2935,7 +2935,7 @@ mod tests {
     async fn test_build_builder_service_applies_batch_knobs() {
         let (service, bn) = builder_service_with_knobs(5, 2, 10);
 
-        service.register_validators(0).await.unwrap();
+        service.submit_epoch_registrations(0).await.unwrap();
 
         let sizes: Vec<usize> = bn.register_validators_calls().iter().map(Vec::len).collect();
         assert_eq!(sizes, vec![2, 2, 1], "5 keys in batches of 2");
@@ -2969,26 +2969,6 @@ mod tests {
 
         assert!(cut.is_err(), "a fixed 10 s cuts the round: {cut:?}");
         assert_eq!(bn.register_validators_calls().len(), 2);
-    }
-
-    /// Old path under its 10 s cut: the batches already sent stay cached, so the
-    /// next round sends only the keys the cut left out.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_cut_registration_round_keeps_the_batches_it_sent() {
-        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
-        let cut =
-            tokio::time::timeout(Duration::from_secs(10), service.register_validators(0)).await;
-        assert!(cut.is_err(), "the round is cut after 2 of 3 batches: {cut:?}");
-        let sent: HashSet<[u8; 48]> =
-            bn.register_validators_calls().iter().flatten().map(|r| r.message.pubkey).collect();
-        assert_eq!(sent.len(), 2);
-
-        service.register_validators(0).await.unwrap();
-
-        let calls = bn.register_validators_calls();
-        assert_eq!(calls.len(), 3, "the next round sends one batch");
-        assert_eq!(calls[2].len(), 1);
-        assert!(!sent.contains(&calls[2][0].message.pubkey), "only the key the cut left out");
     }
 
     #[test]
