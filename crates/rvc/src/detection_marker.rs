@@ -322,6 +322,8 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
     if err.kind() != io::ErrorKind::AlreadyExists {
         return Err(err);
     }
+    #[cfg(test)]
+    run_record_path_hook(&BEFORE_SECOND_RECORD_READ, data_dir);
     existing_record_result(data_dir).unwrap_or_else(|| {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -359,6 +361,8 @@ fn create_clear_record(data_dir: &Path) -> io::Result<()> {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     ));
     let linked = (|| {
+        #[cfg(test)]
+        run_record_path_hook(&BEFORE_RECORD_TEMP_OPEN, &tmp_path);
         let mut file = open_record(&tmp_path, true)?;
         #[cfg(unix)]
         {
@@ -370,7 +374,7 @@ fn create_clear_record(data_dir: &Path) -> io::Result<()> {
         drop(file);
         #[cfg(test)]
         run_before_record_link();
-        fs::hard_link(&tmp_path, record_path(data_dir)).map_err(explain_link_error)
+        link_record(&tmp_path, data_dir).map_err(explain_link_error)
     })();
     if let Err(err) = linked {
         let _ = fs::remove_file(&tmp_path);
@@ -378,6 +382,15 @@ fn create_clear_record(data_dir: &Path) -> io::Result<()> {
     }
     fs::remove_file(&tmp_path)?;
     sync_dir(data_dir)
+}
+
+/// Give the temp file `tmp_path` the record name in `data_dir` with a hard link.
+fn link_record(tmp_path: &Path, data_dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(kind) = take_record_link_failure() {
+        return Err(io::Error::from(kind));
+    }
+    fs::hard_link(tmp_path, record_path(data_dir))
 }
 
 /// Remove the temp files that a crashed record create left in `data_dir`.
@@ -618,6 +631,12 @@ fn write_record_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 type BeforeRecordLinkHook = Box<dyn FnOnce()>;
 
 #[cfg(test)]
+type RecordPathHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+type RecordPathHookSlot = std::thread::LocalKey<RefCell<Option<RecordPathHook>>>;
+
+#[cfg(test)]
 thread_local! {
     static MARKER_WRITE_FAILS_LEFT: Cell<u32> = const { Cell::new(0) };
     static PREALLOCATE_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -626,6 +645,65 @@ thread_local! {
     static FSYNC_CALLS: Cell<u32> = const { Cell::new(0) };
     static RECORD_WRITE_PANICS: Cell<bool> = const { Cell::new(false) };
     static BEFORE_RECORD_LINK: RefCell<Option<BeforeRecordLinkHook>> = const { RefCell::new(None) };
+    static BEFORE_RECORD_TEMP_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+    static BEFORE_SECOND_RECORD_READ: RefCell<Option<RecordPathHook>> =
+        const { RefCell::new(None) };
+    static RECORD_LINK_FAILURE: Cell<Option<io::ErrorKind>> = const { Cell::new(None) };
+}
+
+/// Run `hook` one time on this thread, before the exclusive open of the temp
+/// file. The hook gets the temp path.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_record_temp_open(
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    arm_record_path_hook(&BEFORE_RECORD_TEMP_OPEN, hook)
+}
+
+/// Run `hook` one time on this thread, after the create fails with
+/// `AlreadyExists` and before the second record read. The hook gets the
+/// keystore directory.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_second_record_read(
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    arm_record_path_hook(&BEFORE_SECOND_RECORD_READ, hook)
+}
+
+#[cfg(test)]
+fn arm_record_path_hook(
+    slot: &'static RecordPathHookSlot,
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    slot.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    RecordPathHookGuard(slot)
+}
+
+#[cfg(test)]
+fn run_record_path_hook(slot: &'static RecordPathHookSlot, path: &Path) {
+    let hook = slot.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+/// Make the next record link on this thread fail with `kind`. The link does
+/// not run.
+///
+/// The guard clears the injection when it drops.
+#[cfg(test)]
+pub(crate) fn arm_record_link_failure(kind: io::ErrorKind) -> RecordLinkFailGuard {
+    RECORD_LINK_FAILURE.with(|failure| failure.set(Some(kind)));
+    RecordLinkFailGuard
+}
+
+#[cfg(test)]
+fn take_record_link_failure() -> Option<io::ErrorKind> {
+    RECORD_LINK_FAILURE.with(Cell::take)
 }
 
 /// The injected record-write panic occurs after this number of bytes.
@@ -812,6 +890,28 @@ pub(crate) struct BeforeRecordLinkGuard;
 impl Drop for BeforeRecordLinkGuard {
     fn drop(&mut self) {
         BEFORE_RECORD_LINK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The guard removes its unused record-path hook when it drops.
+#[cfg(test)]
+pub(crate) struct RecordPathHookGuard(&'static RecordPathHookSlot);
+
+#[cfg(test)]
+impl Drop for RecordPathHookGuard {
+    fn drop(&mut self) {
+        self.0.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The guard clears the injected record-link failure when it drops.
+#[cfg(test)]
+pub(crate) struct RecordLinkFailGuard;
+
+#[cfg(test)]
+impl Drop for RecordLinkFailGuard {
+    fn drop(&mut self) {
+        RECORD_LINK_FAILURE.with(|failure| failure.set(None));
     }
 }
 
@@ -1351,13 +1451,14 @@ mod tests {
         }
     }
 
-    /// The directory holds a record and five names that have the temp-file
+    /// The directory holds a record and six names that have the temp-file
     /// shape or a shape near it. The test requires these results:
     ///
     /// - The sweep removes only the regular file `.{RECORD_FILENAME}.1.2.tmp`.
     /// - The sweep does not remove or follow a symlink with the temp-file shape.
     /// - The sweep does not remove a directory with the temp-file shape.
-    /// - The sweep does not remove the two operator files.
+    /// - The sweep does not remove the three operator files. One of them has
+    ///   a PID part that is not digits.
     /// - The record stays `Clear`.
     /// - The sweep fsyncs the directory one time after a removal, and not when
     ///   it removes no file.
@@ -1375,6 +1476,7 @@ mod tests {
         fs::create_dir(path("5.6")).expect("The test must make the directory.");
         fs::write(path("x"), b"operator file").expect("The test must write an operator file.");
         fs::write(path("1.x"), b"operator file").expect("The test must write an operator file.");
+        fs::write(path("x.1"), b"operator file").expect("The test must write an operator file.");
 
         let before = fsync_calls();
         let removed = sweep_stale_record_temps(dir.path());
@@ -1384,7 +1486,14 @@ mod tests {
             "The sweep must remove one file. The result is {removed:?}."
         );
         assert_eq!(fsyncs, 1, "The sweep must fsync the directory one time after the removal.");
-        let mut kept = vec![name("1.x"), name("3.4"), name("5.6"), name("x"), "link-target".into()];
+        let mut kept = vec![
+            name("1.x"),
+            name("3.4"),
+            name("5.6"),
+            name("x"),
+            name("x.1"),
+            "link-target".into(),
+        ];
         kept.sort();
         assert_eq!(
             names_other_than_the_record(dir.path()),
@@ -1512,6 +1621,256 @@ mod tests {
         assert!(
             !err.to_string().contains("hard links"),
             "An AlreadyExists error must not name the hard-link support. The error is: {err}"
+        );
+    }
+
+    /// Another create owns a file at the temp name of this create. The test
+    /// requires these results:
+    ///
+    /// - `preallocate_detection_record` returns `NotFound`, because no record
+    ///   exists.
+    /// - The file at the temp name keeps its bytes.
+    /// - No record is at the final name.
+    #[test]
+    fn failed_temp_open_keeps_the_file_of_another_create() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let temp = std::rc::Rc::new(RefCell::new(None));
+        let hook_temp = std::rc::Rc::clone(&temp);
+        let guard = arm_before_record_temp_open(move |tmp_path| {
+            fs::write(tmp_path, b"other create").expect("The hook must write the other file.");
+            *hook_temp.borrow_mut() = Some(tmp_path.to_path_buf());
+        });
+        let result = preallocate_detection_record(dir.path());
+        drop(guard);
+        let temp = temp.borrow_mut().take().expect("The hook must run before the temp open.");
+        assert_eq!(
+            result.as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound),
+            "The collision at the temp name must give NotFound. The result is {result:?}."
+        );
+        assert_eq!(
+            fs::read(&temp).ok(),
+            Some(b"other create".to_vec()),
+            "The failed temp open must not remove or change the file of the other create."
+        );
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent,
+            "The failed temp open must not put a record at the final name."
+        );
+    }
+
+    /// The link fails with `AlreadyExists`, because a hook writes a file at
+    /// the final name. Each row requires these results:
+    ///
+    /// - `preallocate_detection_record` returns the error kind of the row.
+    /// - The final name keeps the bytes of the row, or it stays absent.
+    /// - No temp file stays in the directory.
+    ///
+    /// In the `removed` row, a second hook removes the record before the
+    /// second read.
+    #[test]
+    fn collision_rejects_an_unreadable_or_absent_record() {
+        let detected = encode_record(true, 5, 6).expect("The test must encode the record.");
+        let rows = [
+            (
+                "short",
+                b"short".to_vec(),
+                false,
+                io::ErrorKind::InvalidData,
+                Some(b"short".to_vec()),
+            ),
+            ("removed", detected.to_vec(), true, io::ErrorKind::NotFound, None),
+        ];
+        for (case, bytes, remove, kind, kept) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let final_path = record_path(dir.path());
+            let link_guard = arm_before_record_link(move || {
+                fs::write(&final_path, bytes).expect("The hook must write the record.");
+            });
+            let read_guard = remove.then(|| {
+                arm_before_second_record_read(|data_dir| {
+                    fs::remove_file(record_path(data_dir))
+                        .expect("The hook must remove the record.");
+                })
+            });
+            let result = preallocate_detection_record(dir.path());
+            drop(read_guard);
+            drop(link_guard);
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                Some(kind),
+                "In the {case} row, the error kind of preallocate_detection_record must be \
+                 {kind:?}. The result is {result:?}."
+            );
+            assert_eq!(
+                fs::read(record_path(dir.path())).ok(),
+                kept,
+                "In the {case} row, the create must not change the final name."
+            );
+            assert_eq!(
+                names_other_than_the_record(dir.path()),
+                Vec::<String>::new(),
+                "In the {case} row, no temp file must stay in the directory."
+            );
+        }
+    }
+
+    /// The fsync of the new record passes, and the directory fsync after the
+    /// link fails. The test requires these results:
+    ///
+    /// - `preallocate_detection_record` returns an error.
+    /// - The create calls fsync two times.
+    /// - The complete `Clear` record is at the final name.
+    /// - No temp file stays in the directory.
+    #[test]
+    fn directory_fsync_failure_after_the_link_returns_an_error() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent,
+            "The directory must not contain a record at the start."
+        );
+        let before = fsync_calls();
+        let guard = arm_fsync_failures_after(1, 1);
+        let result = preallocate_detection_record(dir.path());
+        drop(guard);
+        let fsyncs = fsync_calls() - before;
+        assert!(
+            result.is_err(),
+            "preallocate_detection_record must fail when the directory fsync fails. The result \
+             is {result:?}."
+        );
+        assert_eq!(fsyncs, 2, "The create must fsync the temp file and then the directory.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "The complete record must stay at the final name."
+        );
+        assert_eq!(
+            names_other_than_the_record(dir.path()),
+            Vec::<String>::new(),
+            "The create must remove the temp name before the directory fsync."
+        );
+    }
+
+    /// The guard sets the umask of this process. It sets the previous umask
+    /// again when it drops.
+    #[cfg(unix)]
+    struct UmaskGuard(libc::mode_t);
+
+    #[cfg(unix)]
+    impl UmaskGuard {
+        #[allow(unsafe_code)]
+        fn set(mask: libc::mode_t) -> Self {
+            // SAFETY: umask only changes the file-mode creation mask of this process.
+            Self(unsafe { libc::umask(mask) })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: umask only changes the file-mode creation mask of this process.
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    /// The umask `0o200` removes the owner write bit from a new file. The
+    /// test makes the directory before it sets that umask, and it requires
+    /// mode `0o600` on the new record.
+    ///
+    /// The umask is a value of the process. nextest runs each test in a
+    /// different process.
+    #[cfg(unix)]
+    #[test]
+    fn create_sets_mode_0600_under_a_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let umask = UmaskGuard::set(0o200);
+        let result = preallocate_detection_record(dir.path());
+        drop(umask);
+        assert!(
+            result.is_ok(),
+            "preallocate_detection_record must succeed under the umask 0o200. The result is \
+             {result:?}."
+        );
+        let mode = fs::metadata(record_path(dir.path()))
+            .expect("The test must read the record metadata.")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "The new record must have mode 0o600 under the umask 0o200. The mode is 0o{mode:o}."
+        );
+    }
+
+    /// Return the file status flags of `file` from `fcntl(F_GETFL)`.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn status_flags(file: &File) -> libc::c_int {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` keeps the descriptor open, and F_GETFL only reads its flags.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) must succeed. The error is: {}",
+            io::Error::last_os_error()
+        );
+        flags
+    }
+
+    /// `open_record` opens a new temp file, the record, and names that exist
+    /// already. The test requires these results:
+    ///
+    /// - Each open descriptor has the `O_NONBLOCK` status flag.
+    /// - The create mode returns `AlreadyExists` for the record, a hard link
+    ///   to it, and a symlink to it.
+    /// - The open of the record does not follow a leaf symlink.
+    /// - The bytes of the record do not change.
+    #[cfg(unix)]
+    #[test]
+    fn record_opens_are_nonblocking_and_refuse_existing_names() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let record = record_path(dir.path());
+        let hard_link = dir.path().join("hard-link");
+        let symlink = dir.path().join("symlink");
+        preallocate_detection_record(dir.path()).expect("The test must preallocate the record.");
+        let created = open_record(&dir.path().join("new-temp"), true)
+            .expect("The test must create a temp file.");
+        let existing = open_record(&record, false).expect("The test must open the record.");
+        for (case, file) in [("new temp file", &created), ("record", &existing)] {
+            assert_ne!(
+                status_flags(file) & libc::O_NONBLOCK,
+                0,
+                "The descriptor of the {case} must have O_NONBLOCK."
+            );
+        }
+        let bytes = fs::read(&record).expect("The test must read the record.");
+        fs::hard_link(&record, &hard_link).expect("The test must make the hard link.");
+        std::os::unix::fs::symlink(&record, &symlink).expect("The test must make the symlink.");
+        for (case, path) in [("record", &record), ("hard link", &hard_link), ("symlink", &symlink)]
+        {
+            let result = open_record(path, true);
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                Some(io::ErrorKind::AlreadyExists),
+                "The create mode must return AlreadyExists for the {case}. The result is \
+                 {result:?}."
+            );
+        }
+        let result = open_record(&symlink, false);
+        assert_eq!(
+            result.as_ref().err().and_then(io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "The open of the record must not follow a leaf symlink. The result is {result:?}."
+        );
+        assert_eq!(
+            fs::read(&record).ok(),
+            Some(bytes),
+            "The record opens must not change the bytes of the record."
         );
     }
 }

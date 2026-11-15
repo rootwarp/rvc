@@ -1688,6 +1688,155 @@ mod tests {
         );
     }
 
+    /// Return the boot error for the keystore `dir` with detection on. The
+    /// config has no slashing database.
+    async fn boot_with_detection_on(dir: &std::path::Path) -> BootstrapError {
+        let config = Config {
+            keystore_path: dir.to_path_buf(),
+            doppelganger_detection: true,
+            ..Default::default()
+        };
+        let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+        let options = RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: OperationTimeouts::default(),
+        };
+        run(config, options, executor, rx)
+            .await
+            .expect_err("The boot must stop, because the test has no slashing database.")
+    }
+
+    /// Return the sorted names in `dir`.
+    fn sorted_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("The test must read the directory.")
+            .map(|entry| {
+                let entry = entry.expect("The test must read a directory entry.");
+                entry.file_name().to_string_lossy().into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The keystore holds a stale record temp file, and the slashing database
+    /// is valid. The invalid genesis validators root stops the boot after the
+    /// sweep step. The test requires these results:
+    ///
+    /// - Each boot stops at the genesis validators root.
+    /// - With detection on, the sweep removes the temp file, and the record
+    ///   is `Clear`.
+    /// - With detection off, the temp file stays, and no record exists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_removes_a_stale_record_temp_only_with_detection_on() {
+        use crate::detection_marker::{inspect_record, RecordInspect, RECORD_FILENAME};
+        let stale = format!(".{RECORD_FILENAME}.1.2.tmp");
+        let rows = [
+            ("on", true, vec![RECORD_FILENAME.to_string()], RecordInspect::Clear),
+            ("off", false, vec![stale.clone()], RecordInspect::Absent),
+        ];
+        for (state, detection, kept, record) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let keystore = dir.path().join("keys");
+            std::fs::create_dir_all(&keystore).expect("The test must create the keystore.");
+            let db_path = dir.path().join("slashing.db");
+            try_seed_slashing_db(&db_path);
+            std::fs::write(keystore.join(&stale), b"partial")
+                .expect("The test must write the stale temp file.");
+            let config = Config {
+                keystore_path: keystore.clone(),
+                slashing_db_path: db_path,
+                genesis_validators_root: Some("0xzz".to_string()),
+                doppelganger_detection: detection,
+                ..Default::default()
+            };
+            let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+            let options = RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: OperationTimeouts::default(),
+            };
+            let err = run(config, options, executor, rx)
+                .await
+                .expect_err("The invalid genesis validators root must stop the boot.");
+            assert!(
+                err.to_string().contains("genesis validators root"),
+                "With detection {state}, the boot must stop at the genesis validators root. \
+                 The error is: {err}"
+            );
+            let names: Vec<String> = sorted_names(&keystore)
+                .into_iter()
+                .filter(|name| name.contains(RECORD_FILENAME))
+                .collect();
+            assert_eq!(
+                names, kept,
+                "With detection {state}, the keystore must hold only these record names."
+            );
+            assert_eq!(
+                inspect_record(&keystore),
+                record,
+                "With detection {state}, the record must have this state."
+            );
+        }
+    }
+
+    /// The create fails with `AlreadyExists` at the link, and a hook removes
+    /// the record before the second read. The test requires exit 1 and the
+    /// preallocation error text.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_exits_1_when_the_record_is_absent_after_a_link_collision() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let final_path = crate::detection_marker::record_path(dir.path());
+        let link_guard = crate::detection_marker::arm_before_record_link(move || {
+            std::fs::write(&final_path, b"appeared").expect("The hook must write the record.");
+        });
+        let read_guard = crate::detection_marker::arm_before_second_record_read(|data_dir| {
+            std::fs::remove_file(crate::detection_marker::record_path(data_dir))
+                .expect("The hook must remove the record.");
+        });
+        let err = boot_with_detection_on(dir.path()).await;
+        drop(read_guard);
+        drop(link_guard);
+        assert_eq!(err.exit_code(), 1, "The boot must exit 1. The error is: {err}");
+        assert!(
+            err.to_string().contains("cannot preallocate the doppelganger detection record"),
+            "The boot must stop at the record preallocation. The error is: {err}"
+        );
+    }
+
+    /// A filesystem without hard links fails the record link with
+    /// `PermissionDenied` or `Unsupported`. For each kind, the test requires
+    /// these results:
+    ///
+    /// - The boot with detection on exits 1.
+    /// - The error text names the missing hard-link support.
+    /// - No record and no temp file stay in the keystore.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_names_the_missing_hard_link_support() {
+        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::Unsupported] {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let guard = crate::detection_marker::arm_record_link_failure(kind);
+            let err = boot_with_detection_on(dir.path()).await;
+            drop(guard);
+            assert_eq!(
+                err.exit_code(),
+                1,
+                "The boot must exit 1 for the {kind:?} link error. The error is: {err}"
+            );
+            assert!(
+                err.to_string().contains("does not support hard links"),
+                "The {kind:?} boot error must name the missing hard-link support. The error \
+                 is: {err}"
+            );
+            assert_eq!(
+                sorted_names(dir.path()),
+                Vec::<String>::new(),
+                "The failed {kind:?} create must leave no record and no temp file."
+            );
+        }
+    }
+
     /// ARCH-2i: production body of run.rs must not hard-exit the process.
     #[test]
     fn test_run_rs_has_no_process_exit_call() {
