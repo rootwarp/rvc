@@ -2850,6 +2850,8 @@ struct BoundaryRun {
     warns: Vec<(Option<Slot>, String)>,
     /// Epochs of the `get_proposer_duties` requests made after the seed.
     proposer_requests: Vec<u64>,
+    /// The builder service's signer, when the drive has a builder service.
+    registrations: Option<Arc<CountingRegistrationSigner>>,
 }
 
 impl BoundaryRun {
@@ -2902,7 +2904,34 @@ async fn drive_boundary_keys(
     timeouts: OperationTimeouts,
     from_slot: Slot,
     to_slot: Slot,
+    before_slot: impl FnMut(Slot, &crate::pubkey_index::SharedPubkeyIndexRegistry),
+) -> BoundaryRun {
+    drive_boundary_opts(mock, keys, timeouts, from_slot, to_slot, before_slot, false).await
+}
+
+/// [`drive_boundary`] with `local` as validator 42 and a builder service
+/// over the same mock. The key is builder-enabled. The builder service
+/// signs through a [`CountingRegistrationSigner`].
+async fn drive_boundary_builder(
+    mock: bn_manager::MockBeaconNodeClient,
+    local: SecretKey,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
+    let keys = vec![(local, Some(BOUNDARY_INDEX))];
+    let timeouts = create_test_config().timeouts;
+    drive_boundary_opts(mock, keys, timeouts, from_slot, to_slot, no_hook, true).await
+}
+
+/// [`drive_boundary_keys`], with a builder service when `builder` is true.
+async fn drive_boundary_opts(
+    mock: bn_manager::MockBeaconNodeClient,
+    keys: Vec<(SecretKey, Option<&'static str>)>,
+    timeouts: OperationTimeouts,
+    from_slot: Slot,
+    to_slot: Slot,
     mut before_slot: impl FnMut(Slot, &crate::pubkey_index::SharedPubkeyIndexRegistry),
+    builder: bool,
 ) -> BoundaryRun {
     use ::timing::{DeadlineBps, DeadlineSchedule};
     use tracing_subscriber::layer::SubscriberExt;
@@ -2922,7 +2951,9 @@ async fn drive_boundary_keys(
     for (secret, index) in keys {
         let pubkey = secret.public_key();
         let pk_bytes = pubkey.to_bytes();
-        validator_store.add_validator(ValidatorConfig::new(pk_bytes)).expect("add validator");
+        let mut validator = ValidatorConfig::new(pk_bytes);
+        validator.builder_proposals = builder;
+        validator_store.add_validator(validator).expect("add validator");
         key_manager.insert(secret);
         pubkey_map.insert(pk_bytes, pubkey);
         indices.extend(index.map(|index| (pk_bytes, index.to_string())));
@@ -2954,6 +2985,18 @@ async fn drive_boundary_keys(
     let config = create_test_config()
         .with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start))
         .with_timeouts(timeouts);
+    let validator_signer: Arc<dyn ValidatorSigner> = signer.clone();
+    let registrations = builder.then(|| CountingRegistrationSigner::new(validator_signer));
+    let builder_service = registrations.as_ref().map(|registrations| {
+        let schedule = Arc::clone(&config.fork_schedule);
+        Arc::new(BuilderService::new(
+            registrations.clone(),
+            Arc::new(beacon.clone()),
+            Arc::clone(&validator_store),
+            schedule.genesis_fork_version,
+            schedule,
+        ))
+    });
     let deps = OrchestratorDeps::for_test(
         Arc::clone(&clock),
         duty_tracker,
@@ -2961,7 +3004,7 @@ async fn drive_boundary_keys(
         Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
         beacon,
         create_mock_block_beacon(),
-        None,
+        builder_service,
         validator_store,
         config,
         Arc::new(parking_lot::RwLock::new(pubkey_map)),
@@ -3001,7 +3044,7 @@ async fn drive_boundary_keys(
     let proposer_requests = mock.get_proposer_duties_calls()[seeded..].to_vec();
     let spans = capture.spans.lock().clone();
     let warns = capture.warns.lock().clone();
-    BoundaryRun { mock, spans, warns, proposer_requests }
+    BoundaryRun { mock, spans, warns, proposer_requests, registrations }
 }
 
 /// 653-AC1: the slot-32 pass's prepare POST answers 503, so PrepareProposers
@@ -3050,6 +3093,55 @@ async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
         run.pass_slots("epoch.boundary"),
         [Some(32), Some(33)],
         "nothing is pending at slot 34"
+    );
+}
+
+/// W4-E6a: through `run()`, the runner retries registration at the next
+/// processed slot. The retry reuses the cached signature. The drive has a
+/// builder service over the mock. The registration POSTs of slots 32, 33 and 34
+/// answer 503, and the slot-35 POST answers 200. These results must occur:
+///
+/// - The beacon node accepts one registration POST in epoch 1.
+/// - The passes of slots 32 to 35 each call the registration one time, and
+///   no other registration call occurs.
+/// - The counting signer records one registration signature for the key.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn boundary_registration_failure_is_retried_next_slot_without_resigning() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let attempts = AtomicUsize::new(0);
+    let accepted: Captured<Vec<bn_manager::SignedValidatorRegistration>> = Captured::default();
+    let mock = retirement_beacon().with_register_validators({
+        let accepted = Arc::clone(&accepted);
+        move |registrations| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                return Err(beacon::BeaconError::ApiError {
+                    status: 503,
+                    message: "unavailable".into(),
+                });
+            }
+            accepted.lock().push(registrations);
+            Ok(())
+        }
+    });
+
+    let run = drive_boundary_builder(mock, local, 32, 36).await;
+
+    let accepted = accepted.lock().clone();
+    assert_eq!(accepted.len(), 1, "The beacon node must accept one registration POST in epoch 1.");
+    assert_eq!(
+        run.pass_slots("builder.register"),
+        [Some(32), Some(33), Some(34), Some(35)],
+        "The passes of slots 32 to 35 must each call the registration one time."
+    );
+    let posts = run.mock.register_validators_calls();
+    assert_eq!(posts[3], posts[0], "The accepted POST must carry the first signed registration.");
+    let registrations = run.registrations.expect("The drive must have a builder service.");
+    assert_eq!(
+        registrations.signatures(&local_pk),
+        1,
+        "The counting signer must record one registration signature for the key."
     );
 }
 

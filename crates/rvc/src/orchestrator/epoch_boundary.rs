@@ -878,8 +878,8 @@ mod tests {
     use crate::bootstrap::executor::{ShutdownTier, TierBudget};
     use crate::orchestrator::coordinator::tests::{
         create_mock_block_beacon, create_mock_validator_store, create_test_config,
-        create_test_fork_schedule, fast_timeouts, m2_metric_lock, MockBlockBeacon, MockSubmitter,
-        TEST_GENESIS_TIME,
+        create_test_fork_schedule, fast_timeouts, m2_metric_lock, CountingRegistrationSigner,
+        MockBlockBeacon, MockSubmitter, TEST_GENESIS_TIME,
     };
     use crate::orchestrator::{
         DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorError,
@@ -911,6 +911,8 @@ mod tests {
         index_source: Arc<PubkeyIndexSource>,
         /// The runner task's clock, at genesis until a test moves it.
         clock: Arc<MockSlotClock>,
+        /// The builder service's signer. It counts the registrations it signs.
+        registrations: Arc<CountingRegistrationSigner>,
     }
 
     impl Fixture {
@@ -1046,6 +1048,27 @@ mod tests {
         seed: &[u64],
         config: OrchestratorConfig,
     ) -> Fixture {
+        fixture_batched(mock, local, with_builder, seed, config, Batching::default()).await
+    }
+
+    /// The batch knobs of a fixture's builder service, and the number of
+    /// builder-enabled keys that the fixture adds next to the local key.
+    #[derive(Clone, Copy, Default)]
+    struct Batching {
+        extra_keys: usize,
+        size: usize,
+        delay_ms: u64,
+    }
+
+    /// [`fixture_config`] with the builder service's `batching`.
+    async fn fixture_batched(
+        mock: MockBeaconNodeClient,
+        local: SecretKey,
+        with_builder: bool,
+        seed: &[u64],
+        config: OrchestratorConfig,
+        batching: Batching,
+    ) -> Fixture {
         let pubkey = local.public_key();
         let pk_bytes = pubkey.to_bytes();
         let pk_hex = format!("0x{}", hex::encode(pk_bytes));
@@ -1120,19 +1143,31 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(local);
+        for _ in 0..batching.extra_keys {
+            let extra = SecretKey::generate();
+            let mut validator = ValidatorConfig::new(extra.public_key().to_bytes());
+            validator.builder_proposals = true;
+            validator_store
+                .add_validator(validator)
+                .expect("The fixture must add each builder-enabled validator.");
+            key_manager.insert(extra);
+        }
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        let validator_signer: Arc<dyn ValidatorSigner> = signer.clone();
+        let registrations = CountingRegistrationSigner::new(validator_signer);
         let builder_service = with_builder.then(|| {
-            let registration_signer: Arc<dyn ValidatorSigner> = signer.clone();
             let schedule = create_test_fork_schedule();
-            Arc::new(BuilderService::new(
-                Arc::new(registration_signer),
+            Arc::new(BuilderService::with_batching(
+                registrations.clone(),
                 Arc::new(beacon.clone()),
                 Arc::clone(&validator_store),
                 schedule.genesis_fork_version,
+                batching.size,
+                batching.delay_ms,
                 schedule,
             ))
         });
@@ -1176,6 +1211,7 @@ mod tests {
             failing_subscriptions,
             index_source,
             clock,
+            registrations,
         }
     }
 
@@ -3971,5 +4007,232 @@ mod tests {
         assert_eq!(registrations(&spans), 2, "The pass must call register_validators again.");
         assert_eq!(signed(), 1, "The cache hit must add no signature.");
         assert_eq!(arrivals(&f.mock, register), 1, "The cache hit must add no POST.");
+    }
+
+    // --- W4-E6a: the registration step runs every epoch ---
+
+    /// Returns `mock` with a registration route. The route rejects the first
+    /// `failures` registration POSTs with status 503. It accepts the later
+    /// POSTs with status 200.
+    fn registrations_failing(mock: MockBeaconNodeClient, failures: usize) -> MockBeaconNodeClient {
+        let left = parking_lot::Mutex::new(failures);
+        mock.with_register_validators(move |_registrations| {
+            let mut left = left.lock();
+            if *left == 0 {
+                return Ok(());
+            }
+            *left -= 1;
+            Err(unavailable())
+        })
+    }
+
+    /// 654-AC3, the runner half. The first registration POST answers 503,
+    /// and the next one answers 200. After the 503, the step must stay
+    /// pending. At slot 33, these conditions must hold:
+    ///
+    /// - The POST contains the first signed registration.
+    /// - The signer adds no signature.
+    /// - The successful POST finishes the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_registration_503_then_200_sends_at_next_slot() {
+        use BoundaryStep::BuilderRegistration;
+        let mock = registrations_failing(proposer_duties_at(ROOT_A), 1);
+        let f = fixture_with(mock, SecretKey::generate(), true).await;
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            step_state(&f.runner, BuilderRegistration),
+            (Some(StepOutcome::Failed), false),
+            "The 503 must leave the registration step failed and pending."
+        );
+        assert_eq!(f.registrations.total(), 1, "The slot-32 pass must sign one registration.");
+
+        f.runner.run_pending(33).await;
+
+        let posts = f.mock.register_validators_calls();
+        assert_eq!(posts.len(), 2, "The slot-33 pass must send the registration again.");
+        assert_eq!(posts[1], posts[0], "The slot-33 POST must carry the same signed registration.");
+        assert_eq!(f.registrations.total(), 1, "The slot-33 pass must sign no new registration.");
+        assert_eq!(
+            step_state(&f.runner, BuilderRegistration),
+            (Some(StepOutcome::Done), true),
+            "The 200 must finish the registration step."
+        );
+    }
+
+    /// 653-AC6: a retry re-sends the cached signature and signs nothing again.
+    ///
+    /// 1. The POSTs of slots 32, 33 and 34 answer 503, and the slot-35 POST
+    ///    answers 200. Slots 32 to 35 must each send one POST, and slot 36
+    ///    must send none. Epoch 1 must sign one registration.
+    /// 2. Each POST of epoch 1 answers 503. The slot-64 pass must warn one
+    ///    time for epoch 1 and name BuilderRegistration. Then it must send
+    ///    the epoch-1 signed registration again, with no new signature.
+    /// 3. No local key has a validator index, and each POST answers 200.
+    ///    Epochs 1 and 2 must each send one POST, not one POST per slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_retried_step_resigns_nothing_already_cached() {
+        use BoundaryStep::{BuilderRegistration, PrepareProposers};
+        let register = MockMethod::RegisterValidators;
+
+        let mock = registrations_failing(proposer_duties_at(ROOT_A), 3);
+        let f = fixture_with(mock, SecretKey::generate(), true).await;
+        let mut posts = Vec::new();
+        for slot in 32..=36 {
+            f.runner.run_pending(slot).await;
+            posts.push(arrivals(&f.mock, register));
+        }
+        assert_eq!(
+            posts,
+            [1, 2, 3, 4, 4],
+            "Slots 32 to 35 must each send one POST, and slot 36 must send none."
+        );
+        assert_eq!(f.registrations.total(), 1, "Epoch 1 must sign one registration.");
+        assert_eq!(step_state(&f.runner, BuilderRegistration), (Some(StepOutcome::Done), true));
+
+        let mock = registrations_failing(proposer_duties_at(ROOT_A), 32);
+        let f = fixture_with(mock, SecretKey::generate(), true).await;
+        let warns = Warns::default();
+        let _default = warns.install();
+        for slot in 32..64 {
+            f.runner.run_pending(slot).await;
+        }
+        assert_eq!(arrivals(&f.mock, register), 32, "Each pass of epoch 1 must send one POST.");
+        assert_eq!(warns.abandoned(), Vec::<String>::new(), "Epoch 1 must not warn in the epoch.");
+
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            warns.abandoned(),
+            ["epoch=1 abandoned_steps=[BuilderRegistration] \
+              last_outcomes={BuilderRegistration: Failed}"],
+            "The slot-64 pass must warn one time for epoch 1."
+        );
+        let posts = f.mock.register_validators_calls();
+        assert_eq!(posts.len(), 33, "The slot-64 pass must send the registration.");
+        assert_eq!(posts[32], posts[0], "Epoch 2 must send the epoch-1 signed registration.");
+        assert_eq!(f.registrations.total(), 1, "The two epochs must sign one registration.");
+        assert_eq!(step_state(&f.runner, BuilderRegistration), (Some(StepOutcome::Done), true));
+
+        let mock = registrations_failing(proposer_duties_at(ROOT_A), 0);
+        let f = fixture_with(mock, SecretKey::generate(), true).await;
+        let _resolved = std::mem::take(&mut *f.index_source.registry.write());
+        let mut posts = Vec::new();
+        for epoch in [1, 2] {
+            for slot in epoch * SLOTS_PER_EPOCH..(epoch + 1) * SLOTS_PER_EPOCH {
+                f.runner.run_pending(slot).await;
+            }
+            assert_eq!(
+                step_state(&f.runner, PrepareProposers),
+                (Some(StepOutcome::NotReady), false),
+                "Epoch {epoch}: with no validator index, PrepareProposers must not be ready."
+            );
+            posts.push(arrivals(&f.mock, register));
+        }
+        assert_eq!(posts, [1, 2], "With no validator index, each epoch must send one POST.");
+        assert_eq!(f.registrations.total(), 1, "The two epochs must sign one registration.");
+    }
+
+    /// The registration step runs under `registration_step_timeout()`, not
+    /// a fixed 10 s. Three builder keys go out in batches of one, 6 s apart.
+    /// The step bound is 22 s, and the last batch goes out at 12 s. The
+    /// slot-32 pass must send all three batches and finish the step.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn registration_step_uses_the_scaled_timeout() {
+        let mock = registrations_failing(proposer_duties_at(ROOT_A), 0);
+        let batching = Batching { extra_keys: 2, size: 1, delay_ms: 6_000 };
+        let config = create_test_config();
+        let f = fixture_batched(mock, SecretKey::generate(), true, &[1, 2], config, batching).await;
+        let builder =
+            f.runner.builder_service.clone().expect("The fixture must have a builder service.");
+        assert_eq!(
+            builder.registration_step_timeout(),
+            Duration::from_secs(22),
+            "Three batches 6 s apart must give a 22 s bound."
+        );
+
+        f.runner.run_pending(32).await;
+
+        let sizes: Vec<usize> = f.mock.register_validators_calls().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [1, 1, 1], "All three batches must land, although the delays are 12 s.");
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::BuilderRegistration),
+            (Some(StepOutcome::Done), true),
+            "The registration step must finish inside its bound."
+        );
+    }
+
+    /// Proposer duties at root A in which validator 42 (`local_hex`)
+    /// proposes at slot 5 of each epoch from `from`.
+    fn proposals_from(local_hex: String, from: u64) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_get_proposer_duties(move |epoch| {
+                let duty = beacon::ProposerDuty {
+                    pubkey: local_hex.clone(),
+                    validator_index: "42".to_string(),
+                    slot: (epoch * SLOTS_PER_EPOCH + 5).to_string(),
+                };
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: ROOT_A.to_string(),
+                    execution_optimistic: false,
+                    data: if epoch >= from { vec![duty] } else { Vec::new() },
+                })
+            })
+            .with_post_ptc_duties(|_epoch, _indices| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: ROOT_A.to_string(),
+                    execution_optimistic: false,
+                    data: Vec::new(),
+                })
+            })
+            .with_submit_proposer_preferences(|_preferences| Ok(()))
+    }
+
+    /// The runner broadcasts the preferences one time per epoch, as the
+    /// slot-0 builder block did. The test has this setup:
+    ///
+    /// - The local key proposes at slot 5 of each epoch from Gloas onward.
+    /// - The dependent root stays unchanged.
+    /// - Two passes run in each of the epochs Gloas-1, Gloas and Gloas+1.
+    ///
+    /// Each epoch must make one broadcast. Its POST must carry the proposal
+    /// of the next epoch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interim_preferences_step_runs_once_per_epoch() {
+        let gloas = create_test_fork_schedule().gloas_fork_epoch;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let mock = registrations_failing(proposals_from(local_hex, gloas), 0);
+        let f = fixture_seeded(mock, local, true, &[]).await;
+        let spans = OpenedSpans::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let broadcasts = || {
+            let name = "builder.broadcast_proposer_preferences";
+            spans.0.lock().iter().filter(|opened| **opened == name).count()
+        };
+
+        let mut seen = Vec::new();
+        for epoch in [gloas - 1, gloas, gloas + 1] {
+            for slot in [epoch * SLOTS_PER_EPOCH, epoch * SLOTS_PER_EPOCH + 1] {
+                f.runner.run_pending(slot).await;
+            }
+            seen.push(broadcasts());
+        }
+
+        assert_eq!(seen, [1, 2, 3], "Each epoch must make one preferences broadcast.");
+        let posted: Vec<Vec<Slot>> = f
+            .mock
+            .submit_proposer_preferences_calls()
+            .iter()
+            .map(|post| post.iter().map(|signed| signed.message.proposal_slot).collect())
+            .collect();
+        let proposal = |epoch: u64| vec![epoch * SLOTS_PER_EPOCH + 5];
+        assert_eq!(
+            posted,
+            [proposal(gloas), proposal(gloas + 1), proposal(gloas + 2)],
+            "Each epoch must send the preferences of the next epoch's proposal."
+        );
     }
 }

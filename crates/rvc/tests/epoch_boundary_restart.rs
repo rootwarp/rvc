@@ -18,7 +18,7 @@
 //! not in the ledger. A std-thread watchdog stops a test that hangs. The
 //! watchdog is not an assertion.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -127,6 +127,59 @@ async fn test_restart_at_slot_10_registers_in_that_epoch_when_the_builder_is_on(
         boot.shut_down().await;
     })
     .await;
+}
+
+/// W4-E6a (654-AC1). The client starts at slot 10 with the builder enabled.
+/// These conditions must hold:
+///
+/// - The beacon node receives a register_validator POST in epoch 0.
+/// - The beacon node receives a register_validator POST in epoch 1.
+/// - The two POSTs contain the same keys and the same signature bytes.
+///
+/// The byte check does not count the signer calls. The runner tests and the
+/// coordinator tests count them.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_registration_reaches_bn_in_restart_epoch_and_every_epoch_after() {
+    let boot = boot_at_slot(10, BootOpts { builder: true }).await;
+    let ledger = boot.recorders.ledger.clone();
+    watched(&ledger, async move {
+        boot.step_to(31, 11_900).await;
+        let epoch_0 = boot.posted(REGISTRATION).await;
+        boot.step_to(32, 11_900).await;
+        let epoch_1 = boot.posted(REGISTRATION).await.split_off(epoch_0.len());
+        assert!(
+            !epoch_0.is_empty(),
+            "The beacon node must receive a register_validator POST in epoch 0."
+        );
+        assert!(
+            !epoch_1.is_empty(),
+            "The beacon node must receive a register_validator POST in epoch 1. Epoch-0 \
+             entries: {epoch_0:?}"
+        );
+        assert_eq!(
+            signatures_by_key(&epoch_1),
+            signatures_by_key(&epoch_0),
+            "The epoch-1 POST must carry the same keys, each with its epoch-0 signature."
+        );
+        assert!(
+            signatures_by_key(&epoch_0).contains_key(boot.pubkey.as_str()),
+            "The registration must carry the key. Entries: {epoch_0:?}"
+        );
+        boot.shut_down().await;
+    })
+    .await;
+}
+
+/// Maps each registration entry's `message.pubkey` to its `signature`.
+fn signatures_by_key(entries: &[Value]) -> BTreeMap<String, Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            let pubkey =
+                entry["message"]["pubkey"].as_str().expect("Each entry must have a pubkey.");
+            (pubkey.to_owned(), entry["signature"].clone())
+        })
+        .collect()
 }
 
 /// This is the harness self-test. The server holds the answer, so the call stays

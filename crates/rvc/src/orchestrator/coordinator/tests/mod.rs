@@ -535,6 +535,72 @@ pub(crate) fn create_mock_validator_store() -> Arc<ValidatorStore> {
     Arc::new(ValidatorStore::new([0u8; 20], 100))
 }
 
+/// This `RegistrationSigner` records the key of each builder registration it
+/// signs. The real `SignerService` makes each signature.
+pub(crate) struct CountingRegistrationSigner {
+    inner: Arc<dyn ValidatorSigner>,
+    signed: parking_lot::Mutex<Vec<[u8; 48]>>,
+}
+
+impl CountingRegistrationSigner {
+    pub(crate) fn new(inner: Arc<dyn ValidatorSigner>) -> Arc<Self> {
+        Arc::new(Self { inner, signed: parking_lot::Mutex::new(Vec::new()) })
+    }
+
+    /// Returns the number of builder registrations that the signer signs for
+    /// `pubkey`.
+    pub(crate) fn signatures(&self, pubkey: &[u8; 48]) -> usize {
+        self.signed.lock().iter().filter(|signed| *signed == pubkey).count()
+    }
+
+    /// Returns the number of builder registrations that the signer signs for
+    /// all keys.
+    pub(crate) fn total(&self) -> usize {
+        self.signed.lock().len()
+    }
+}
+
+#[async_trait]
+impl ::builder::RegistrationSigner for CountingRegistrationSigner {
+    async fn sign_builder_registration(
+        &self,
+        registration: &::eth_types::ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        self.signed.lock().push(pubkey.to_bytes());
+        ValidatorSigner::sign_builder_registration(&*self.inner, registration, pubkey, fork_version)
+            .await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &::eth_types::ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_proposer_preferences(
+            &*self.inner,
+            prefs,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &::eth_types::BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_builder_request_auth(&*self.inner, auth, pubkey, genesis_fork_version)
+            .await
+    }
+}
+
 // ── H-7 mock: captures sync committee message submissions (shared mock, RF4-24)
 //
 // Configurable MockBeaconNodeClient with:
