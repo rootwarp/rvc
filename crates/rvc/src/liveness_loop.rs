@@ -2680,6 +2680,51 @@ mod tests {
         assert!(!m.is_signing_enabled(&pk));
     }
 
+    /// While no beacon node is admitted, each tick has two failed queries.
+    /// The loop logs "liveness query failed" at warn one time in each epoch.
+    /// The other failures in that epoch log the same text at debug.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn liveness_query_failure_warns_once_per_epoch_while_halted() {
+        const FAILED: &str = "liveness query failed";
+        let m = machine();
+        let pk = new_pk();
+        let start = 10u64;
+        m.register(&pk, start);
+        let bn = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_validator_liveness(|_, _| Err(BeaconError::NoAdmittedNode)),
+        );
+        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&bn) as Arc<dyn LivenessApi>, "7", &pk);
+        let count = |level: &str| {
+            let hits = std::cell::Cell::new(0);
+            logs_assert(|lines| {
+                hits.set(lines.iter().filter(|l| l.contains(level) && l.contains(FAILED)).count());
+                Ok(())
+            });
+            hits.get()
+        };
+
+        for _ in 0..3 {
+            loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+        }
+        let queries = bn.post_validator_liveness_calls().len();
+        assert_eq!(queries, 6, "The three ticks in epoch 11 must send six queries.");
+        assert_eq!(count(" WARN "), 1, "The six failures in epoch 11 must log one warning.");
+        assert_eq!(count("DEBUG "), 5, "The other five failures in epoch 11 must log at debug.");
+
+        loop_.drive_once_for_test(start + 2, CLOSED_EPOCH_SLOT).await;
+        let queries = bn.post_validator_liveness_calls().len();
+        assert_eq!(queries, 8, "The tick in epoch 12 must send two queries.");
+        assert_eq!(count(" WARN "), 2, "The first failure in epoch 12 must log a second warning.");
+        assert_eq!(count("DEBUG "), 6, "The second failure in epoch 12 must log at debug.");
+        assert_eq!(
+            m.status(&pk),
+            ForwardWindowStatus::Pending,
+            "A failed query must not decrement."
+        );
+    }
+
     struct RecordingExit {
         codes: std::sync::Mutex<Vec<i32>>,
     }
