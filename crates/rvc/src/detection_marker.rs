@@ -296,7 +296,10 @@ pub fn inspect_record(data_dir: &Path) -> RecordInspect {
 
 /// Create the fixed-size record when it is missing, filled with `not-detected`.
 ///
-/// A file that is already a clear record is left in place. A detected record
+/// A file that is already a clear record keeps its bytes. The effective user
+/// of this process must own it, and its mode must have no group or other
+/// bits. This function then fsyncs the record and `data_dir` again, because
+/// an earlier boot can stop before its directory fsync. A detected record
 /// is not overwritten. Anything else, including a symlink, is an error: this
 /// does not unlink and recreate, because that recreation can fail with no
 /// space left. The new file is mode `0600`, a regular file, and fsynced
@@ -333,11 +336,12 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
 }
 
 /// The result for the record in `data_dir`, or `None` when there is no
-/// record. This does not change the record.
+/// record. This does not write the record. A clear record must pass
+/// [`reverify_clear_record`].
 fn existing_record_result(data_dir: &Path) -> Option<io::Result<()>> {
     match inspect_record(data_dir) {
         RecordInspect::Absent => None,
-        RecordInspect::Clear => Some(Ok(())),
+        RecordInspect::Clear => Some(reverify_clear_record(data_dir)),
         RecordInspect::Detected { .. } => Some(Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "detection record is already in the detected state",
@@ -346,6 +350,59 @@ fn existing_record_result(data_dir: &Path) -> Option<io::Result<()>> {
             Some(Err(io::Error::new(io::ErrorKind::InvalidData, reason)))
         }
     }
+}
+
+/// Check the clear record in `data_dir` again, then fsync it and `data_dir`.
+///
+/// The read-write [`open_record`] refuses a symlink, a file that is not
+/// regular, a file that is not [`RECORD_LEN`] bytes, and a file that this
+/// process cannot write. The effective user of this process must own the
+/// record, and its mode must have no group or other bits. An earlier boot
+/// can stop before its directory fsync, so this boot fsyncs the record and
+/// its directory again. This does not write the record, because a process
+/// that holds the keystore lock can write `detected` into it at that time.
+fn reverify_clear_record(data_dir: &Path) -> io::Result<()> {
+    let path = record_path(data_dir);
+    let file = open_record(&path, false)?;
+    #[cfg(unix)]
+    check_record_owner_and_mode(&path, &file.metadata()?)?;
+    sync_file(&file)?;
+    sync_dir(data_dir)
+}
+
+/// Refuse a record that another user owns, or whose mode has group or
+/// other bits.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn check_record_owner_and_mode(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid only reads the effective user ID of this process.
+    let euid = unsafe { libc::geteuid() };
+    #[cfg(test)]
+    let euid = OWNER_UID_OVERRIDE.with(Cell::get).unwrap_or(euid);
+    let owner = meta.uid();
+    if owner != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the owner of the detection record {} is uid {owner}, not uid {euid} of this \
+                 process. Change the owner to uid {euid} and set mode 0600",
+                path.display()
+            ),
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the detection record {} has mode 0o{mode:o}, which gives access to the group or \
+                 to other users. Set mode 0600",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Write a clear record to a temp file in `data_dir`, fsync it, and give it
