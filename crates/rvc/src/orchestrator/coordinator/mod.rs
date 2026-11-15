@@ -33,7 +33,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
-use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask, PreferenceBroadcaster};
+use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
@@ -379,9 +379,6 @@ where
     /// The runner [`EpochBoundaryTask`] owns, for tests that drive one pass.
     #[cfg(test)]
     pub(crate) epoch_boundary: Arc<EpochBoundaryRunner>,
-    /// The runner's broadcaster, for tests that broadcast directly.
-    #[cfg(test)]
-    preferences: Arc<PreferenceBroadcaster>,
     /// Each processed slot, for [`EpochBoundaryTask`].
     processed_slot_tx: watch::Sender<Option<Slot>>,
     /// Until [`Self::take_epoch_boundary_runner`].
@@ -560,21 +557,16 @@ where
             pubkey_index.clone(),
             config.clone(),
         ));
-        let preferences = Arc::new(PreferenceBroadcaster::new(
-            builder_service.clone(),
-            duty_tracker.clone(),
-            pubkey_map.clone(),
-            validator_store.clone(),
-            config.genesis_validators_root,
-        ));
         let epoch_boundary = Arc::new(EpochBoundaryRunner::new(
             Arc::clone(&duty_management),
             circuit_breaker.clone(),
-            Arc::clone(&preferences),
             duty_tracker.clone(),
             config.timeouts.clone(),
             builder_service.clone(),
             Arc::clone(&config.fork_schedule),
+            pubkey_map.clone(),
+            validator_store.clone(),
+            config.genesis_validators_root,
         ));
         let (processed_slot_tx, processed_slots) = watch::channel(None);
         let epoch_boundary_task = EpochBoundaryTask::new(
@@ -604,8 +596,6 @@ where
             duty_management,
             #[cfg(test)]
             epoch_boundary,
-            #[cfg(test)]
-            preferences,
             processed_slot_tx,
             epoch_boundary_task: Some(epoch_boundary_task),
             key_gen_rx,
@@ -884,12 +874,6 @@ where
         let remaining =
             self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO);
         tokio::time::Instant::now().checked_add(remaining).unwrap_or_else(tokio::time::Instant::now)
-    }
-
-    /// Re-broadcast preferences after a proposer `dependent_root` change.
-    #[cfg(test)]
-    pub(crate) async fn on_proposer_dependent_root_changed(&self, current_epoch: u64) {
-        self.preferences.on_proposer_dependent_root_changed(current_epoch).await;
     }
 
     /// Bounded proposer-only fetch when the current epoch cache is empty.

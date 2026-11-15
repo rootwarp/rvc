@@ -19,14 +19,16 @@
 //! `NotReady` until the attester duties of E and E+1 are cached.
 //! `BuilderRegistration` runs in every epoch and needs no duties: it re-sends
 //! each builder key's registration and signs only the new or changed ones.
-//! `ProposerPreferences` makes one preferences attempt per epoch. The full
-//! attempt, with its signature calls, runs under `PREFERENCES_STEP_TIMEOUT`,
-//! and the step is `Done` when the attempt returns or reaches that bound.
-//! Each other step with beacon-node work runs under its own bound,
+//! `ProposerPreferences` runs from the epoch before Gloas. It is `NotReady`
+//! until the proposer duties of E and E+1 are cached, and `Done` once the
+//! proposer and builder broadcasts both succeed. A proposer root change that
+//! ReorgCheck caches re-opens it, so it signs again with the new root.
+//! Each step with beacon-node work runs under its own bound,
 //! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
-//! CommitteeSubscriptions, `timeouts.preparation` for PrepareProposers and
-//! the builder service's `registration_step_timeout()` for
-//! BuilderRegistration: a step that reaches it is dropped and `Failed`.
+//! CommitteeSubscriptions, `timeouts.preparation` for PrepareProposers, the
+//! builder service's `registration_step_timeout()` for BuilderRegistration
+//! and `PREFERENCES_STEP_TIMEOUT` for ProposerPreferences: a step that
+//! reaches it is dropped and `Failed`.
 //! The first pass of a later epoch logs
 //! one warn for the steps the old epoch did not finish, with each one's last
 //! outcome. The epoch summary is logged once per epoch, at the end of the
@@ -43,15 +45,15 @@
 //! positions and do not reorder the existing ones:
 //!
 //! 1. `BreakerReset`
-//! 2. `ReorgCheck` (re-broadcasts preferences on a proposer root change)
+//! 2. `ReorgCheck` (re-opens `ProposerPreferences` on a proposer root change)
 //! 3. `DutyFetch` (the uncached E and E+1 attester and proposer duties,
 //!    bounded by `timeouts.duty_fetch`; never waits on the slot loop's warm-up)
 //! 4. `PrepareProposers`
 //! 5. `CommitteeSubscriptions` (epoch E, then E+1)
 //! 6. `SyncCommitteeSubscriptions` (reserved, W4-E9b)
 //! 7. `BuilderRegistration` (every epoch)
-//! 8. `ProposerPreferences` (interim: one attempt per epoch, bounded by
-//!    `PREFERENCES_STEP_TIMEOUT`, until W4-E6b1)
+//! 8. `ProposerPreferences` (from the epoch before Gloas, until the proposer
+//!    and builder broadcasts both succeed)
 //!
 //! # Lock rule
 //!
@@ -71,7 +73,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
-use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
+use builder::{legacy_proposer_ops_retired, BuilderService, BuilderServiceError, UpcomingProposal};
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use signer::CircuitBreakerState;
@@ -91,7 +93,7 @@ pub const TASK_NAME: &str = "epoch.boundary.runner";
 
 /// This bound limits one ProposerPreferences attempt, with its signature
 /// calls. The deleted slot-0 builder block had the same 10 s bound. A
-/// stalled signer thus stops the runner for 10 s at most.
+/// stalled signer thus holds each pass for 10 s at most.
 const PREFERENCES_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The wait before the next read of a clock that fails for a reason other
@@ -227,7 +229,6 @@ pub(crate) enum BoundaryStep {
     PrepareProposers,
     CommitteeSubscriptions,
     BuilderRegistration,
-    /// Interim until W4-E6b1: one broadcast per epoch.
     ProposerPreferences,
 }
 
@@ -244,7 +245,7 @@ impl BoundaryStep {
 
     /// Reads E and E+1 duties from the cache, so DutyFetch runs before it.
     fn needs_duties(self) -> bool {
-        matches!(self, Self::CommitteeSubscriptions)
+        matches!(self, Self::CommitteeSubscriptions | Self::ProposerPreferences)
     }
 }
 
@@ -359,17 +360,24 @@ impl EpochProgress {
 pub(crate) struct EpochBoundaryRunner {
     duty_management: Arc<DutyManagementService>,
     circuit_breaker: Arc<CircuitBreakerState>,
-    preferences: Arc<PreferenceBroadcaster>,
     duty_tracker: Arc<DutyTracker>,
     timeouts: OperationTimeouts,
-    /// Registers the builder keys; none without a builder service.
+    /// Registers the builder keys and broadcasts the preferences; none
+    /// without a builder service.
     builder_service: Option<Arc<BuilderService>>,
-    /// Gloas retired the registration.
+    /// Gloas retired the registration, and the epoch before it starts the
+    /// preferences.
     fork_schedule: Arc<ForkSchedule>,
-    /// A proposer root change whose preferences are not broadcast yet. The
-    /// reorg check sets it when it caches the change, and it is cleared once
-    /// the broadcast returns, so an attempt cut in between leaves it to the
-    /// next one, in this epoch or a later one.
+    /// The local keys whose proposals get preferences.
+    pubkey_map: PubkeyMap,
+    /// Each key's signing gate, fee recipient and gas limit.
+    validator_store: Arc<ValidatorStore>,
+    /// The signing domain input of each proposer-preferences signature.
+    genesis_validators_root: Root,
+    /// A proposer root change that has not re-opened ProposerPreferences
+    /// yet. The reorg check sets it when it caches the change, and it is
+    /// cleared when ReorgCheck re-opens the step, so a check cut in between
+    /// leaves it to the next attempt, in this epoch or a later one.
     preferences_owed: AtomicBool,
     progress: parking_lot::Mutex<Option<EpochProgress>>,
     /// The selection proofs the subscription step signed in the progress
@@ -380,23 +388,28 @@ pub(crate) struct EpochBoundaryRunner {
 }
 
 impl EpochBoundaryRunner {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         duty_management: Arc<DutyManagementService>,
         circuit_breaker: Arc<CircuitBreakerState>,
-        preferences: Arc<PreferenceBroadcaster>,
         duty_tracker: Arc<DutyTracker>,
         timeouts: OperationTimeouts,
         builder_service: Option<Arc<BuilderService>>,
         fork_schedule: Arc<ForkSchedule>,
+        pubkey_map: PubkeyMap,
+        validator_store: Arc<ValidatorStore>,
+        genesis_validators_root: Root,
     ) -> Self {
         Self {
             duty_management,
             circuit_breaker,
-            preferences,
             duty_tracker,
             timeouts,
             builder_service,
             fork_schedule,
+            pubkey_map,
+            validator_store,
+            genesis_validators_root,
             preferences_owed: AtomicBool::new(false),
             progress: parking_lot::Mutex::new(None),
             selection_proofs: SelectionProofs::default(),
@@ -534,23 +547,27 @@ impl EpochBoundaryRunner {
         StepOutcome::Done
     }
 
-    /// Re-broadcasts preferences after a proposer root change. One that an
-    /// earlier attempt cached before its bound cut it goes first, before
-    /// this check's requests. `Done` once it returns. Its fetch errors are
-    /// logged; whether the duties are cached is DutyFetch's concern.
+    /// Re-opens ProposerPreferences after a proposer root change, so the
+    /// step signs again with the new root later in the same pass. A change
+    /// that an earlier attempt cached before its bound cut it re-opens the
+    /// step first, before this check's requests. `Done` once it returns. Its
+    /// fetch errors are logged; whether the duties are cached is DutyFetch's
+    /// concern.
     async fn reorg_check(&self, epoch: u64) -> StepOutcome {
-        self.broadcast_owed_preferences(epoch).await;
+        self.reopen_owed_preferences(epoch);
         let owed = &self.preferences_owed;
         self.duty_management.check_reorg_at_epoch_boundary(epoch, owed).await;
-        self.broadcast_owed_preferences(epoch).await;
+        self.reopen_owed_preferences(epoch);
         StepOutcome::Done
     }
 
-    /// Broadcasts the preferences a root change owes, if any.
-    async fn broadcast_owed_preferences(&self, epoch: u64) {
-        if self.preferences_owed.load(Ordering::Acquire) {
-            self.preferences.on_proposer_dependent_root_changed(epoch).await;
-            self.preferences_owed.store(false, Ordering::Release);
+    /// Re-opens ProposerPreferences when a root change owes it.
+    fn reopen_owed_preferences(&self, epoch: u64) {
+        if self.preferences_owed.swap(false, Ordering::AcqRel) {
+            debug!(epoch, "Proposer root changed: the preferences step runs again");
+            self.update_progress(epoch, |current| {
+                current.done.remove(&BoundaryStep::ProposerPreferences);
+            });
         }
     }
 
@@ -739,22 +756,39 @@ impl EpochBoundaryRunner {
         bounded(epoch, BoundaryStep::BuilderRegistration, bound, registration).await
     }
 
-    /// Interim until W4-E6b1: one preferences broadcast per epoch. The full
-    /// broadcast, with its signature calls, runs under
-    /// `PREFERENCES_STEP_TIMEOUT`. The step is `Done` when the broadcast
-    /// returns or reaches the bound, so it makes one attempt per epoch. The
-    /// broadcast logs its own errors.
+    /// Broadcasts the preferences of the local proposals of E and E+1, from
+    /// the epoch before Gloas: the gate reads the fork of E+1, so the Gloas
+    /// slots of the next epoch go out one epoch early. With no builder
+    /// service, or before that epoch, `Done` with no call. `NotReady` while
+    /// the proposer duties of E or E+1 are not cached. The full attempt,
+    /// with its signature calls, runs under `PREFERENCES_STEP_TIMEOUT`.
+    /// `Done` once the two broadcasts succeed, and `Failed` on an error or at
+    /// the bound. Each broadcast skips its cache hits, so a retry signs and
+    /// sends only the entries that the beacon node did not accept.
     async fn proposer_preferences(&self, epoch: u64) -> StepOutcome {
-        let broadcast = self.preferences.broadcast_preferences(epoch);
-        if tokio::time::timeout(PREFERENCES_STEP_TIMEOUT, broadcast).await.is_err() {
-            warn!(
-                epoch,
-                step = ?BoundaryStep::ProposerPreferences,
-                timeout = ?PREFERENCES_STEP_TIMEOUT,
-                "Epoch boundary step timed out"
-            );
+        let Some(builder) = &self.builder_service else {
+            return StepOutcome::Done;
+        };
+        if !legacy_proposer_ops_retired(ForkName::from_epoch(epoch + 1, &self.fork_schedule)) {
+            return StepOutcome::Done;
         }
-        StepOutcome::Done
+        for duty_epoch in [epoch, epoch + 1] {
+            if !self.duty_tracker.is_proposer_epoch_cached(duty_epoch).await {
+                debug!(epoch, duty_epoch, "Proposer preferences wait for cached proposer duties");
+                return StepOutcome::NotReady;
+            }
+        }
+        let broadcast = async {
+            match self.broadcast_preferences(builder, epoch).await {
+                Ok(()) => StepOutcome::Done,
+                Err(e) => {
+                    warn!(epoch, error = %e, "Epoch preferences broadcast failed");
+                    StepOutcome::Failed
+                }
+            }
+        };
+        let step = BoundaryStep::ProposerPreferences;
+        bounded(epoch, step, PREFERENCES_STEP_TIMEOUT, broadcast).await
     }
 }
 
@@ -771,57 +805,23 @@ async fn bounded(
     })
 }
 
-/// Picks local proposals and broadcasts proposer and builder preferences for them.
-///
-/// One instance is shared by the runner's ReorgCheck and ProposerPreferences
-/// steps. The broadcaster holds no mutable state; two broadcasts may each
-/// sign the same `(pubkey, slot)` once, and a duplicate POST is harmless.
-pub(crate) struct PreferenceBroadcaster {
-    builder_service: Option<Arc<BuilderService>>,
-    duty_tracker: Arc<DutyTracker>,
-    pubkey_map: PubkeyMap,
-    validator_store: Arc<ValidatorStore>,
-    genesis_validators_root: Root,
-}
-
-impl PreferenceBroadcaster {
-    pub(crate) fn new(
-        builder_service: Option<Arc<BuilderService>>,
-        duty_tracker: Arc<DutyTracker>,
-        pubkey_map: PubkeyMap,
-        validator_store: Arc<ValidatorStore>,
-        genesis_validators_root: Root,
-    ) -> Self {
-        Self { builder_service, duty_tracker, pubkey_map, validator_store, genesis_validators_root }
-    }
-
-    /// Re-broadcast preferences after a proposer `dependent_root` change.
-    ///
-    /// Call when [`DutyTracker::cache_proposer_duties`] returns `true`.
-    pub(crate) async fn on_proposer_dependent_root_changed(&self, current_epoch: u64) {
-        self.broadcast_preferences(current_epoch).await;
-    }
-
-    pub(crate) async fn broadcast_preferences(&self, current_epoch: u64) {
-        let Some(bs) = &self.builder_service else {
-            return;
-        };
+/// The local proposals of the ProposerPreferences step, and their broadcasts.
+impl EpochBoundaryRunner {
+    /// Runs the proposer broadcast, then the builder broadcast, over the
+    /// local proposals of `current_epoch` and the next epoch. The builder
+    /// broadcast runs when the proposer one fails too. Returns the first
+    /// error.
+    async fn broadcast_preferences(
+        &self,
+        builder: &BuilderService,
+        current_epoch: u64,
+    ) -> Result<(), BuilderServiceError> {
         let proposals = self.upcoming_proposals(current_epoch).await;
-        match bs
-            .broadcast_proposer_preferences(
-                current_epoch,
-                &proposals,
-                &self.genesis_validators_root,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Proposer preferences broadcast failed (non-fatal)"),
-        }
-        match bs.broadcast_builder_preferences(current_epoch, &proposals).await {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Builder preferences broadcast failed (non-fatal)"),
-        }
+        let root = &self.genesis_validators_root;
+        let proposer =
+            builder.broadcast_proposer_preferences(current_epoch, &proposals, root).await;
+        let builders = builder.broadcast_builder_preferences(current_epoch, &proposals).await;
+        proposer.and(builders)
     }
 
     /// Local signing-enabled proposer duties for the current and next epoch.
@@ -1197,19 +1197,13 @@ mod tests {
         });
         let timeouts = config.timeouts.clone();
         let fork_schedule = Arc::clone(&config.fork_schedule);
-        let preferences = Arc::new(PreferenceBroadcaster::new(
-            builder_service.clone(),
-            Arc::clone(&duty_tracker),
-            Arc::clone(&pubkey_map),
-            Arc::clone(&validator_store),
-            config.genesis_validators_root,
-        ));
+        let genesis_validators_root = config.genesis_validators_root;
         let duty_management = Arc::new(DutyManagementService::new(
             signer,
             beacon,
             Arc::clone(&duty_tracker),
             Arc::clone(&validator_store),
-            pubkey_map,
+            Arc::clone(&pubkey_map),
             pubkey_index,
             config,
         ));
@@ -1217,11 +1211,13 @@ mod tests {
         let runner = Arc::new(EpochBoundaryRunner::new(
             duty_management,
             Arc::clone(&breaker),
-            preferences,
             Arc::clone(&duty_tracker),
             timeouts,
             builder_service,
             fork_schedule,
+            pubkey_map,
+            Arc::clone(&validator_store),
+            genesis_validators_root,
         ));
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, SLOT, SLOTS_PER_EPOCH));
         Fixture {
@@ -1367,8 +1363,9 @@ mod tests {
         assert_breaker_reset(&f.breaker, 2);
     }
 
-    /// A proposer root change seen by ReorgCheck re-broadcasts preferences
-    /// inside the runner's own pass, before the subscription step. No
+    /// A proposer root change seen by ReorgCheck re-opens the preferences
+    /// step inside the runner's own pass. The step is done before the pass,
+    /// and it runs again after the subscription step, with the new root. No
     /// `DutyOrchestrator` exists here. An unchanged root, or no builder
     /// service, sends none.
     #[tokio::test(flavor = "current_thread")]
@@ -1384,7 +1381,7 @@ mod tests {
             let mock = proposer_duties_then(local_hex, epoch, ROOT_A, then);
             let f = fixture_with(mock, local, with_builder).await;
             f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
-            skip_interim_preferences(&f.runner, epoch);
+            mark_preferences_done(&f.runner, epoch);
 
             f.runner.run_pending(epoch * SLOTS_PER_EPOCH).await;
 
@@ -1415,24 +1412,30 @@ mod tests {
                     )
                 })
                 .collect();
+            // The calls must occur in this order:
+            //
+            // 1. The proposer request of the seed.
+            // 2. The proposer requests of ReorgCheck for E and E+1.
+            // 3. The two subscription POSTs.
+            // 4. The POST of the re-opened preferences step.
             assert_eq!(
                 order,
                 [
                     MockMethod::GetProposerDuties,
                     MockMethod::GetProposerDuties,
                     MockMethod::GetProposerDuties,
+                    MockMethod::SubmitBeaconCommitteeSubscriptions,
+                    MockMethod::SubmitBeaconCommitteeSubscriptions,
                     MockMethod::SubmitProposerPreferences,
-                    MockMethod::SubmitBeaconCommitteeSubscriptions,
-                    MockMethod::SubmitBeaconCommitteeSubscriptions,
                 ],
-                "seed, ReorgCheck E and E+1, re-broadcast, then subscriptions"
+                "The calls must occur in the order of the list above."
             );
         }
     }
 
-    /// Marks the ProposerPreferences step of `epoch` done, so that a test
-    /// sees only the broadcasts of ReorgCheck.
-    fn skip_interim_preferences(runner: &EpochBoundaryRunner, epoch: u64) {
+    /// Marks the ProposerPreferences step of `epoch` done. Thus only a root
+    /// change that ReorgCheck finds can make the step run again.
+    fn mark_preferences_done(runner: &EpochBoundaryRunner, epoch: u64) {
         runner.begin_epoch(epoch);
         runner.record(epoch, BoundaryStep::ProposerPreferences, StepOutcome::Done);
     }
@@ -2794,12 +2797,17 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("asyncfnbounded(").next())
             .expect("`proposer_preferences`, then `bounded`");
-        let bound = "letbroadcast=self.preferences.broadcast_preferences(epoch);\
-                     iftokio::time::timeout(PREFERENCES_STEP_TIMEOUT,broadcast).await.is_err()";
-        assert!(
-            preferences.contains(bound),
-            "The full preferences broadcast must run under PREFERENCES_STEP_TIMEOUT: {preferences}"
-        );
+        for bound in [
+            "letbroadcast=async{matchself.broadcast_preferences(builder,epoch).await{",
+            "letstep=BoundaryStep::ProposerPreferences;\
+             bounded(epoch,step,PREFERENCES_STEP_TIMEOUT,broadcast).await",
+        ] {
+            assert!(
+                preferences.contains(bound),
+                "The full preferences broadcast must run under PREFERENCES_STEP_TIMEOUT: \
+                 {preferences}"
+            );
+        }
     }
 
     /// With the default timeouts and no time passing before the POST, the
@@ -3061,17 +3069,19 @@ mod tests {
         }
     }
 
-    /// RSA B1 / Harper B1: a proposer root change that ReorgCheck commits to
-    /// the cache is broadcast even when the step bound cuts the check before
-    /// it gets there. Root A is cached for E and the beacon node answers B,
-    /// under the 2 s step bound. Passes run until ReorgCheck is done; the
-    /// list is the preferences POSTs answered after each pass.
+    /// RSA B1 / Harper B1: ReorgCheck caches a changed proposer root. The
+    /// step bound then stops the check before it opens the preferences step
+    /// again. The preferences step must open again after that timeout. Root
+    /// A is cached for E and the beacon node answers B, under the 2 s step
+    /// bound. The fixture marks the step Done before the first pass. Passes
+    /// run until ReorgCheck is done; the list is the preferences POSTs
+    /// answered after each pass.
     /// - Cut after the change: E's request takes 1 s and E+1's is held, so
-    ///   the bound cuts the check after it cached B. The retry broadcasts.
-    /// - Retry cut too: the retry is cut the same way, and broadcasts before
-    ///   its own check. The pass after it broadcasts nothing more.
-    /// - Cut in the broadcast: the first preferences POST is held. The retry
-    ///   broadcasts again.
+    ///   the bound cuts the check after it cached B. The retry re-opens the
+    ///   step, and the step broadcasts.
+    /// - Retry cut too: the retry is cut the same way. It re-opens the step
+    ///   before its own check, so the step broadcasts in that pass. The pass
+    ///   after it broadcasts nothing more.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_root_change_cut_before_its_broadcast_is_broadcast_on_retry() {
         use BoundaryStep::ReorgCheck;
@@ -3081,20 +3091,18 @@ mod tests {
         // Proposer requests: the seed, ReorgCheck's E and E+1, DutyFetch's
         // E+1, then the retry's E and E+1.
         let arms = [
-            ("cut after the change", vec![zero, slow, HOLD], vec![], vec![0, 1]),
-            ("retry cut too", vec![zero, slow, HOLD, zero, slow, HOLD], vec![], vec![0, 1, 1]),
-            ("cut in the broadcast", vec![], vec![HOLD], vec![0, 1]),
+            ("cut after the change", vec![zero, slow, HOLD], vec![0, 1]),
+            ("retry cut too", vec![zero, slow, HOLD, zero, slow, HOLD], vec![0, 1, 1]),
         ];
-        for (arm, duties, preferences, want) in arms {
+        for (arm, duties, want) in arms {
             let local = SecretKey::generate();
             let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
             let mock = proposer_duties_then(local_hex, epoch, ROOT_A, ROOT_B)
-                .with_call_delays(MockMethod::GetProposerDuties, duties)
-                .with_call_delays(MockMethod::SubmitProposerPreferences, preferences);
+                .with_call_delays(MockMethod::GetProposerDuties, duties);
             let seed = [epoch, epoch + 1];
             let f = fixture_config(mock, local, true, &seed, short_duty_fetch()).await;
             f.duty_tracker.fetch_proposer_duties(epoch).await.expect("seed root A");
-            skip_interim_preferences(&f.runner, epoch);
+            mark_preferences_done(&f.runner, epoch);
 
             let mut posts = Vec::new();
             for slot in first..first + 3 {
@@ -3118,11 +3126,12 @@ mod tests {
         }
     }
 
-    /// A root change the last pass of an epoch cached, cut before its
-    /// broadcast, is broadcast by the next epoch's ReorgCheck. Root A is
-    /// cached for E+1, where the local proposal is. At slot 31 of E the
-    /// check caches B for E+1 after 1 s, and its E+1 PTC request is held, so
-    /// the 2 s step bound cuts it. Epoch E+1's first pass broadcasts B.
+    /// The last pass of E caches a changed proposer root before the timeout
+    /// stops ReorgCheck. The preferences step of E+1 must send preferences
+    /// with that root. Root A is cached for E+1, where the local proposal
+    /// is. At slot 31 of E the check caches B for E+1 after 1 s, and its E+1
+    /// PTC request is held, so the 2 s step bound cuts it. Epoch E+1's first
+    /// pass broadcasts B.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_root_change_owed_at_the_epoch_end_is_broadcast_in_the_next_epoch() {
         let epoch = create_test_fork_schedule().gloas_fork_epoch;
@@ -3136,7 +3145,7 @@ mod tests {
             .with_call_delays(MockMethod::PostPtcDuties, [Duration::ZERO, HOLD]);
         let f = fixture_config(mock, local, true, &[epoch, next], short_duty_fetch()).await;
         f.duty_tracker.fetch_proposer_duties(next).await.expect("seed root A");
-        skip_interim_preferences(&f.runner, epoch);
+        mark_preferences_done(&f.runner, epoch);
 
         f.runner.run_pending(next * SLOTS_PER_EPOCH - 1).await;
 
@@ -4237,8 +4246,9 @@ mod tests {
             .with_register_validators(|_registrations| Ok(()))
     }
 
-    /// The runner broadcasts the preferences one time per epoch, as the
-    /// slot-0 builder block did. The test has this setup:
+    /// When each POST succeeds, the runner broadcasts the preferences one
+    /// time per epoch, as the slot-0 builder block did. The test has this
+    /// setup:
     ///
     /// - The local key proposes at slot 5 of each epoch from Gloas onward.
     /// - The dependent root stays unchanged.
@@ -4247,7 +4257,7 @@ mod tests {
     /// Each epoch must make one broadcast. Its POST must carry the proposal
     /// of the next epoch.
     #[tokio::test(flavor = "current_thread")]
-    async fn interim_preferences_step_runs_once_per_epoch() {
+    async fn preferences_step_runs_once_per_epoch() {
         let gloas = create_test_fork_schedule().gloas_fork_epoch;
         let local = SecretKey::generate();
         let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
@@ -4298,8 +4308,8 @@ mod tests {
     /// - At slot 0 of Gloas+1, ReorgCheck and CommitteeSubscriptions of
     ///   Gloas+1 must finish.
     /// - The 10 s bound must stop each held attempt, and the step must then
-    ///   be `Done`.
-    /// - Each epoch must start one preferences signature.
+    ///   be `Failed` and stay pending.
+    /// - Each pass must start one preferences signature.
     /// - No preferences POST must reach the beacon node.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stalled_preferences_signer_does_not_hold_the_next_epoch() {
@@ -4321,9 +4331,14 @@ mod tests {
         runner.slots.send_replace(Some(first + 1));
         tokio::time::sleep(second).await;
         assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "The bound must stop the first attempt, and the step must stay pending."
+        );
+        assert_eq!(
             f.registrations.preferences_calls(),
-            1,
-            "Epoch {gloas} must start one preferences signature."
+            2,
+            "Each of the two passes of epoch {gloas} must start one preferences signature."
         );
 
         let epoch_length = Duration::from_secs(SLOT.as_secs() * SLOTS_PER_EPOCH);
@@ -4351,8 +4366,8 @@ mod tests {
         );
         assert_eq!(
             f.registrations.preferences_calls(),
-            2,
-            "Epoch {} must start one preferences signature.",
+            3,
+            "The first pass of epoch {} must start one preferences signature.",
             gloas + 1
         );
 
@@ -4365,15 +4380,15 @@ mod tests {
         tokio::time::sleep_until(at_next + bound + second).await;
         assert_eq!(
             step_state(&f.runner, ProposerPreferences),
-            (Some(StepOutcome::Done), true),
-            "The bound must stop the held attempt, and the step must be done."
+            (Some(StepOutcome::Failed), false),
+            "The bound must stop the held attempt, and the step must stay pending."
         );
         runner.slots.send_replace(Some(next + 1));
         tokio::time::sleep(second).await;
         assert_eq!(
             f.registrations.preferences_calls(),
-            2,
-            "Slot 1 of epoch {} must not start a second preferences signature.",
+            4,
+            "Slot 1 of epoch {} must retry the step and start one more preferences signature.",
             gloas + 1
         );
         assert!(
@@ -4421,7 +4436,7 @@ mod tests {
         use BoundaryStep::ProposerPreferences;
         let first = gloas_minus_one_slot();
         let (epoch, next) = (first / SLOTS_PER_EPOCH, first / SLOTS_PER_EPOCH + 1);
-        let proposal = vec![next * SLOTS_PER_EPOCH + 5];
+        let proposal = next * SLOTS_PER_EPOCH + 5;
         for (arm, next_failures) in [("DutyFetch fills E+1", 1), ("DutyFetch fails for E+1", 2)] {
             let local = SecretKey::generate();
             let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
@@ -4440,7 +4455,7 @@ mod tests {
             if next_failures == 1 {
                 assert_eq!(
                     preference_slots(&f.mock),
-                    [proposal.clone()],
+                    [vec![proposal]],
                     "{arm}: The same pass must send the preferences."
                 );
                 assert_eq!(
@@ -4470,7 +4485,7 @@ mod tests {
             );
             assert_eq!(
                 preference_slots(&f.mock),
-                [proposal.clone()],
+                [vec![proposal]],
                 "{arm}: The next pass must send one POST."
             );
             assert_eq!(
@@ -4530,7 +4545,7 @@ mod tests {
         use BoundaryStep::ProposerPreferences;
         let first = gloas_minus_one_slot();
         let next = first / SLOTS_PER_EPOCH + 1;
-        let proposal = vec![next * SLOTS_PER_EPOCH + 5];
+        let proposal = next * SLOTS_PER_EPOCH + 5;
         let local = SecretKey::generate();
         let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
         let failures = parking_lot::Mutex::new(1_usize);
@@ -4557,12 +4572,12 @@ mod tests {
         );
         assert_eq!(
             preference_slots(&f.mock),
-            [proposal.clone()],
+            [vec![proposal]],
             "The first pass must send the proposer POST."
         );
         assert_eq!(
             builder_preference_slots(&f.mock),
-            [proposal.clone()],
+            [vec![proposal]],
             "The first builder POST must carry the Gloas proposal."
         );
 
@@ -4570,7 +4585,7 @@ mod tests {
 
         assert_eq!(
             builder_preference_slots(&f.mock),
-            [proposal.clone(), proposal.clone()],
+            [vec![proposal], vec![proposal]],
             "The retry must send the builder entry again."
         );
         assert_eq!(
