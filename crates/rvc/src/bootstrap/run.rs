@@ -1621,6 +1621,62 @@ mod tests {
         );
     }
 
+    /// Return `true` when `body` has these calls in this order:
+    ///
+    /// 1. `open_slashing_db(`
+    /// 2. `sweep_stale_record_temps(`
+    /// 3. `wire_signing_enablement(`
+    ///
+    /// The scan uses the first instance of each call.
+    fn sweep_runs_under_the_lock(body: &str) -> bool {
+        let [lock, sweep, wire] =
+            ["open_slashing_db(", "sweep_stale_record_temps(", "wire_signing_enablement("]
+                .map(|call| body.find(call));
+        matches!((lock, sweep, wire), (Some(lock), Some(sweep), Some(wire)) if lock < sweep && sweep < wire)
+    }
+
+    /// The boot body must remove stale record temp files only after
+    /// `open_slashing_db` takes the keystore lock, and before
+    /// `wire_signing_enablement`. The fixtures make sure that the scan rejects
+    /// each wrong order and a body without the sweep.
+    #[test]
+    fn record_temp_sweep_runs_under_the_keystore_lock() {
+        assert!(
+            sweep_runs_under_the_lock(
+                "open_slashing_db(); sweep_stale_record_temps(); wire_signing_enablement();"
+            ),
+            "The scan must accept the sweep between the lock and the enablement."
+        );
+        for (case, fixture) in [
+            (
+                "a sweep before the lock",
+                "sweep_stale_record_temps(); open_slashing_db(); wire_signing_enablement();",
+            ),
+            (
+                "a sweep after the enablement",
+                "open_slashing_db(); wire_signing_enablement(); sweep_stale_record_temps();",
+            ),
+            ("a body without the sweep", "open_slashing_db(); wire_signing_enablement();"),
+        ] {
+            assert!(!sweep_runs_under_the_lock(fixture), "The scan must reject {case}.");
+        }
+
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        let start = prod.find("async fn run_with_clock<").unwrap_or(prod.len());
+        let rest = &prod[start..];
+        let body = &rest[..rest.find("pub(crate) struct ShutdownInputs").unwrap_or(0)];
+        assert!(
+            body.contains("let _keystore_lock_guard = slashing_handles.keystore_lock;"),
+            "The scan must find the boot body that holds the keystore lock."
+        );
+        assert!(
+            sweep_runs_under_the_lock(body),
+            "run_with_clock must call sweep_stale_record_temps after open_slashing_db and \
+             before wire_signing_enablement."
+        );
+    }
+
     /// ARCH-2i: production body of run.rs must not hard-exit the process.
     #[test]
     fn test_run_rs_has_no_process_exit_call() {

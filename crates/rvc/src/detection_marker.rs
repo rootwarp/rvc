@@ -22,7 +22,7 @@
 //! that skips the force-window file.
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -330,6 +330,8 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
         }
         write_record_bytes(&mut file, &bytes)?;
         sync_file(&file)?;
+        #[cfg(test)]
+        run_before_record_link();
         Ok(())
     })();
     if let Err(err) = write_result {
@@ -341,6 +343,18 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
     drop(file);
     sync_dir(data_dir)?;
     Ok(())
+}
+
+/// Remove the temp files that a crashed record create left in `data_dir`.
+///
+/// Returns the number of removed files.
+pub fn sweep_stale_record_temps(_data_dir: &Path) -> io::Result<usize> {
+    Ok(0)
+}
+
+#[allow(dead_code)]
+fn explain_link_error(err: io::Error) -> io::Error {
+    err
 }
 
 /// Overwrite the pre-allocated record with `detected` and fsync it.
@@ -491,6 +505,11 @@ fn open_record(path: &Path, create: bool) -> io::Result<File> {
 }
 
 fn write_record_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if take_record_write_panic() {
+        file.write_all(&bytes[..RECORD_WRITE_PANIC_AFTER])?;
+        panic!("The test injects a crash after {RECORD_WRITE_PANIC_AFTER} record bytes.");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -517,12 +536,55 @@ fn write_record_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+type BeforeRecordLinkHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
 thread_local! {
     static MARKER_WRITE_FAILS_LEFT: Cell<u32> = const { Cell::new(0) };
     static PREALLOCATE_FAILS: Cell<bool> = const { Cell::new(false) };
     static FSYNC_SKIPS_LEFT: Cell<u32> = const { Cell::new(0) };
     static FSYNC_FAILS_LEFT: Cell<u32> = const { Cell::new(0) };
     static FSYNC_CALLS: Cell<u32> = const { Cell::new(0) };
+    static RECORD_WRITE_PANICS: Cell<bool> = const { Cell::new(false) };
+    static BEFORE_RECORD_LINK: RefCell<Option<BeforeRecordLinkHook>> = const { RefCell::new(None) };
+}
+
+/// The injected record-write panic occurs after this number of bytes.
+#[cfg(test)]
+const RECORD_WRITE_PANIC_AFTER: usize = 64;
+
+/// Make the next record write on this thread panic after
+/// [`RECORD_WRITE_PANIC_AFTER`] bytes.
+///
+/// The panic skips all cleanup paths, as a crash does. The guard clears the
+/// injection when it drops.
+#[cfg(test)]
+pub(crate) fn arm_record_write_panic() -> RecordWritePanicGuard {
+    RECORD_WRITE_PANICS.with(|armed| armed.set(true));
+    RecordWritePanicGuard
+}
+
+/// Run `hook` one time on this thread. Run it after the fsync of the new
+/// record and before the record gets its final name.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_record_link(hook: impl FnOnce() + 'static) -> BeforeRecordLinkGuard {
+    BEFORE_RECORD_LINK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    BeforeRecordLinkGuard
+}
+
+#[cfg(test)]
+fn take_record_write_panic() -> bool {
+    RECORD_WRITE_PANICS.with(|armed| armed.replace(false))
+}
+
+#[cfg(test)]
+fn run_before_record_link() {
+    let hook = BEFORE_RECORD_LINK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// Fail the next `count` [`write_marker`] calls on this thread.
@@ -649,6 +711,28 @@ pub(crate) struct PreallocateFailGuard;
 impl Drop for PreallocateFailGuard {
     fn drop(&mut self) {
         PREALLOCATE_FAILS.with(|fail| fail.set(false));
+    }
+}
+
+/// The guard clears the injected record-write panic when it drops.
+#[cfg(test)]
+pub(crate) struct RecordWritePanicGuard;
+
+#[cfg(test)]
+impl Drop for RecordWritePanicGuard {
+    fn drop(&mut self) {
+        RECORD_WRITE_PANICS.with(|armed| armed.set(false));
+    }
+}
+
+/// The guard removes an unused before-link hook when it drops.
+#[cfg(test)]
+pub(crate) struct BeforeRecordLinkGuard;
+
+#[cfg(test)]
+impl Drop for BeforeRecordLinkGuard {
+    fn drop(&mut self) {
+        BEFORE_RECORD_LINK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -1050,6 +1134,305 @@ mod tests {
         assert!(
             matches!(inspect(dir.path()), MarkerInspect::Present(_)),
             "The marker must be at its final path before the directory fsync fails."
+        );
+    }
+
+    /// Return the sorted names in `dir`, without the record name.
+    fn names_other_than_the_record(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("The test must read the directory.")
+            .map(|entry| {
+                let entry = entry.expect("The test must read a directory entry.");
+                entry.file_name().to_string_lossy().into_owned()
+            })
+            .filter(|name| name != RECORD_FILENAME)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Return the boot error for the keystore `dir` with detection off.
+    ///
+    /// The config is the config that `bootstrap::run::tests::boot_with_keystore`
+    /// builds.
+    async fn boot_with_detection_off(dir: &Path) -> crate::bootstrap::BootstrapError {
+        let config = crate::config::Config {
+            keystore_path: dir.to_path_buf(),
+            doppelganger_detection: false,
+            ..Default::default()
+        };
+        let (executor, rx) =
+            crate::bootstrap::TaskExecutor::new(tokio_util::sync::CancellationToken::new());
+        let options = crate::bootstrap::RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: bn_manager::OperationTimeouts::default(),
+        };
+        crate::bootstrap::run(config, options, executor, rx)
+            .await
+            .expect_err("The boot must stop, because the test has no slashing database.")
+    }
+
+    /// The first record write panics after 64 bytes, as a crash in the first
+    /// boot does. The test requires these results:
+    ///
+    /// - No record is at the final name after the panic.
+    /// - A boot with detection off does not exit 12.
+    /// - The next `preallocate_detection_record` call makes a `Clear` record.
+    /// - The sweep removes the temp file of the crash and no other file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn crash_during_create_leaves_no_record_at_the_final_name() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let guard = arm_record_write_panic();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            preallocate_detection_record(dir.path())
+        }));
+        drop(guard);
+        assert!(crashed.is_err(), "The injected panic must stop preallocate_detection_record.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent,
+            "The crash must not leave a record at the final name."
+        );
+        let err = boot_with_detection_off(dir.path()).await;
+        assert_ne!(
+            err.exit_code(),
+            crate::startup::EXIT_DOPPELGANGER_DETECTED,
+            "The boot after the crash must not exit 12. The error is: {err}"
+        );
+        let result = preallocate_detection_record(dir.path());
+        assert!(
+            result.is_ok(),
+            "preallocate_detection_record after the crash must succeed. The result is {result:?}."
+        );
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "preallocate_detection_record after the crash must make a Clear record."
+        );
+        let swept = sweep_stale_record_temps(dir.path());
+        assert!(
+            matches!(swept, Ok(1)),
+            "The sweep must remove the temp file of the crash. The result is {swept:?}."
+        );
+        assert_eq!(
+            names_other_than_the_record(dir.path()),
+            Vec::<String>::new(),
+            "Only the record must stay in the directory after the sweep."
+        );
+    }
+
+    /// A hook writes a full record at the final name after the fsync of the
+    /// new record and before the link. Each row requires these results:
+    ///
+    /// - The hook runs.
+    /// - `preallocate_detection_record` returns the error kind of the row, or `Ok`.
+    /// - The record keeps the state that the hook wrote.
+    /// - No temp file stays in the directory.
+    #[test]
+    fn create_does_not_replace_a_record_that_appeared() {
+        let rows = [
+            (
+                "detected",
+                encode_record(true, 77, 1_234),
+                RecordInspect::Detected { epoch: 77, unix_secs: 1_234 },
+                Some(io::ErrorKind::AlreadyExists),
+            ),
+            ("not-detected", encode_record(false, 0, 0), RecordInspect::Clear, None),
+        ];
+        for (state, bytes, record, error) in rows {
+            let bytes = bytes.expect("The test must encode the record.");
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let final_path = record_path(dir.path());
+            let ran = std::rc::Rc::new(Cell::new(false));
+            let hook_ran = std::rc::Rc::clone(&ran);
+            let guard = arm_before_record_link(move || {
+                fs::write(&final_path, bytes).expect("The hook must write the record.");
+                hook_ran.set(true);
+            });
+            let result = preallocate_detection_record(dir.path());
+            drop(guard);
+            assert!(ran.get(), "The hook must run before the link in the {state} row.");
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                error,
+                "In the {state} row, the error kind of preallocate_detection_record must be \
+                 {error:?}. The result is {result:?}."
+            );
+            assert_eq!(
+                inspect_record(dir.path()),
+                record,
+                "The {state} record from the hook must stay at the final name."
+            );
+            assert_eq!(
+                names_other_than_the_record(dir.path()),
+                Vec::<String>::new(),
+                "No temp file must stay in the directory after the {state} row."
+            );
+        }
+    }
+
+    /// The directory holds a record and five names that have the temp-file
+    /// shape or a shape near it. The test requires these results:
+    ///
+    /// - The sweep removes only the regular file `.{RECORD_FILENAME}.1.2.tmp`.
+    /// - The sweep does not remove or follow a symlink with the temp-file shape.
+    /// - The sweep does not remove a directory with the temp-file shape.
+    /// - The sweep does not remove the two operator files.
+    /// - The record stays `Clear`.
+    /// - The sweep fsyncs the directory one time after a removal, and not when
+    ///   it removes no file.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_stale_record_temps() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        preallocate_detection_record(dir.path()).expect("The test must preallocate the record.");
+        let name = |middle: &str| format!(".{RECORD_FILENAME}.{middle}.tmp");
+        let path = |middle: &str| dir.path().join(name(middle));
+        let target = dir.path().join("link-target");
+        fs::write(path("1.2"), b"partial").expect("The test must write the stale temp file.");
+        fs::write(&target, b"operator data").expect("The test must write the link target.");
+        std::os::unix::fs::symlink(&target, path("3.4")).expect("The test must make the symlink.");
+        fs::create_dir(path("5.6")).expect("The test must make the directory.");
+        fs::write(path("x"), b"operator file").expect("The test must write an operator file.");
+        fs::write(path("1.x"), b"operator file").expect("The test must write an operator file.");
+
+        let before = fsync_calls();
+        let removed = sweep_stale_record_temps(dir.path());
+        let fsyncs = fsync_calls() - before;
+        assert!(
+            matches!(removed, Ok(1)),
+            "The sweep must remove one file. The result is {removed:?}."
+        );
+        assert_eq!(fsyncs, 1, "The sweep must fsync the directory one time after the removal.");
+        let mut kept = vec![name("1.x"), name("3.4"), name("5.6"), name("x"), "link-target".into()];
+        kept.sort();
+        assert_eq!(
+            names_other_than_the_record(dir.path()),
+            kept,
+            "The sweep must remove only the stale regular temp file."
+        );
+        assert!(
+            fs::symlink_metadata(path("3.4"))
+                .expect("The test must read the symlink metadata.")
+                .file_type()
+                .is_symlink(),
+            "The symlink with the temp-file shape must stay a symlink."
+        );
+        assert_eq!(
+            fs::read(&target).expect("The test must read the link target."),
+            b"operator data",
+            "The sweep must not change the file that the symlink points to."
+        );
+        assert!(path("5.6").is_dir(), "The directory with the temp-file shape must stay.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Clear,
+            "The sweep must not change the record."
+        );
+
+        let before = fsync_calls();
+        let again = sweep_stale_record_temps(dir.path());
+        assert!(
+            matches!(again, Ok(0)),
+            "The second sweep must remove no file. The result is {again:?}."
+        );
+        assert_eq!(
+            fsync_calls() - before,
+            0,
+            "A sweep that removes no file must not fsync the directory."
+        );
+    }
+
+    /// Return the argument text of each `custom_flags(` call in `src` that
+    /// does not contain `O_NONBLOCK`, and the number of calls. The argument
+    /// text of a call ends at the next `;`.
+    fn custom_flags_without_nonblock(src: &str) -> (usize, Vec<&str>) {
+        let calls: Vec<&str> = src
+            .split("custom_flags(")
+            .skip(1)
+            .map(|rest| rest.split(';').next().unwrap_or(rest))
+            .collect();
+        let missing = calls.iter().copied().filter(|call| !call.contains("O_NONBLOCK")).collect();
+        (calls.len(), missing)
+    }
+
+    /// Every `custom_flags(` call in the production part of this file must
+    /// set `O_NONBLOCK`. The production part ends at `mod tests`. The fixture
+    /// makes sure that the scan finds a call without the flag.
+    #[test]
+    fn record_opens_are_non_blocking() {
+        let fixture = "opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);\n\
+                       opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);\n";
+        assert_eq!(
+            custom_flags_without_nonblock(fixture),
+            (2, vec!["libc::O_NOFOLLOW | libc::O_CLOEXEC)"]),
+            "The scan must find the two fixture calls and report the call without O_NONBLOCK."
+        );
+
+        let src = include_str!("detection_marker.rs");
+        let (production, _) =
+            src.split_once("\nmod tests {").expect("detection_marker.rs must have a tests module.");
+        let (calls, missing) = custom_flags_without_nonblock(production);
+        assert!(calls > 0, "The production code must call custom_flags.");
+        assert!(
+            missing.is_empty(),
+            "Every record open must set O_NONBLOCK. The calls without it are {missing:?}."
+        );
+    }
+
+    /// The fsync of the new record fails. The test requires these results:
+    ///
+    /// - `preallocate_detection_record` returns an error.
+    /// - No record is at the final name.
+    /// - No temp file stays in the directory.
+    #[test]
+    fn temp_file_fsync_failure_publishes_no_record() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let guard = arm_fsync_failures(1);
+        let result = preallocate_detection_record(dir.path());
+        drop(guard);
+        assert!(
+            result.is_err(),
+            "preallocate_detection_record must fail when the record fsync fails."
+        );
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Absent,
+            "A record whose fsync failed must not get the final name."
+        );
+        assert_eq!(
+            names_other_than_the_record(dir.path()),
+            Vec::<String>::new(),
+            "The failed create must remove its temp file."
+        );
+    }
+
+    /// The test checks link errors. It requires these results:
+    ///
+    /// - The message names the missing hard-link support for
+    ///   `PermissionDenied` and `Unsupported`.
+    /// - The error kind does not change.
+    /// - Other link errors keep their messages.
+    #[test]
+    fn link_error_names_the_missing_hard_link_support() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
+            let err = explain_link_error(io::Error::from(kind));
+            assert_eq!(err.kind(), kind, "The error kind {kind:?} must not change.");
+            assert!(
+                err.to_string().contains("does not support hard links"),
+                "The {kind:?} error must name the missing hard-link support. The error is: {err}"
+            );
+        }
+        let err = explain_link_error(io::Error::from(io::ErrorKind::AlreadyExists));
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists,
+            "The AlreadyExists error kind must not change."
+        );
+        assert!(
+            !err.to_string().contains("hard links"),
+            "An AlreadyExists error must not name the hard-link support. The error is: {err}"
         );
     }
 }
