@@ -117,7 +117,7 @@ Before Gloas, `max-profit` and `builder-always` with the flag off do not request
 
 When more than one beacon node returns a block, a blinded block is ranked at `value * builder_boost_factor / 100` and a local block at its raw value. The quotient saturates at the maximum `u128`. Boost `u64::MAX` puts every blinded block ahead of every local block. Boost `0` puts every local block ahead of every blinded block. A block on the primary parent still wins before that comparison.
 
-Setting `builder_proposals` to false does not deregister the validator at the relay and does not evict a registration this process already sent. The relay keeps that registration until a later registration update.
+Setting `builder_proposals` to false stops this process from re-sending the validator's registration, from the next epoch. It does not deregister the validator at the relay: the relay keeps the last registration it received. When the flag is set back to true, this process signs a new registration and sends it again in each epoch.
 
 ---
 

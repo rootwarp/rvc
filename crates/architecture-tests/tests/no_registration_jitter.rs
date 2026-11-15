@@ -2,14 +2,17 @@
 //!
 //! The scan reads each tracked `*.rs` file under `crates/` (`git ls-files`).
 //! A file fails when it contains the name of the old delay helper or the old
-//! delay log text. This file builds the two strings from parts, so the scan
-//! does not find them in this file.
+//! delay log text. The scan skips this file, because the name of its test
+//! contains the helper name. The file builds the two strings from parts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The strings that must not come back.
 const FORBIDDEN: [&str; 2] = [concat!("jitter", "_seconds"), concat!("with", " jitter")];
+
+/// This file, relative to the workspace root.
+const THIS_FILE: &str = "crates/architecture-tests/tests/no_registration_jitter.rs";
 
 fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -33,7 +36,7 @@ fn tracked_rs_files(root: &Path) -> Vec<String> {
         .split(|byte| *byte == 0)
         .filter(|raw| !raw.is_empty())
         .map(|raw| String::from_utf8(raw.to_vec()).expect("Each tracked path must be UTF-8."))
-        .filter(|path| path.ends_with(".rs"))
+        .filter(|path| path.ends_with(".rs") && path != THIS_FILE)
         .collect()
 }
 

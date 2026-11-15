@@ -351,8 +351,8 @@ sequenceDiagram
     Orch->>Sync: produce_contributions(slot, duties, head_root)
     Sync->>BNM: submit_contribution_and_proofs(proofs)
 
-    Note over Clock,Builder: Post-duty (epoch boundary only)<br/>EpochBoundaryRunner::run_pending: BreakerReset → ReorgCheck → PrepareProposers → CommitteeSubscriptions (E, then E+1)
-    Orch->>Builder: register_validators (with jitter)
+    Note over Clock,Builder: Separate runner task: first processed slot of each epoch, then retries at later processed slots.<br/>EpochBoundaryRunner::run_pending: BreakerReset → ReorgCheck → DutyFetch → PrepareProposers → CommitteeSubscriptions (E, then E+1) → BuilderRegistration → ProposerPreferences
+    Orch->>Builder: runner BuilderRegistration step: submit_epoch_registrations (every epoch)
 ```
 
 ## Block Proposal Lifecycle
@@ -557,8 +557,7 @@ Builder registration management and proposer preparation.
 
 - **`BuilderService`** — Batch-signs `ValidatorRegistrationV1` with `DOMAIN_APPLICATION_BUILDER` (zeroed genesis root), submits via `register_validator` endpoint.
 - **`prepare_proposers`** — Sends fee recipients to BN at epoch start.
-- **Jitter** — Random 0–30s delay before registration to spread load.
-- Registration runs at epoch boundary AFTER all duty phases.
+- Registration is the epoch boundary runner's BuilderRegistration step. It re-sends every builder key's registration in each epoch, signs only new or changed keys, and retries a failed send at the next slot of the epoch.
 
 ### `crates/doppelganger` — Doppelganger Detection
 
