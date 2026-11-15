@@ -352,7 +352,9 @@ fn existing_record_result(data_dir: &Path) -> Option<io::Result<()>> {
 /// the final name with a hard link.
 ///
 /// The link fails with `AlreadyExists` when the final name exists, so this
-/// never replaces a record. An error before the link removes the temp file.
+/// never replaces a record. A failed exclusive open of the temp file removes
+/// nothing, because that name can belong to another create. After the open,
+/// an error before the link removes the temp file.
 fn create_clear_record(data_dir: &Path) -> io::Result<()> {
     let bytes = encode_record(false, 0, 0)?;
     let tmp_path = data_dir.join(format!(
@@ -360,10 +362,10 @@ fn create_clear_record(data_dir: &Path) -> io::Result<()> {
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     ));
+    #[cfg(test)]
+    run_record_path_hook(&BEFORE_RECORD_TEMP_OPEN, &tmp_path);
+    let mut file = open_record(&tmp_path, true)?;
     let linked = (|| {
-        #[cfg(test)]
-        run_record_path_hook(&BEFORE_RECORD_TEMP_OPEN, &tmp_path);
-        let mut file = open_record(&tmp_path, true)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
