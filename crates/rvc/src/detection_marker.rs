@@ -1,7 +1,9 @@
 //! Durable doppelganger detection marker and the pre-allocated record.
 //!
 //! At boot the process creates a fixed-size `.rvc.doppelganger_record` in the
-//! keystore directory and fills it with a `not-detected` header. Detection
+//! keystore directory and fills it with a `not-detected` header. It writes
+//! and fsyncs a temp file first, and a hard link then gives that file the
+//! final name, so the final name never holds a partial record. Detection
 //! overwrites that file in place (`pwrite`, then `fsync`). An in-place
 //! overwrite does not allocate a new directory entry. On copy-on-write or
 //! thin storage (btrfs, ZFS, thin LVM) it can still allocate a new block.
@@ -297,7 +299,12 @@ pub fn inspect_record(data_dir: &Path) -> RecordInspect {
 /// A file that is already a clear record is left in place. A detected record
 /// is not overwritten. Anything else, including a symlink, is an error: this
 /// does not unlink and recreate, because that recreation can fail with no
-/// space left. The new file is mode `0600`, a regular file, and fsynced.
+/// space left. The new file is mode `0600`, a regular file, and fsynced
+/// before a hard link gives it the final name. The link does not replace a
+/// record that another process created in the meantime: this function then
+/// reads that record and gives the same result as for a record that was there
+/// first. A crash during the create leaves at most a temp file, which
+/// [`sweep_stale_record_temps`] removes.
 pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     if take_preallocate_failure() {
@@ -306,23 +313,53 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
             "injected detection-record preallocation failure",
         ));
     }
-    match inspect_record(data_dir) {
-        RecordInspect::Clear => return Ok(()),
-        RecordInspect::Detected { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "detection record is already in the detected state",
-            ));
-        }
-        RecordInspect::Unreadable { reason, .. } => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
-        }
-        RecordInspect::Absent => {}
+    if let Some(existing) = existing_record_result(data_dir) {
+        return existing;
     }
-    let path = record_path(data_dir);
+    let Err(err) = create_clear_record(data_dir) else {
+        return Ok(());
+    };
+    if err.kind() != io::ErrorKind::AlreadyExists {
+        return Err(err);
+    }
+    existing_record_result(data_dir).unwrap_or_else(|| {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the detection record was removed while this process created it",
+        ))
+    })
+}
+
+/// The result for the record in `data_dir`, or `None` when there is no
+/// record. This does not change the record.
+fn existing_record_result(data_dir: &Path) -> Option<io::Result<()>> {
+    match inspect_record(data_dir) {
+        RecordInspect::Absent => None,
+        RecordInspect::Clear => Some(Ok(())),
+        RecordInspect::Detected { .. } => Some(Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "detection record is already in the detected state",
+        ))),
+        RecordInspect::Unreadable { reason, .. } => {
+            Some(Err(io::Error::new(io::ErrorKind::InvalidData, reason)))
+        }
+    }
+}
+
+/// Write a clear record to a temp file in `data_dir`, fsync it, and give it
+/// the final name with a hard link.
+///
+/// The link fails with `AlreadyExists` when the final name exists, so this
+/// never replaces a record. An error before the link removes the temp file.
+fn create_clear_record(data_dir: &Path) -> io::Result<()> {
     let bytes = encode_record(false, 0, 0)?;
-    let mut file = open_record(&path, true)?;
-    let write_result = (|| {
+    let tmp_path = data_dir.join(format!(
+        ".{RECORD_FILENAME}.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+    ));
+    let linked = (|| {
+        let mut file = open_record(&tmp_path, true)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -330,31 +367,70 @@ pub fn preallocate_detection_record(data_dir: &Path) -> io::Result<()> {
         }
         write_record_bytes(&mut file, &bytes)?;
         sync_file(&file)?;
+        drop(file);
         #[cfg(test)]
         run_before_record_link();
-        Ok(())
+        fs::hard_link(&tmp_path, record_path(data_dir)).map_err(explain_link_error)
     })();
-    if let Err(err) = write_result {
-        drop(file);
-        let _ = fs::remove_file(&path);
-        let _ = sync_dir(data_dir);
+    if let Err(err) = linked {
+        let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }
-    drop(file);
-    sync_dir(data_dir)?;
-    Ok(())
+    fs::remove_file(&tmp_path)?;
+    sync_dir(data_dir)
 }
 
 /// Remove the temp files that a crashed record create left in `data_dir`.
 ///
+/// This removes only a regular file whose name is exactly
+/// `.{RECORD_FILENAME}.<digits>.<digits>.tmp`. It does not follow or remove a
+/// symlink or a directory with that name. When it removes a file, it fsyncs
+/// the directory. Call it only while the keystore lock is held: the temp file
+/// of a create in another process is not stale.
+///
 /// Returns the number of removed files.
-pub fn sweep_stale_record_temps(_data_dir: &Path) -> io::Result<usize> {
-    Ok(0)
+pub fn sweep_stale_record_temps(data_dir: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in fs::read_dir(data_dir)? {
+        let path = entry?.path();
+        if is_record_temp_name(&path) && fs::symlink_metadata(&path)?.is_file() {
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        sync_dir(data_dir)?;
+    }
+    Ok(removed)
 }
 
-#[allow(dead_code)]
+/// `true` when the file name of `path` is `.{RECORD_FILENAME}.<digits>.<digits>.tmp`.
+fn is_record_temp_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    name.strip_prefix(&format!(".{RECORD_FILENAME}."))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|middle| middle.split_once('.'))
+        .is_some_and(|(pid, nanos)| digits(pid) && digits(nanos))
+}
+
+/// Name the missing hard-link support in a link error of that kind.
+///
+/// A filesystem without hard links fails the link with `PermissionDenied`
+/// or `Unsupported`. Other errors do not change.
 fn explain_link_error(err: io::Error) -> io::Error {
-    err
+    match err.kind() {
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported => io::Error::new(
+            err.kind(),
+            format!(
+                "the keystore filesystem does not support hard links, which the detection \
+                 record create needs: {err}"
+            ),
+        ),
+        _ => err,
+    }
 }
 
 /// Overwrite the pre-allocated record with `detected` and fsync it.
@@ -481,8 +557,11 @@ fn open_record(path: &Path, create: bool) -> io::Result<File> {
     }
     #[cfg(unix)]
     {
+        use std::ops::BitOr;
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        opts.custom_flags(
+            [libc::O_NOFOLLOW, libc::O_NONBLOCK, libc::O_CLOEXEC].into_iter().fold(0, BitOr::bitor),
+        );
         if create {
             opts.mode(0o600);
         }

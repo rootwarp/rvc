@@ -150,6 +150,17 @@ async fn run_with_clock<C: SlotClock + 'static>(
     let slashing_db = slashing_handles.db;
     let _keystore_lock_guard = slashing_handles.keystore_lock;
     let deletion_denylist = slashing_handles.denylist;
+    if config.doppelganger_detection {
+        // This process holds the keystore lock when locking is enabled. A
+        // concurrent create can still fail closed.
+        if let Err(err) = crate::detection_marker::sweep_stale_record_temps(&config.keystore_path) {
+            warn!(
+                path = %config.keystore_path.display(),
+                error = %err,
+                "cannot remove the stale doppelganger detection record temp files"
+            );
+        }
+    }
 
     // Steps 3–5: beacon client, BnManager, GVR, genesis gate, reachability.
     let beacon_handles =
