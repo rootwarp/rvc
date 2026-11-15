@@ -24,14 +24,14 @@ CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 # Each runtime stage has the same name as the binary that it ships.
 RUNTIME_STAGES = ("rvc", "rvc-signer", "rvc-keygen")
 
-# The reviewed runtime base: Alpine 3.24.4, with the digest of the image index.
+# The reviewed runtime base uses Alpine 3.24.4 and the digest of its image index.
 # The index has linux/amd64 and linux/arm64/v8 manifests. If you change this
 # reference, give registry evidence for the two platforms in the pull request.
 RUNTIME_BASE = "alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
 
-# The reviewed builder: cargo-chef 0.1.78 and Rust 1.97.1 on Alpine 3.24, with
-# the digest of the image index (linux/amd64 and linux/arm64). If you change
-# this reference, record the Rust and cargo-chef versions in the pull request.
+# The reviewed builder uses cargo-chef 0.1.78 and Rust 1.97.1 on Alpine 3.24.
+# Its image index contains both platforms. If you change this reference,
+# record the Rust and cargo-chef versions in the pull request.
 BUILDER_BASE = (
     "lukemathwalker/cargo-chef:latest-rust-1.97-alpine3.24"
     "@sha256:980619ec8e88608ad967ee0fb697ed3b3e4368acdbac71e5e85ae61f9e2f1a2a"
@@ -54,11 +54,12 @@ MUSL_TARGETS = {
     "aarch64": "aarch64-unknown-linux-musl",
 }
 
-# The stages that run cargo chef cook and cargo build.
+# These stages run cargo chef cook and cargo build.
 CARGO_STAGES = ("cook", "builder")
 
-# The CPU baseline of each musl target. A binary for the baseline runs on each
-# CPU of its platform. The value "native" selects the CPU of the build host.
+# This map gives the CPU baseline for each musl target. A binary for the
+# baseline runs on each CPU of its platform. The value "native" selects the
+# CPU of the build host.
 PORTABLE_CPU = {
     "x86_64-unknown-linux-musl": "x86-64",
     "aarch64-unknown-linux-musl": "generic",
