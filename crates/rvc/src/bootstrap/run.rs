@@ -721,6 +721,9 @@ pub(crate) fn refuse_if_detection_records(
 }
 
 /// Exit 12 when the pre-allocated record is `detected` or cannot be trusted.
+///
+/// Each refusal log gives the `clear-detection` command. That command
+/// replaces a record that does not parse when it is a regular file.
 fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
     match crate::detection_marker::inspect_record(data_dir) {
         crate::detection_marker::RecordInspect::Absent
@@ -739,7 +742,9 @@ fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), Bootstra
             error!(
                 path = %path.display(),
                 reason,
-                "doppelganger detection record is unreadable; refusing to start"
+                "doppelganger detection record cannot be read or does not parse; refusing to \
+                 start. A symlink, directory or FIFO at that path must be removed first. {}",
+                DETECTION_CLEAR_HINT
             );
             Err(BootstrapError::DoppelgangerDetected)
         }

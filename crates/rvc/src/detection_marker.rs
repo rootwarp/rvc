@@ -17,16 +17,21 @@
 //! or is not valid. Clearing it is `rvc doppelganger clear-detection
 //! --datadir … --slashing-db-path … --confirm`, which also forces a full
 //! forward window on the next boot. Deleting only the keystore marker by
-//! hand does not force that window and does not clear a detected record. A
-//! record that is not a regular 4096-byte file cannot be reset in place:
-//! stop the process, remove `.rvc.doppelganger_record`, and run
-//! `clear-detection` again. Do not remove a valid `detected` record by hand;
-//! that skips the force-window file.
+//! hand does not force that window and does not clear a detected record.
+//! `clear-detection` resets a detected record in place. It replaces a record
+//! that does not parse when that record is a regular file: it writes a clear
+//! record to a temp file and exchanges the temp file with the old record in
+//! one atomic step. It does not replace a record that it cannot read or a
+//! record that changed after its read. A symlink, directory or FIFO at that
+//! path still needs `rm`: stop the process, remove
+//! `.rvc.doppelganger_record`, and run `clear-detection` again. Do not
+//! remove a valid `detected` record by hand; that skips the force-window
+//! file.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,9 +82,12 @@ struct MarkerDocument {
 }
 
 /// `Removed` when a marker file was unlinked. `Absent` when there was none.
+/// `Replaced` when [`reset_or_replace_detection_record`] replaced a record
+/// that does not parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClearOutcome {
     Removed,
+    Replaced,
     Absent,
 }
 
@@ -409,10 +417,27 @@ fn check_record_owner_and_mode(path: &Path, meta: &fs::Metadata) -> io::Result<(
 /// the final name with a hard link.
 ///
 /// The link fails with `AlreadyExists` when the final name exists, so this
-/// never replaces a record. A failed exclusive open of the temp file removes
-/// nothing, because that name can belong to another create. After the open,
-/// an error before the link removes the temp file.
+/// never replaces a record. An error before the link removes the temp file.
 fn create_clear_record(data_dir: &Path) -> io::Result<()> {
+    let tmp_path = write_clear_record_temp(data_dir)?;
+    #[cfg(test)]
+    run_before_record_link();
+    if let Err(err) = link_record(&tmp_path, data_dir).map_err(explain_link_error) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    fs::remove_file(&tmp_path)?;
+    sync_dir(data_dir)
+}
+
+/// Write a clear record to a new temp file in `data_dir` and fsync it.
+/// Returns the path of the temp file.
+///
+/// The temp file is `.{RECORD_FILENAME}.<pid>.<nanos>.tmp`, a regular file
+/// with mode `0600`, opened with `O_NOFOLLOW` and `O_NONBLOCK`. A failed
+/// exclusive open of the temp file removes nothing, because that name can
+/// belong to another create. After the open, an error removes the temp file.
+fn write_clear_record_temp(data_dir: &Path) -> io::Result<PathBuf> {
     let bytes = encode_record(false, 0, 0)?;
     let tmp_path = data_dir.join(format!(
         ".{RECORD_FILENAME}.{}.{}.tmp",
@@ -422,25 +447,197 @@ fn create_clear_record(data_dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     run_record_path_hook(&BEFORE_RECORD_TEMP_OPEN, &tmp_path);
     let mut file = open_record(&tmp_path, true)?;
-    let linked = (|| {
+    let written = (|| {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         write_record_bytes(&mut file, &bytes)?;
-        sync_file(&file)?;
-        drop(file);
-        #[cfg(test)]
-        run_before_record_link();
-        link_record(&tmp_path, data_dir).map_err(explain_link_error)
+        sync_file(&file)
     })();
-    if let Err(err) = linked {
+    if let Err(err) = written {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }
+    Ok(tmp_path)
+}
+
+/// What a read of the record path found.
+enum RecordFile {
+    /// No entry is at the path.
+    Absent,
+    /// The entry is not a regular file.
+    NotRegular,
+    /// A regular file: the `fstat` metadata of the read descriptor, and at
+    /// most [`RECORD_LEN`] + 1 bytes. A longer file does not parse.
+    Read(fs::Metadata, Vec<u8>),
+}
+
+/// Read the entry at `path` through one descriptor.
+///
+/// The read does not follow a symlink, and the open does not block on a
+/// FIFO. An error is a read error, not a parse result.
+fn read_record_file(path: &Path) -> io::Result<RecordFile> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if take_durable_fault(DurableFault::RecordRead) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(RecordFile::Absent),
+        Err(err) => return Err(err),
+        Ok(meta) if !meta.is_file() => return Ok(RecordFile::NotRegular),
+        Ok(_) => {}
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::ops::BitOr;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(
+            [libc::O_NOFOLLOW, libc::O_NONBLOCK, libc::O_CLOEXEC].into_iter().fold(0, BitOr::bitor),
+        );
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(RecordFile::NotRegular);
+    }
+    let mut bytes = Vec::new();
+    file.take(RECORD_LEN as u64 + 1).read_to_end(&mut bytes)?;
+    Ok(RecordFile::Read(meta, bytes))
+}
+
+/// Replace the record at `path` in `data_dir` with a clear record.
+///
+/// The caller read that record through one descriptor, and the record does
+/// not parse. `checked` is the `fstat` metadata of that descriptor, and
+/// `checked_bytes` are the bytes that it read. This writes and fsyncs a
+/// clear temp record with the writer of [`create_clear_record`]. Then
+/// `renameat2` with `RENAME_EXCHANGE` swaps the temp record and the entry at
+/// `path` in one atomic step, so a reader sees the old entry or the new
+/// record. The old entry is then at the temp path. If it is not the checked
+/// file with the checked bytes, another process changed `path` after the
+/// read: a second exchange puts that entry back at `path`, the clear temp
+/// record is removed, and this returns an error. Else this removes the old
+/// entry and fsyncs `data_dir`. An exchange error removes the temp record.
+///
+/// Call this only while this process holds the keystore lock. A crash after
+/// the first exchange leaves the old entry at the temp path, which
+/// [`sweep_stale_record_temps`] removes.
+fn replace_unparseable_record(
+    data_dir: &Path,
+    path: &Path,
+    checked: &fs::Metadata,
+    checked_bytes: &[u8],
+) -> io::Result<()> {
+    let tmp_path = write_clear_record_temp(data_dir)?;
+    #[cfg(any(test, feature = "test-utils"))]
+    run_before_record_exchange(path);
+    if let Err(err) = exchange_record(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "the clear record could not be exchanged with the detection record {}: {err}",
+                path.display()
+            ),
+        ));
+    }
+    if !is_checked_record(&tmp_path, checked, checked_bytes) {
+        if let Err(err) = exchange_record(&tmp_path, path) {
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "the detection record {} changed after this command read it, and the \
+                     command could not put the changed entry back: {err}. The changed entry is \
+                     at {}. Stop the process and examine the two paths",
+                    path.display(),
+                    tmp_path.display()
+                ),
+            ));
+        }
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the detection record {} changed after this command read it, so the command did \
+                 not replace it. Run `rvc doppelganger clear-detection` again",
+                path.display()
+            ),
+        ));
+    }
     fs::remove_file(&tmp_path)?;
     sync_dir(data_dir)
+}
+
+/// `true` when `path` is the regular file that the caller read: the same
+/// device number, inode number, length and bytes.
+fn is_checked_record(path: &Path, checked: &fs::Metadata, checked_bytes: &[u8]) -> bool {
+    let Ok(RecordFile::Read(meta, bytes)) = read_record_file(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != checked.dev() || meta.ino() != checked.ino() {
+            return false;
+        }
+    }
+    meta.len() == checked.len() && bytes == checked_bytes
+}
+
+/// Swap the entries at `tmp_path` and `path` in one atomic step with
+/// `renameat2` and `RENAME_EXCHANGE`. Both entries must exist. Only Linux
+/// has this exchange, so other platforms return `Unsupported`.
+#[allow(unsafe_code)]
+fn exchange_record(tmp_path: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if take_durable_fault(DurableFault::Exchange) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = |path: &Path| {
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+        };
+        let (from, to) = (c_path(tmp_path)?, c_path(path)?);
+        // SAFETY: `from` and `to` are NUL-terminated strings that live during
+        // the call, and the kernel only reads them. The syscall takes no
+        // other pointer.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::c_long::from(libc::AT_FDCWD),
+                from.as_ptr(),
+                libc::c_long::from(libc::AT_FDCWD),
+                to.as_ptr(),
+                libc::RENAME_EXCHANGE as libc::c_long,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        DURABLE_STEPS.with(|steps| steps.borrow_mut().push(DurableStep::Exchange));
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tmp_path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "this platform has no atomic exchange for the detection record {path}. Remove \
+                 {path}, then run `rvc doppelganger clear-detection` again",
+                path = path.display()
+            ),
+        ))
+    }
 }
 
 /// Give the temp file `tmp_path` the record name in `data_dir` with a hard link.
@@ -518,26 +715,60 @@ pub fn commit_detection_record(data_dir: &Path, epoch: u64, unix_secs: u64) -> i
     Ok(())
 }
 
-/// Write `not-detected` over a detected record. A missing record is success.
+/// Write `not-detected` over a detected record, or replace a record that
+/// does not parse. A missing or clear record is [`ClearOutcome::Absent`].
 ///
-/// A record that is not the pre-allocated size is left untouched and this
-/// returns an error. `clear-detection` then leaves the marker in place. Stop
-/// the process, remove [`RECORD_FILENAME`], and run
-/// `clear-detection` again. A valid `detected` record is reset by that
-/// command; deleting the file by hand skips the force-window file.
-pub fn reset_detection_record(data_dir: &Path) -> io::Result<ClearOutcome> {
-    match inspect_record(data_dir) {
-        RecordInspect::Absent | RecordInspect::Clear => Ok(ClearOutcome::Absent),
-        RecordInspect::Detected { .. } => {
-            let path = record_path(data_dir);
+/// A `detected` record gets `not-detected` in place, and the result is
+/// [`ClearOutcome::Removed`]. A record that does not parse is replaced when
+/// it is a regular file that this function read, and the result is
+/// [`ClearOutcome::Replaced`]: this writes a clear record to a temp file and
+/// exchanges it with the record in one atomic step. If the record changed
+/// after the read, the record stays and this returns an error. A read error
+/// is not a parse result, so the record stays and this returns an error. A
+/// symlink, directory or FIFO at that path does not change, and the error
+/// names the path. Stop the process, remove that path with `rm`, and run
+/// `clear-detection` again. Call this only while this process holds the
+/// keystore lock and after the force-window file is durable. A valid
+/// `detected` record is reset by that command; deleting the file by hand
+/// skips the force-window file.
+pub fn reset_or_replace_detection_record(data_dir: &Path) -> io::Result<ClearOutcome> {
+    let path = record_path(data_dir);
+    let (checked, bytes) = match read_record_file(&path) {
+        Ok(RecordFile::Absent) => return Ok(ClearOutcome::Absent),
+        Ok(RecordFile::NotRegular) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the detection record {path} does not parse and is not a regular file. \
+                     Remove {path}, then run `rvc doppelganger clear-detection` again",
+                    path = path.display()
+                ),
+            ));
+        }
+        Ok(RecordFile::Read(checked, bytes)) => (checked, bytes),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "the detection record {} cannot be read: {err}. The command does not \
+                     replace a record that it cannot read",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    match parse_record(&bytes) {
+        Ok(ParsedRecord::Clear) => Ok(ClearOutcome::Absent),
+        Ok(ParsedRecord::Detected { .. }) => {
             let mut file = open_record(&path, false)?;
             let bytes = encode_record(false, 0, 0)?;
             write_record_bytes(&mut file, &bytes)?;
             sync_file(&file)?;
             Ok(ClearOutcome::Removed)
         }
-        RecordInspect::Unreadable { reason, .. } => {
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+        Err(_) => {
+            replace_unparseable_record(data_dir, &path, &checked, &bytes)?;
+            Ok(ClearOutcome::Replaced)
         }
     }
 }
@@ -691,7 +922,7 @@ fn write_record_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 type BeforeRecordLinkHook = Box<dyn FnOnce()>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 type RecordPathHook = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
@@ -1072,6 +1303,113 @@ impl Drop for FsyncTargetFailGuard {
     }
 }
 
+/// A step of a durable write on this thread, for tests. The seam adds a
+/// step for each fsync and for each exchange of a temp record with the
+/// record path. [`take_durable_steps`] returns the steps.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableStep {
+    /// An fsync of a regular file: the device number, the inode number and
+    /// the length of the file at the fsync.
+    SyncFile(u64, u64, u64),
+    /// An fsync of a directory: the device number and the inode number.
+    SyncDir(u64, u64),
+    /// An exchange of a temp record with the record path.
+    Exchange,
+}
+
+/// A failure that the seam injects one time on this thread.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFault {
+    /// The fsync with this index fails with `EIO`. The first fsync after
+    /// the arm has the index 0.
+    Sync(u32),
+    /// The next exchange of a temp record with the record path fails with
+    /// `EIO`. The exchange does not occur.
+    Exchange,
+    /// The next read of the record by [`reset_or_replace_detection_record`]
+    /// fails with `EIO`.
+    RecordRead,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static DURABLE_STEPS: RefCell<Vec<DurableStep>> = const { RefCell::new(Vec::new()) };
+    static DURABLE_FAULT: Cell<Option<DurableFault>> = const { Cell::new(None) };
+    static BEFORE_RECORD_EXCHANGE: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+}
+
+/// Return the durable steps of this thread since the last call. The seam
+/// then has no steps.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn take_durable_steps() -> Vec<DurableStep> {
+    DURABLE_STEPS.with(RefCell::take)
+}
+
+/// Inject `fault` one time on this thread. A new arm replaces a fault that
+/// did not occur.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn arm_durable_fault(fault: DurableFault) {
+    DURABLE_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+/// Run `hook` one time on this thread, after the clear temp record is
+/// durable and before its exchange with the record path. The hook gets the
+/// record path.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn arm_before_record_exchange(hook: impl FnOnce(&Path) + 'static) {
+    BEFORE_RECORD_EXCHANGE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn run_before_record_exchange(path: &Path) {
+    let hook = BEFORE_RECORD_EXCHANGE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+/// `true` when the armed fault is `fault`. The fault then does not occur
+/// again.
+#[cfg(any(test, feature = "test-utils"))]
+fn take_durable_fault(fault: DurableFault) -> bool {
+    DURABLE_FAULT.with(|slot| {
+        let armed = slot.get() == Some(fault);
+        if armed {
+            slot.set(None);
+        }
+        armed
+    })
+}
+
+/// Add the step of this fsync. Return `true` when the armed fault fails
+/// this fsync.
+#[cfg(any(test, feature = "test-utils"))]
+fn note_durable_sync(file: &File) -> bool {
+    #[cfg(unix)]
+    if let Ok(meta) = file.metadata() {
+        use std::os::unix::fs::MetadataExt;
+        let step = if meta.is_dir() {
+            DurableStep::SyncDir(meta.dev(), meta.ino())
+        } else {
+            DurableStep::SyncFile(meta.dev(), meta.ino(), meta.len())
+        };
+        DURABLE_STEPS.with(|steps| steps.borrow_mut().push(step));
+    }
+    DURABLE_FAULT.with(|slot| match slot.get() {
+        Some(DurableFault::Sync(0)) => {
+            slot.set(None);
+            true
+        }
+        Some(DurableFault::Sync(index)) => {
+            slot.set(Some(DurableFault::Sync(index - 1)));
+            false
+        }
+        _ => false,
+    })
+}
+
 fn sync_file(file: &File) -> io::Result<()> {
     #[cfg(test)]
     FSYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1081,6 +1419,10 @@ fn sync_file(file: &File) -> io::Result<()> {
     }
     #[cfg(test)]
     if take_fsync_failure() {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if note_durable_sync(file) {
         return Err(io::Error::from_raw_os_error(libc::EIO));
     }
     file.sync_all()
@@ -1281,12 +1623,22 @@ mod tests {
     #[test]
     fn preallocate_writes_a_clear_fixed_record_and_commit_overwrites_it() {
         let dir = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string()),
+            Ok(ClearOutcome::Absent),
+            "The reset must return Absent when no record exists."
+        );
         preallocate_detection_record(dir.path()).expect("preallocate");
         let path = record_path(dir.path());
         let meta = fs::metadata(&path).expect("meta");
         assert!(meta.is_file());
         assert_eq!(meta.len(), RECORD_LEN as u64);
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Clear));
+        assert_eq!(
+            reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string()),
+            Ok(ClearOutcome::Absent),
+            "The reset must return Absent for a clear record."
+        );
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Absent | RecordInspect::Clear));
         #[cfg(unix)]
         {
@@ -1313,9 +1665,25 @@ mod tests {
         assert!(bytes.iter().skip(80).all(|byte| *byte == 0));
         preallocate_detection_record(dir.path()).expect_err("must not clobber a detected record");
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Detected { .. }));
-        assert_eq!(reset_detection_record(dir.path()).expect("reset"), ClearOutcome::Removed);
+        #[cfg(unix)]
+        let detected_id = file_id(&path);
+        assert_eq!(
+            reset_or_replace_detection_record(dir.path()).expect("reset"),
+            ClearOutcome::Removed
+        );
         assert!(matches!(inspect_record(dir.path()), RecordInspect::Clear));
         assert_eq!(fs::metadata(&path).expect("meta").len(), RECORD_LEN as u64);
+        #[cfg(unix)]
+        assert_eq!(
+            file_id(&path),
+            detected_id,
+            "The reset must keep the device number and the inode number of a detected record."
+        );
+        assert_eq!(
+            temp_file_names(dir.path()),
+            Vec::<String>::new(),
+            "The reset of a detected record must not leave a temp file."
+        );
     }
 
     #[test]
@@ -1333,7 +1701,6 @@ mod tests {
             RecordInspect::Absent | RecordInspect::Clear
         ));
         assert!(preallocate_detection_record(dir.path()).is_err());
-        assert!(reset_detection_record(dir.path()).is_err());
         assert_eq!(fs::read(record_path(dir.path())).expect("untouched"), b"short");
 
         #[cfg(unix)]
@@ -1348,6 +1715,522 @@ mod tests {
                 .file_type()
                 .is_symlink());
         }
+    }
+
+    /// Return the names of the temp files in `dir`.
+    fn temp_file_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("The test must read the directory.")
+            .map(|entry| {
+                entry
+                    .expect("The test must read a directory entry.")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// The function handles a regular record that does not parse. A hard
+    /// link keeps the old inode for the checks. The test requires these
+    /// results:
+    ///
+    /// - The function returns `Replaced`.
+    /// - The new record is Clear, a regular file, mode `0600` and
+    ///   `RECORD_LEN` bytes.
+    /// - The new record has a new inode, and the old inode keeps its bytes.
+    /// - The durable steps are the fsync of the full temp record, the
+    ///   exchange, and the fsync of the keystore directory, in that order.
+    /// - No temp file stays.
+    /// - The next preallocation accepts the record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reset_or_replace_replaces_an_unparseable_regular_record() {
+        let clear = encode_record(false, 0, 0).expect("The test must encode a clear record.");
+        let rows: [(&str, Vec<u8>); 3] = [
+            ("4096 zero bytes", vec![0; RECORD_LEN]),
+            ("a 5-byte regular file", b"short".to_vec()),
+            ("a clear record with one more zero byte", [clear.as_slice(), &[0]].concat()),
+        ];
+        for (case, bytes) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let path = record_path(dir.path());
+            let old_link = dir.path().join("old-record-link");
+            fs::write(&path, &bytes).expect("The test must write the record file.");
+            fs::hard_link(&path, &old_link).expect("The test must make a hard link to the record.");
+            take_durable_steps();
+
+            let outcome =
+                reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string());
+            let steps = take_durable_steps();
+
+            assert_eq!(
+                outcome,
+                Ok(ClearOutcome::Replaced),
+                "The function must replace the record. The input case is {case}."
+            );
+            assert_eq!(
+                inspect_record(dir.path()),
+                RecordInspect::Clear,
+                "The record must be clear after the replace. The input case is {case}."
+            );
+            let meta = fs::symlink_metadata(&path)
+                .expect("The test must read the metadata of the record.");
+            assert!(
+                meta.is_file(),
+                "The new record must be a regular file. The input case is {case}."
+            );
+            assert_eq!(
+                meta.len(),
+                RECORD_LEN as u64,
+                "The new record must have RECORD_LEN bytes. The input case is {case}."
+            );
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "The new record must have mode 0600. The input case is {case}."
+                );
+            }
+            let (new_dev, new_ino) = file_id(&path);
+            assert_ne!(
+                (new_dev, new_ino),
+                file_id(&old_link),
+                "The new record must have a new inode. The input case is {case}."
+            );
+            assert_eq!(
+                fs::read(&old_link).map_err(|err| err.to_string()),
+                Ok(bytes.clone()),
+                "The old inode must keep its bytes. The input case is {case}."
+            );
+            let (dir_dev, dir_ino) = file_id(dir.path());
+            assert_eq!(
+                steps,
+                vec![
+                    DurableStep::SyncFile(new_dev, new_ino, RECORD_LEN as u64),
+                    DurableStep::Exchange,
+                    DurableStep::SyncDir(dir_dev, dir_ino),
+                ],
+                "The durable steps must be the fsync of the full temp record, the exchange and \
+                 the fsync of the keystore directory. The input case is {case}."
+            );
+            assert_eq!(
+                temp_file_names(dir.path()),
+                Vec::<String>::new(),
+                "The function must not leave a temp file. The input case is {case}."
+            );
+            assert_eq!(
+                preallocate_detection_record(dir.path()).map_err(|err| err.to_string()),
+                Ok(()),
+                "The next boot must accept the new record. The input case is {case}."
+            );
+        }
+    }
+
+    /// The function replaces a record of 4096 zero bytes, and the seam fails
+    /// one step. Each row requires these results:
+    ///
+    /// - The function returns an error that gives the injected `EIO`.
+    /// - The durable steps stop at the failed step.
+    /// - When the temp-record fsync or the exchange fails, the record keeps
+    ///   its inode and its bytes.
+    /// - When the keystore-directory fsync fails, the exchange is done, and
+    ///   the record is Clear.
+    /// - No temp file stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reset_or_replace_stops_at_a_failed_replace_step() {
+        let rows = [
+            ("the temp-record fsync fails", DurableFault::Sync(0)),
+            ("the exchange fails", DurableFault::Exchange),
+            ("the keystore-directory fsync fails", DurableFault::Sync(1)),
+        ];
+        for (case, fault) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let path = record_path(dir.path());
+            fs::write(&path, vec![0; RECORD_LEN]).expect("The test must write the record file.");
+            let before = file_id(&path);
+            take_durable_steps();
+            arm_durable_fault(fault);
+
+            let result =
+                reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string());
+            let steps = take_durable_steps();
+
+            let message = result.err().unwrap_or_default();
+            let injected = io::Error::from_raw_os_error(libc::EIO).to_string();
+            assert!(
+                message.contains(&injected),
+                "The function must return the injected error. The input case is {case}. The \
+                 error is: {message:?}"
+            );
+            if fault == DurableFault::Sync(1) {
+                let (new_dev, new_ino) = file_id(&path);
+                let (dir_dev, dir_ino) = file_id(dir.path());
+                assert_eq!(
+                    steps,
+                    vec![
+                        DurableStep::SyncFile(new_dev, new_ino, RECORD_LEN as u64),
+                        DurableStep::Exchange,
+                        DurableStep::SyncDir(dir_dev, dir_ino),
+                    ],
+                    "The durable steps must stop at the keystore-directory fsync."
+                );
+                assert_eq!(
+                    inspect_record(dir.path()),
+                    RecordInspect::Clear,
+                    "The record must be clear after the exchange."
+                );
+            } else {
+                assert!(
+                    matches!(
+                        steps.as_slice(),
+                        [DurableStep::SyncFile(_, _, len)] if *len == RECORD_LEN as u64
+                    ),
+                    "The durable steps must stop after the temp-record fsync. The input case is \
+                     {case}. The steps are {steps:?}."
+                );
+                assert_eq!(
+                    file_id(&path),
+                    before,
+                    "The record must keep its inode. The input case is {case}."
+                );
+                assert_eq!(
+                    fs::read(&path).map_err(|err| err.to_string()),
+                    Ok(vec![0; RECORD_LEN]),
+                    "The record must keep its bytes. The input case is {case}."
+                );
+            }
+            assert_eq!(
+                temp_file_names(dir.path()),
+                Vec::<String>::new(),
+                "The function must not leave a temp file. The input case is {case}."
+            );
+        }
+    }
+
+    /// The replace runs under the umask `0o022`. A hook reads the temp
+    /// record right after the exclusive open, before `set_permissions` and
+    /// before the write. The test requires these results:
+    ///
+    /// - The hook gets a record temp path.
+    /// - At that time, the temp record has mode `0o600` and no bytes.
+    /// - The function returns `Replaced`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replace_opens_the_temp_record_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        fs::write(record_path(dir.path()), b"short").expect("The test must write the record file.");
+        let seen = std::rc::Rc::new(Cell::new(None));
+        let hook_seen = std::rc::Rc::clone(&seen);
+        let _hook = arm_after_record_open(move |path| {
+            let meta =
+                fs::symlink_metadata(path).expect("The hook must read the temp record metadata.");
+            hook_seen.set(Some((
+                is_record_temp_name(path),
+                meta.permissions().mode() & 0o777,
+                meta.len(),
+            )));
+        });
+        let umask = UmaskGuard::set(0o022);
+
+        let outcome = reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string());
+        drop(umask);
+
+        assert_eq!(
+            seen.get(),
+            Some((true, 0o600, 0)),
+            "Right after the exclusive open, the temp record must have mode 0o600 and no bytes."
+        );
+        assert_eq!(outcome, Ok(ClearOutcome::Replaced), "The function must replace the record.");
+    }
+
+    /// The function handles a symlink, a directory or a FIFO at the record
+    /// path. Each row requires these results:
+    ///
+    /// - The function returns `InvalidData`.
+    /// - The error names the record path and says that it is not a regular
+    ///   file.
+    /// - The entry keeps its type and its inode.
+    /// - The symlink keeps its target, and the target keeps its bytes.
+    /// - The directory stays empty.
+    /// - The FIFO row has a marker, and the marker stays.
+    /// - No temp file stays.
+    #[cfg(unix)]
+    #[test]
+    fn reset_or_replace_keeps_a_record_that_is_not_a_regular_file() {
+        use std::os::unix::fs::FileTypeExt;
+        let marker = DetectionMarker { epoch: 7, unix_secs: 8, pubkeys: vec![pubkey()] };
+        for case in ["a symlink", "a directory", "a FIFO"] {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let path = record_path(dir.path());
+            let target = dir.path().join("symlink-target");
+            if case == "a FIFO" {
+                write_marker(dir.path(), &marker).expect("The test must write the marker.");
+            }
+            if case == "a symlink" {
+                fs::write(&target, b"short").expect("The test must write the link target.");
+                std::os::unix::fs::symlink(&target, &path)
+                    .expect("The test must create a symlink at the record path.");
+            } else if case == "a directory" {
+                fs::create_dir(&path)
+                    .expect("The test must create a directory at the record path.");
+            } else {
+                make_fifo(&path);
+            }
+            let before = entry_id(&path);
+
+            let result = reset_or_replace_detection_record(dir.path());
+
+            assert_eq!(
+                result.as_ref().copied().map_err(|err| err.kind()),
+                Err(io::ErrorKind::InvalidData),
+                "The function must refuse the record path when it is {case}."
+            );
+            let message = result.err().map(|err| err.to_string()).unwrap_or_default();
+            assert!(
+                message.contains(&path.display().to_string()),
+                "The error must name the record path when it is {case}. The error is: \
+                 {message:?}"
+            );
+            assert!(
+                message.contains("is not a regular file"),
+                "The error must say that the record path is not a regular file. The input case \
+                 is {case}. The error is: {message:?}"
+            );
+            assert_eq!(
+                entry_id(&path),
+                before,
+                "The entry must keep its inode. The input case is {case}."
+            );
+            let file_type = fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type())
+                .map_err(|err| err.to_string());
+            if case == "a FIFO" {
+                assert!(
+                    file_type.as_ref().is_ok_and(|kind| kind.is_fifo()),
+                    "The FIFO must stay a FIFO. The file type is {file_type:?}."
+                );
+                let found = inspect(dir.path());
+                assert!(
+                    matches!(&found, MarkerInspect::Present(read) if *read == marker),
+                    "The marker must stay when the record path is a FIFO. The marker read gives \
+                     {found:?}."
+                );
+            } else if case == "a symlink" {
+                assert!(
+                    file_type.as_ref().is_ok_and(|kind| kind.is_symlink()),
+                    "The symlink must stay a symlink. The file type is {file_type:?}."
+                );
+                assert_eq!(
+                    fs::read_link(&path).map_err(|err| err.to_string()),
+                    Ok(target.clone()),
+                    "The symlink must point to the same target."
+                );
+                assert_eq!(
+                    fs::read(&target).map_err(|err| err.to_string()),
+                    Ok(b"short".to_vec()),
+                    "The function must not write through the symlink."
+                );
+            } else {
+                assert!(
+                    file_type.as_ref().is_ok_and(|kind| kind.is_dir()),
+                    "The directory must stay a directory. The file type is {file_type:?}."
+                );
+                assert_eq!(
+                    fs::read_dir(&path)
+                        .map(|entries| entries.count())
+                        .map_err(|err| err.to_string()),
+                    Ok(0),
+                    "The directory must stay empty."
+                );
+            }
+            assert_eq!(
+                temp_file_names(dir.path()),
+                Vec::<String>::new(),
+                "The function must not leave a temp file when the record path is {case}."
+            );
+        }
+    }
+
+    /// Make a FIFO at `path` with the `mkfifo` command.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("The test must start mkfifo.");
+        assert!(status.success(), "The mkfifo command must succeed. The status is {status}.");
+    }
+
+    /// Return the device number and the inode number of the entry at
+    /// `path`. The function does not follow a symlink.
+    #[cfg(unix)]
+    fn entry_id(path: &Path) -> FileId {
+        use std::os::unix::fs::MetadataExt;
+        let meta =
+            fs::symlink_metadata(path).expect("The test must read the metadata of the entry.");
+        (meta.dev(), meta.ino())
+    }
+
+    /// The function reads a record of 4096 zero bytes. Then a hook changes
+    /// the record path after the temp record is durable and before the
+    /// exchange. Each row requires these results:
+    ///
+    /// - The function returns `InvalidData`, and the error names the record
+    ///   path.
+    /// - The record path has the entry from the hook, with the same device
+    ///   number and inode number.
+    /// - A regular file from the hook keeps its bytes. A symlink keeps its
+    ///   target, and a FIFO stays a FIFO.
+    /// - No temp file stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reset_or_replace_keeps_a_record_that_changes_before_the_exchange() {
+        use std::os::unix::fs::FileTypeExt;
+        let detected = encode_record(true, 7, 8).expect("The test must encode a detected record.");
+        let rows = [
+            "a new inode with the same bytes",
+            "detected bytes in the same inode",
+            "a symlink",
+            "a FIFO",
+        ];
+        for case in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            let path = record_path(dir.path());
+            let side = dir.path().join("side");
+            fs::write(&path, vec![0; RECORD_LEN]).expect("The test must write the record file.");
+            let changed = std::rc::Rc::new(Cell::new(None));
+            let seen = std::rc::Rc::clone(&changed);
+            let hook_side = side.clone();
+            arm_before_record_exchange(move |path| {
+                if case == "a new inode with the same bytes" {
+                    fs::write(&hook_side, vec![0; RECORD_LEN])
+                        .expect("The hook must write the new file.");
+                    fs::rename(&hook_side, path).expect("The hook must move the new file.");
+                } else if case == "detected bytes in the same inode" {
+                    let data_dir = path.parent().expect("The record path must have a parent.");
+                    commit_detection_record(data_dir, 7, 8)
+                        .expect("The hook must write a detected record.");
+                } else if case == "a symlink" {
+                    fs::write(&hook_side, vec![0; RECORD_LEN])
+                        .expect("The hook must write the symlink target.");
+                    fs::remove_file(path).expect("The hook must remove the record.");
+                    std::os::unix::fs::symlink(&hook_side, path)
+                        .expect("The hook must make the symlink.");
+                } else {
+                    fs::remove_file(path).expect("The hook must remove the record.");
+                    make_fifo(path);
+                }
+                seen.set(Some(entry_id(path)));
+            });
+
+            let result = reset_or_replace_detection_record(dir.path())
+                .map_err(|err| (err.kind(), err.to_string()));
+
+            assert_eq!(
+                result.as_ref().map_err(|(kind, _)| *kind),
+                Err(io::ErrorKind::InvalidData),
+                "The function must refuse the record. The input case is {case}."
+            );
+            let message = result.err().map(|(_, message)| message).unwrap_or_default();
+            assert!(
+                message.contains(&path.display().to_string()),
+                "The error must name the record path. The input case is {case}. The error is: \
+                 {message:?}"
+            );
+            assert_eq!(
+                Some(entry_id(&path)),
+                changed.get(),
+                "The record path must have the entry from the hook. The input case is {case}."
+            );
+            if case == "a symlink" {
+                assert_eq!(
+                    fs::read_link(&path).map_err(|err| err.to_string()),
+                    Ok(side.clone()),
+                    "The symlink must keep its target."
+                );
+            } else if case == "a FIFO" {
+                assert!(
+                    fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_fifo()),
+                    "The FIFO must stay a FIFO."
+                );
+            } else {
+                let expected = if case == "a new inode with the same bytes" {
+                    [0; RECORD_LEN]
+                } else {
+                    detected
+                };
+                assert_eq!(
+                    fs::read(&path).map_err(|err| err.to_string()),
+                    Ok(expected.to_vec()),
+                    "The file from the hook must keep its bytes. The input case is {case}."
+                );
+            }
+            assert_eq!(
+                temp_file_names(dir.path()),
+                Vec::<String>::new(),
+                "The function must not leave a temp file. The input case is {case}."
+            );
+        }
+    }
+
+    /// The read of a detected record fails with an injected `EIO`. Then a
+    /// keystore path that is a regular file makes the metadata read fail
+    /// with an error other than `NotFound`. The test requires these results:
+    ///
+    /// - The function returns an error that names the record path and the
+    ///   read error.
+    /// - The record keeps its device number and inode number, and it stays
+    ///   `Detected`.
+    /// - No temp file stays.
+    /// - The metadata error is a read error, not an absent record.
+    #[cfg(unix)]
+    #[test]
+    fn reset_or_replace_keeps_a_record_that_cannot_be_read() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        preallocate_detection_record(dir.path()).expect("The test must create the record.");
+        commit_detection_record(dir.path(), 7, 8).expect("The test must write a detected record.");
+        let path = record_path(dir.path());
+        let before = file_id(&path);
+        arm_durable_fault(DurableFault::RecordRead);
+
+        let result = reset_or_replace_detection_record(dir.path()).map_err(|err| err.to_string());
+
+        assert!(result.is_err(), "The function must refuse a record that it cannot read.");
+        let message = result.err().unwrap_or_default();
+        assert!(
+            message.contains(&path.display().to_string()),
+            "The error must name the record path. The error is: {message:?}"
+        );
+        let read_error = io::Error::from_raw_os_error(libc::EIO).to_string();
+        assert!(
+            message.contains(&read_error),
+            "The error must give the read error. The error is: {message:?}"
+        );
+        assert_eq!(file_id(&path), before, "The record must keep its device and inode numbers.");
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Detected { epoch: 7, unix_secs: 8 },
+            "The record must stay Detected."
+        );
+        assert_eq!(
+            temp_file_names(dir.path()),
+            Vec::<String>::new(),
+            "The function must not leave a temp file."
+        );
+
+        let not_a_dir = dir.path().join("not-a-directory");
+        fs::write(&not_a_dir, b"x").expect("The test must write a regular file.");
+        let result = reset_or_replace_detection_record(&not_a_dir).map_err(|err| err.to_string());
+        assert!(
+            result.as_ref().is_err_and(|message| message.contains("cannot be read")),
+            "A metadata error other than NotFound must give a read error. The result is \
+             {result:?}."
+        );
     }
 
     #[test]

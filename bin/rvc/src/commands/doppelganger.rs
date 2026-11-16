@@ -12,8 +12,13 @@ use rvc::startup;
 /// another process holds it. A process started with `--disable-keystore-locking`
 /// holds no lock, so this command cannot see it. It then writes
 /// `.rvc.doppelganger_force_window` so the next start runs a full forward
-/// window for every key loaded on that boot. It then resets
-/// `.rvc.doppelganger_record` in place to `not-detected`. When
+/// window for every key loaded on that boot. It then resets a detected
+/// `.rvc.doppelganger_record` in place to `not-detected`. A record that does
+/// not parse is replaced with a clear record when it is a regular file. The
+/// command does not replace a record that it cannot read or a record that
+/// changes after its read, and the marker stays. A symlink, directory or
+/// FIFO at that path still needs `rm`: the command returns an error that
+/// names the path, and the marker stays. When
 /// `slashing_db_path` is set and its directory is not `datadir`, the fallback
 /// marker in that directory is removed too. The keystore marker is unlinked
 /// last. Deleting only that marker by hand does not write the force-window
@@ -38,11 +43,17 @@ pub fn execute_clear_detection(
     // The force-window file lands first. A crash before the unlink leaves the
     // detection marker in place, so the next start still exits 12.
     detection_marker::write_force_window(datadir)?;
-    detection_marker::reset_detection_record(datadir).map_err(|err| {
+    let record = detection_marker::reset_or_replace_detection_record(datadir).map_err(|err| {
         anyhow::anyhow!(
-            "refusing to remove the detection marker because the in-place record could not be reset: {err}"
+            "refusing to remove the detection marker because the detection record could not be reset or replaced: {err}"
         )
     })?;
+    if let ClearOutcome::Replaced = record {
+        println!(
+            "replaced the doppelganger detection record that did not parse at {} with a clear record.",
+            detection_marker::record_path(datadir).display()
+        );
+    }
     if let Some(db_path) = slashing_db_path {
         if let Some(dir) = detection_marker::fallback_marker_dir(datadir, db_path) {
             detection_marker::clear_marker(&dir)?;
@@ -55,7 +66,7 @@ pub fn execute_clear_detection(
                 detection_marker::marker_path(datadir).display()
             );
         }
-        ClearOutcome::Absent => {
+        ClearOutcome::Absent | ClearOutcome::Replaced => {
             println!(
                 "no doppelganger detection marker at {}. The next start runs a full forward window.",
                 detection_marker::marker_path(datadir).display()
@@ -203,6 +214,7 @@ mod tests {
 
     /// The command replaces a record that does not parse when the record is
     /// a regular file. Then it removes the marker.
+    #[cfg(target_os = "linux")]
     #[test]
     fn clear_detection_replaces_an_unreadable_regular_record() {
         use rvc::detection_marker::{
@@ -410,5 +422,155 @@ mod tests {
                 record.display()
             );
         }
+    }
+
+    /// Return a label for each durable step of this thread since the last
+    /// call. A file fsync label gives the file length. A directory fsync
+    /// label tells if the directory is `dir`.
+    #[cfg(target_os = "linux")]
+    fn durable_step_labels(dir: &Path) -> Vec<String> {
+        use rvc::detection_marker::{take_durable_steps, DurableStep};
+        let dir_id = entry_id(dir);
+        take_durable_steps()
+            .into_iter()
+            .map(|step| match step {
+                DurableStep::SyncFile(_, _, len) => format!("file {len}"),
+                DurableStep::SyncDir(dev, ino) if (dev, ino) == dir_id => "dir".to_string(),
+                DurableStep::SyncDir(..) => "other dir".to_string(),
+                DurableStep::Exchange => "exchange".to_string(),
+            })
+            .collect()
+    }
+
+    /// The command runs on a 5-byte record and a marker. In each row except
+    /// the last, the seam fails one durable step. Each row requires these
+    /// results:
+    ///
+    /// - The durable steps stop at the failed step. Their order is:
+    ///
+    ///   1. The force-window file fsync.
+    ///   2. The keystore-directory fsync.
+    ///   3. The temp-record fsync.
+    ///   4. The exchange.
+    ///   5. The keystore-directory fsync.
+    ///   6. The keystore-directory fsync after marker removal.
+    ///
+    /// - When a step fails, the command returns the injected error, and the
+    ///   marker stays.
+    /// - When a step before the exchange fails, the record keeps its inode
+    ///   and its bytes.
+    /// - When no step fails, the command removes the marker, and the record
+    ///   is Clear.
+    /// - No temp file stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_keeps_the_marker_when_a_durable_step_fails() {
+        use rvc::detection_marker::{
+            arm_durable_fault, inspect, inspect_record, record_path, DurableFault, MarkerInspect,
+            RecordInspect,
+        };
+        let all_steps = ["file 2", "dir", "file 4096", "exchange", "dir", "dir"];
+        let rows = [
+            ("the force-window file fsync fails", Some(DurableFault::Sync(0)), 1),
+            ("the force-window directory fsync fails", Some(DurableFault::Sync(1)), 2),
+            ("the record read fails", Some(DurableFault::RecordRead), 2),
+            ("the temp-record fsync fails", Some(DurableFault::Sync(2)), 3),
+            ("the exchange fails", Some(DurableFault::Exchange), 3),
+            ("the keystore-directory fsync fails", Some(DurableFault::Sync(3)), 5),
+            ("no step fails", None, 6),
+        ];
+        for (case, fault, step_count) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            write_marker_without_keys(dir.path());
+            let record = record_path(dir.path());
+            std::fs::write(&record, b"short").expect("The test must write the record file.");
+            let before = entry_id(&record);
+            durable_step_labels(dir.path());
+            if let Some(fault) = fault {
+                arm_durable_fault(fault);
+            }
+
+            let result =
+                execute_clear_detection(dir.path(), None, true).map_err(|err| err.to_string());
+            let steps = durable_step_labels(dir.path());
+
+            assert_eq!(
+                steps,
+                all_steps[..step_count],
+                "The durable steps must occur in order and stop at the failed step. The input \
+                 case is {case}."
+            );
+            assert_eq!(
+                temp_file_names(dir.path()),
+                Vec::<String>::new(),
+                "The command must not leave a temp file. The input case is {case}."
+            );
+            if fault.is_none() {
+                assert_eq!(result, Ok(()), "The command must succeed when no step fails.");
+                assert!(
+                    matches!(inspect(dir.path()), MarkerInspect::Absent),
+                    "The command must remove the marker when no step fails."
+                );
+                assert_eq!(
+                    inspect_record(dir.path()),
+                    RecordInspect::Clear,
+                    "The record must be clear when no step fails."
+                );
+                continue;
+            }
+            let err = result.err().unwrap_or_default();
+            let injected = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+            assert!(
+                err.contains(&injected),
+                "The command must return the injected error. The input case is {case}. The \
+                 error is: {err:?}"
+            );
+            assert!(
+                matches!(inspect(dir.path()), MarkerInspect::Present(_)),
+                "The marker must stay. The input case is {case}."
+            );
+            if step_count < 4 {
+                assert_eq!(
+                    entry_id(&record),
+                    before,
+                    "The record must keep its inode. The input case is {case}."
+                );
+                assert_eq!(
+                    std::fs::read(&record).map_err(|err| err.to_string()),
+                    Ok(b"short".to_vec()),
+                    "The record must keep its bytes. The input case is {case}."
+                );
+            }
+        }
+    }
+
+    /// A contender tries the keystore lock at the exchange of the record
+    /// replace. The test requires these results:
+    ///
+    /// - The contender runs, and its lock attempt fails.
+    /// - The command succeeds.
+    /// - After the command, a lock attempt succeeds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_holds_the_keystore_lock_during_the_exchange() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        write_marker_without_keys(dir.path());
+        std::fs::write(rvc::detection_marker::record_path(dir.path()), b"short")
+            .expect("The test must write the record file.");
+        let attempt = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = std::rc::Rc::clone(&attempt);
+        let data_dir = dir.path().to_path_buf();
+        rvc::detection_marker::arm_before_record_exchange(move |_| {
+            seen.set(Some(rvc::startup::acquire_keystore_lock(&data_dir).is_ok()));
+        });
+
+        let result = execute_clear_detection(dir.path(), None, true).map_err(|err| err.to_string());
+
+        assert_eq!(attempt.get(), Some(false), "The lock attempt at the exchange must fail.");
+        assert_eq!(result, Ok(()), "The command must succeed.");
+        assert!(
+            rvc::startup::acquire_keystore_lock(dir.path()).is_ok(),
+            "A lock attempt after the command must succeed."
+        );
     }
 }

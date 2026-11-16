@@ -52,6 +52,9 @@ eth-types = { workspace = true, features = ["test-fixtures"] }
 # test-utils: EncryptionKdf cheap-KDF helpers in integration tests (#602).
 # Dev-edge only — production `cargo build -p rvc-bin` does not enable it.
 crypto = { workspace = true, features = ["test-utils"] }
+# test-utils: the fault and trace seam of the detection record for the
+# clear-detection tests (W4-D1d). Dev-edge only, like the line above.
+rvc = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["blocking"] }

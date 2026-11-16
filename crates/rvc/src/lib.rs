@@ -1,5 +1,11 @@
 //! rvc - Rust Validator Client
 
+#[cfg(all(feature = "test-utils", not(debug_assertions)))]
+compile_error!(
+    "The rvc test-utils feature is for test builds. Do not enable it in a build without debug \
+     assertions."
+);
+
 pub mod background_tasks;
 pub mod beacon_adapter;
 pub mod bootstrap;
