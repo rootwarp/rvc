@@ -1322,6 +1322,33 @@ mod tests {
         );
     }
 
+    /// Boot refuses a zero-filled record with exit 12. The refusal log gives
+    /// the `clear-detection` command.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn boot_refusal_of_an_unparseable_record_prints_the_clear_hint() {
+        use crate::detection_marker::{record_path, RECORD_LEN};
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        std::fs::write(record_path(dir.path()), vec![0u8; RECORD_LEN])
+            .expect("The test must write the zero-filled record.");
+
+        let err = boot_with_keystore(dir.path()).await;
+
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "Boot must exit 12 for a zero-filled record. The error is: {err}"
+        );
+        assert!(
+            logs_contain("rvc doppelganger clear-detection"),
+            "The refusal log must give the clear-detection command."
+        );
+        assert!(
+            logs_contain("symlink, directory or FIFO"),
+            "The refusal log must name the three entry types that require removal."
+        );
+    }
+
     #[tokio::test]
     async fn detection_enabled_refuses_a_keystore_dir_that_cannot_hold_the_marker() {
         let missing = std::env::temp_dir().join(format!(
