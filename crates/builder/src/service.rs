@@ -53,8 +53,31 @@ pub enum BuilderServiceError {
     #[error("{failed} of {total} builder registrations could not be signed")]
     RegistrationSigningFailed { failed: usize, total: usize },
 
+    /// The signer failed for `failed` of the `total` entries that needed a
+    /// signature. The other entries went out. `kind` names the signature.
+    #[error("{failed} of {total} {kind} signatures failed")]
+    PreferencesSigningFailed { kind: &'static str, failed: usize, total: usize },
+
+    /// The beacon node accepted the POST, but it rejected `rejected` of its
+    /// `total` builder preferences entries.
+    #[error("the beacon node rejected {rejected} of {total} builder preferences entries")]
+    BuilderPreferencesRejected { rejected: usize, total: usize },
+
     #[error("system clock is before the unix epoch")]
     ClockBeforeUnixEpoch,
+}
+
+/// `Err` when `failed` of the `total` signatures of `kind` failed. The
+/// unsigned entries stay out of the cache, so the next broadcast signs them.
+fn signing_result(
+    kind: &'static str,
+    failed: usize,
+    total: usize,
+) -> Result<(), BuilderServiceError> {
+    if failed == 0 {
+        return Ok(());
+    }
+    Err(BuilderServiceError::PreferencesSigningFailed { kind, failed, total })
 }
 
 /// A signed registration and the fee recipient and gas limit it was signed for.
@@ -462,6 +485,14 @@ impl BuilderService {
 
     /// Sign and submit one [`SignedProposerPreferences`] per Gloas+ proposal
     /// slot. Gated on each slot's fork, so Gloas-1 can advertise Gloas slots.
+    ///
+    /// # Errors
+    ///
+    /// - [`BuilderServiceError::BeaconError`] when the POST fails. The cache
+    ///   does not change.
+    /// - Otherwise [`BuilderServiceError::PreferencesSigningFailed`] when a
+    ///   signature failed. The POST sends the signed entries, and the cache
+    ///   keeps them.
     #[tracing::instrument(
         name = "builder.broadcast_proposer_preferences",
         skip_all,
@@ -505,6 +536,7 @@ impl BuilderService {
 
         let mut signed = Vec::new();
         let mut signed_keys = Vec::new();
+        let mut failed_signatures = 0;
         for proposal in &candidates {
             let Some(admission) = self.preference_admission() else {
                 continue;
@@ -561,13 +593,15 @@ impl BuilderService {
                         error = %e,
                         "failed to sign proposer preferences"
                     );
+                    failed_signatures += 1;
                 }
             }
         }
 
+        let unsigned = signing_result("proposer preferences", failed_signatures, candidates.len());
         if signed.is_empty() {
             debug!("no signed proposer preferences to submit");
-            return Ok(());
+            return unsigned;
         }
 
         let count = signed.len();
@@ -579,7 +613,7 @@ impl BuilderService {
                     cache.insert((pubkey, slot), cached);
                 }
                 cache.retain(|(_, slot), _| *slot / SLOTS_PER_EPOCH >= epoch);
-                Ok(())
+                unsigned
             }
             Err(e) => {
                 warn!(error = %e, "proposer preferences broadcast failure");
@@ -595,6 +629,15 @@ impl BuilderService {
     /// A `dependent_root`-only change re-submits the cached auth without
     /// re-signing: `BuilderRequestAuth` is `{data, slot}` and does not include
     /// the root. A slot or URL change is a cache miss and re-signs.
+    ///
+    /// # Errors
+    ///
+    /// - [`BuilderServiceError::BeaconError`] when the POST fails. The cache
+    ///   does not change.
+    /// - Otherwise [`BuilderServiceError::BuilderPreferencesRejected`] when the
+    ///   beacon node rejected an entry. The cache keeps the accepted entries.
+    /// - Otherwise [`BuilderServiceError::PreferencesSigningFailed`] when an
+    ///   auth signature failed. The POST sends the signed entries.
     #[tracing::instrument(
         name = "builder.broadcast_builder_preferences",
         skip_all,
@@ -651,6 +694,7 @@ impl BuilderService {
             }
         }
 
+        let mut failed_signatures = 0;
         for (proposal, url) in &to_sign {
             let Some(admission) = self.preference_admission() else {
                 continue;
@@ -716,13 +760,15 @@ impl BuilderService {
                         error = %e,
                         "failed to sign builder request auth"
                     );
+                    failed_signatures += 1;
                 }
             }
         }
 
+        let unsigned = signing_result("builder request auth", failed_signatures, to_sign.len());
         if entries.is_empty() {
             debug!("no signed builder preferences to submit");
-            return Ok(());
+            return unsigned;
         }
 
         let count = entries.len();
@@ -756,9 +802,16 @@ impl BuilderService {
                         },
                     )
                     .collect();
+                let rejected = count - kept.len();
                 info!(count, kept = kept.len(), epoch, "builder preferences broadcast");
                 self.write_builder_pref_cache(epoch, kept).await;
-                Ok(())
+                if rejected > 0 {
+                    return Err(BuilderServiceError::BuilderPreferencesRejected {
+                        rejected,
+                        total: count,
+                    });
+                }
+                unsigned
             }
             Err(e) => {
                 warn!(error = %e, "builder preferences broadcast failure");
