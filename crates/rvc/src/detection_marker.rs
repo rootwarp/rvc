@@ -639,6 +639,8 @@ fn open_record(path: &Path, create: bool) -> io::Result<File> {
         }
     }
     let file = opts.open(path)?;
+    #[cfg(test)]
+    run_record_path_hook(&AFTER_RECORD_OPEN, path);
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(
@@ -709,6 +711,69 @@ thread_local! {
         const { RefCell::new(None) };
     static RECORD_LINK_FAILURE: Cell<Option<io::ErrorKind>> = const { Cell::new(None) };
     static OWNER_UID_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };
+    static AFTER_RECORD_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+    static FSYNC_TARGETS: RefCell<Vec<FileId>> = const { RefCell::new(Vec::new()) };
+    static FSYNC_TARGET_FAILURE: Cell<Option<(FileId, u32)>> = const { Cell::new(None) };
+}
+
+/// The device number and the inode number of a file.
+#[cfg(test)]
+pub(crate) type FileId = (u64, u64);
+
+/// Run `hook` one time on this thread, after the next record open and before
+/// the checks of the open descriptor. The hook gets the record path.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_after_record_open(hook: impl FnOnce(&Path) + 'static) -> RecordPathHookGuard {
+    arm_record_path_hook(&AFTER_RECORD_OPEN, hook)
+}
+
+/// Return the device number and the inode number of the file at `path`.
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) fn file_id(path: &Path) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).expect("The test must read the metadata of the file.");
+    (meta.dev(), meta.ino())
+}
+
+/// Return the file of each fsync on this thread, in the order of the calls.
+#[cfg(test)]
+pub(crate) fn fsync_targets() -> Vec<FileId> {
+    FSYNC_TARGETS.with(|targets| targets.borrow().clone())
+}
+
+/// Let the next `skip` fsyncs of the file at `path` on this thread pass.
+/// Then fail each fsync of that file with `EIO`.
+///
+/// The guard stops these failures when it drops.
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) fn arm_fsync_failure_for(path: &Path, skip: u32) -> FsyncTargetFailGuard {
+    FSYNC_TARGET_FAILURE.with(|failure| failure.set(Some((file_id(path), skip))));
+    FsyncTargetFailGuard
+}
+
+/// Add the file of this fsync to the list of fsync targets. Return `true`
+/// when the injector fails this fsync.
+#[cfg(test)]
+#[cfg(unix)]
+fn note_fsync_target(file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let id = (meta.dev(), meta.ino());
+    FSYNC_TARGETS.with(|targets| targets.borrow_mut().push(id));
+    FSYNC_TARGET_FAILURE.with(|failure| match failure.get() {
+        Some((target, 0)) => target == id,
+        Some((target, skip)) if target == id => {
+            failure.set(Some((target, skip - 1)));
+            false
+        }
+        _ => false,
+    })
 }
 
 /// Make the owner check compare the file owner with `uid` on this thread.
@@ -996,9 +1061,24 @@ impl Drop for OwnerUidGuard {
     }
 }
 
+/// The guard stops the injected fsync failures of one file when it drops.
+#[cfg(test)]
+pub(crate) struct FsyncTargetFailGuard;
+
+#[cfg(test)]
+impl Drop for FsyncTargetFailGuard {
+    fn drop(&mut self) {
+        FSYNC_TARGET_FAILURE.with(|failure| failure.set(None));
+    }
+}
+
 fn sync_file(file: &File) -> io::Result<()> {
     #[cfg(test)]
     FSYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(all(test, unix))]
+    if note_fsync_target(file) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
     #[cfg(test)]
     if take_fsync_failure() {
         return Err(io::Error::from_raw_os_error(libc::EIO));
@@ -2064,5 +2144,402 @@ mod tests {
             Some(inode),
             "The check must not replace the record file."
         );
+    }
+
+    /// The keystore holds a `Clear` record. In each row after the first, a
+    /// hook runs after the open of the record and puts a different file at
+    /// the record path. Each row requires these results:
+    ///
+    /// - `preallocate_detection_record` returns the error kind of the row, or
+    ///   `Ok`.
+    /// - An error names the mode of the open record, not the mode of the new
+    ///   file.
+    /// - The check fsyncs the open record and then the directory. When the
+    ///   check fails, it fsyncs no file.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_checks_and_fsyncs_the_descriptor_that_it_opened() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        enum Change {
+            Nothing,
+            File(Vec<u8>),
+            Directory,
+        }
+        let clear = encode_record(false, 0, 0).expect("The test must encode the record.").to_vec();
+        let invalid = Some(io::ErrorKind::InvalidData);
+        let rows = [
+            ("no change", 0o600, Change::Nothing, None),
+            ("a new Clear record", 0o600, Change::File(clear.clone()), None),
+            ("a file of 5 bytes", 0o600, Change::File(b"short".to_vec()), None),
+            ("a directory", 0o600, Change::Directory, None),
+            ("a new Clear record with mode 0o600", 0o644, Change::File(clear), invalid),
+        ];
+        for (case, mode, change, kind) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            preallocate_detection_record(dir.path())
+                .expect("The test must preallocate the record.");
+            let path = record_path(dir.path());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("The test must set the mode of the record.");
+            let opened = file_id(&path);
+            let guard = match change {
+                Change::Nothing => None,
+                Change::File(bytes) => {
+                    let other = dir.path().join("other");
+                    fs::write(&other, bytes).expect("The test must write the other file.");
+                    fs::set_permissions(&other, fs::Permissions::from_mode(0o600))
+                        .expect("The test must set mode 0o600 on the other file.");
+                    Some(arm_after_record_open(move |path| {
+                        fs::rename(&other, path)
+                            .expect("The hook must move the other file to the record path.");
+                    }))
+                }
+                Change::Directory => Some(arm_after_record_open(|path| {
+                    fs::remove_file(path).expect("The hook must remove the record.");
+                    fs::create_dir(path).expect("The hook must make a directory.");
+                })),
+            };
+            let hooked = guard.is_some();
+            let before = fsync_targets().len();
+            let result = preallocate_detection_record(dir.path());
+            drop(guard);
+            let fsyncs = fsync_targets().split_off(before);
+            if hooked {
+                let now = fs::symlink_metadata(&path).ok().map(|meta| (meta.dev(), meta.ino()));
+                assert_ne!(now, Some(opened), "The hook must put {case} at the record path.");
+            }
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                kind,
+                "With {case} at the record path, the error kind must be {kind:?}. The result is \
+                 {result:?}."
+            );
+            if let Err(err) = &result {
+                assert!(
+                    err.to_string().contains(&format!("mode 0o{mode:o}")),
+                    "The error must name the mode 0o{mode:o} of the open record. The error is: \
+                     {err}"
+                );
+                assert_eq!(fsyncs, Vec::<FileId>::new(), "A failed check must not fsync a file.");
+            } else {
+                assert_eq!(
+                    fsyncs,
+                    vec![opened, file_id(dir.path())],
+                    "With {case} at the record path, the check must fsync the open record and \
+                     then the directory."
+                );
+            }
+        }
+    }
+
+    /// Return the bytes, the mode bits, the owner uid and the inode of the
+    /// file at `path`.
+    #[cfg(unix)]
+    fn record_state(path: &Path) -> (Vec<u8>, u32, u32, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).expect("The test must read the record metadata.");
+        let bytes = fs::read(path).expect("The test must read the record.");
+        (bytes, meta.mode() & 0o7777, meta.uid(), meta.ino())
+    }
+
+    /// The keystore holds a `Clear` record, and each row sets a mode on it.
+    /// The rule refuses each group bit and each other bit. Mode `0o700` has
+    /// no group or other bit, so the rule accepts it. Each row requires these
+    /// results:
+    ///
+    /// - `preallocate_detection_record` returns `InvalidData`, or `Ok` for
+    ///   mode `0o700`.
+    /// - The error names the mode of the row.
+    /// - The bytes, the mode, the owner and the inode of the record do not
+    ///   change.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_mode_rule_rejects_each_group_or_other_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let invalid = Some(io::ErrorKind::InvalidData);
+        let rows = [
+            (0o640, invalid),
+            (0o620, invalid),
+            (0o610, invalid),
+            (0o604, invalid),
+            (0o602, invalid),
+            (0o601, invalid),
+            (0o700, None),
+        ];
+        for (mode, kind) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            preallocate_detection_record(dir.path())
+                .expect("The test must preallocate the record.");
+            let path = record_path(dir.path());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("The test must set the mode of the record.");
+            let before = record_state(&path);
+            let result = preallocate_detection_record(dir.path());
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                kind,
+                "For mode 0o{mode:o}, the error kind must be {kind:?}. The result is {result:?}."
+            );
+            if let Err(err) = &result {
+                assert!(
+                    err.to_string().contains(&format!("mode 0o{mode:o}")),
+                    "The error must name the mode 0o{mode:o}. The error is: {err}"
+                );
+            }
+            assert!(
+                record_state(&path) == before,
+                "For mode 0o{mode:o}, the check must not change the bytes, the mode, the owner \
+                 or the inode of the record."
+            );
+        }
+    }
+
+    /// An inotify watch on one file. It reports each write and each metadata
+    /// change of the file.
+    #[cfg(target_os = "linux")]
+    struct ChangeWatch(std::os::fd::OwnedFd);
+
+    #[cfg(target_os = "linux")]
+    impl ChangeWatch {
+        /// Watch the file at `path` for `IN_MODIFY` and `IN_ATTRIB` events.
+        #[allow(unsafe_code)]
+        fn new(path: &Path) -> Self {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: inotify_init1 has no pointer argument. It returns a new
+            // descriptor or -1.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(
+                fd >= 0,
+                "inotify_init1 must succeed. The error is: {}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: `fd` is a new open descriptor, and only this value owns it.
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .expect("The path must not contain a zero byte.");
+            let mask = libc::IN_MODIFY | libc::IN_ATTRIB;
+            // SAFETY: `name` is a C string, and `owned` keeps the descriptor open.
+            let watch = unsafe { libc::inotify_add_watch(owned.as_raw_fd(), name.as_ptr(), mask) };
+            assert!(
+                watch >= 0,
+                "inotify_add_watch must succeed. The error is: {}",
+                io::Error::last_os_error()
+            );
+            Self(owned)
+        }
+
+        /// Read the queued events. Return the mask of each event.
+        #[allow(unsafe_code)]
+        fn events(&self) -> Vec<u32> {
+            use std::os::fd::AsRawFd;
+            let mut buf = [0u8; 4096];
+            // SAFETY: `buf` is valid for `buf.len()` bytes, and `self.0` keeps
+            // the descriptor open.
+            let read =
+                unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let Ok(read) = usize::try_from(read) else {
+                let err = io::Error::last_os_error();
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock,
+                    "The read of the inotify queue must succeed. The error is: {err}"
+                );
+                return Vec::new();
+            };
+            let header = std::mem::size_of::<libc::inotify_event>();
+            let mut masks = Vec::new();
+            let mut at = 0;
+            while at + header <= read {
+                let field = |offset: usize| {
+                    let start = at + offset;
+                    u32::from_ne_bytes([buf[start], buf[start + 1], buf[start + 2], buf[start + 3]])
+                };
+                let mask = field(4);
+                let name_len = field(12) as usize;
+                masks.push(mask);
+                at += header + name_len;
+            }
+            masks
+        }
+    }
+
+    /// The keystore holds a `Clear` record, and an inotify watch reports each
+    /// write and each metadata change of the record. Each row requires these
+    /// results:
+    ///
+    /// - `preallocate_detection_record` returns the error kind of the row, or
+    ///   `Ok`.
+    /// - The watch reports no event during the check.
+    ///
+    /// A write of the same bytes and a `chown` to the same owner each give an
+    /// event. The last part of the test makes sure that the watch reports them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reuse_check_does_not_write_or_change_the_record() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let invalid = Some(io::ErrorKind::InvalidData);
+        let rows = [
+            ("mode 0o600", 0o600, false, None),
+            ("another owner", 0o600, true, invalid),
+            ("mode 0o620", 0o620, false, invalid),
+        ];
+        for (case, mode, other_owner, kind) in rows {
+            let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+            preallocate_detection_record(dir.path())
+                .expect("The test must preallocate the record.");
+            let path = record_path(dir.path());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("The test must set the mode of the record.");
+            let uid = fs::metadata(&path).expect("The test must read the record metadata.").uid();
+            let owner = other_owner.then(|| arm_owner_uid_override(uid + 1));
+            let watch = ChangeWatch::new(&path);
+            let result = preallocate_detection_record(dir.path());
+            drop(owner);
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                kind,
+                "In the {case} row, the error kind must be {kind:?}. The result is {result:?}."
+            );
+            assert_eq!(
+                watch.events(),
+                Vec::<u32>::new(),
+                "In the {case} row, the check must not write the record or change its metadata."
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        preallocate_detection_record(dir.path()).expect("The test must preallocate the record.");
+        let path = record_path(dir.path());
+        let uid = fs::metadata(&path).expect("The test must read the record metadata.").uid();
+        let bytes = fs::read(&path).expect("The test must read the record.");
+        let watch = ChangeWatch::new(&path);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(&bytes))
+            .expect("The test must write the same bytes into the record.");
+        assert!(
+            watch.events().iter().any(|mask| mask & libc::IN_MODIFY != 0),
+            "The watch must report a write of the same bytes."
+        );
+        std::os::unix::fs::chown(&path, Some(uid), None)
+            .expect("The test must set the same owner on the record.");
+        assert!(
+            watch.events().iter().any(|mask| mask & libc::IN_ATTRIB != 0),
+            "The watch must report a chown to the same owner."
+        );
+    }
+
+    /// Return each line of `src`, with `true` when a `#[cfg(test)]` line
+    /// gates it.
+    ///
+    /// A `#[cfg(test)]` line gates the next item or statement. That item ends
+    /// at the line that closes its braces. An item without braces ends at
+    /// its first line that ends with `;`.
+    fn cfg_test_gates(src: &str) -> Vec<(bool, &str)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut gated = vec![false; lines.len()];
+        let mut at = 0;
+        while at < lines.len() {
+            if lines[at].trim() != "#[cfg(test)]" {
+                at += 1;
+                continue;
+            }
+            let mut depth = 0;
+            let mut end = at + 1;
+            while end < lines.len() {
+                let line = lines[end].trim();
+                depth += line.matches('{').count();
+                depth -= line.matches('}').count().min(depth);
+                let attribute = line.starts_with("#[") || line.starts_with("//");
+                if depth == 0 && !attribute && (line.ends_with(';') || line.ends_with('}')) {
+                    break;
+                }
+                end += 1;
+            }
+            let end = end.min(lines.len() - 1);
+            gated[at..=end].fill(true);
+            at = end + 1;
+        }
+        gated.into_iter().zip(lines).collect()
+    }
+
+    /// Return the code lines of `src` that name one of `names` and that no
+    /// `#[cfg(test)]` line gates.
+    fn ungated_lines<'a>(src: &'a str, names: &[&str]) -> Vec<&'a str> {
+        cfg_test_gates(src)
+            .into_iter()
+            .filter(|(gated, line)| {
+                !gated
+                    && !line.trim_start().starts_with("//")
+                    && names.iter().any(|name| line.contains(name))
+            })
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    /// Each code line in the production part of this file that names the
+    /// owner uid override must be in a `#[cfg(test)]` item or statement. The
+    /// test requires these results:
+    ///
+    /// - The scan finds the three ungated lines of the fixture. A `cfg` that
+    ///   the `test-utils` feature can enable does not gate a line.
+    /// - The production part has no ungated line that names the override.
+    /// - The scan finds these gated parts: the storage, the arm function, the
+    ///   guard, the `Drop` implementation of the guard, and the read in the
+    ///   owner check.
+    #[test]
+    fn owner_uid_override_is_test_only() {
+        let names = ["OWNER_UID_OVERRIDE", "OwnerUidGuard", "arm_owner_uid_override"];
+        let fixture = "thread_local! {\n\
+                       \x20   static OWNER_UID_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };\n\
+                       }\n\
+                       #[cfg(test)]\n\
+                       fn arm() -> OwnerUidGuard {\n\
+                       \x20   OwnerUidGuard\n\
+                       }\n\
+                       fn check() {\n\
+                       \x20   #[cfg(test)]\n\
+                       \x20   let other = 1;\n\
+                       \x20   let euid = OWNER_UID_OVERRIDE.with(Cell::get).unwrap_or(0);\n\
+                       }\n\
+                       #[cfg(any(test, feature = \"test-utils\"))]\n\
+                       pub(crate) struct OwnerUidGuard;\n";
+        assert_eq!(
+            ungated_lines(fixture, &names),
+            vec![
+                "    static OWNER_UID_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };",
+                "    let euid = OWNER_UID_OVERRIDE.with(Cell::get).unwrap_or(0);",
+                "pub(crate) struct OwnerUidGuard;",
+            ],
+            "The scan must find the three ungated lines of the fixture."
+        );
+
+        let src = include_str!("detection_marker.rs");
+        let (production, _) =
+            src.split_once("\nmod tests {").expect("detection_marker.rs must have a tests module.");
+        assert_eq!(
+            ungated_lines(production, &names),
+            Vec::<&str>::new(),
+            "Each line that names the owner uid override must be in a #[cfg(test)] item or \
+             statement."
+        );
+        let gated: Vec<&str> = cfg_test_gates(production)
+            .into_iter()
+            .filter_map(|(gated, line)| gated.then_some(line))
+            .collect();
+        for part in [
+            "static OWNER_UID_OVERRIDE:",
+            "fn arm_owner_uid_override(",
+            "struct OwnerUidGuard;",
+            "impl Drop for OwnerUidGuard",
+            "let euid = OWNER_UID_OVERRIDE.with(",
+        ] {
+            assert!(
+                gated.iter().any(|line| line.contains(part)),
+                "The scan must find `{part}` in a #[cfg(test)] item or statement."
+            );
+        }
     }
 }

@@ -1875,6 +1875,108 @@ mod tests {
         );
     }
 
+    /// The keystore holds a `Clear` record, and each case makes the check of
+    /// that record fail. The test runs each case at two entries:
+    ///
+    /// - The first entry: the boot reads the record before the create.
+    /// - The collision entry: a hook moves the record to the final name after
+    ///   the fsync of the new record and before the link.
+    ///
+    /// For each case and each entry, the test requires these results:
+    ///
+    /// - The boot with detection on exits 1 at the record step.
+    /// - The boot error names the cause of the case.
+    /// - The bytes and the mode of the record do not change.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_stops_at_the_record_step_for_each_failed_reuse_check() {
+        use crate::detection_marker::{
+            arm_before_record_link, arm_fsync_failure_for, arm_owner_uid_override,
+            preallocate_detection_record, record_path,
+        };
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fault {
+            Mode,
+            Owner,
+            RecordFsync,
+            DirFsync,
+        }
+        let cases = [
+            ("group write", 0o620, Fault::Mode),
+            ("other write", 0o602, Fault::Mode),
+            ("another owner", 0o600, Fault::Owner),
+            ("record fsync error", 0o600, Fault::RecordFsync),
+            ("directory fsync error", 0o600, Fault::DirFsync),
+        ];
+        for (case, mode, fault) in cases {
+            for entry in ["first", "collision"] {
+                let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+                preallocate_detection_record(dir.path())
+                    .expect("The test must preallocate the record.");
+                let path = record_path(dir.path());
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .expect("The test must set the mode of the record.");
+                let bytes = std::fs::read(&path).expect("The test must read the record.");
+                let uid = std::fs::metadata(&path).expect("The test must read the metadata.").uid();
+                let fsync_guard = match fault {
+                    Fault::RecordFsync => Some(arm_fsync_failure_for(&path, 0)),
+                    // The marker probe fsyncs the directory one time before the record step.
+                    Fault::DirFsync => Some(arm_fsync_failure_for(dir.path(), 1)),
+                    Fault::Mode | Fault::Owner => None,
+                };
+                let owner_guard = (fault == Fault::Owner).then(|| arm_owner_uid_override(uid + 1));
+                let link_guard = (entry == "collision").then(|| {
+                    let moved = dir.path().join("moved-record");
+                    std::fs::rename(&path, &moved).expect("The test must move the record.");
+                    let final_path = path.clone();
+                    arm_before_record_link(move || {
+                        std::fs::rename(&moved, &final_path)
+                            .expect("The hook must move the record to the final name.");
+                    })
+                });
+                let err = boot_with_detection_on(dir.path()).await;
+                drop(link_guard);
+                drop(owner_guard);
+                drop(fsync_guard);
+                let text = err.to_string();
+                assert_eq!(
+                    err.exit_code(),
+                    1,
+                    "In the {case} case at the {entry} entry, the boot must exit 1. The error is: \
+                     {text}"
+                );
+                assert!(
+                    text.contains("cannot preallocate the doppelganger detection record"),
+                    "In the {case} case at the {entry} entry, the boot must stop at the record \
+                     step. The error is: {text}"
+                );
+                let cause = match fault {
+                    Fault::Mode => format!("mode 0o{mode:o}"),
+                    Fault::Owner => format!("uid {uid}"),
+                    Fault::RecordFsync | Fault::DirFsync => "os error 5".to_string(),
+                };
+                assert!(
+                    text.contains(&cause),
+                    "In the {case} case at the {entry} entry, the boot error must name {cause}. \
+                     The error is: {text}"
+                );
+                assert!(
+                    std::fs::read(&path).ok() == Some(bytes),
+                    "In the {case} case at the {entry} entry, the boot must keep the bytes of \
+                     the record."
+                );
+                let after = std::fs::metadata(&path).ok().map(|meta| meta.mode() & 0o7777);
+                assert_eq!(
+                    after,
+                    Some(mode),
+                    "In the {case} case at the {entry} entry, the boot must not change the mode \
+                     of the record."
+                );
+            }
+        }
+    }
+
     /// ARCH-2i: production body of run.rs must not hard-exit the process.
     #[test]
     fn test_run_rs_has_no_process_exit_call() {
