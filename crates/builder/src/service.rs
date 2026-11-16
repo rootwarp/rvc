@@ -183,8 +183,10 @@ impl BuilderService {
     /// Duty fence for preferences and builder-request auth.
     ///
     /// Those messages carry `dependent_root` and `proposal_slot` from beacon
-    /// duties. No admitted node skips the sign.
-    fn preference_admission(&self) -> Option<signer::BeaconAdmission> {
+    /// duties. No admitted node gives one warn and `None`. A caller takes
+    /// this once for each attempt, before it reads the duties, and passes it
+    /// to [`Self::broadcast_preferences_under`].
+    pub fn preference_admission(&self) -> Option<signer::BeaconAdmission> {
         match self.bn.beacon_admission() {
             Ok(admission) if admission.holds() => Some(admission),
             _ => {
@@ -486,6 +488,10 @@ impl BuilderService {
     /// Sign and submit one [`SignedProposerPreferences`] per Gloas+ proposal
     /// slot. Gated on each slot's fork, so Gloas-1 can advertise Gloas slots.
     ///
+    /// Takes [`Self::preference_admission`] one time, at entry, and signs
+    /// every entry under it. With no admitted node, it signs and sends
+    /// nothing and returns `Ok`.
+    ///
     /// # Errors
     ///
     /// - [`BuilderServiceError::BeaconError`] when the POST fails. The cache
@@ -493,13 +499,28 @@ impl BuilderService {
     /// - Otherwise [`BuilderServiceError::PreferencesSigningFailed`] when a
     ///   signature failed. The POST sends the signed entries, and the cache
     ///   keeps them.
+    pub async fn broadcast_proposer_preferences(
+        &self,
+        epoch: u64,
+        proposals: &[UpcomingProposal],
+        genesis_validators_root: &Root,
+    ) -> Result<(), BuilderServiceError> {
+        let Some(admission) = self.preference_admission() else {
+            return Ok(());
+        };
+        self.proposer_preferences_under(&admission, epoch, proposals, genesis_validators_root).await
+    }
+
+    /// The body of [`Self::broadcast_proposer_preferences`]. Each signature
+    /// is under `admission`.
     #[tracing::instrument(
         name = "builder.broadcast_proposer_preferences",
         skip_all,
         fields(epoch = epoch)
     )]
-    pub async fn broadcast_proposer_preferences(
+    async fn proposer_preferences_under(
         &self,
+        admission: &signer::BeaconAdmission,
         epoch: u64,
         proposals: &[UpcomingProposal],
         genesis_validators_root: &Root,
@@ -538,9 +559,6 @@ impl BuilderService {
         let mut signed_keys = Vec::new();
         let mut failed_signatures = 0;
         for proposal in &candidates {
-            let Some(admission) = self.preference_admission() else {
-                continue;
-            };
             let fee_recipient = self.validator_store.effective_fee_recipient(&proposal.pubkey);
             let gas_limit = self.validator_store.effective_gas_limit(&proposal.pubkey);
             let prefs = ProposerPreferences {
@@ -562,7 +580,7 @@ impl BuilderService {
                 }
             };
             match signer::with_beacon_admission(
-                admission,
+                admission.clone(),
                 self.signer.sign_proposer_preferences(
                     &prefs,
                     &pk,
@@ -638,13 +656,31 @@ impl BuilderService {
     ///   beacon node rejected an entry. The cache keeps the accepted entries.
     /// - Otherwise [`BuilderServiceError::PreferencesSigningFailed`] when an
     ///   auth signature failed. The POST sends the signed entries.
+    ///
+    /// Takes [`Self::preference_admission`] one time, at entry, and signs
+    /// every auth under it. With no admitted node, it signs and sends
+    /// nothing and returns `Ok`.
+    pub async fn broadcast_builder_preferences(
+        &self,
+        epoch: u64,
+        proposals: &[UpcomingProposal],
+    ) -> Result<(), BuilderServiceError> {
+        let Some(admission) = self.preference_admission() else {
+            return Ok(());
+        };
+        self.builder_preferences_under(&admission, epoch, proposals).await
+    }
+
+    /// The body of [`Self::broadcast_builder_preferences`]. Each auth
+    /// signature is under `admission`.
     #[tracing::instrument(
         name = "builder.broadcast_builder_preferences",
         skip_all,
         fields(epoch = epoch)
     )]
-    pub async fn broadcast_builder_preferences(
+    async fn builder_preferences_under(
         &self,
+        admission: &signer::BeaconAdmission,
         epoch: u64,
         proposals: &[UpcomingProposal],
     ) -> Result<(), BuilderServiceError> {
@@ -696,9 +732,6 @@ impl BuilderService {
 
         let mut failed_signatures = 0;
         for (proposal, url) in &to_sign {
-            let Some(admission) = self.preference_admission() else {
-                continue;
-            };
             // No out-of-band override is configured; default to URL UTF-8 bytes.
             let auth =
                 match BuilderRequestAuth::new(url.as_bytes().to_vec(), proposal.proposal_slot) {
@@ -725,7 +758,7 @@ impl BuilderService {
                 }
             };
             match signer::with_beacon_admission(
-                admission,
+                admission.clone(),
                 self.signer.sign_builder_request_auth(&auth, &pk, self.genesis_fork_version),
             )
             .await
@@ -821,17 +854,28 @@ impl BuilderService {
     }
 
     /// Runs the proposer broadcast, then the builder broadcast, for one
-    /// attempt under `admission`.
+    /// attempt. Every signature of the two halves is under `admission`, so a
+    /// revocation after the caller took it refuses each later signature.
+    ///
+    /// The builder half runs when the proposer half fails too.
+    ///
+    /// # Errors
+    ///
+    /// The first error, proposer half first: each half has the errors of
+    /// [`Self::broadcast_proposer_preferences`] and
+    /// [`Self::broadcast_builder_preferences`]. A signature that `admission`
+    /// refuses is a [`BuilderServiceError::PreferencesSigningFailed`].
     pub async fn broadcast_preferences_under(
         &self,
-        _admission: &signer::BeaconAdmission,
+        admission: &signer::BeaconAdmission,
         epoch: u64,
         proposals: &[UpcomingProposal],
         genesis_validators_root: &Root,
     ) -> Result<(), BuilderServiceError> {
-        let proposer =
-            self.broadcast_proposer_preferences(epoch, proposals, genesis_validators_root).await;
-        let builders = self.broadcast_builder_preferences(epoch, proposals).await;
+        let proposer = self
+            .proposer_preferences_under(admission, epoch, proposals, genesis_validators_root)
+            .await;
+        let builders = self.builder_preferences_under(admission, epoch, proposals).await;
         proposer.and(builders)
     }
 

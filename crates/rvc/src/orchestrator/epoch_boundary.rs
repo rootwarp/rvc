@@ -21,7 +21,9 @@
 //! each builder key's registration and signs only the new or changed ones.
 //! `ProposerPreferences` runs from the epoch before Gloas. It is `NotReady`
 //! until the proposer duties of E and E+1 are cached, and `Done` once the
-//! proposer and builder broadcasts both succeed. A proposer root change that
+//! proposer and builder broadcasts both succeed. Each attempt signs under one
+//! beacon-node admission, taken before it reads the duties, and it is
+//! `Failed` when no node is admitted. A proposer root change that
 //! ReorgCheck caches re-opens it, so it signs again with the new root.
 //! Each step with beacon-node work runs under its own bound,
 //! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
@@ -762,6 +764,8 @@ impl EpochBoundaryRunner {
     /// service, or before that epoch, `Done` with no call. `NotReady` while
     /// the proposer duties of E or E+1 are not cached. The full attempt,
     /// with its signature calls, runs under `PREFERENCES_STEP_TIMEOUT`.
+    /// Each attempt takes one admission before it reads the duties and signs
+    /// every preference under it; with no admitted node, it is `Failed`.
     /// `Done` once the two broadcasts succeed, and `Failed` on an error or at
     /// the bound. Each broadcast skips its cache hits, so a retry signs and
     /// sends only the entries that the beacon node did not accept.
@@ -780,11 +784,12 @@ impl EpochBoundaryRunner {
         }
         let broadcast = async {
             match self.broadcast_preferences(builder, epoch).await {
-                Ok(()) => StepOutcome::Done,
-                Err(e) => {
+                Some(Ok(())) => StepOutcome::Done,
+                Some(Err(e)) => {
                     warn!(epoch, error = %e, "Epoch preferences broadcast failed");
                     StepOutcome::Failed
                 }
+                None => StepOutcome::Failed,
             }
         };
         let step = BoundaryStep::ProposerPreferences;
@@ -807,21 +812,24 @@ async fn bounded(
 
 /// The local proposals of the ProposerPreferences step, and their broadcasts.
 impl EpochBoundaryRunner {
-    /// Runs the proposer broadcast, then the builder broadcast, over the
-    /// local proposals of `current_epoch` and the next epoch. The builder
-    /// broadcast runs when the proposer one fails too. Returns the first
-    /// error.
+    /// Takes one beacon-node admission for the attempt, before it reads the
+    /// duties. Then it reads the local proposals of `current_epoch` and the
+    /// next epoch, and runs the proposer broadcast, then the builder
+    /// broadcast, under that admission. A revocation after the capture
+    /// refuses each later signature of the attempt. The builder broadcast
+    /// runs when the proposer one fails too.
+    ///
+    /// `None`, with no read and no signature, when no node is admitted.
+    /// Else the first error.
     async fn broadcast_preferences(
         &self,
         builder: &BuilderService,
         current_epoch: u64,
-    ) -> Result<(), BuilderServiceError> {
+    ) -> Option<Result<(), BuilderServiceError>> {
+        let admission = builder.preference_admission()?;
         let proposals = self.upcoming_proposals(current_epoch).await;
         let root = &self.genesis_validators_root;
-        let proposer =
-            builder.broadcast_proposer_preferences(current_epoch, &proposals, root).await;
-        let builders = builder.broadcast_builder_preferences(current_epoch, &proposals).await;
-        proposer.and(builders)
+        Some(builder.broadcast_preferences_under(&admission, current_epoch, &proposals, root).await)
     }
 
     /// Local signing-enabled proposer duties for the current and next epoch.
