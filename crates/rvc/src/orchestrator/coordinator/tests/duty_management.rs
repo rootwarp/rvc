@@ -4037,3 +4037,185 @@ async fn test_stale_registry_after_a_stale_sample_post_names_prepare_at_the_epoc
         "The slot-64 pass must warn one time that PrepareProposers did not finish in epoch 1."
     );
 }
+
+// --- W4-E6b2: one admission for each preferences attempt ---
+
+/// This `RegistrationSigner` sends each call to the real signer. After the
+/// first `sign_proposer_preferences` call returns, it increments
+/// `generation`, as a beacon node revocation does.
+struct RevokeAfterFirstPreference {
+    inner: Arc<dyn ValidatorSigner>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    revoked: AtomicBool,
+}
+
+#[async_trait]
+impl ::builder::RegistrationSigner for RevokeAfterFirstPreference {
+    async fn sign_builder_registration(
+        &self,
+        registration: &::eth_types::ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_builder_registration(&*self.inner, registration, pubkey, fork_version)
+            .await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &::eth_types::ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        let signed = ValidatorSigner::sign_proposer_preferences(
+            &*self.inner,
+            prefs,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await;
+        if !self.revoked.swap(true, Ordering::AcqRel) {
+            revoke(&self.generation);
+        }
+        signed
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &::eth_types::BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_builder_request_auth(&*self.inner, auth, pubkey, genesis_fork_version)
+            .await
+    }
+}
+
+/// W4-E6b2: a revocation during a proposer broadcast must stop each later
+/// sign of that broadcast. The test has this setup:
+///
+/// - The schedule has Gloas at epoch 100. The local key proposes at slot 5
+///   of epochs 100 and 101.
+/// - The builder service uses the production admission bridge over a
+///   `MockBeaconNodeClient`, and the real `SignerService`.
+/// - The signer wrapper increments the generation after the first
+///   preferences signature.
+///
+/// The broadcast must send only the preference that it signed before the
+/// revocation, and it must report the refused signature.
+#[tokio::test]
+async fn test_preferences_revoked_mid_broadcast_sign_nothing_after_the_revoke() {
+    let gloas_epoch = 100u64;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_submit_proposer_preferences(|_| Ok(()));
+    let generation = mock.track_admission();
+    let mock = Arc::new(mock);
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(local);
+    let signer = SignerService::new(
+        Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+        Arc::new(SlashingDb::open_in_memory().expect("The slashing database must open.")),
+    )
+    .with_enablement(always_enabled());
+    let inner: Arc<dyn ValidatorSigner> = Arc::new(signer);
+    let wrapper = RevokeAfterFirstPreference { inner, generation, revoked: AtomicBool::new(false) };
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(local_pk))
+        .expect("The store must add the local validator.");
+    let builder = BuilderService::new(
+        Arc::new(wrapper),
+        Arc::new(beacon),
+        validator_store,
+        schedule.genesis_fork_version,
+        Arc::clone(&schedule),
+    );
+    let proposal = |epoch: u64| ::builder::UpcomingProposal {
+        pubkey: local_pk,
+        validator_index: 42,
+        proposal_slot: epoch * slots + 5,
+        dependent_root: [0x33; 32],
+    };
+    let proposals = [proposal(gloas_epoch), proposal(gloas_epoch + 1)];
+
+    let result = builder.broadcast_proposer_preferences(gloas_epoch, &proposals, &[0xaa; 32]).await;
+
+    let sent: Vec<Vec<Slot>> = mock
+        .submit_proposer_preferences_calls()
+        .iter()
+        .map(|post| post.iter().map(|signed| signed.message.proposal_slot).collect())
+        .collect();
+    assert_eq!(
+        sent,
+        [vec![gloas_epoch * slots + 5]],
+        "The broadcast must send only the preference that it signed before the revocation."
+    );
+    assert_eq!(
+        result.map_err(|e| e.to_string()),
+        Err("1 of 2 proposer preferences signatures failed".to_string()),
+        "The broadcast must report the signature that it did not get after the revocation."
+    );
+}
+
+/// W4-E6b2, a joint pin with W4-E7c1: the preferences step must not sign
+/// proposer duties that the tracker cached before a revocation. The epoch E
+/// is Gloas, and the local key proposes at slot 5 of E and E+1.
+///
+/// 1. The tracker fetches the proposer duties of E and E+1 under
+///    generation 0.
+/// 2. A revocation moves the generation to 1. After it, each proposer
+///    duties request answers 503.
+/// 3. The pass at the first slot of E must send no proposer preference and
+///    no builder preference.
+#[tokio::test]
+async fn preferences_from_duties_cached_before_revocation_are_not_signed() {
+    let gloas_epoch = 100u64;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon_base();
+    let generation = mock.track_admission();
+    let answered = Arc::clone(&generation);
+    let mock = mock.with_get_proposer_duties(move |epoch| {
+        if answered.load(Ordering::Acquire) > 0 {
+            let message = "unavailable".to_string();
+            return Err(beacon::BeaconError::ApiError { status: 503, message });
+        }
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+            execution_optimistic: false,
+            data: vec![proposer_duty(&local_hex, "42", epoch * slots + 5)],
+        })
+    });
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let (orchestrator, _handle, mock) =
+        retirement_orchestrator(gloas_epoch, schedule, mock, (local, true), vec![], vec![]).await;
+    for epoch in [gloas_epoch, gloas_epoch + 1] {
+        orchestrator
+            .duty_tracker
+            .fetch_proposer_duties(epoch)
+            .await
+            .expect("The tracker must fetch the proposer duties before the revocation.");
+    }
+
+    revoke(&generation);
+    orchestrator.epoch_boundary.run_pending(gloas_epoch * slots).await;
+
+    assert_eq!(
+        mock.submit_proposer_preferences_calls().len(),
+        0,
+        "The pass must not send a proposer preference from duties cached before the revocation."
+    );
+    assert_eq!(
+        mock.submit_builder_preferences_calls().len(),
+        0,
+        "The pass must not send a builder preference from duties cached before the revocation."
+    );
+}

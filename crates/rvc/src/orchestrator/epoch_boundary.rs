@@ -937,6 +937,56 @@ mod tests {
         registrations: Arc<CountingRegistrationSigner>,
         /// The store that the builder service reads the builder URLs from.
         validator_store: Arc<ValidatorStore>,
+        /// The beacon node of the builder service. It is open until a test
+        /// closes it.
+        admission: Arc<AdmissionGate>,
+    }
+
+    /// This type supplies the beacon node for the builder service in the
+    /// fixture. Each call goes to `inner`. While `closed` is true,
+    /// `beacon_admission` returns no admitted node.
+    struct AdmissionGate {
+        inner: Arc<dyn BeaconNodeClient>,
+        closed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl builder::BuilderBeaconClient for AdmissionGate {
+        async fn register_validators(
+            &self,
+            registrations: &[bn_manager::SignedValidatorRegistration],
+        ) -> Result<(), beacon::BeaconError> {
+            builder::BuilderBeaconClient::register_validators(&self.inner, registrations).await
+        }
+
+        async fn prepare_beacon_proposer(
+            &self,
+            preparations: &[bn_manager::ProposerPreparation],
+        ) -> Result<(), beacon::BeaconError> {
+            builder::BuilderBeaconClient::prepare_beacon_proposer(&self.inner, preparations).await
+        }
+
+        async fn submit_proposer_preferences(
+            &self,
+            preferences: &[eth_types::SignedProposerPreferences],
+        ) -> Result<(), beacon::BeaconError> {
+            builder::BuilderBeaconClient::submit_proposer_preferences(&self.inner, preferences)
+                .await
+        }
+
+        async fn submit_builder_preferences(
+            &self,
+            entries: &[bn_manager::BuilderPreferencesEntry],
+        ) -> Result<bn_manager::SubmitBuilderPreferencesResult, beacon::BeaconError> {
+            builder::BuilderBeaconClient::submit_builder_preferences(&self.inner, entries).await
+        }
+
+        fn beacon_admission(&self) -> Result<signer::BeaconAdmission, beacon::BeaconError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(beacon::BeaconError::NoAdmittedNode);
+            }
+            builder::BuilderBeaconClient::beacon_admission(&self.inner)
+        }
     }
 
     impl Fixture {
@@ -1183,11 +1233,13 @@ mod tests {
 
         let validator_signer: Arc<dyn ValidatorSigner> = signer.clone();
         let registrations = CountingRegistrationSigner::new(validator_signer);
+        let admission =
+            Arc::new(AdmissionGate { inner: beacon.clone(), closed: AtomicBool::new(false) });
         let builder_service = with_builder.then(|| {
             let schedule = create_test_fork_schedule();
             Arc::new(BuilderService::with_batching(
                 registrations.clone(),
-                Arc::new(beacon.clone()),
+                admission.clone(),
                 Arc::clone(&validator_store),
                 schedule.genesis_fork_version,
                 batching.size,
@@ -1233,6 +1285,7 @@ mod tests {
             clock,
             registrations,
             validator_store,
+            admission,
         }
     }
 
@@ -4922,5 +4975,261 @@ mod tests {
                 "{arm}: The accepted retry must finish the step."
             );
         }
+    }
+
+    // --- W4-E6b2: one admission for each preferences attempt ---
+
+    /// The step needs an admitted node before it signs. The epoch is
+    /// Gloas-1, and the local key proposes at slot 5 of Gloas.
+    ///
+    /// With no admitted node, the test requires these results:
+    ///
+    /// - The step has the `Failed` state and remains pending.
+    /// - The pass emits one warning.
+    /// - The step signs no preference.
+    /// - The step sends no preference.
+    ///
+    /// The fixture restores admission. The next pass must send the
+    /// preference and finish the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_without_admission_fail_and_retry() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let next = first / SLOTS_PER_EPOCH + 1;
+        let proposal = next * SLOTS_PER_EPOCH + 5;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let f = fixture_seeded(proposals_from(local_hex, next), local, true, &[]).await;
+        f.admission.closed.store(true, Ordering::Release);
+        let warns = Warns::default();
+        let _default = warns.install();
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "With no admitted node, the step must be failed and pending."
+        );
+        assert_eq!(
+            warns.lines(),
+            ["skipping builder preference sign: beacon node admission revoked"],
+            "The pass must give one warn, for the missing admission."
+        );
+        assert_eq!(
+            f.registrations.preferences_calls(),
+            0,
+            "The step must not sign a preference with no admission."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+            0,
+            "The step must not send a preference with no admission."
+        );
+
+        f.admission.closed.store(false, Ordering::Release);
+        f.runner.run_pending(first + 1).await;
+
+        assert_eq!(
+            preference_slots(&f.mock),
+            [vec![proposal]],
+            "The next pass must send the preference of slot {proposal}."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
+        );
+    }
+
+    /// This layer moves `generation` from 0 to 1, as a beacon node
+    /// revocation does. It does this when the first span with the name
+    /// `name` closes. When `slot` is set, only a span with that `slot` field
+    /// counts.
+    struct RevokeOnClose {
+        name: &'static str,
+        slot: Option<Slot>,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        span: Arc<parking_lot::Mutex<Option<tracing::span::Id>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RevokeOnClose {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut slot = SlotField(None);
+            attrs.record(&mut slot);
+            let wanted = attrs.metadata().name() == self.name
+                && self.slot.is_none_or(|want| slot.0 == Some(want));
+            if wanted && self.generation.load(Ordering::Acquire) == 0 {
+                self.span.lock().get_or_insert_with(|| id.clone());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if self.span.lock().take_if(|span| *span == id).is_some() {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// This function returns the `Epoch preferences broadcast failed`
+    /// warnings that `warns` holds.
+    fn broadcast_failures(warns: &Warns) -> Vec<String> {
+        let failed = "Epoch preferences broadcast failed";
+        warns.lines().into_iter().filter(|line| line.starts_with(failed)).collect()
+    }
+
+    /// Harper B1 and RSA B1: the step takes its admission before it reads
+    /// the duties. The epoch E is Gloas-1, and the local key proposes at
+    /// slot 5 of E+1. The generation moves when the last proposer-duty read
+    /// of the step closes. This occurs before `upcoming_proposals` returns.
+    /// Thus the admission and the duties are both older than the
+    /// revocation. If the step reads the duties first, its admission is
+    /// newer than the duties.
+    ///
+    /// The first pass must give these results:
+    ///
+    /// - The signer refuses the one preference signature.
+    /// - The step sends no preference.
+    /// - The step has the `Failed` state and remains pending.
+    ///
+    /// The next pass must fetch the proposer duties of E and E+1 again. It
+    /// must sign and send the preference under a new admission, and it must
+    /// finish the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_revoked_after_the_duty_read_are_not_signed() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let epoch = first / SLOTS_PER_EPOCH;
+        let proposal = (epoch + 1) * SLOTS_PER_EPOCH + 5;
+        let last_read = (epoch + 2) * SLOTS_PER_EPOCH - 1;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let f = fixture_seeded(proposals_from(local_hex, epoch + 1), local, true, &[]).await;
+        let generation = f.mock.track_admission();
+        let (name, slot) = ("duty_tracker.get_proposer_duty", Some(last_read));
+        let revoke =
+            RevokeOnClose { name, slot, generation: Arc::clone(&generation), span: Arc::default() };
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone()).with(revoke);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            1,
+            "The generation must move one time, after the read of slot {last_read}."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitProposerPreferences),
+            0,
+            "The step must not send a preference after the revocation."
+        );
+        assert_eq!(
+            broadcast_failures(&warns),
+            [format!(
+                "Epoch preferences broadcast failed epoch={epoch} \
+                 error=1 of 1 proposer preferences signatures failed"
+            )],
+            "The signer must refuse the preference signature after the revocation."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "After the revocation, the step must be failed and pending."
+        );
+
+        let fetched = f.mock.get_proposer_duties_calls().len();
+        f.runner.run_pending(first + 1).await;
+
+        assert_eq!(
+            f.mock.get_proposer_duties_calls()[fetched..],
+            [epoch, epoch + 1],
+            "The next pass must fetch the proposer duties of E and E+1 again."
+        );
+        assert_eq!(
+            preference_slots(&f.mock),
+            [vec![proposal]],
+            "The next pass must sign and send the preference under a new admission."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
+        );
+        assert_eq!(generation.load(Ordering::Acquire), 1, "The next pass must not revoke.");
+    }
+
+    /// Harper B2: the proposer half and the builder half of an attempt sign
+    /// under one admission. The epoch E is Gloas-1. The local key proposes
+    /// at slot 5 of E+1, and it has one builder URL. The generation moves
+    /// when the first proposer-preferences signature closes.
+    ///
+    /// The pass must give these results:
+    ///
+    /// - The proposer POST holds only the preference that the step signed
+    ///   before the revocation.
+    /// - The signer refuses the one builder auth signature.
+    /// - The step sends no builder entry.
+    /// - The step has the `Failed` state and remains pending.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preferences_revoked_after_the_first_signature_sign_no_builder_auth() {
+        use BoundaryStep::ProposerPreferences;
+        let first = gloas_minus_one_slot();
+        let epoch = first / SLOTS_PER_EPOCH;
+        let proposal = (epoch + 1) * SLOTS_PER_EPOCH + 5;
+        let local = SecretKey::generate();
+        let local_hex = format!("0x{}", hex::encode(local.public_key().to_bytes()));
+        let mock =
+            proposals_from(local_hex, epoch + 1).with_submit_builder_preferences(|_entries| {
+                Ok(beacon::SubmitBuilderPreferencesResult::Success)
+            });
+        let f = fixture_seeded(mock, local, true, &[]).await;
+        f.validator_store
+            .set_global_builders(vec![BUILDER_URL.to_string()])
+            .expect("The builder URL must be valid.");
+        let generation = f.mock.track_admission();
+        let (name, slot) = ("sign.proposer_preferences", None);
+        let revoke =
+            RevokeOnClose { name, slot, generation: Arc::clone(&generation), span: Arc::default() };
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone()).with(revoke);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        f.runner.run_pending(first).await;
+
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            1,
+            "The generation must move one time, after the first preference signature."
+        );
+        assert_eq!(
+            preference_slots(&f.mock),
+            [vec![proposal]],
+            "The proposer POST must hold only the preference signed before the revocation."
+        );
+        assert_eq!(
+            arrivals(&f.mock, MockMethod::SubmitBuilderPreferences),
+            0,
+            "The builder half must not send an auth signed after the revocation."
+        );
+        assert_eq!(
+            broadcast_failures(&warns),
+            [format!(
+                "Epoch preferences broadcast failed epoch={epoch} \
+                 error=1 of 1 builder request auth signatures failed"
+            )],
+            "The signer must refuse the auth signature after the revocation."
+        );
+        assert_eq!(
+            step_state(&f.runner, ProposerPreferences),
+            (Some(StepOutcome::Failed), false),
+            "After the revocation, the step must be failed and pending."
+        );
     }
 }

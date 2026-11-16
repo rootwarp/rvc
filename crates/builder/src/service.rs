@@ -820,6 +820,21 @@ impl BuilderService {
         }
     }
 
+    /// Runs the proposer broadcast, then the builder broadcast, for one
+    /// attempt under `admission`.
+    pub async fn broadcast_preferences_under(
+        &self,
+        _admission: &signer::BeaconAdmission,
+        epoch: u64,
+        proposals: &[UpcomingProposal],
+        genesis_validators_root: &Root,
+    ) -> Result<(), BuilderServiceError> {
+        let proposer =
+            self.broadcast_proposer_preferences(epoch, proposals, genesis_validators_root).await;
+        let builders = self.broadcast_builder_preferences(epoch, proposals).await;
+        proposer.and(builders)
+    }
+
     async fn write_builder_pref_cache(
         &self,
         epoch: u64,
@@ -926,6 +941,9 @@ mod tests {
         fail_register_on_calls: Vec<usize>,
         /// The first builder-preferences POST rejects these entries.
         indexed_fail_on: Mutex<Option<Vec<bn_manager::IndexedFailure>>>,
+        /// This field supplies the admission for `beacon_admission`. With
+        /// `None`, `beacon_admission` returns `BeaconAdmission::unbound`.
+        admission: Option<signer::BeaconAdmission>,
     }
 
     impl MockBn {
@@ -940,7 +958,14 @@ mod tests {
                 fail_preferences: false,
                 fail_register_on_calls: Vec::new(),
                 indexed_fail_on: Mutex::new(None),
+                admission: None,
             }
+        }
+
+        /// This method sets the admission that `beacon_admission` returns.
+        fn with_admission(mut self, admission: signer::BeaconAdmission) -> Self {
+            self.admission = Some(admission);
+            self
         }
 
         fn with_register_error(mut self) -> Self {
@@ -1015,7 +1040,7 @@ mod tests {
         }
 
         fn beacon_admission(&self) -> Result<signer::BeaconAdmission, BeaconError> {
-            Ok(signer::BeaconAdmission::unbound())
+            Ok(self.admission.clone().unwrap_or_else(signer::BeaconAdmission::unbound))
         }
     }
 
@@ -3179,5 +3204,263 @@ mod tests {
         .await
         .expect_err("missing admission scope");
         assert!(matches!(err, SignerError::BeaconAdmissionRevoked));
+    }
+
+    /// This function returns an admission with a separate generation. The
+    /// admission holds when `holds` is true.
+    fn tracked_admission(holds: bool) -> signer::BeaconAdmission {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(u64::from(!holds)));
+        signer::BeaconAdmission::new(0, generation)
+    }
+
+    /// `broadcast_preferences_under` signs the proposer entry and the builder
+    /// entry under the admission that the caller gives. The test uses these
+    /// components:
+    ///
+    /// - The real signer.
+    /// - One key with one builder URL.
+    /// - One Gloas proposal.
+    ///
+    /// A missing scope refuses each signature. The test has two arms:
+    ///
+    /// 1. The caller's admission holds, and the beacon node admission is
+    ///    revoked. The service must sign and send both entries.
+    /// 2. The caller's admission is revoked, and the beacon node admission
+    ///    holds. The service must not sign either entry. The call must
+    ///    return the proposer error.
+    #[tokio::test]
+    async fn broadcast_preferences_under_signs_both_halves_under_one_admission() {
+        let gloas_epoch = 10;
+        for (arm, passed_holds) in [("caller admission holds", true), ("caller revoked", false)] {
+            let (_service, pubkey, signer) = production_signer();
+            let pk = pubkey.to_bytes();
+            let store = store_with_builders(pk, &["https://a.example"]);
+            let bn = Arc::new(MockBn::new().with_admission(tracked_admission(!passed_holds)));
+            let builder = BuilderService::new(
+                signer,
+                bn.clone(),
+                Arc::new(store),
+                GENESIS_FORK,
+                gloas_at(gloas_epoch),
+            );
+            let proposal = upcoming_for(pk, gloas_epoch, 1);
+            let passed = tracked_admission(passed_holds);
+
+            let result =
+                signer::require_beacon_admission_scope(builder.broadcast_preferences_under(
+                    &passed,
+                    gloas_epoch,
+                    std::slice::from_ref(&proposal),
+                    &TEST_GVR,
+                ))
+                .await;
+
+            let proposer_entries: usize = bn.preference_calls.lock().iter().map(Vec::len).sum();
+            let builder_entries: usize = bn.builder_pref_calls.lock().iter().map(Vec::len).sum();
+            if passed_holds {
+                assert_eq!(
+                    (proposer_entries, builder_entries),
+                    (1, 1),
+                    "{arm}: The call must send one proposer entry and one builder entry."
+                );
+                assert!(result.is_ok(), "{arm}: The call must succeed: {result:?}");
+                continue;
+            }
+            assert_eq!(
+                (proposer_entries, builder_entries),
+                (0, 0),
+                "{arm}: The call must not send an entry."
+            );
+            assert_eq!(
+                result.map_err(|e| e.to_string()),
+                Err("1 of 1 proposer preferences signatures failed".to_string()),
+                "{arm}: The call must return the error of the proposer half."
+            );
+        }
+    }
+
+    /// This text is the warning that `preference_admission` logs when no
+    /// node is admitted.
+    const NO_ADMISSION_WARN: &str =
+        "skipping builder preference sign: beacon node admission revoked";
+
+    /// This subscriber records the message of each WARN event and the name
+    /// of each span.
+    #[derive(Clone, Default)]
+    struct Recorded {
+        warns: Arc<Mutex<Vec<String>>>,
+        spans: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Recorded {
+        /// Records the events and spans of this thread until the guard drops.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(self.clone())
+        }
+
+        fn warns(&self) -> Vec<String> {
+            self.warns.lock().clone()
+        }
+
+        /// Returns the number of signer calls. Each call opens one `sign.*`
+        /// span.
+        fn signer_calls(&self) -> usize {
+            self.spans.lock().iter().filter(|name| name.starts_with("sign.")).count()
+        }
+    }
+
+    /// This visitor reads the `message` field of an event.
+    #[derive(Default)]
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Recorded {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut spans = self.spans.lock();
+            spans.push(span.metadata().name());
+            tracing::span::Id::from_u64(spans.len().try_into().expect("The span count fits u64."))
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = Message::default();
+                event.record(&mut message);
+                self.warns.lock().push(message.0);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// This function returns a service over the real signer and `bn`, with
+    /// Gloas at epoch 10. The one key of the service has one builder URL.
+    /// The function also returns one Gloas proposal of that key.
+    fn real_signer_service(bn: &Arc<MockBn>) -> (BuilderService, UpcomingProposal) {
+        let (_service, pubkey, signer) = production_signer();
+        let pk = pubkey.to_bytes();
+        let store = Arc::new(store_with_builders(pk, &["https://a.example"]));
+        let builder = BuilderService::new(signer, bn.clone(), store, GENESIS_FORK, gloas_at(10));
+        (builder, upcoming_for(pk, 10, 1))
+    }
+
+    /// RSA B2: `broadcast_proposer_preferences` stops when no beacon node is
+    /// admitted. The test uses these components:
+    ///
+    /// - The real signer, under the production scope rule.
+    /// - A beacon client that supplies only a revoked admission.
+    /// - One key and one Gloas proposal.
+    ///
+    /// The call must return `Ok` and log one warning. It must not call the
+    /// signer, and it must not send a POST.
+    #[tokio::test]
+    async fn broadcast_proposer_preferences_without_admission_signs_and_sends_nothing() {
+        let bn = Arc::new(MockBn::new().with_admission(tracked_admission(false)));
+        let (builder, proposal) = real_signer_service(&bn);
+        let recorded = Recorded::default();
+        let _default = recorded.install();
+
+        let result =
+            signer::require_beacon_admission_scope(builder.broadcast_proposer_preferences(
+                proposal.proposal_slot / SLOTS_PER_EPOCH,
+                std::slice::from_ref(&proposal),
+                &TEST_GVR,
+            ))
+            .await;
+
+        assert!(result.is_ok(), "The call must return Ok: {result:?}");
+        assert_eq!(recorded.warns(), [NO_ADMISSION_WARN], "The call must log one warning.");
+        assert_eq!(recorded.signer_calls(), 0, "The call must not ask the signer for a signature.");
+        assert!(bn.preference_calls.lock().is_empty(), "The call must not send a POST.");
+    }
+
+    /// RSA B2: `broadcast_builder_preferences` stops when no beacon node is
+    /// admitted. The test uses these components:
+    ///
+    /// - The real signer, under the production scope rule.
+    /// - A beacon client that supplies only a revoked admission.
+    /// - One key with one builder URL, and one Gloas proposal.
+    ///
+    /// The call must return `Ok` and log one warning. It must not call the
+    /// signer, and it must not send a POST.
+    #[tokio::test]
+    async fn broadcast_builder_preferences_without_admission_signs_and_sends_nothing() {
+        let bn = Arc::new(MockBn::new().with_admission(tracked_admission(false)));
+        let (builder, proposal) = real_signer_service(&bn);
+        let recorded = Recorded::default();
+        let _default = recorded.install();
+
+        let epoch = proposal.proposal_slot / SLOTS_PER_EPOCH;
+        let result = signer::require_beacon_admission_scope(
+            builder.broadcast_builder_preferences(epoch, std::slice::from_ref(&proposal)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "The call must return Ok: {result:?}");
+        assert_eq!(recorded.warns(), [NO_ADMISSION_WARN], "The call must log one warning.");
+        assert_eq!(recorded.signer_calls(), 0, "The call must not ask the signer for a signature.");
+        assert!(bn.builder_pref_calls.lock().is_empty(), "The call must not send a POST.");
+    }
+
+    /// RSA B2: with no admitted node, `broadcast_builder_preferences` does
+    /// not send a cached auth again. The test uses these components:
+    ///
+    /// - The real signer, under the production scope rule.
+    /// - A beacon client with an admission that the test revokes.
+    /// - One key with one builder URL, and one Gloas proposal.
+    ///
+    /// 1. The admission holds. The first call signs the auth and sends it.
+    /// 2. The test revokes the admission and changes the dependent root of
+    ///    the proposal. The second call must return `Ok` and log one
+    ///    warning. It must not call the signer, and it must not send a POST.
+    #[tokio::test]
+    async fn broadcast_builder_preferences_without_admission_sends_no_cached_auth() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let admission = signer::BeaconAdmission::new(0, Arc::clone(&generation));
+        let bn = Arc::new(MockBn::new().with_admission(admission));
+        let (builder, mut proposal) = real_signer_service(&bn);
+        let epoch = proposal.proposal_slot / SLOTS_PER_EPOCH;
+        let recorded = Recorded::default();
+        let _default = recorded.install();
+        signer::require_beacon_admission_scope(
+            builder.broadcast_builder_preferences(epoch, std::slice::from_ref(&proposal)),
+        )
+        .await
+        .expect("The first call must sign and send the auth.");
+        assert_eq!(
+            (recorded.signer_calls(), bn.builder_pref_calls.lock().len()),
+            (1, 1),
+            "The first call must sign the auth and send it."
+        );
+
+        generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        proposal.dependent_root = [0x44; 32];
+        let result = signer::require_beacon_admission_scope(
+            builder.broadcast_builder_preferences(epoch, std::slice::from_ref(&proposal)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "The second call must return Ok: {result:?}");
+        assert_eq!(recorded.warns(), [NO_ADMISSION_WARN], "The second call must log one warning.");
+        let calls = recorded.signer_calls();
+        assert_eq!(calls, 1, "The second call must not ask the signer for a signature.");
+        let posts = bn.builder_pref_calls.lock().len();
+        assert_eq!(posts, 1, "The second call must not send the cached auth again.");
     }
 }
