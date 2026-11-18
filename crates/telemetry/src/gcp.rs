@@ -150,22 +150,33 @@ async fn metadata_project_id(host: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-// The selection test sets GCP_PROJECT. nextest runs each test in its own process.
-#[allow(unsafe_code)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use google_cloud_auth::credentials::{CredentialsProvider, EntityTag};
     use google_cloud_auth::errors::CredentialsError;
     use opentelemetry::trace::{Tracer, TracerProvider};
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Gives `Bearer test-token`, or `NotModified` when `token` is false.
+    /// When set, the `gcp` exporter uses this endpoint and these credentials one time.
+    pub(crate) static DESTINATION: Mutex<Option<(String, Credentials)>> = Mutex::new(None);
+
+    /// A fake ADC source. `Tokens` gives `Bearer token-N` for call N and a quota header.
     #[derive(Debug)]
-    struct FakeCredentials {
-        token: bool,
+    enum FakeCredentials {
+        Tokens(AtomicUsize),
+        NoHeaders,
+        Stall(#[allow(dead_code)] Arc<()>),
+    }
+
+    impl FakeCredentials {
+        fn tokens() -> Credentials {
+            Credentials::from(Self::Tokens(AtomicUsize::new(0)))
+        }
     }
 
     impl CredentialsProvider for FakeCredentials {
@@ -173,17 +184,24 @@ mod tests {
             &self,
             _: http::Extensions,
         ) -> Result<CacheableResource<HeaderMap>, CredentialsError> {
-            if !self.token {
-                return Ok(CacheableResource::NotModified);
-            }
+            let call = match self {
+                Self::Tokens(calls) => calls.fetch_add(1, Ordering::SeqCst) + 1,
+                Self::NoHeaders => return Ok(CacheableResource::NotModified),
+                Self::Stall(_) => std::future::pending().await,
+            };
             let mut data = HeaderMap::new();
-            data.insert(AUTHORIZATION, HeaderValue::from_static("Bearer test-token"));
+            data.insert(AUTHORIZATION, format!("Bearer token-{call}").parse().unwrap());
+            data.insert("x-goog-user-project", HeaderValue::from_static("quota-p"));
             Ok(CacheableResource::New { entity_tag: EntityTag::new(), data })
         }
 
         async fn universe_domain(&self) -> Option<String> {
             None
         }
+    }
+
+    fn contains(body: &[u8], text: &str) -> bool {
+        body.windows(text.len()).any(|w| w == text.as_bytes())
     }
 
     async fn metadata_server(body: &str) -> MockServer {
@@ -202,6 +220,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!(r#"{{"quota_project_id":"{quota_project}"}}"#)).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn production_destinations_use_tls_and_the_google_hosts() {
+        assert_eq!(GCP_TRACES_ENDPOINT, "https://telemetry.googleapis.com/v1/traces");
     }
 
     #[tokio::test]
@@ -226,7 +249,11 @@ mod tests {
             ("HOME", "home-p"),
         ] {
             let found = detect_project_id(&vars).await;
-            assert_eq!(found.as_deref(), Some(project), "{remove} must win over later sources.");
+            assert_eq!(
+                found.as_deref(),
+                Some(project),
+                "{remove} must take priority over later sources."
+            );
             vars.remove(remove);
         }
         let found = detect_project_id(&vars).await;
@@ -241,6 +268,20 @@ mod tests {
         assert_eq!(metadata_project_id(&missing.address().to_string()).await, None);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn metadata_project_id_stops_at_the_deadline() {
+        let server = MockServer::start().await;
+        let late = ResponseTemplate::new(200).set_body_string("late-p");
+        Mock::given(method("GET"))
+            .respond_with(late.set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let start = tokio::time::Instant::now();
+        let found = metadata_project_id(&server.address().to_string()).await;
+        assert_eq!(found, None, "A late metadata answer must give no project ID.");
+        assert_eq!(start.elapsed(), Duration::from_secs(3), "The metadata deadline must be 3 s.");
+    }
+
     #[test]
     fn quota_project_id_is_none_without_the_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -251,17 +292,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn gcp_exporter_sends_spans_with_auth_headers_and_the_project_id() {
+    async fn gcp_exporter_sends_the_project_id_and_does_not_follow_a_redirect() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/traces"))
-            .and(header("authorization", "Bearer test-token"))
-            .and(header("content-type", "application/x-protobuf"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        let redirect = ResponseTemplate::new(307).insert_header("location", "/moved");
+        Mock::given(path("/v1/traces")).respond_with(redirect).mount(&server).await;
+        Mock::given(path("/moved")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let endpoint = format!("{}/v1/traces", server.uri());
-        let credentials = Credentials::from(FakeCredentials { token: true });
+        let credentials = FakeCredentials::tokens();
         let resource = Resource::builder_empty().with_service_name("rvc-test").build();
         let (exporter, resource) =
             build_exporter(&endpoint, credentials, Handle::current(), "test-p".into(), resource)
@@ -275,13 +312,13 @@ mod tests {
             provider.tracer("test").in_span("gcp-export", |_| {});
             provider.shutdown()
         });
-        flushed.await.unwrap().expect("The export must succeed.");
+        flushed.await.unwrap().expect("The shutdown must succeed.");
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "The exporter must send one request.");
-        let body = &requests[0].body;
-        for text in [&b"gcp.project_id"[..], b"test-p", b"rvc-test", b"gcp-export"] {
-            assert!(body.windows(text.len()).any(|w| w == text), "Body must hold {text:?}.");
+        let paths: Vec<&str> = requests.iter().map(|r| r.url.path()).collect();
+        assert_eq!(paths, ["/v1/traces"], "The exporter must not follow a redirect.");
+        for text in ["gcp.project_id", "test-p", "rvc-test", "gcp-export"] {
+            assert!(contains(&requests[0].body, text), "The request body must contain {text:?}.");
         }
     }
 
@@ -290,7 +327,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = GcpHttpClient {
             http: reqwest::Client::new(),
-            credentials: Credentials::from(FakeCredentials { token: false }),
+            credentials: Credentials::from(FakeCredentials::NoHeaders),
             runtime: Handle::current(),
         };
         let request = Request::post(server.uri()).body(Bytes::new()).unwrap();
@@ -298,21 +335,73 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn init_tracing_selects_the_gcp_exporter_with_the_env_project() {
-        use crate::config::{ExporterKind, TelemetryConfig};
-        unsafe { std::env::set_var("GCP_PROJECT", "env-project") };
-        unsafe { std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS") };
-        let config = TelemetryConfig {
-            endpoint: String::new(),
-            exporter: ExporterKind::Gcp,
-            ..Default::default()
+    #[tokio::test(start_paused = true)]
+    async fn gcp_client_stops_a_stalled_credential_request_at_the_deadline() {
+        let alive = Arc::new(());
+        let client = GcpHttpClient {
+            http: reqwest::Client::new(),
+            credentials: Credentials::from(FakeCredentials::Stall(alive.clone())),
+            runtime: Handle::current(),
         };
-        let result = crate::init::init_tracing(&config);
-        let env = adc_env();
-        unsafe { std::env::remove_var("GCP_PROJECT") };
-        assert_eq!(env.get("GCP_PROJECT").map(String::as_str), Some("env-project"));
-        let (_layer, guard) = result.expect("Gcp with GCP_PROJECT must initialize.");
-        guard.provider.shutdown().ok();
+        let request = Request::post("http://127.0.0.1:9/v1/traces").body(Bytes::new()).unwrap();
+        let start = tokio::time::Instant::now();
+        let sent = tokio::time::timeout(Duration::from_secs(20), client.send_bytes(request)).await;
+        sent.expect("The client must return in 20 s.").expect_err("A stall must give an error.");
+        assert_eq!(start.elapsed(), Duration::from_secs(10), "The export deadline must be 10 s.");
+        drop(client);
+        assert_eq!(Arc::strong_count(&alive), 1, "The deadline must stop the credential request.");
+    }
+
+    /// Runs the child test below in a new process with a set environment.
+    /// Thus this process does not change its own environment.
+    #[test]
+    fn init_tracing_selects_the_gcp_exporter_with_the_env_project() {
+        let child = "gcp::tests::gcp_child_exports_two_batches_with_new_adc_headers";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([child, "--exact", "--ignored", "--nocapture"])
+            .env("GCP_PROJECT", "env-project")
+            .env("GOOGLE_APPLICATION_CREDENTIALS", "/nonexistent/adc.json")
+            .output()
+            .expect("The test binary must start.");
+        let text = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).into_owned();
+        assert!(output.status.success(), "The child test must pass:\n{text}");
+        assert!(text.contains("1 passed"), "The child test must run:\n{text}");
+        assert!(!text.contains("token-"), "The output must not contain a credential:\n{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "init_tracing_selects_the_gcp_exporter_with_the_env_project runs this test"]
+    async fn gcp_child_exports_two_batches_with_new_adc_headers() {
+        use crate::config::{ExporterKind, TelemetryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let local = (format!("{}/v1/traces", server.uri()), FakeCredentials::tokens());
+        *DESTINATION.lock().unwrap() = Some(local);
+        let config = TelemetryConfig { exporter: ExporterKind::Gcp, ..Default::default() };
+        let (_layer, guard) = crate::init::init_tracing(&config).expect("The exporter must start.");
+        let provider = guard.provider.clone();
+        let exported = tokio::task::spawn_blocking(move || {
+            for name in ["batch-1", "batch-2"] {
+                provider.tracer("test").in_span(name, |_| {});
+                provider.force_flush()?;
+            }
+            provider.shutdown()
+        });
+        exported.await.unwrap().expect("The two exports must succeed.");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "The exporter must send one request for each flush.");
+        for (request, n) in requests.iter().zip(1..) {
+            let header = |name: &str| request.headers.get(name).and_then(|v| v.to_str().ok());
+            assert_eq!(request.method, "POST", "Request {n} must be a POST.");
+            assert_eq!(request.url.path(), "/v1/traces", "Request {n} must use the trace path.");
+            assert_eq!(header("content-type"), Some("application/x-protobuf"));
+            let token = format!("Bearer token-{n}");
+            assert!(header("authorization") == Some(&*token), "Request {n} must use ADC call {n}.");
+            assert_eq!(header("x-goog-user-project"), Some("quota-p"), "Request {n} quota header.");
+            for text in ["gcp.project_id", "env-project", &format!("batch-{n}")] {
+                assert!(contains(&request.body, text), "Request {n} must contain {text:?}.");
+            }
+        }
     }
 }

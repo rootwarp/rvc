@@ -167,11 +167,19 @@ impl Write for RollingWriter {
 pub(crate) mod tests {
     use super::*;
     use flate2::read::GzDecoder;
+    use std::cell::Cell;
     use std::io::Read;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// While a test holds this lock, the background cleanup cannot start.
     pub(crate) static CLEANUP_GATE: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// When set, the writer on this thread uses this owner UID instead of the process UID.
+        pub(crate) static OWNER_UID: Cell<Option<u32>> = const { Cell::new(None) };
+    }
 
     const MIB: usize = 1024 * 1024;
 
@@ -209,6 +217,12 @@ pub(crate) mod tests {
         byte[0]
     }
 
+    fn gunzip(path: &Path) -> Vec<u8> {
+        let mut text = Vec::new();
+        GzDecoder::new(File::open(path).unwrap()).read_to_end(&mut text).unwrap();
+        text
+    }
+
     /// Writes one full MiB of `fill` and waits for the cleanup thread.
     fn roll(writer: &mut RollingWriter, fill: u8) {
         writer.write_all(&vec![fill; MIB]).unwrap();
@@ -221,7 +235,11 @@ pub(crate) mod tests {
         let mut writer = RollingWriter::open(&config(dir.path(), 5, false)).unwrap();
 
         writer.write_all(&vec![b'a'; MIB - 1]).unwrap();
-        assert_eq!(names(dir.path()), ["app.log"], "1 byte below the limit must not rotate.");
+        assert_eq!(
+            names(dir.path()),
+            ["app.log"],
+            "The writer must not rotate when the file size is one byte below the limit."
+        );
 
         writer.write_all(b"a").unwrap();
         writer.join_cleanup();
@@ -285,15 +303,18 @@ pub(crate) mod tests {
         drop(gate);
         writer.join_cleanup();
         assert_eq!(names(dir.path()), ["app.log", "app.log.1.gz"]);
-        let mut text = Vec::new();
-        GzDecoder::new(File::open(dir.path().join("app.log.1.gz")).unwrap())
-            .read_to_end(&mut text)
-            .unwrap();
-        assert_eq!(text, vec![b'a'; MIB], "The archive must hold the rotated bytes.");
+        let archive = |index: usize| gunzip(&dir.path().join(format!("app.log.{index}.gz")));
+        assert_eq!(archive(1), vec![b'a'; MIB], "The archive must hold the rotated bytes.");
 
         writer.write_all(b"b").unwrap();
         writer.join_cleanup();
         assert_eq!(names(dir.path()), ["app.log", "app.log.1.gz", "app.log.2.gz"]);
+        assert_eq!(
+            archive(1),
+            vec![b'b'; MIB + 1],
+            "The writer must keep the bytes that it wrote while the cleanup ran."
+        );
+        assert_eq!(archive(2), vec![b'a'; MIB], "The older archive must move to index 2.");
     }
 
     #[test]
@@ -303,8 +324,8 @@ pub(crate) mod tests {
         fs::write(path("app.log"), vec![b'a'; MIB - 1]).unwrap();
         fs::write(path("app.log.1"), "b").unwrap();
         fs::write(path("app.log.2.gz"), "c").unwrap();
-        fs::write(path("app.log.7"), "d").unwrap();
         fs::write(path("other.log.1"), "e").unwrap();
+        symlink(path("other.log.1"), path("app.log.7")).unwrap();
         let mut writer = RollingWriter::open(&config(dir.path(), 4, false)).unwrap();
 
         writer.write_all(b"a").unwrap();
@@ -317,6 +338,7 @@ pub(crate) mod tests {
         assert_eq!(fs::read(path("app.log.1")).unwrap(), vec![b'a'; MIB]);
         assert_eq!(fs::read(path("app.log.2")).unwrap(), b"b");
         assert_eq!(fs::read(path("app.log.3.gz")).unwrap(), b"c");
+        assert_eq!(fs::read(path("other.log.1")).unwrap(), b"e", "The target must not change.");
     }
 
     #[test]
@@ -330,6 +352,94 @@ pub(crate) mod tests {
             writer.write_all(&vec![b'a'; MIB]).expect_err("A rename onto a directory fails.");
         assert_ne!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(fs::read(dir.path().join("app.log.1")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(dir.path().join("app.log")).unwrap(),
+            vec![b'a'; MIB],
+            "A failed rename must keep the bytes of the active file."
+        );
+    }
+
+    #[test]
+    fn new_and_existing_log_files_are_private_under_a_permissive_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |name: &str| fs::metadata(dir.path().join(name)).unwrap().permissions().mode();
+        fs::write(dir.path().join("app.log"), "old").unwrap();
+        fs::set_permissions(dir.path().join("app.log"), fs::Permissions::from_mode(0o644)).unwrap();
+        let umask = rustix::process::umask(rustix::fs::Mode::empty());
+        let mut writer = RollingWriter::open(&config(dir.path(), 5, true)).unwrap();
+        let existing = mode("app.log") & 0o777;
+        roll(&mut writer, b'a');
+        rustix::process::umask(umask);
+        assert_eq!(existing, 0o600, "The writer must make the existing active file private.");
+        for name in ["app.log", "app.log.1.gz"] {
+            assert_eq!(mode(name) & 0o777, 0o600, "The writer must create {name} with mode 0600.");
+        }
+    }
+
+    #[test]
+    fn open_rejects_a_file_name_that_is_not_one_component() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        fs::create_dir(&dir).unwrap();
+        let outside = root.path().join("outside.log").to_string_lossy().into_owned();
+        for name in ["", ".", "..", "a/app.log", "../app.log", "app.log/", &outside] {
+            let config = FileAppenderConfig { filename: name.into(), ..config(&dir, 5, false) };
+            let error = RollingWriter::open(&config).expect_err("The writer must reject the name.");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?} is not one component.");
+        }
+        assert_eq!(names(root.path()), ["logs"], "The writer must not create a file outside logs.");
+    }
+
+    #[test]
+    fn open_and_compression_do_not_follow_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        let secret = root.path().join("secret");
+        fs::write(&secret, "secret").unwrap();
+        let mut writer = RollingWriter::open(&config(&dir, 5, true)).unwrap();
+        fs::remove_file(dir.join("app.log")).unwrap();
+        symlink(&secret, dir.join("app.log")).unwrap();
+
+        RollingWriter::open(&config(&dir, 5, true)).expect_err("The open must not follow a link.");
+        roll(&mut writer, b'a');
+        assert_eq!(names(&dir), ["app.log", "app.log.1"], "The cleanup must not gzip a link.");
+        assert_eq!(fs::read(&secret).unwrap(), b"secret", "The symlink target must not change.");
+    }
+
+    #[test]
+    fn open_rejects_a_file_of_another_user_and_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("app.log");
+        fs::write(&active, "old").unwrap();
+        OWNER_UID.with(|uid| uid.set(Some(rustix::process::geteuid().as_raw() + 1)));
+        let result = RollingWriter::open(&config(dir.path(), 5, false));
+        OWNER_UID.with(|uid| uid.set(None));
+        let error = result.expect_err("The writer must reject a file of another user.");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        fs::remove_file(&active).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(&active).status().unwrap().success());
+        let config = config(dir.path(), 5, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || tx.send(RollingWriter::open(&config).map(drop)));
+        let opened = rx.recv_timeout(Duration::from_secs(10)).expect("The open must not block.");
+        assert!(opened.is_err(), "The writer must reject a FIFO.");
+    }
+
+    #[test]
+    fn open_accepts_the_largest_rotation_index() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("app.log.1"), "b").unwrap();
+        fs::write(dir.path().join(format!("app.log.{}", usize::MAX)), "c").unwrap();
+        let mut writer = RollingWriter::open(&config(dir.path(), 4, false)).unwrap();
+
+        roll(&mut writer, b'a');
+        assert_eq!(
+            names(dir.path()),
+            ["app.log", "app.log.1", "app.log.2"],
+            "The cleanup must remove the file with the largest index."
+        );
+        assert_eq!(fs::read(dir.path().join("app.log.2")).unwrap(), b"b");
     }
 
     #[test]
