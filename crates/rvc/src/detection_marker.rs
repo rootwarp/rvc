@@ -117,11 +117,87 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// File name of the fallback marker of the database at `slashing_db_path`.
+pub fn fallback_marker_name(_slashing_db_path: &Path) -> String {
+    MARKER_FILENAME.to_string()
+}
+
+/// The fallback marker of one slashing database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackMarkerPath {
+    /// Parent of the slashing database.
+    pub dir: PathBuf,
+    /// The slashing database. Its file name names the owned marker.
+    pub slashing_db_path: PathBuf,
+}
+
+impl FallbackMarkerPath {
+    /// `None` when [`fallback_marker_dir`] gives no fallback directory.
+    pub fn for_config(keystore_dir: &Path, slashing_db_path: &Path) -> Option<Self> {
+        let dir = fallback_marker_dir(keystore_dir, slashing_db_path)?;
+        Some(Self { dir, slashing_db_path: slashing_db_path.to_path_buf() })
+    }
+
+    /// Path of the owned marker of this database.
+    pub fn owned_path(&self) -> PathBuf {
+        self.dir.join(fallback_marker_name(&self.slashing_db_path))
+    }
+}
+
+/// What a start-up read found at the owned name and at the legacy name.
+#[derive(Debug)]
+pub struct FallbackInspect {
+    pub owned: MarkerInspect,
+    pub legacy: MarkerInspect,
+}
+
+/// Read the owned fallback marker and the legacy fallback marker.
+pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
+    FallbackInspect { owned: inspect_at(&fallback.owned_path()), legacy: inspect(&fallback.dir) }
+}
+
+/// Write the owned fallback marker of `fallback`.
+pub fn write_fallback_marker(
+    fallback: &FallbackMarkerPath,
+    _keystore_dir: &Path,
+    marker: &DetectionMarker,
+) -> io::Result<()> {
+    write_marker(&fallback.dir, marker)
+}
+
+/// What [`clear_fallback_marker`] did with one fallback marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackClear {
+    /// The owned marker of this keystore was removed.
+    Removed { path: PathBuf },
+    /// The owned marker names another keystore and stays.
+    OtherOwner { path: PathBuf, owner: String },
+    /// The legacy marker, which has no owner, was removed.
+    LegacyRemoved { path: PathBuf },
+}
+
+/// Remove the fallback markers of `fallback` that belong to `keystore_dir`.
+pub fn clear_fallback_marker(
+    fallback: &FallbackMarkerPath,
+    _keystore_dir: &Path,
+) -> io::Result<Vec<FallbackClear>> {
+    let mut cleared = Vec::new();
+    if let ClearOutcome::Removed = clear_marker(&fallback.dir)? {
+        cleared.push(FallbackClear::LegacyRemoved { path: marker_path(&fallback.dir) });
+    }
+    Ok(cleared)
+}
+
 /// Read the marker. A missing file is [`MarkerInspect::Absent`].
 ///
 /// A symlink, including a dangling one, is [`MarkerInspect::Unreadable`].
 pub fn inspect(data_dir: &Path) -> MarkerInspect {
-    let path = marker_path(data_dir);
+    inspect_at(&marker_path(data_dir))
+}
+
+/// Read the marker at `path`. A missing file is [`MarkerInspect::Absent`].
+pub fn inspect_at(path: &Path) -> MarkerInspect {
+    let path = path.to_path_buf();
     match doppelganger::marker_file::read_marker_file(&path) {
         doppelganger::marker_file::MarkerFile::Absent => MarkerInspect::Absent,
         doppelganger::marker_file::MarkerFile::Unreadable(source) => {
@@ -1618,6 +1694,150 @@ mod tests {
         );
         assert_eq!(fallback_marker_dir(&keys, &keys.join("slashing.sqlite")), None);
         assert_eq!(fallback_marker_dir(&keys, Path::new("slashing.sqlite")), None);
+    }
+
+    /// A version-1 marker without the `keystore_dir` field parses as
+    /// `Present`.
+    #[test]
+    fn marker_without_keystore_dir_still_parses() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        fs::write(
+            marker_path(dir.path()),
+            format!(r#"{{"version":1,"epoch":5,"unix_secs":6,"pubkeys":["{}"]}}"#, pubkey()),
+        )
+        .expect("The test must write the marker.");
+        let expected = DetectionMarker { epoch: 5, unix_secs: 6, pubkeys: vec![pubkey()] };
+
+        let inspected = inspect(dir.path());
+
+        assert!(
+            matches!(&inspected, MarkerInspect::Present(marker) if *marker == expected),
+            "A version-1 marker without keystore_dir must parse as Present. The result is \
+             {inspected:?}."
+        );
+    }
+
+    /// A marker with a field that the document does not define is `Corrupt`.
+    #[test]
+    fn marker_with_an_unknown_field_is_corrupt() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        fs::write(
+            marker_path(dir.path()),
+            br#"{"version":1,"epoch":5,"unix_secs":6,"pubkeys":[],"foo":1}"#,
+        )
+        .expect("The test must write the marker.");
+
+        let inspected = inspect(dir.path());
+
+        assert!(
+            matches!(inspected, MarkerInspect::Corrupt { .. }),
+            "A marker with the unknown field foo must be Corrupt. The result is {inspected:?}."
+        );
+    }
+
+    /// The owned fallback name is the legacy name, a dot, and the file name
+    /// of the database. The owned marker is in the database directory.
+    #[test]
+    fn fallback_marker_name_appends_the_db_file_name() {
+        let fallback = FallbackMarkerPath {
+            dir: PathBuf::from("/srv/db"),
+            slashing_db_path: PathBuf::from("/srv/db/a.sqlite"),
+        };
+
+        assert_eq!(
+            fallback.owned_path(),
+            PathBuf::from("/srv/db/.rvc.doppelganger_detected.a.sqlite"),
+            "The owned path must be the legacy name, a dot, and the database file name."
+        );
+    }
+
+    /// `clear_fallback_marker` reads the owner of the owned marker. The
+    /// blocks of the test require these results:
+    ///
+    /// 1. The owner is another keystore: the marker stays, and the result
+    ///    gives the path and the canonical owner.
+    /// 2. The owner is this keystore, and a legacy marker exists: the
+    ///    function removes the two markers.
+    /// 3. The marker records no owner: the function removes it.
+    /// 4. The marker does not parse: the marker stays, and the function
+    ///    returns `InvalidData` with the path.
+    #[test]
+    fn clear_fallback_marker_removes_only_an_owned_marker_of_this_keystore() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        let other = root.path().join("other");
+        let slash = root.path().join("slash");
+        for dir in [&keys, &other, &slash] {
+            fs::create_dir(dir).expect("The test must create a directory.");
+        }
+        let fallback = FallbackMarkerPath::for_config(&keys, &slash.join("a.sqlite"))
+            .expect("The database directory must take a fallback marker.");
+        let owned = fallback.owned_path();
+        let marker = DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![pubkey()] };
+        let canonical_other = fs::canonicalize(&other)
+            .expect("The test must read the canonical path of the other keystore.")
+            .to_string_lossy()
+            .into_owned();
+
+        write_fallback_marker(&fallback, &other.join("."), &marker)
+            .expect("The test must write the marker of the other keystore.");
+        assert_eq!(
+            clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
+            Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner: canonical_other }]),
+            "The function must keep the marker of another keystore and give its canonical owner."
+        );
+        assert!(
+            matches!(inspect_at(&owned), MarkerInspect::Present(_)),
+            "The marker of another keystore must stay."
+        );
+
+        write_fallback_marker(&fallback, &keys, &marker)
+            .expect("The test must write the marker of this keystore.");
+        write_marker(&slash, &marker).expect("The test must write a legacy marker.");
+        assert_eq!(
+            clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
+            Ok(vec![
+                FallbackClear::Removed { path: owned.clone() },
+                FallbackClear::LegacyRemoved { path: marker_path(&slash) },
+            ]),
+            "The function must remove the marker of this keystore and the legacy marker."
+        );
+        let after = inspect_fallback(&fallback);
+        assert!(
+            matches!(after.owned, MarkerInspect::Absent)
+                && matches!(after.legacy, MarkerInspect::Absent),
+            "The two markers must be absent. The result is {after:?}."
+        );
+
+        fs::write(&owned, br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#)
+            .expect("The test must write a marker with no owner.");
+        assert_eq!(
+            clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
+            Ok(vec![FallbackClear::Removed { path: owned.clone() }]),
+            "The function must remove an owned marker that records no owner."
+        );
+        assert!(
+            matches!(inspect_at(&owned), MarkerInspect::Absent),
+            "The owned marker with no owner must be absent."
+        );
+
+        fs::write(&owned, b"{").expect("The test must write a marker that does not parse.");
+        let result =
+            clear_fallback_marker(&fallback, &keys).map_err(|err| (err.kind(), err.to_string()));
+        assert!(
+            matches!(
+                &result,
+                Err((io::ErrorKind::InvalidData, text))
+                    if text.contains(&owned.display().to_string())
+            ),
+            "The function must return InvalidData with the path for a marker that does not \
+             parse. The result is {result:?}."
+        );
+        assert_eq!(
+            fs::read(&owned).map_err(|err| err.to_string()),
+            Ok(b"{".to_vec()),
+            "A marker that does not parse must stay."
+        );
     }
 
     #[test]

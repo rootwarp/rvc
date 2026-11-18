@@ -3741,7 +3741,7 @@ mod tests {
                 Some(detection_shutdown(
                     Arc::clone(&m),
                     missing,
-                    Some(fallback.path().to_path_buf()),
+                    Some(fallback_in(fallback.path())),
                     clock,
                 )),
             ),
@@ -3754,7 +3754,7 @@ mod tests {
         );
         assert!(
             matches!(
-                crate::detection_marker::inspect(fallback.path()),
+                crate::detection_marker::inspect_fallback(&fallback_in(fallback.path())).owned,
                 crate::detection_marker::MarkerInspect::Present(_)
             ),
             "the fallback marker must be durable"
@@ -3778,7 +3778,7 @@ mod tests {
                 executor,
                 shutdown_rx,
                 token,
-                Some(detection_shutdown(m, missing, Some(fallback.path().to_path_buf()), clock)),
+                Some(detection_shutdown(m, missing, Some(fallback_in(fallback.path())), clock)),
             ),
             std::future::pending(),
         )
@@ -3788,7 +3788,7 @@ mod tests {
             "token cancel during the marker retry must exit 12, got {res:?}"
         );
         assert!(matches!(
-            crate::detection_marker::inspect(fallback.path()),
+            crate::detection_marker::inspect_fallback(&fallback_in(fallback.path())).owned,
             crate::detection_marker::MarkerInspect::Present(_)
         ));
         task.abort();
@@ -3818,7 +3818,7 @@ mod tests {
                 executor,
                 shutdown_rx,
                 token,
-                Some(detection_shutdown(m, missing, Some(fallback.path().to_path_buf()), clock)),
+                Some(detection_shutdown(m, missing, Some(fallback_in(fallback.path())), clock)),
             ),
             std::future::pending(),
         )
@@ -3828,7 +3828,7 @@ mod tests {
             "a panic while latched must exit 12, got {res:?}"
         );
         assert!(matches!(
-            crate::detection_marker::inspect(fallback.path()),
+            crate::detection_marker::inspect_fallback(&fallback_in(fallback.path())).owned,
             crate::detection_marker::MarkerInspect::Present(_)
         ));
     }
@@ -3864,14 +3864,14 @@ mod tests {
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
         let keystore = keys.path().to_path_buf();
-        let fallback_dir = fallback.path().to_path_buf();
+        let fallback_path = fallback_in(fallback.path());
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
                 drain_inputs(
                     executor,
                     shutdown_rx,
                     token,
-                    Some(detection_shutdown(m, keystore, Some(fallback_dir), clock)),
+                    Some(detection_shutdown(m, keystore, Some(fallback_path), clock)),
                 ),
                 std::future::ready(()),
             )
@@ -3891,7 +3891,7 @@ mod tests {
         );
         assert!(
             matches!(
-                crate::detection_marker::inspect(fallback.path()),
+                crate::detection_marker::inspect_fallback(&fallback_in(fallback.path())).owned,
                 crate::detection_marker::MarkerInspect::Absent
             ),
             "the injected fallback write must not have created a marker"
@@ -3905,6 +3905,66 @@ mod tests {
         );
         let err = boot_refusing(keys.path(), None).await;
         assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
+    }
+
+    /// Instances A and B keep their slashing databases in one directory.
+    /// The keystore directory of instance A does not exist, so the drain of
+    /// instance A writes only the fallback marker of `a.sqlite`. The test
+    /// requires these results:
+    ///
+    /// - The drain of instance A returns exit 12.
+    /// - The boot of instance B with `b.sqlite` does not exit 12.
+    /// - The boot of instance A with `a.sqlite` exits 12.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_marker_of_one_instance_does_not_refuse_another_sharing_the_db_dir() {
+        let shared = tempfile::tempdir().expect("The test must create the database directory.");
+        let root_a = tempfile::tempdir().expect("The test must create the root of instance A.");
+        let keys_a = root_a.path().join("keys");
+        let db_a = shared.path().join("a.sqlite");
+        let fallback = crate::detection_marker::FallbackMarkerPath::for_config(&keys_a, &db_a)
+            .expect("Instance A must have a fallback marker beside its database.");
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let keystore = keys_a.clone();
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(
+                    executor,
+                    shutdown_rx,
+                    token,
+                    Some(detection_shutdown(
+                        latched_machine(),
+                        keystore,
+                        Some(fallback),
+                        test_clock(),
+                    )),
+                ),
+                std::future::ready(()),
+            )
+            .await
+        });
+
+        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
+
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain of instance A must return exit 12. The result is {res:?}."
+        );
+        let keys_b = tempfile::tempdir().expect("The test must create the keystore of instance B.");
+        let err = boot_refusing(keys_b.path(), Some(shared.path().join("b.sqlite"))).await;
+        assert_ne!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "The boot of instance B must not exit 12 for the detection of instance A. The \
+             error is: {err}"
+        );
+        std::fs::create_dir(&keys_a).expect("The test must create the keystore of instance A.");
+        let err = boot_refusing(&keys_a, Some(db_a)).await;
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "The boot of instance A must exit 12. The error is: {err}"
+        );
     }
 
     /// A write whose fsync already returned `Ok` exits 12 even when every later rewrite fails.
@@ -4136,10 +4196,18 @@ mod tests {
     fn detection_shutdown(
         machine: Arc<ForwardWindowMachine>,
         keystore_dir: std::path::PathBuf,
-        fallback_dir: Option<std::path::PathBuf>,
+        fallback: Option<crate::detection_marker::FallbackMarkerPath>,
         epoch_clock: Arc<MonotonicEpochClock>,
     ) -> crate::bootstrap::DetectionShutdown {
-        crate::bootstrap::DetectionShutdown { machine, keystore_dir, fallback_dir, epoch_clock }
+        crate::bootstrap::DetectionShutdown { machine, keystore_dir, fallback, epoch_clock }
+    }
+
+    /// Return the fallback marker of the database `slashing.sqlite` in `dir`.
+    fn fallback_in(dir: &std::path::Path) -> crate::detection_marker::FallbackMarkerPath {
+        crate::detection_marker::FallbackMarkerPath {
+            dir: dir.to_path_buf(),
+            slashing_db_path: dir.join("slashing.sqlite"),
+        }
     }
 
     fn drain_inputs(

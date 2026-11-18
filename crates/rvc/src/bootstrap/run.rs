@@ -448,7 +448,7 @@ async fn run_with_clock<C: SlotClock + 'static>(
     let detection = forward_window_machine.map(|machine| DetectionShutdown {
         machine,
         keystore_dir: config.keystore_path.clone(),
-        fallback_dir: crate::detection_marker::fallback_marker_dir(
+        fallback: crate::detection_marker::FallbackMarkerPath::for_config(
             &config.keystore_path,
             &config.slashing_db_path,
         ),
@@ -497,8 +497,9 @@ pub(crate) struct DetectionShutdown {
     pub(crate) machine: Arc<doppelganger::ForwardWindowMachine>,
     /// Keystore directory. The primary marker is written here.
     pub(crate) keystore_dir: std::path::PathBuf,
-    /// Parent of the slashing database when that directory is not the keystore.
-    pub(crate) fallback_dir: Option<std::path::PathBuf>,
+    /// Fallback marker of the slashing database when its directory is not
+    /// the keystore.
+    pub(crate) fallback: Option<crate::detection_marker::FallbackMarkerPath>,
     /// Epoch recorded in the marker.
     pub(crate) epoch_clock: Arc<doppelganger::MonotonicEpochClock>,
 }
@@ -622,7 +623,7 @@ const DETECTION_CLEAR_HINT: &str = "Clear it with `rvc doppelganger clear-detect
 /// Write a durable detection record once the latch is set.
 ///
 /// The pre-allocated keystore record is overwritten in place first. The
-/// keystore marker and [`DetectionShutdown::fallback_dir`] are additional
+/// keystore marker and [`DetectionShutdown::fallback`] are additional
 /// paths. `true` only when this process has seen a write and its fsync return
 /// `Ok` (a rename also needs the directory fsync). A later rewrite failure
 /// does not retry. A read of the record or a marker is not durability, and
@@ -662,12 +663,16 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
                     path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
                     "in-place detection record is durable; the marker write failed"
                 );
-                if let Some(dir) = &detection.fallback_dir {
-                    if let Err(fallback_err) = crate::detection_marker::write_marker(dir, &marker) {
+                if let Some(fallback) = &detection.fallback {
+                    if let Err(fallback_err) = crate::detection_marker::write_fallback_marker(
+                        fallback,
+                        &detection.keystore_dir,
+                        &marker,
+                    ) {
                         crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
                         error!(
                             error = %fallback_err,
-                            path = %crate::detection_marker::marker_path(dir).display(),
+                            path = %fallback.owned_path().display(),
                             "in-place detection record is durable; the fallback marker write failed"
                         );
                     }
@@ -681,17 +686,23 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
                 path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
                 "failed to persist doppelganger detection marker during shutdown"
             );
-            if let Some(dir) = &detection.fallback_dir {
-                if crate::detection_marker::write_marker(dir, &marker).is_ok() {
+            if let Some(fallback) = &detection.fallback {
+                if crate::detection_marker::write_fallback_marker(
+                    fallback,
+                    &detection.keystore_dir,
+                    &marker,
+                )
+                .is_ok()
+                {
                     detection.machine.mark_detection_persisted();
                     error!(
-                        path = %crate::detection_marker::marker_path(dir).display(),
+                        path = %fallback.owned_path().display(),
                         "persisted doppelganger detection marker beside the slashing database"
                     );
                 } else {
                     crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
                     error!(
-                        path = %crate::detection_marker::marker_path(dir).display(),
+                        path = %fallback.owned_path().display(),
                         "failed to persist the fallback doppelganger detection marker"
                     );
                 }
@@ -1351,6 +1362,51 @@ mod tests {
         assert!(
             logs_contain("symlink, directory or FIFO"),
             "The refusal log must name the three entry types that require removal."
+        );
+    }
+
+    /// Boot refuses the owned fallback marker of its slashing database. The
+    /// test writes the marker as raw JSON, so it does not use the writer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_an_owned_fallback_marker() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let owned = slash.path().join(".rvc.doppelganger_detected.a.sqlite");
+        let body = serde_json::json!({
+            "version": 1,
+            "epoch": 3,
+            "unix_secs": 4,
+            "pubkeys": [],
+            "keystore_dir": keys.path().to_string_lossy(),
+        });
+        std::fs::write(&owned, body.to_string())
+            .expect("The test must write the owned fallback marker.");
+        let config = crate::config::Config {
+            keystore_path: keys.path().to_path_buf(),
+            slashing_db_path: slash.path().join("a.sqlite"),
+            doppelganger_detection: false,
+            ..Default::default()
+        };
+        let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+
+        let err = run(
+            config,
+            RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: bn_manager::OperationTimeouts::default(),
+            },
+            executor,
+            rx,
+        )
+        .await
+        .expect_err("The boot must fail.");
+
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "The boot must exit 12 for the owned fallback marker {}. The error is: {err}",
+            owned.display()
         );
     }
 

@@ -142,6 +142,47 @@ mod tests {
         assert!(rvc::detection_marker::force_window_path(keys.path()).is_file());
     }
 
+    /// The owned fallback marker of `a.sqlite` belongs to keystore A. The
+    /// command for keystore B keeps it. The command for keystore A removes
+    /// it.
+    #[test]
+    fn clear_detection_keeps_an_owned_fallback_marker_of_another_keystore() {
+        use rvc::detection_marker::{
+            inspect_fallback, write_fallback_marker, DetectionMarker, FallbackMarkerPath,
+            MarkerInspect,
+        };
+        let keys_a = tempfile::tempdir().expect("The test must create keystore A.");
+        let keys_b = tempfile::tempdir().expect("The test must create keystore B.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let db = slash.path().join("a.sqlite");
+        let fallback = FallbackMarkerPath::for_config(keys_a.path(), &db)
+            .expect("The database directory must take a fallback marker.");
+        write_fallback_marker(
+            &fallback,
+            keys_a.path(),
+            &DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![] },
+        )
+        .expect("The test must write the owned fallback marker of keystore A.");
+
+        let result =
+            execute_clear_detection(keys_b.path(), Some(&db), true).map_err(|err| err.to_string());
+
+        assert_eq!(result, Ok(()), "The command for keystore B must succeed.");
+        assert!(
+            matches!(inspect_fallback(&fallback).owned, MarkerInspect::Present(_)),
+            "The command for keystore B must keep the owned fallback marker of keystore A."
+        );
+
+        let result =
+            execute_clear_detection(keys_a.path(), Some(&db), true).map_err(|err| err.to_string());
+
+        assert_eq!(result, Ok(()), "The command for keystore A must succeed.");
+        assert!(
+            matches!(inspect_fallback(&fallback).owned, MarkerInspect::Absent),
+            "The command for keystore A must remove its owned fallback marker."
+        );
+    }
+
     #[test]
     fn clear_resets_an_in_place_detection_record() {
         let dir = tempfile::tempdir().expect("temp");
