@@ -19,10 +19,12 @@
 //! watchdog is not an assertion.
 //!
 //! `orchestrator_at_slot` is the second harness (W4-E6b3). It starts
-//! `DutyOrchestrator::run` and the epoch boundary runner with in-process
-//! doubles and no server. The builder-flag tests use it, because they write
-//! to the live `ValidatorStore` and count the registration signatures. The
-//! public bootstrap path does not give these two items to a test.
+//! `DutyOrchestrator::run` and its epoch boundary runner. The harness uses a
+//! mock beacon node in the test process. The tests update the live
+//! `ValidatorStore` and count calls to the registration signer. The public
+//! bootstrap function gives callers no access to the store or the signer.
+//! A tracing layer records the end of each registration step of the runner.
+//! The tests wait for this event before they check the POSTs and the calls.
 
 mod common;
 
@@ -35,7 +37,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{BeaconClient, BeaconClientConfig, DependentRootResponse};
 use bn_manager::{
-    BeaconNodeClient, MockBeaconNodeClient, OperationTimeouts, Propagator,
+    BeaconNodeClient, MockBeaconNodeClient, MockMethod, OperationTimeouts, Propagator,
     SignedValidatorRegistration,
 };
 use builder::{BuilderService, RegistrationSigner};
@@ -101,9 +103,11 @@ const METRICS_TASK: &str = "metrics_server";
 const WATCHDOG: Duration = Duration::from_secs(120);
 const RECORDING: &str = "The wiremock server must record the requests.";
 const SLOT: Duration = Duration::from_millis(SLOT_MS);
-/// The builder-flag tests start at the first slot of this epoch, epoch E.
+/// The tests start in the first slot of epoch E.
 const EPOCH_E: u64 = 3;
-/// These are the secret-key bytes of the builder-enabled keys A and B.
+/// The runner logs this event at the end of the registration step of an epoch.
+const REGISTRATION_DONE: &str = "Epoch builder registration completed";
+/// These constants contain the bytes of the secret keys for validators A and B.
 const KEY_A: [u8; 32] = [0x2b; 32];
 const KEY_B: [u8; 32] = [0x2c; 32];
 
@@ -221,106 +225,142 @@ fn signatures_by_key(entries: &[Value]) -> BTreeMap<String, Value> {
 }
 
 /// W4-E6b3 (654-AC10, 696-5). No keymanager route sets `builder_proposals`.
-/// Thus the test uses the keymanager DELETE, which is the runtime keymanager
-/// writer. The epoch E POST carries keys A and B. Then
-/// `ValidatorManagerAdapter::remove_validator` removes key A. These
-/// conditions must hold for the epoch E+1 POST:
+/// The test uses `ValidatorManagerAdapter::remove_validator` to remove key A
+/// from the store. The keymanager DELETE uses this adapter. These conditions
+/// must hold:
 ///
-/// - The POST does not carry key A.
-/// - The signer makes no new registration signature.
-/// - The POST carries only key B, with its epoch-E registration.
+/// - The epoch E POST must contain keys A and B.
+/// - After the adapter removes key A, the epoch E+1 POST must contain only
+///   the epoch E registration for key B.
+/// - The service must make no calls to sign a registration in epoch E+1.
+///
+/// `registration_epoch` also requires one POST in each epoch, in the first
+/// slot of that epoch.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_builder_flag_off_via_keymanager_evicts_registration() {
     let opts = OrchestratorOpts { builder_keys: vec![KEY_A, KEY_B] };
     let mut orch = orchestrator_at_slot(EPOCH_E * SLOTS_PER_EPOCH, opts).await;
     let (a, b) = (orch.pubkeys[0], orch.pubkeys[1]);
-    let epoch_e = orch.registration_post(1).await;
-    assert_eq!(keys_of(&epoch_e), BTreeSet::from([a, b]), "The epoch E POST must carry A and B.");
-    let signed = orch.signer.total();
+    let epoch_e = orch.registration_epoch(EPOCH_E).await;
+    assert_epoch_e(&epoch_e, a, b);
 
     let removed = ValidatorManagerAdapter::new(Arc::clone(&orch.store)).remove_validator(&a);
-    assert_eq!(removed, Ok(true), "The keymanager DELETE must remove key A from the store.");
+    assert_eq!(removed, Ok(true), "The validator manager must remove key A from the store.");
     orch.advance_to_epoch(EPOCH_E + 1).await;
-    let epoch_e1 = orch.registration_post(2).await;
+    let epoch_e1 = orch.registration_epoch(EPOCH_E + 1).await;
 
     assert!(
-        !keys_of(&epoch_e1).contains(&a),
-        "The epoch E+1 POST must not carry key A after the keymanager DELETE."
+        !keys_of(&epoch_e1.post).contains(&a),
+        "After the keymanager DELETE, the epoch E+1 POST must not contain key A."
     );
-    assert_eq!(
-        orch.signer.since(signed),
-        Vec::<[u8; 48]>::new(),
-        "The signer must make no new registration signature in epoch E+1."
-    );
-    assert_eq!(
-        epoch_e1,
-        entries_of(&epoch_e, &b),
-        "The epoch E+1 POST must carry only key B, with its epoch-E registration."
-    );
+    assert_epoch_e1(&epoch_e1, &epoch_e, &b);
     orch.shut_down().await;
 }
 
-/// W4-E6b3 (654-AC11, 696-5). The proposer-config URL writer sets the builder
-/// flag of key A to off, and then to on. The epoch E POST carries keys A and
-/// B. These conditions must hold:
+/// W4-E6b3 (654-AC11, 696-5). The test uses `ProposerConfigApplier::apply` to
+/// set `builder_enabled` to `false` for key A. Then the test sets
+/// `builder_enabled` to `true` for key A. These conditions must hold:
 ///
-/// - After `builder_enabled: false`, the epoch E+1 POST does not carry key A.
-/// - The signer makes no new registration signature in epoch E+1.
-/// - The epoch E+1 POST carries only key B, with its epoch-E registration.
-/// - After `builder_enabled: true`, the epoch E+2 POST carries key A.
-/// - The signer makes one new registration signature in epoch E+2, for key A.
+/// - The epoch E POST must contain keys A and B.
+/// - While `builder_enabled` is `false`, the epoch E+1 POST must contain only
+///   the epoch E registration for key B.
+/// - The service must make no calls to sign a registration in epoch E+1.
+/// - After the test sets `builder_enabled` to `true`, the epoch E+2 POST must
+///   contain key A.
+/// - In epoch E+2, the service must make one call to sign a registration for
+///   key A.
+/// - The epoch E+2 POST must contain only the new registration for key A and
+///   the epoch E registration for key B.
+///
+/// `registration_epoch` also requires one POST in each epoch, in the first
+/// slot of that epoch.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_builder_flag_off_via_proposer_config_url_evicts_registration() {
     let opts = OrchestratorOpts { builder_keys: vec![KEY_A, KEY_B] };
     let mut orch = orchestrator_at_slot(EPOCH_E * SLOTS_PER_EPOCH, opts).await;
     let (a, b) = (orch.pubkeys[0], orch.pubkeys[1]);
     let mut applier = ProposerConfigApplier::new();
-    let epoch_e = orch.registration_post(1).await;
-    assert_eq!(keys_of(&epoch_e), BTreeSet::from([a, b]), "The epoch E POST must carry A and B.");
-    let signed = orch.signer.total();
+    let epoch_e = orch.registration_epoch(EPOCH_E).await;
+    assert_epoch_e(&epoch_e, a, b);
 
     applier.apply(&orch.store, Some(vec![builder_flag(&a, false)]), None);
     orch.advance_to_epoch(EPOCH_E + 1).await;
-    let epoch_e1 = orch.registration_post(2).await;
+    let epoch_e1 = orch.registration_epoch(EPOCH_E + 1).await;
 
     assert!(
-        !keys_of(&epoch_e1).contains(&a),
-        "The epoch E+1 POST must not carry key A after builder_enabled false."
+        !keys_of(&epoch_e1.post).contains(&a),
+        "While `builder_enabled` is `false`, the epoch E+1 POST must not contain key A."
     );
-    assert_eq!(
-        orch.signer.since(signed),
-        Vec::<[u8; 48]>::new(),
-        "The signer must make no new registration signature in epoch E+1."
-    );
-    assert_eq!(
-        epoch_e1,
-        entries_of(&epoch_e, &b),
-        "The epoch E+1 POST must carry only key B, with its epoch-E registration."
-    );
-    let signed = orch.signer.total();
+    assert_epoch_e1(&epoch_e1, &epoch_e, &b);
 
     applier.apply(&orch.store, Some(vec![builder_flag(&a, true)]), None);
     orch.advance_to_epoch(EPOCH_E + 2).await;
-    let epoch_e2 = orch.registration_post(3).await;
+    let epoch_e2 = orch.registration_epoch(EPOCH_E + 2).await;
 
     assert!(
-        keys_of(&epoch_e2).contains(&a),
-        "The epoch E+2 POST must carry key A after builder_enabled true."
+        keys_of(&epoch_e2.post).contains(&a),
+        "After the test sets `builder_enabled` to `true`, the epoch E+2 POST must contain key A."
     );
     assert_eq!(
-        orch.signer.since(signed),
+        keys_of(&epoch_e2.signed),
         vec![a],
-        "The signer must make one new registration signature in epoch E+2, for key A."
+        "In epoch E+2, the service must make one call to sign a registration for key A."
+    );
+    assert_eq!(
+        by_key(&epoch_e2.post),
+        by_key(&[epoch_e2.signed.clone(), entries_of(&epoch_e.post, &b)].concat()),
+        "The epoch E+2 POST must contain only the new registration for key A and the epoch E \
+         registration for key B."
     );
     orch.shut_down().await;
 }
 
-/// Returns the `message.pubkey` of each registration.
-fn keys_of(posted: &[SignedValidatorRegistration]) -> BTreeSet<[u8; 48]> {
-    posted.iter().map(|entry| entry.message.pubkey).collect()
+/// Checks the epoch E record of the two builder-flag tests.
+fn assert_epoch_e(epoch_e: &EpochRegistration, a: [u8; 48], b: [u8; 48]) {
+    let mut both = vec![a, b];
+    both.sort_unstable();
+    assert_eq!(keys_of(&epoch_e.post), both, "The epoch E POST must contain keys A and B.");
+    assert_eq!(
+        keys_of(&epoch_e.signed),
+        both,
+        "In epoch E, the service must make one call to sign a registration for each of keys A \
+         and B."
+    );
+    assert_eq!(
+        by_key(&epoch_e.post),
+        by_key(&epoch_e.signed),
+        "The epoch E POST must contain the registrations that the signer signs in epoch E."
+    );
 }
 
-/// Returns the registrations of `pubkey` in `posted`.
+/// Checks the epoch E+1 record of the two builder-flag tests. Key A is not
+/// in the builder set in epoch E+1.
+fn assert_epoch_e1(epoch_e1: &EpochRegistration, epoch_e: &EpochRegistration, b: &[u8; 48]) {
+    assert_eq!(
+        keys_of(&epoch_e1.signed),
+        Vec::<[u8; 48]>::new(),
+        "The service must make no calls to sign a registration in epoch E+1."
+    );
+    assert_eq!(
+        epoch_e1.post,
+        entries_of(&epoch_e.post, b),
+        "The epoch E+1 POST must contain only the epoch E registration for key B."
+    );
+}
+
+/// Gets the `message.pubkey` values of the registrations, in sorted order.
+fn keys_of(posted: &[SignedValidatorRegistration]) -> Vec<[u8; 48]> {
+    by_key(posted).iter().map(|entry| entry.message.pubkey).collect()
+}
+
+/// Gets a copy of the registrations, in the order of `message.pubkey`.
+fn by_key(posted: &[SignedValidatorRegistration]) -> Vec<SignedValidatorRegistration> {
+    let mut sorted = posted.to_vec();
+    sorted.sort_by_key(|entry| entry.message.pubkey);
+    sorted
+}
+
+/// Gets the registrations for `pubkey` from `posted`.
 fn entries_of(
     posted: &[SignedValidatorRegistration],
     pubkey: &[u8; 48],
@@ -328,7 +368,7 @@ fn entries_of(
     posted.iter().filter(|entry| entry.message.pubkey == *pubkey).cloned().collect()
 }
 
-/// Returns a proposer-config URL entry that sets only the builder flag of
+/// Makes a proposer configuration update that sets only `builder_enabled` for
 /// `pubkey`.
 fn builder_flag(pubkey: &[u8; 48], enabled: bool) -> UrlUpdate {
     UrlUpdate {
@@ -567,6 +607,12 @@ struct PausedSlotClock {
 impl PausedSlotClock {
     fn since_genesis(&self) -> Duration {
         Duration::from_millis(self.start_slot * SLOT_MS) + self.origin.elapsed()
+    }
+
+    /// Gets the slot number at the virtual time `at`.
+    fn slot_at(&self, at: Instant) -> u64 {
+        let slots = at.duration_since(self.origin).as_millis() / u128::from(SLOT_MS);
+        self.start_slot + u64::try_from(slots).expect("The slot must fit in u64.")
     }
 }
 
@@ -966,43 +1012,57 @@ async fn mount_beacon_node(server: &MockServer, pubkey: &str) {
 
 /// `orchestrator_at_slot` reads these options.
 struct OrchestratorOpts {
-    /// The store holds one builder-enabled key for each of these secret keys.
+    /// Each secret key gives one validator with the builder enabled.
     builder_keys: Vec<[u8; 32]>,
 }
 
-/// This is one `DutyOrchestrator::run` and its epoch boundary runner, with
-/// in-process doubles.
+/// This harness keeps `DutyOrchestrator::run`, its epoch boundary runner, and
+/// the mock beacon node of the test process.
 struct Orchestrated {
     store: Arc<ValidatorStore>,
     mock: Arc<MockBeaconNodeClient>,
     signer: Arc<CountingSigner>,
+    clock: Arc<PausedSlotClock>,
     handle: OrchestratorHandle,
-    /// These are the pubkeys of `OrchestratorOpts::builder_keys`, in order.
+    /// The public keys, in the order of `OrchestratorOpts::builder_keys`.
     pubkeys: Vec<[u8; 48]>,
-    /// This is the number of registration POSTs that the mock received.
-    posts: watch::Receiver<usize>,
-    /// This is the slot at the current paused time.
+    /// The epochs of the `REGISTRATION_DONE` events, in event order.
+    done: watch::Receiver<Vec<u64>>,
+    /// The number of registration POSTs that `registration_epoch` checked.
+    checked_posts: usize,
+    /// The number of signer calls that `registration_epoch` checked.
+    checked_calls: usize,
+    /// The slot number at the current virtual time.
     slot: u64,
     run: JoinHandle<Result<(), OrchestratorError>>,
     runner: JoinHandle<()>,
+    _events: DefaultGuard,
+}
+
+/// The registration POST and the signer calls of one epoch.
+struct EpochRegistration {
+    /// The body of the one registration POST.
+    post: Vec<SignedValidatorRegistration>,
+    /// The registration and the signature of each signer call.
+    signed: Vec<SignedValidatorRegistration>,
 }
 
 /// Starts `DutyOrchestrator::run` and the epoch boundary runner at the start
-/// of `slot`. The fork schedule has no Gloas epoch, thus the registration
-/// step sends a POST in each epoch. Each duty phase is due at slot start, and
-/// each epoch has no duties.
+/// of `slot`. The fork schedule has no Gloas activation epoch. The
+/// registration step sends a POST in each epoch. The duty phase offsets are
+/// zero. The mock gives no duties.
 async fn orchestrator_at_slot(slot: u64, opts: OrchestratorOpts) -> Orchestrated {
-    let (posted, posts) = watch::channel(0);
+    let (steps, done) = watch::channel(Vec::new());
+    let events = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(RegistrationSteps(steps)),
+    );
     let mock = Arc::new(
         MockBeaconNodeClient::new()
             .with_get_attester_duties(|_, _| Ok(no_duties()))
             .with_get_proposer_duties(|_| Ok(no_duties()))
             .with_prepare_beacon_proposer(|_| Ok(()))
             .with_submit_beacon_committee_subscriptions(|_| Ok(()))
-            .with_register_validators(move |_| {
-                posted.send_modify(|count| *count += 1);
-                Ok(())
-            }),
+            .with_register_validators(|_| Ok(())),
     );
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let store = Arc::new(ValidatorStore::new([0x11; 20], 30_000_000));
@@ -1019,13 +1079,14 @@ async fn orchestrator_at_slot(slot: u64, opts: OrchestratorOpts) -> Orchestrated
         pubkey_map.insert(pubkey.to_bytes(), pubkey);
         key_manager.insert(secret);
     }
-    let slashing = SlashingDb::open_in_memory().expect("The test must open the slashing DB.");
+    let slashing =
+        SlashingDb::open_in_memory().expect("The test must open the slashing database in memory.");
     let service = SignerService::new(
         Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
         Arc::new(slashing),
     );
     let service = Arc::new(service.with_enablement(always_enabled()));
-    let signer = Arc::new(CountingSigner { inner: Arc::clone(&service), signed: Mutex::default() });
+    let signer = Arc::new(CountingSigner { inner: Arc::clone(&service), calls: Mutex::default() });
     let schedule = Arc::new(ForkSchedule::unscheduled_gloas());
     let builder = BuilderService::new(
         signer.clone(),
@@ -1045,8 +1106,9 @@ async fn orchestrator_at_slot(slot: u64, opts: OrchestratorOpts) -> Orchestrated
     let config = OrchestratorConfig::new([0x11; 32], schedule)
         .with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start));
     let indices: Vec<String> = (0..pubkeys.len()).map(|index| index.to_string()).collect();
+    let clock = Arc::new(PausedSlotClock { origin: Instant::now(), start_slot: slot });
     let deps = OrchestratorDeps::for_test(
-        Arc::new(PausedSlotClock { origin: Instant::now(), start_slot: slot }),
+        Arc::clone(&clock),
         Arc::new(DutyTracker::new(mock.clone(), indices.clone())),
         service,
         Arc::new(Propagator::new(Arc::clone(&mock))),
@@ -1064,12 +1126,26 @@ async fn orchestrator_at_slot(slot: u64, opts: OrchestratorOpts) -> Orchestrated
     let runner = orchestrator.take_epoch_boundary_runner().expect("The runner must be present.");
     let runner = tokio::spawn(runner.run());
     let run = tokio::spawn(async move { orchestrator.run().await });
-    Orchestrated { store, mock, signer, handle, pubkeys, posts, slot, run, runner }
+    Orchestrated {
+        store,
+        mock,
+        signer,
+        clock,
+        handle,
+        pubkeys,
+        done,
+        checked_posts: 0,
+        checked_calls: 0,
+        slot,
+        run,
+        runner,
+        _events: events,
+    }
 }
 
 impl Orchestrated {
-    /// Moves paused time to the start of `epoch`, one whole slot for each
-    /// `tokio::time::advance` call.
+    /// Advances virtual time to the start of `epoch`. Each call to
+    /// `tokio::time::advance` moves time forward by one slot.
     async fn advance_to_epoch(&mut self, epoch: u64) {
         while self.slot < epoch * SLOTS_PER_EPOCH {
             tokio::time::advance(SLOT).await;
@@ -1077,34 +1153,91 @@ impl Orchestrated {
         }
     }
 
-    /// Waits in the current slot until the mock has `count` registration
-    /// POSTs. Returns the body of POST number `count`.
-    async fn registration_post(&mut self, count: usize) -> Vec<SignedValidatorRegistration> {
-        let arrived = tokio::time::timeout(SLOT / 2, self.posts.wait_for(|posts| *posts >= count))
-            .await
-            .map(|seen| seen.map(|_| ()));
+    /// Waits for the `REGISTRATION_DONE` event of `epoch`. The wait has a time
+    /// limit of half a slot. Then gets each registration POST and each signer
+    /// call that the last call of this function did not get. These conditions
+    /// must hold:
+    ///
+    /// - Each of these POSTs must arrive in the first slot of `epoch`.
+    /// - The epoch must have one POST.
+    async fn registration_epoch(&mut self, epoch: u64) -> EpochRegistration {
+        let done = self.done.wait_for(|epochs| epochs.contains(&epoch));
+        let done = tokio::time::timeout(SLOT / 2, done).await.map(|seen| seen.map(|_| ()));
         assert!(
-            matches!(arrived, Ok(Ok(()))),
-            "The beacon node must receive registration POST {count} in slot {}.",
-            self.slot
+            matches!(done, Ok(Ok(()))),
+            "The runner must end the registration step of epoch {epoch} before the time limit."
         );
-        self.mock.register_validators_calls().swap_remove(count - 1)
+        let posts = self.mock.register_validators_calls().split_off(self.checked_posts);
+        let stamps = self.mock.call_stamps().into_iter();
+        let stamps = stamps.filter(|stamp| stamp.method == MockMethod::RegisterValidators);
+        let expected_slot = epoch * SLOTS_PER_EPOCH;
+        for (count, stamp) in (self.checked_posts + 1..).zip(stamps.skip(self.checked_posts)) {
+            let actual_slot = self.clock.slot_at(stamp.at);
+            assert_eq!(
+                actual_slot, expected_slot,
+                "Registration POST {count} must arrive in slot {expected_slot}. The recorded slot \
+                 is {actual_slot}."
+            );
+        }
+        assert_eq!(
+            posts.len(),
+            1,
+            "In epoch {epoch}, the service must send one registration POST. The POSTs are \
+             {posts:?}."
+        );
+        let signed = self.signer.calls()[self.checked_calls..].to_vec();
+        self.checked_posts += posts.len();
+        self.checked_calls += signed.len();
+        EpochRegistration { post: posts.concat(), signed }
     }
 
-    /// Requests the shutdown. Asserts that `run` returns `Ok` and that the
-    /// runner task ends.
+    /// Stops the orchestrator and its epoch boundary runner. The test checks
+    /// that both tasks stop and that `DutyOrchestrator::run` returns `Ok`.
     async fn shut_down(self) {
         self.handle.shutdown();
-        let result = self.run.await.expect("The run task must not panic.");
+        let result = self.run.await.expect("The orchestrator task must not panic.");
         assert!(
             result.is_ok(),
-            "DutyOrchestrator::run must return Ok after the shutdown: {result:?}"
+            "`DutyOrchestrator::run` must return `Ok` on shutdown. The result is `{result:?}`."
         );
-        self.runner.await.expect("The runner task must not panic.");
+        self.runner.await.expect("The epoch boundary runner task must not panic.");
     }
 }
 
-/// Returns a duty answer that has no duties.
+/// Records the epoch of each `REGISTRATION_DONE` event.
+struct RegistrationSteps(watch::Sender<Vec<u64>>);
+
+impl<S: Subscriber> Layer<S> for RegistrationSteps {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = StepFields::default();
+        event.record(&mut fields);
+        if let (REGISTRATION_DONE, Some(epoch)) = (fields.message.as_str(), fields.epoch) {
+            self.0.send_modify(|epochs| epochs.push(epoch));
+        }
+    }
+}
+
+#[derive(Default)]
+struct StepFields {
+    message: String,
+    epoch: Option<u64>,
+}
+
+impl Visit for StepFields {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "epoch" {
+            self.epoch = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+/// Gives a duty response with no duties.
 fn no_duties<T>() -> DependentRootResponse<Vec<T>> {
     DependentRootResponse {
         dependent_root: root("00"),
@@ -1113,26 +1246,17 @@ fn no_duties<T>() -> DependentRootResponse<Vec<T>> {
     }
 }
 
-/// This `RegistrationSigner` records the key of each builder registration
-/// that it signs. The real `SignerService` makes each signature.
+/// This `RegistrationSigner` records each call to sign a registration. The
+/// wrapper records the registration before each call. `SignerService` handles
+/// the call. Then the wrapper adds the signature to the record.
 struct CountingSigner {
     inner: Arc<SignerService>,
-    signed: Mutex<Vec<[u8; 48]>>,
+    calls: Mutex<Vec<SignedValidatorRegistration>>,
 }
 
 impl CountingSigner {
-    fn signed(&self) -> MutexGuard<'_, Vec<[u8; 48]>> {
-        self.signed.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Returns the number of registration signatures.
-    fn total(&self) -> usize {
-        self.signed().len()
-    }
-
-    /// Returns the key of each registration signature after the first `from`.
-    fn since(&self, from: usize) -> Vec<[u8; 48]> {
-        self.signed()[from..].to_vec()
+    fn calls(&self) -> MutexGuard<'_, Vec<SignedValidatorRegistration>> {
+        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -1144,9 +1268,18 @@ impl RegistrationSigner for CountingSigner {
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
-        self.signed().push(pubkey.to_bytes());
-        ValidatorSigner::sign_builder_registration(&*self.inner, registration, pubkey, fork_version)
-            .await
+        let call = {
+            let mut calls = self.calls();
+            let message = registration.clone();
+            calls.push(SignedValidatorRegistration { message, signature: Vec::new() });
+            calls.len() - 1
+        };
+        let inner = &*self.inner;
+        let signature =
+            ValidatorSigner::sign_builder_registration(inner, registration, pubkey, fork_version)
+                .await?;
+        self.calls()[call].signature = signature.to_bytes().to_vec();
+        Ok(signature)
     }
 
     async fn sign_proposer_preferences(
