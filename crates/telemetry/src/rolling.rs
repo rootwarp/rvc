@@ -276,7 +276,7 @@ pub(crate) mod tests {
         text
     }
 
-    /// Writes one full MiB of `fill` and waits for the cleanup thread.
+    /// The helper writes one MiB of `fill`. It then waits for the cleanup thread.
     fn roll(writer: &mut RollingWriter, fill: u8) {
         writer.write_all(&vec![fill; MIB]).unwrap();
         writer.join_cleanup();

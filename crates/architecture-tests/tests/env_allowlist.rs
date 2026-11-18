@@ -147,8 +147,8 @@ const ECOSYSTEM_CONFIG_WINS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The reason for each Google ADC name in class 3.
-const GCP_ADC: &str = "Google ADC lookup for the `gcp` tracing exporter (`telemetry/src/gcp.rs`)";
+/// The constant gives the reason for each Google ADC name in class 3.
+const GCP_ADC: &str = "The `gcp` exporter reads Google ADC settings in `telemetry/src/gcp.rs`.";
 
 /// One shrinking-only row: file, 1-based line, allowed expr, constructor-arg
 /// idents that flow in, reason.

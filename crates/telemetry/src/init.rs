@@ -603,7 +603,7 @@ mod tests {
             endpoint: format!("{}/v1/traces", server.uri()),
             ..Default::default()
         };
-        let (_layer, guard) = init_tracing(&config).expect("init_tracing");
+        let (_layer, guard) = init_tracing(&config).expect("Tracing must initialize.");
         let flushed = tokio::task::spawn_blocking(move || {
             guard.provider.tracer("test").in_span("otlp-export", |_| {});
             guard.provider.shutdown()

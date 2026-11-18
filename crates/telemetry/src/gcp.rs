@@ -186,7 +186,11 @@ pub(crate) mod tests {
     /// When set, the `gcp` exporter uses this endpoint and these credentials one time.
     pub(crate) static DESTINATION: Mutex<Option<(String, Credentials)>> = Mutex::new(None);
 
-    /// A fake ADC source. `Tokens` gives `Bearer token-N` for call N and a quota header.
+    /// The fake ADC source has three modes:
+    ///
+    /// - `Tokens` gives `Bearer token-N` for call N and a quota header.
+    /// - `NoHeaders` gives `NotModified`.
+    /// - `Stall` does not answer.
     #[derive(Debug)]
     enum FakeCredentials {
         Tokens(AtomicUsize),
@@ -279,7 +283,11 @@ pub(crate) mod tests {
             vars.remove(remove);
         }
         let found = detect_project_id(&vars).await;
-        assert_eq!(found.as_deref(), Some("metadata-p"), "The metadata ID must be trimmed.");
+        assert_eq!(
+            found.as_deref(),
+            Some("metadata-p"),
+            "The reader must remove whitespace around the metadata ID."
+        );
     }
 
     #[tokio::test]
@@ -324,7 +332,7 @@ pub(crate) mod tests {
         let resource = Resource::builder_empty().with_service_name("rvc-test").build();
         let (exporter, resource) =
             build_exporter(&endpoint, credentials, Handle::current(), "test-p".into(), resource)
-                .expect("build_exporter");
+                .expect("The exporter must initialize.");
 
         let flushed = tokio::task::spawn_blocking(move || {
             let provider = SdkTracerProvider::builder()
@@ -374,7 +382,7 @@ pub(crate) mod tests {
         assert_eq!(Arc::strong_count(&alive), 1, "The deadline must stop the credential request.");
     }
 
-    /// Runs the child test below in a new process with a set environment.
+    /// The test runs the child test below in a new process with a set environment.
     /// Thus this process does not change its own environment.
     #[test]
     fn init_tracing_selects_the_gcp_exporter_with_the_env_project() {
