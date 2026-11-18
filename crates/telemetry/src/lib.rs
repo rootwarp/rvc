@@ -12,9 +12,12 @@
 pub mod config;
 pub mod file_appender;
 pub mod format;
+#[cfg(feature = "gcp-trace")]
+pub mod gcp;
 pub mod health_probe;
 pub mod init;
 pub mod propagation;
+mod rolling;
 pub mod shutdown;
 pub mod trace_id;
 

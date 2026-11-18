@@ -172,16 +172,8 @@ mod tests {
         drop(file_guard);
         std::thread::sleep(std::time::Duration::from_millis(150));
 
-        let path = dir.path().join("trace-id-test.log");
-        let contents = fs::read_to_string(&path).unwrap_or_else(|_| {
-            // logroller may suffix the name; take any file in the directory.
-            let entry = fs::read_dir(dir.path())
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .next()
-                .expect("log file created");
-            fs::read_to_string(entry.path()).expect("read log file")
-        });
+        let contents = fs::read_to_string(dir.path().join("trace-id-test.log"))
+            .expect("The active log file must have the configured name.");
         let line = contents
             .lines()
             .find(|l| l.contains("file appender correlated event"))

@@ -616,6 +616,27 @@ mod tests {
         result.unwrap().shutdown().ok();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_exporter_sends_spans_to_the_configured_endpoint() {
+        use opentelemetry::trace::Tracer;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let config = TelemetryConfig {
+            endpoint: format!("{}/v1/traces", server.uri()),
+            ..Default::default()
+        };
+        let (_layer, guard) = init_tracing(&config).expect("init_tracing");
+        let flushed = tokio::task::spawn_blocking(move || {
+            guard.provider.tracer("test").in_span("otlp-export", |_| {});
+            guard.provider.shutdown()
+        });
+        flushed.await.unwrap().expect("The export must succeed.");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "The exporter must send one request to the endpoint.");
+    }
+
     #[test]
     fn test_init_tracing_with_service_version() {
         let config =

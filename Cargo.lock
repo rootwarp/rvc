@@ -4837,12 +4837,18 @@ name = "rvc-telemetry"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "flate2",
+ "google-cloud-auth",
+ "http",
  "logroller",
  "opentelemetry",
  "opentelemetry-gcloud-trace",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest 0.12.28",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4851,6 +4857,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
