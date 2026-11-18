@@ -145,25 +145,91 @@ mod tests {
         assert!(!rvc::detection_marker::force_window_path(dir.path()).exists());
     }
 
+    /// A legacy fallback marker records no owner, so the command keeps it.
+    /// The test requires these results:
+    ///
+    /// - The command returns an error that names the legacy marker and gives
+    ///   the recovery step.
+    /// - The legacy marker stays.
+    /// - The keystore marker stays.
     #[test]
-    fn clear_removes_a_fallback_marker_beside_the_slashing_db() {
-        let keys = tempfile::tempdir().expect("keys");
-        let slash = tempfile::tempdir().expect("slash");
-        let marker =
-            rvc::detection_marker::DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![] };
-        rvc::detection_marker::write_marker(keys.path(), &marker).expect("keystore marker");
-        rvc::detection_marker::write_marker(slash.path(), &marker).expect("fallback marker");
+    fn clear_keeps_a_legacy_fallback_marker_beside_the_slashing_db() {
+        use rvc::detection_marker::{inspect, marker_path, MarkerInspect};
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        write_marker_without_keys(keys.path());
+        write_marker_without_keys(slash.path());
         let db = slash.path().join("slashing.sqlite");
-        execute_clear_detection(keys.path(), Some(&db), true).expect("clear");
-        assert!(matches!(
-            rvc::detection_marker::inspect(keys.path()),
-            rvc::detection_marker::MarkerInspect::Absent
-        ));
-        assert!(matches!(
-            rvc::detection_marker::inspect(slash.path()),
-            rvc::detection_marker::MarkerInspect::Absent
-        ));
-        assert!(rvc::detection_marker::force_window_path(keys.path()).is_file());
+
+        let result = execute_clear_detection(keys.path(), Some(&db), true);
+
+        let err = result.map_err(|err| err.to_string()).err().unwrap_or_default();
+        let legacy = marker_path(slash.path()).display().to_string();
+        assert!(
+            err.contains(&legacy) && err.contains("clear-detection"),
+            "The command must fail with an error that names {legacy} and gives the recovery \
+             step. The error is: {err:?}"
+        );
+        assert!(
+            matches!(inspect(slash.path()), MarkerInspect::Present(_)),
+            "The legacy fallback marker must stay."
+        );
+        assert!(
+            matches!(inspect(keys.path()), MarkerInspect::Present(_)),
+            "The keystore marker must stay."
+        );
+    }
+
+    /// The owner of the owned fallback marker of `a.sqlite` is not known.
+    /// Each row requires these results:
+    ///
+    /// - The command returns an error that names the owned marker.
+    /// - The owned entry stays and does not change.
+    /// - The keystore marker stays.
+    #[test]
+    fn clear_detection_stops_on_an_owned_fallback_marker_with_an_unknown_owner() {
+        use rvc::detection_marker::{inspect, MarkerInspect};
+        let no_owner = br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#;
+        let rows: [(&str, Option<&[u8]>); 3] = [
+            ("a file that does not parse", Some(b"{".as_slice())),
+            ("a marker that records no owner", Some(no_owner.as_slice())),
+            ("a directory", None),
+        ];
+        for (case, bytes) in rows {
+            let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+            let slash = tempfile::tempdir().expect("The test must create the database directory.");
+            write_marker_without_keys(keys.path());
+            let owned = slash.path().join(".rvc.doppelganger_detected.a.sqlite");
+            if let Some(bytes) = bytes {
+                std::fs::write(&owned, bytes).expect("The test must write the owned entry.");
+            } else {
+                std::fs::create_dir(&owned).expect("The test must create the owned entry.");
+            }
+
+            let result =
+                execute_clear_detection(keys.path(), Some(&slash.path().join("a.sqlite")), true);
+
+            let err = result.map_err(|err| err.to_string()).err().unwrap_or_default();
+            assert!(
+                err.contains(&owned.display().to_string()),
+                "The command must fail with an error that names {}. The input case is {case}. \
+                 The error is: {err:?}",
+                owned.display()
+            );
+            if let Some(bytes) = bytes {
+                assert_eq!(
+                    std::fs::read(&owned).map_err(|err| err.to_string()),
+                    Ok(bytes.to_vec()),
+                    "The owned entry must keep its bytes. The input case is {case}."
+                );
+            } else {
+                assert!(owned.is_dir(), "The owned directory must stay. The input case is {case}.");
+            }
+            assert!(
+                matches!(inspect(keys.path()), MarkerInspect::Present(_)),
+                "The keystore marker must stay. The input case is {case}."
+            );
+        }
     }
 
     /// The owned fallback marker of `a.sqlite` belongs to keystore A. The

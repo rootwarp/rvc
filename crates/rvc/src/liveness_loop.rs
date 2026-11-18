@@ -3967,6 +3967,65 @@ mod tests {
         );
     }
 
+    /// The keystore directory does not exist, so the record write and the
+    /// keystore marker write fail. An injected failure stops the fallback
+    /// write. The test requires these results:
+    ///
+    /// - While the three writes fail, the drain stays active and the durable
+    ///   flag stays clear.
+    /// - After the injection stops, the fallback write succeeds on the next
+    ///   attempt, and the drain returns exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_retries_while_three_writes_fail_and_exits_12_after_one_succeeds() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let fallback = tempfile::tempdir().expect("The test must create the database directory.");
+        let guard = crate::detection_marker::arm_marker_write_failures(u32::MAX);
+        let m = latched_machine();
+        let machine = Arc::clone(&m);
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection = detection_shutdown(
+            m,
+            root.path().join("keys"),
+            Some(fallback_in(fallback.path())),
+            test_clock(),
+        );
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if drain.is_finished() {
+                break;
+            }
+        }
+
+        assert!(!drain.is_finished(), "The drain must stay active while the three writes fail.");
+        assert!(
+            !machine.detection_persisted(),
+            "The durable flag must stay clear while the three writes fail."
+        );
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the fallback write succeeds. The result is \
+             {res:?}."
+        );
+        assert!(
+            matches!(
+                crate::detection_marker::inspect_fallback(&fallback_in(fallback.path())).owned,
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The fallback marker must be present after the drain."
+        );
+    }
+
     /// A write whose fsync already returned `Ok` exits 12 even when every later rewrite fails.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn durable_marker_exits_12_when_a_later_rewrite_fails() {

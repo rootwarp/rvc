@@ -1424,6 +1424,87 @@ mod tests {
         );
     }
 
+    /// Run boot with the keystore `keys` and the slashing database `db`.
+    /// Detection is off. Return the boot error.
+    async fn boot_with_db(
+        keys: &std::path::Path,
+        db: &std::path::Path,
+        allow_fresh_db: bool,
+    ) -> BootstrapError {
+        let config = crate::config::Config {
+            keystore_path: keys.to_path_buf(),
+            slashing_db_path: db.to_path_buf(),
+            allow_fresh_db,
+            doppelganger_detection: false,
+            ..Default::default()
+        };
+        let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+        let options = RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: bn_manager::OperationTimeouts::default(),
+        };
+        run(config, options, executor, rx).await.expect_err("Boot must return an error.")
+    }
+
+    /// A directory is at the owned fallback path of `a.sqlite`, so the
+    /// marker cannot be read. The database does not exist. Boot must return
+    /// exit code 12 before it opens the database.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_an_unreadable_owned_fallback_marker() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let owned = slash.path().join(".rvc.doppelganger_detected.a.sqlite");
+        std::fs::create_dir(&owned).expect("The test must create a directory at the owned path.");
+
+        let err = boot_with_db(keys.path(), &slash.path().join("a.sqlite"), false).await;
+
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "Boot must return exit code 12 for the unreadable entry {}. The error is: {err}",
+            owned.display()
+        );
+    }
+
+    /// Boot checks the file name of the slashing database before SQLite
+    /// opens it. A new database is allowed. Each row requires these results:
+    ///
+    /// - Boot returns exit code 1 with an error that gives the reason.
+    /// - No file is at the database path after boot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_a_db_name_that_cannot_get_a_fallback_marker() {
+        let rows = [
+            (
+                "a name in the reserved name space",
+                ".rvc.doppelganger_detected.other.sqlite".to_string(),
+                "name space",
+            ),
+            ("a name of 229 bytes", format!("{}.sqlite", "x".repeat(222)), "at most 255 bytes"),
+        ];
+        for (case, name, reason) in rows {
+            let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+            let slash = tempfile::tempdir().expect("The test must create the database directory.");
+            let db = slash.path().join(&name);
+
+            let err = boot_with_db(keys.path(), &db, true).await;
+
+            assert_eq!(
+                err.exit_code(),
+                1,
+                "Boot must return exit code 1 for {case}. The error is: {err}"
+            );
+            assert!(
+                err.to_string().contains(reason),
+                "The error must give the reason \"{reason}\" for {case}. The error is: {err}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&db).is_err(),
+                "Boot must not create a file at the database path for {case}."
+            );
+        }
+    }
+
     #[tokio::test]
     async fn detection_enabled_refuses_a_keystore_dir_that_cannot_hold_the_marker() {
         let missing = std::env::temp_dir().join(format!(

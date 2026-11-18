@@ -123,6 +123,16 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// File name of the lock that serializes the writes and the clears of the
+/// fallback markers in one database directory.
+pub const FALLBACK_LOCK_FILENAME: &str = ".rvc.doppelganger_lock";
+
+/// Refuse a slashing database file name that rvc cannot protect.
+pub fn check_slashing_db_name(keystore_dir: &Path, slashing_db_path: &Path) -> io::Result<()> {
+    let _ = (keystore_dir, slashing_db_path);
+    Ok(())
+}
+
 /// File name of the fallback marker of the database at `slashing_db_path`:
 /// [`MARKER_FILENAME`], a dot, and the file name of the database.
 ///
@@ -242,6 +252,8 @@ pub fn clear_fallback_marker(
             cleared.push(FallbackClear::OtherOwner { path, owner });
         }
         Some(Ok(_)) => {
+            #[cfg(test)]
+            run_record_path_hook(&BEFORE_FALLBACK_UNLINK, &path);
             fs::remove_file(&path)?;
             sync_dir(&fallback.dir)?;
             cleared.push(FallbackClear::Removed { path });
@@ -356,12 +368,16 @@ fn encode_marker(marker: &DetectionMarker, keystore_dir: Option<String>) -> io::
 }
 
 fn atomic_write(data_dir: &Path, filename: &str, body: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, data_dir);
     let final_path = data_dir.join(filename);
     let tmp_path = data_dir.join(format!(
         ".{filename}.{}.{}.tmp",
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     ));
+    #[cfg(test)]
+    run_record_path_hook(&BEFORE_MARKER_TEMP_OPEN, &tmp_path);
     let write_result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
         #[cfg(unix)]
@@ -1090,6 +1106,44 @@ thread_local! {
     static AFTER_RECORD_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static FSYNC_TARGETS: RefCell<Vec<FileId>> = const { RefCell::new(Vec::new()) };
     static FSYNC_TARGET_FAILURE: Cell<Option<(FileId, u32)>> = const { Cell::new(None) };
+    static AFTER_MARKER_DIR_RESOLVE: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+    static BEFORE_MARKER_TEMP_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+    static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+}
+
+/// Run `hook` one time on this thread, after a marker writer resolves its
+/// directory and before it opens that directory. The hook gets the
+/// resolved directory.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_after_marker_dir_resolve(
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    arm_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, hook)
+}
+
+/// Run `hook` one time on this thread, before a marker writer opens its
+/// temp file. The hook gets the temp path.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_marker_temp_open(
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    arm_record_path_hook(&BEFORE_MARKER_TEMP_OPEN, hook)
+}
+
+/// Run `hook` one time on this thread, after [`clear_fallback_marker`]
+/// checks the owner and before it removes the owned marker. The hook gets
+/// the owned path.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_fallback_unlink(
+    hook: impl FnOnce(&Path) + 'static,
+) -> RecordPathHookGuard {
+    arm_record_path_hook(&BEFORE_FALLBACK_UNLINK, hook)
 }
 
 /// The device number and the inode number of a file.
@@ -1830,93 +1884,614 @@ mod tests {
         );
     }
 
-    /// `clear_fallback_marker` reads the owner of the owned marker. The
-    /// blocks of the test require these results:
+    /// A marker with one key for the fallback tests.
+    fn sample_marker() -> DetectionMarker {
+        DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![pubkey()] }
+    }
+
+    /// Create the directories `names` in a new temporary directory. Return
+    /// the temporary directory and the paths of the new directories.
+    fn temp_dirs<const N: usize>(names: [&str; N]) -> (tempfile::TempDir, [PathBuf; N]) {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let paths = names.map(|name| root.path().join(name));
+        for path in &paths {
+            fs::create_dir(path).expect("The test must create a directory.");
+        }
+        (root, paths)
+    }
+
+    /// The fallback path of `a.sqlite` in `slash` for the keystore `keys`.
+    fn fallback_of(keys: &Path, slash: &Path) -> FallbackMarkerPath {
+        FallbackMarkerPath::for_config(keys, &slash.join("a.sqlite"))
+            .expect("The configuration must have a fallback path outside the keystore directory.")
+    }
+
+    /// Try the fallback lock of `dir` through a new open file description.
+    /// Return `true` when the try gets the lock.
+    fn try_fallback_lock(dir: &Path) -> bool {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(FALLBACK_LOCK_FILENAME))
+            .expect("The test must open the fallback lock file.");
+        fd_lock::RwLock::new(file).try_write().is_ok()
+    }
+
+    /// Return the text of an `InvalidData` error, or a text that names the
+    /// other result.
+    fn invalid_data_text(result: io::Result<Vec<FallbackClear>>) -> String {
+        match result {
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => err.to_string(),
+            other => format!("The result is not InvalidData: {other:?}"),
+        }
+    }
+
+    /// `clear_fallback_marker` reads the owner of the owned marker. The test
+    /// requires these results:
     ///
-    /// 1. The owner is another keystore: the marker stays, and the result
-    ///    gives the path and the canonical owner.
-    /// 2. The owner is this keystore, and a legacy marker exists: the
-    ///    function removes the two markers.
-    /// 3. The marker records no owner: the function removes it.
-    /// 4. The marker does not parse: the marker stays, and the function
-    ///    returns `InvalidData` with the path.
+    /// 1. When a different keystore owns the marker, the function keeps the
+    ///    marker. It returns the marker path and the canonical path of that
+    ///    keystore.
+    /// 2. When this keystore owns the marker and a legacy marker exists, the
+    ///    function keeps the two markers. It returns `InvalidData` with the
+    ///    legacy path and the recovery step.
+    /// 3. When only the marker of this keystore exists, the function removes
+    ///    it.
+    /// 4. When the marker records no owner, the function keeps it. It returns
+    ///    `InvalidData` with the marker path and the recovery step.
+    /// 5. When the marker does not parse, the function keeps it. It returns
+    ///    `InvalidData` with the marker path.
     #[test]
     fn clear_fallback_marker_removes_only_an_owned_marker_of_this_keystore() {
-        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
-        let keys = root.path().join("keys");
-        let other = root.path().join("other");
-        let slash = root.path().join("slash");
-        for dir in [&keys, &other, &slash] {
-            fs::create_dir(dir).expect("The test must create a directory.");
-        }
-        let fallback = FallbackMarkerPath::for_config(&keys, &slash.join("a.sqlite"))
-            .expect("The database directory must take a fallback marker.");
+        let (_root, [keys, other, slash]) = temp_dirs(["keys", "other", "slash"]);
+        let fallback = fallback_of(&keys, &slash);
         let owned = fallback.owned_path();
-        let marker = DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![pubkey()] };
+        let owned_text = owned.display().to_string();
         let canonical_other = fs::canonicalize(&other)
             .expect("The test must read the canonical path of the other keystore.")
-            .to_string_lossy()
-            .into_owned();
+            .into_os_string()
+            .into_string()
+            .expect("The test path must be valid UTF-8.");
 
-        write_fallback_marker(&fallback, &other.join("."), &marker)
+        write_fallback_marker(&fallback, &other.join("."), &sample_marker())
             .expect("The test must write the marker of the other keystore.");
         assert_eq!(
             clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
             Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner: canonical_other }]),
-            "The function must keep the marker of another keystore and give its canonical owner."
+            "The function must return the marker path and the canonical path of the other \
+             keystore."
         );
         assert!(
             matches!(inspect_at(&owned), MarkerInspect::Present(_)),
-            "The marker of another keystore must stay."
+            "The function must keep the marker of the other keystore."
         );
 
-        write_fallback_marker(&fallback, &keys, &marker)
+        fs::remove_file(&owned).expect("The test must remove the marker of the other keystore.");
+        write_fallback_marker(&fallback, &keys, &sample_marker())
             .expect("The test must write the marker of this keystore.");
-        write_marker(&slash, &marker).expect("The test must write a legacy marker.");
-        assert_eq!(
-            clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
-            Ok(vec![
-                FallbackClear::Removed { path: owned.clone() },
-                FallbackClear::LegacyRemoved { path: marker_path(&slash) },
-            ]),
-            "The function must remove the marker of this keystore and the legacy marker."
+        write_marker(&slash, &sample_marker()).expect("The test must write a legacy marker.");
+        let text = invalid_data_text(clear_fallback_marker(&fallback, &keys));
+        assert!(
+            text.contains(&marker_path(&slash).display().to_string())
+                && text.contains("records no owner")
+                && text.contains("clear-detection"),
+            "The function must return InvalidData with the legacy path and the recovery step. \
+             The text is: {text}"
         );
         let after = inspect_fallback(&fallback);
         assert!(
-            matches!(after.owned, MarkerInspect::Absent)
-                && matches!(after.legacy, MarkerInspect::Absent),
-            "The two markers must be absent. The result is {after:?}."
+            matches!(after.owned, MarkerInspect::Present(_))
+                && matches!(after.legacy, MarkerInspect::Present(_)),
+            "The function must keep the two markers. The result is {after:?}."
         );
 
-        fs::write(&owned, br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#)
-            .expect("The test must write a marker with no owner.");
+        fs::remove_file(marker_path(&slash)).expect("The test must remove the legacy marker.");
         assert_eq!(
             clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
             Ok(vec![FallbackClear::Removed { path: owned.clone() }]),
-            "The function must remove an owned marker that records no owner."
+            "The function must remove the marker of this keystore."
         );
         assert!(
             matches!(inspect_at(&owned), MarkerInspect::Absent),
-            "The owned marker with no owner must be absent."
+            "The marker of this keystore must be absent."
+        );
+
+        let no_owner = br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#;
+        fs::write(&owned, no_owner).expect("The test must write a marker with no owner.");
+        let text = invalid_data_text(clear_fallback_marker(&fallback, &keys));
+        assert!(
+            text.contains(&owned_text)
+                && text.contains("records no owner")
+                && text.contains("clear-detection"),
+            "The function must return InvalidData with the marker path and the recovery step \
+             for a marker with no owner. The text is: {text}"
+        );
+        assert_eq!(
+            fs::read(&owned).map_err(|err| err.to_string()),
+            Ok(no_owner.to_vec()),
+            "The function must keep the marker with no owner."
         );
 
         fs::write(&owned, b"{").expect("The test must write a marker that does not parse.");
-        let result =
-            clear_fallback_marker(&fallback, &keys).map_err(|err| (err.kind(), err.to_string()));
+        let text = invalid_data_text(clear_fallback_marker(&fallback, &keys));
         assert!(
-            matches!(
-                &result,
-                Err((io::ErrorKind::InvalidData, text))
-                    if text.contains(&owned.display().to_string())
-            ),
-            "The function must return InvalidData with the path for a marker that does not \
-             parse. The result is {result:?}."
+            text.contains(&owned_text) && text.contains("does not parse"),
+            "The function must return InvalidData with the path of the marker that does not \
+             parse. The text is: {text}"
         );
         assert_eq!(
             fs::read(&owned).map_err(|err| err.to_string()),
             Ok(b"{".to_vec()),
-            "A marker that does not parse must stay."
+            "The function must keep the marker that does not parse."
         );
+    }
+
+    /// A directory is at the owned path, and a legacy marker exists. The
+    /// test requires these results:
+    ///
+    /// - The clear returns `InvalidData` with the owned path. The error says
+    ///   that the marker cannot be read.
+    /// - The directory at the owned path stays.
+    /// - The legacy marker stays.
+    #[test]
+    fn clear_fallback_marker_keeps_an_unreadable_owned_entry() {
+        let (_root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let fallback = fallback_of(&keys, &slash);
+        let owned = fallback.owned_path();
+        fs::create_dir(&owned).expect("The test must create a directory at the owned path.");
+        write_marker(&slash, &sample_marker()).expect("The test must write a legacy marker.");
+
+        let text = invalid_data_text(clear_fallback_marker(&fallback, &keys));
+
+        assert!(
+            text.contains(&owned.display().to_string()) && text.contains("cannot be read"),
+            "The clear must return InvalidData with the owned path. The text is: {text}"
+        );
+        assert!(owned.is_dir(), "The directory at the owned path must stay.");
+        assert!(
+            matches!(inspect(&slash), MarkerInspect::Present(_)),
+            "The legacy marker must stay."
+        );
+    }
+
+    /// The file names of databases A and B are different only in a byte
+    /// that is not valid UTF-8, so the lossy strings of the two names are
+    /// the same. The test requires these results:
+    ///
+    /// - The owned paths of A and B are different.
+    /// - The marker of A does not show at the owned path of B.
+    /// - A clear for B finds no marker, and the marker of A stays.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_names_keep_the_native_bytes_of_the_db_file_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_root, [keys_a, keys_b, slash]) = temp_dirs(["a", "b", "slash"]);
+        let db = |name: &[u8]| slash.join(std::ffi::OsStr::from_bytes(name));
+        let fallback_a = FallbackMarkerPath::for_config(&keys_a, &db(b"a\xff.sqlite"))
+            .expect("The configuration of A must have a fallback path.");
+        let fallback_b = FallbackMarkerPath::for_config(&keys_b, &db(b"a\xfe.sqlite"))
+            .expect("The configuration of B must have a fallback path.");
+
+        assert_ne!(
+            fallback_a.owned_path(),
+            fallback_b.owned_path(),
+            "Databases A and B must have different owned paths."
+        );
+        write_fallback_marker(&fallback_a, &keys_a, &sample_marker())
+            .expect("The test must write the marker of database A.");
+        assert!(
+            matches!(inspect_fallback(&fallback_b).owned, MarkerInspect::Absent),
+            "The marker of database A must not show at the owned path of database B."
+        );
+        assert_eq!(
+            clear_fallback_marker(&fallback_b, &keys_b).map_err(|err| err.to_string()),
+            Ok(vec![]),
+            "A clear for database B must find no marker."
+        );
+        assert!(
+            matches!(inspect_fallback(&fallback_a).owned, MarkerInspect::Present(_)),
+            "The marker of database A must stay."
+        );
+    }
+
+    /// The keystore path `keys` is relative. The directory does not exist in
+    /// the working directory of the writer. The test requires these results:
+    ///
+    /// - The write succeeds.
+    /// - A clear from a different working directory keeps the marker. It
+    ///   returns the absolute keystore path that the writer resolved.
+    /// - After the keystore directory exists in the working directory of
+    ///   the writer, a clear from that directory removes the marker.
+    #[test]
+    fn fallback_owner_of_a_relative_keystore_is_resolved_at_write_time() {
+        let (_root, [writer, other, slash]) = temp_dirs(["writer", "other", "slash"]);
+        fs::create_dir(other.join("keys"))
+            .expect("The test must create the keystore in the other directory.");
+        let fallback =
+            FallbackMarkerPath { dir: slash.clone(), slashing_db_path: slash.join("a.sqlite") };
+        let owned = fallback.owned_path();
+        let owner = fs::canonicalize(&writer)
+            .expect("The test must read the canonical path of the writer directory.")
+            .join("keys")
+            .into_os_string()
+            .into_string()
+            .expect("The test path must be valid UTF-8.");
+        let keys = Path::new("keys");
+        let start = std::env::current_dir().expect("The test must read the working directory.");
+
+        std::env::set_current_dir(&writer).expect("The test must change the working directory.");
+        let written = write_fallback_marker(&fallback, keys, &sample_marker());
+        std::env::set_current_dir(&other).expect("The test must change the working directory.");
+        let from_other = clear_fallback_marker(&fallback, keys).map_err(|err| err.to_string());
+        let kept = matches!(inspect_at(&owned), MarkerInspect::Present(_));
+        std::env::set_current_dir(&writer).expect("The test must change the working directory.");
+        fs::create_dir(keys).expect("The test must create the keystore of the writer.");
+        let from_writer = clear_fallback_marker(&fallback, keys).map_err(|err| err.to_string());
+        std::env::set_current_dir(start).expect("The test must restore the working directory.");
+
+        assert!(written.is_ok(), "The write must succeed. The result is {written:?}.");
+        assert_eq!(
+            from_other,
+            Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner }]),
+            "A clear from a different working directory must return the absolute keystore \
+             path that the writer resolved."
+        );
+        assert!(kept, "A clear from a different working directory must keep the marker.");
+        assert_eq!(
+            from_writer,
+            Ok(vec![FallbackClear::Removed { path: owned }]),
+            "A clear from the working directory of the writer must remove the marker."
+        );
+    }
+
+    /// The keystore directory `keys-\xff` is not valid UTF-8. Its lossy
+    /// string is the name of a different directory, `keys-\u{FFFD}`. The
+    /// marker cannot record that owner without loss, so it records no owner.
+    /// For a clear for each of the two directories, the test requires these
+    /// results:
+    ///
+    /// - The clear returns `InvalidData` with the marker path.
+    /// - The marker stays.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_owner_that_is_not_utf8_keeps_the_marker() {
+        use std::os::unix::ffi::OsStrExt;
+        let (root, [slash]) = temp_dirs(["slash"]);
+        let native = root.path().join(std::ffi::OsStr::from_bytes(b"keys-\xff"));
+        let lossy = root.path().join("keys-\u{FFFD}");
+        for dir in [&native, &lossy] {
+            fs::create_dir(dir).expect("The test must create a keystore directory.");
+        }
+        let fallback = fallback_of(&native, &slash);
+        let owned = fallback.owned_path();
+        write_fallback_marker(&fallback, &native, &sample_marker())
+            .expect("The test must write the marker.");
+
+        for keys in [&lossy, &native] {
+            let text = invalid_data_text(clear_fallback_marker(&fallback, keys));
+            assert!(
+                text.contains(&owned.display().to_string()) && text.contains("records no owner"),
+                "A clear for {} must return InvalidData with the marker path, because the \
+                 marker records no owner. The text is: {text}",
+                keys.display()
+            );
+            assert!(
+                matches!(inspect_at(&owned), MarkerInspect::Present(_)),
+                "The marker must stay after a clear for {}.",
+                keys.display()
+            );
+        }
+    }
+
+    /// The owned path of `a.sqlite` holds an entry that is not a marker of
+    /// the keystore `keys`. Each row requires these results:
+    ///
+    /// - `write_fallback_marker` for `keys` returns `AlreadyExists` with the
+    ///   owned path.
+    /// - The entry stays and does not change.
+    ///
+    /// After the rows, the owned path holds a marker of `keys`. A write for
+    /// `keys` must replace that marker.
+    #[test]
+    fn fallback_write_replaces_only_a_marker_of_the_same_keystore() {
+        let (_root, [keys, other, slash]) = temp_dirs(["keys", "other", "slash"]);
+        let fallback = fallback_of(&keys, &slash);
+        let owned = fallback.owned_path();
+        let other_owner = fs::canonicalize(&other)
+            .expect("The test must read the canonical path of the other keystore.")
+            .into_os_string()
+            .into_string()
+            .expect("The test path must be valid UTF-8.");
+        let rows: [(&str, Option<String>); 5] = [
+            ("a slashing database file", Some("SQLite format 3\0".to_string())),
+            (
+                "a marker of another keystore",
+                Some(format!(
+                    r#"{{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[],"keystore_dir":"{other_owner}"}}"#
+                )),
+            ),
+            (
+                "a marker that records no owner",
+                Some(r#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#.to_string()),
+            ),
+            ("a file that does not parse", Some("{".to_string())),
+            ("a directory", None),
+        ];
+        for (case, text) in rows {
+            let made = match &text {
+                Some(text) => fs::write(&owned, text),
+                None => fs::create_dir(&owned),
+            };
+            made.expect("The test must create the entry at the owned path.");
+
+            let result = write_fallback_marker(&fallback, &keys, &sample_marker())
+                .map_err(|err| (err.kind(), err.to_string()));
+
+            assert!(
+                matches!(
+                    &result,
+                    Err((io::ErrorKind::AlreadyExists, message))
+                        if message.contains(&owned.display().to_string())
+                ),
+                "The write must return AlreadyExists with the owned path for {case}. The \
+                 result is {result:?}."
+            );
+            if let Some(text) = text {
+                assert_eq!(
+                    fs::read_to_string(&owned).map_err(|err| err.to_string()),
+                    Ok(text),
+                    "The write must not change {case}."
+                );
+                fs::remove_file(&owned).expect("The test must remove the entry.");
+            } else {
+                assert!(owned.is_dir(), "The write must not change {case}.");
+                fs::remove_dir(&owned).expect("The test must remove the entry.");
+            }
+        }
+
+        write_fallback_marker(&fallback, &keys, &sample_marker())
+            .expect("The test must write the marker of keys.");
+        let update = DetectionMarker { epoch: 9, ..sample_marker() };
+        assert_eq!(
+            write_fallback_marker(&fallback, &keys, &update).map_err(|err| err.to_string()),
+            Ok(()),
+            "The write must replace a marker of the same keystore."
+        );
+        assert!(
+            matches!(inspect_at(&owned), MarkerInspect::Present(marker) if marker == update),
+            "The owned path must hold the second marker."
+        );
+    }
+
+    /// Before the exclusive open of the temp file, the hook creates an entry
+    /// at the temp path. A marker of the same keystore is at the owned path.
+    /// The test requires these results:
+    ///
+    /// - The write returns an error.
+    /// - The entry at the temp path keeps its bytes.
+    /// - The owned marker keeps its bytes.
+    #[test]
+    fn fallback_write_keeps_an_entry_that_it_did_not_create() {
+        let (_root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let fallback = fallback_of(&keys, &slash);
+        write_fallback_marker(&fallback, &keys, &sample_marker())
+            .expect("The test must write the first marker.");
+        let before = fs::read(fallback.owned_path()).map_err(|err| err.to_string());
+        let temp = std::rc::Rc::new(std::cell::RefCell::new(PathBuf::new()));
+        let seen = std::rc::Rc::clone(&temp);
+        let _hook = arm_before_marker_temp_open(move |path| {
+            fs::write(path, b"other entry")
+                .expect("The hook must create an entry at the temp path.");
+            *seen.borrow_mut() = path.to_path_buf();
+        });
+
+        let result = write_fallback_marker(
+            &fallback,
+            &keys,
+            &DetectionMarker { epoch: 9, ..sample_marker() },
+        );
+
+        let temp = temp.borrow().clone();
+        assert!(
+            result.is_err(),
+            "The write must fail when an entry is at the temp path. The result is {result:?}."
+        );
+        assert_eq!(
+            fs::read(&temp).map_err(|err| err.to_string()),
+            Ok(b"other entry".to_vec()),
+            "The entry at the temp path {} must keep its bytes.",
+            temp.display()
+        );
+        assert_eq!(
+            fs::read(fallback.owned_path()).map_err(|err| err.to_string()),
+            before,
+            "The owned marker must keep its bytes."
+        );
+    }
+
+    /// The hook runs before the temp open of the writer. It tries the
+    /// fallback lock. Then it moves the database directory and creates a new
+    /// empty directory at the old path. The test requires these results:
+    ///
+    /// - The lock try in the hook fails.
+    /// - The write succeeds.
+    /// - The marker is in the moved directory.
+    /// - The new directory at the old path has no marker.
+    #[test]
+    fn fallback_write_holds_the_lock_and_one_directory_handle() {
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let moved = root.path().join("moved");
+        let fallback = fallback_of(&keys, &slash);
+        let name = fallback_marker_name(&fallback.slashing_db_path);
+        let attempt = std::rc::Rc::new(Cell::new(None));
+        let seen = std::rc::Rc::clone(&attempt);
+        let (from, to) = (slash.clone(), moved.clone());
+        let _hook = arm_before_marker_temp_open(move |_| {
+            seen.set(Some(try_fallback_lock(&from)));
+            fs::rename(&from, &to).expect("The hook must move the database directory.");
+            fs::create_dir(&from).expect("The hook must create a new directory at the old path.");
+        });
+
+        let result = write_fallback_marker(&fallback, &keys, &sample_marker())
+            .map_err(|err| err.to_string());
+
+        assert_eq!(attempt.get(), Some(false), "The lock try in the hook must fail.");
+        assert_eq!(result, Ok(()), "The write must succeed.");
+        assert!(
+            matches!(inspect_at(&moved.join(&name)), MarkerInspect::Present(_)),
+            "The marker must be in the moved directory."
+        );
+        assert!(
+            matches!(inspect_at(&fallback.owned_path()), MarkerInspect::Absent),
+            "The new directory at the old path must have no marker."
+        );
+    }
+
+    /// The hook runs after the writer resolves the database directory. It
+    /// moves that directory and puts a symlink to another directory at the
+    /// old path. The test requires these results:
+    ///
+    /// - The write returns an error.
+    /// - The other directory has no marker.
+    /// - The moved directory has no marker.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_write_refuses_a_directory_that_changes_after_the_resolve() {
+        let (root, [keys, slash, elsewhere]) = temp_dirs(["keys", "slash", "elsewhere"]);
+        let moved = root.path().join("moved");
+        let fallback = fallback_of(&keys, &slash);
+        let name = fallback_marker_name(&fallback.slashing_db_path);
+        let (from, to, target) = (slash.clone(), moved.clone(), elsewhere.clone());
+        let _hook = arm_after_marker_dir_resolve(move |_| {
+            fs::rename(&from, &to).expect("The hook must move the database directory.");
+            std::os::unix::fs::symlink(&target, &from)
+                .expect("The hook must create a symlink at the old path.");
+        });
+
+        let result = write_fallback_marker(&fallback, &keys, &sample_marker());
+
+        assert!(
+            result.is_err(),
+            "The write must fail when a symlink replaces the directory after the resolve. The \
+             result is {result:?}."
+        );
+        assert!(
+            matches!(inspect_at(&elsewhere.join(&name)), MarkerInspect::Absent),
+            "The other directory must have no marker."
+        );
+        assert!(
+            matches!(inspect_at(&moved.join(&name)), MarkerInspect::Absent),
+            "The moved directory must have no marker."
+        );
+    }
+
+    /// The hook runs after the clear checks the owner and before it removes
+    /// the marker. It tries the fallback lock. Then it moves the database
+    /// directory and creates a new empty directory at the old path. The test
+    /// requires these results:
+    ///
+    /// - The lock try in the hook fails.
+    /// - The clear returns `Removed`.
+    /// - The moved directory has no marker.
+    #[test]
+    fn fallback_clear_holds_the_lock_and_one_directory_handle() {
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let moved = root.path().join("moved");
+        let fallback = fallback_of(&keys, &slash);
+        let name = fallback_marker_name(&fallback.slashing_db_path);
+        write_fallback_marker(&fallback, &keys, &sample_marker())
+            .expect("The test must write the marker of keys.");
+        let attempt = std::rc::Rc::new(Cell::new(None));
+        let seen = std::rc::Rc::clone(&attempt);
+        let (from, to) = (slash.clone(), moved.clone());
+        let _hook = arm_before_fallback_unlink(move |_| {
+            seen.set(Some(try_fallback_lock(&from)));
+            fs::rename(&from, &to).expect("The hook must move the database directory.");
+            fs::create_dir(&from).expect("The hook must create a new directory at the old path.");
+        });
+
+        let result = clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string());
+
+        assert_eq!(attempt.get(), Some(false), "The lock try in the hook must fail.");
+        assert_eq!(
+            result,
+            Ok(vec![FallbackClear::Removed { path: fallback.owned_path() }]),
+            "The clear must remove the marker of keys."
+        );
+        assert!(
+            matches!(inspect_at(&moved.join(&name)), MarkerInspect::Absent),
+            "The moved directory must have no marker."
+        );
+    }
+
+    /// The database file name has 228 bytes, so the fallback marker name has
+    /// 255 bytes, the limit for one name. The test requires these results:
+    ///
+    /// - The write succeeds, because the temp name has a fixed length.
+    /// - A read gives `Present` for the owned marker.
+    #[test]
+    fn fallback_write_accepts_a_db_file_name_of_228_bytes() {
+        let (_root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let db = slash.join(format!("{}.sqlite", "x".repeat(221)));
+        let fallback = FallbackMarkerPath::for_config(&keys, &db)
+            .expect("The configuration must have a fallback path outside the keystore directory.");
+
+        assert_eq!(fallback_marker_name(&db).len(), 255, "The marker name must have 255 bytes.");
+        assert_eq!(
+            write_fallback_marker(&fallback, &keys, &sample_marker())
+                .map_err(|err| err.to_string()),
+            Ok(()),
+            "The write must succeed for a database file name of 228 bytes."
+        );
+        assert!(
+            matches!(inspect_fallback(&fallback).owned, MarkerInspect::Present(_)),
+            "A read must give Present for the owned marker."
+        );
+    }
+
+    /// `check_slashing_db_name` checks the file name of the database. Each
+    /// row gives the database directory, the file name, and the reason of
+    /// the refusal. A row without a reason must pass the check.
+    #[test]
+    fn slashing_db_name_check_refuses_reserved_and_too_long_names() {
+        let (_root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let long = |len: usize| format!("{}.sqlite", "x".repeat(len - 7));
+        let rows = [
+            ("a name of 228 bytes", &slash, long(228), None),
+            ("a name of 229 bytes", &slash, long(229), Some("at most 255 bytes")),
+            ("a name of 229 bytes in the keystore directory", &keys, long(229), None),
+            (
+                "an owned marker name",
+                &slash,
+                format!("{MARKER_FILENAME}.a.sqlite"),
+                Some("name space"),
+            ),
+            (
+                "a record temp name",
+                &slash,
+                "..rvc.doppelganger_record.1.2.tmp".to_string(),
+                Some("name space"),
+            ),
+            ("a name without the first dot", &slash, "rvc.doppelganger.sqlite".to_string(), None),
+        ];
+        for (case, dir, name, reason) in rows {
+            let result = check_slashing_db_name(&keys, &dir.join(&name))
+                .map_err(|err| (err.kind(), err.to_string()));
+            if let Some(reason) = reason {
+                assert!(
+                    matches!(
+                        &result,
+                        Err((io::ErrorKind::InvalidInput, text)) if text.contains(reason)
+                    ),
+                    "The check must refuse {case} and give the reason \"{reason}\". The result \
+                     is {result:?}."
+                );
+            } else {
+                assert_eq!(result, Ok(()), "The check must accept {case}.");
+            }
+        }
     }
 
     #[test]
