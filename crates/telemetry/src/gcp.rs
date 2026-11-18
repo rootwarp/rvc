@@ -190,12 +190,12 @@ pub(crate) mod tests {
     ///
     /// - `Tokens` gives `Bearer token-N` for call N and a quota header.
     /// - `NoHeaders` gives `NotModified`.
-    /// - `Stall` does not answer.
+    /// - `Stall` does not answer. Each waiting call holds one more reference to the `Arc`.
     #[derive(Debug)]
     enum FakeCredentials {
         Tokens(AtomicUsize),
         NoHeaders,
-        Stall(#[allow(dead_code)] Arc<()>),
+        Stall(Arc<()>),
     }
 
     impl FakeCredentials {
@@ -212,7 +212,10 @@ pub(crate) mod tests {
             let call = match self {
                 Self::Tokens(calls) => calls.fetch_add(1, Ordering::SeqCst) + 1,
                 Self::NoHeaders => return Ok(CacheableResource::NotModified),
-                Self::Stall(_) => std::future::pending().await,
+                Self::Stall(waiting) => {
+                    let _call = Arc::clone(waiting);
+                    std::future::pending().await
+                }
             };
             let mut data = HeaderMap::new();
             data.insert(AUTHORIZATION, format!("Bearer token-{call}").parse().unwrap());
@@ -365,21 +368,58 @@ pub(crate) mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    /// Gives a client with `Stall` credentials. The count of `waiting` is 2 when no
+    /// credential request waits, and 3 when one request waits.
+    fn stalled_client(waiting: &Arc<()>) -> GcpHttpClient {
+        GcpHttpClient {
+            http: reqwest::Client::new(),
+            credentials: Credentials::from(FakeCredentials::Stall(Arc::clone(waiting))),
+            runtime: Handle::current(),
+        }
+    }
+
+    fn trace_request() -> Request<Bytes> {
+        Request::post("http://127.0.0.1:9/v1/traces").body(Bytes::new()).unwrap()
+    }
+
+    /// The test has no outer timeout. It examines the request at two points of
+    /// paused time. Thus, without the deadline, an assertion fails.
     #[tokio::test(start_paused = true)]
     async fn gcp_client_stops_a_stalled_credential_request_at_the_deadline() {
-        let alive = Arc::new(());
-        let client = GcpHttpClient {
-            http: reqwest::Client::new(),
-            credentials: Credentials::from(FakeCredentials::Stall(alive.clone())),
-            runtime: Handle::current(),
-        };
-        let request = Request::post("http://127.0.0.1:9/v1/traces").body(Bytes::new()).unwrap();
+        let waiting = Arc::new(());
+        let client = Arc::new(stalled_client(&waiting));
+        let caller = Arc::clone(&client);
         let start = tokio::time::Instant::now();
-        let sent = tokio::time::timeout(Duration::from_secs(20), client.send_bytes(request)).await;
-        sent.expect("The client must return in 20 s.").expect_err("A stall must give an error.");
-        assert_eq!(start.elapsed(), Duration::from_secs(10), "The export deadline must be 10 s.");
-        drop(client);
-        assert_eq!(Arc::strong_count(&alive), 1, "The deadline must stop the credential request.");
+        let sent = tokio::spawn(async move {
+            let failed = caller.send_bytes(trace_request()).await.is_err();
+            (failed, start.elapsed())
+        });
+        tokio::time::sleep_until(start + Duration::from_millis(9_999)).await;
+        let count = Arc::strong_count(&waiting);
+        assert_eq!(count, 3, "The credential request must continue at 9.999 s.");
+        tokio::time::sleep_until(start + Duration::from_millis(10_001)).await;
+        let count = Arc::strong_count(&waiting);
+        assert_eq!(count, 2, "The deadline must stop the credential request.");
+        assert!(sent.is_finished(), "The client must return at the deadline.");
+        let (failed, elapsed) = sent.await.unwrap();
+        assert!(failed, "A stall must give an error.");
+        assert_eq!(elapsed, Duration::from_secs(10), "The export deadline must be 10 s.");
+    }
+
+    /// The caller drops the export at 1 s. The deadline is at 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn gcp_client_stops_the_credential_request_when_the_caller_cancels() {
+        let waiting = Arc::new(());
+        let client = stalled_client(&waiting);
+        let mut sent = client.send_bytes(trace_request());
+        let early = tokio::time::timeout(Duration::from_secs(1), &mut sent).await;
+        assert!(early.is_err(), "The stalled export must not return in 1 s.");
+        let count = Arc::strong_count(&waiting);
+        assert_eq!(count, 3, "The credential request must continue at 1 s.");
+        drop(sent);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let count = Arc::strong_count(&waiting);
+        assert_eq!(count, 2, "When the caller drops the export, the request must stop.");
     }
 
     /// The test runs the child test below in a new process with a set environment.
