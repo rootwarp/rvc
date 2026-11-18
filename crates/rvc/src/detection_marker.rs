@@ -135,8 +135,7 @@ pub const FALLBACK_LOCK_FILENAME: &str = ".rvc.doppelganger_lock";
 /// refused. rvc uses the names in this name space for its detection files.
 const RESERVED_NAME_PREFIXES: [&str; 2] = [".rvc.doppelganger", "..rvc.doppelganger"];
 
-/// The longest file name in one directory on Linux file systems such as
-/// ext4, XFS and btrfs.
+/// The longest file name on Linux file systems such as ext4, XFS and btrfs.
 const MAX_NAME_BYTES: usize = 255;
 
 /// Refuse a slashing database file name that rvc cannot protect: a name in
@@ -214,13 +213,10 @@ pub struct FallbackInspect {
     pub legacy: MarkerInspect,
 }
 
-/// Read the owned fallback marker and the legacy fallback marker through one
-/// handle of the database directory.
-///
-/// Boot refuses when either one is not [`MarkerInspect::Absent`]. The owner
-/// that the owned marker records does not change that. A missing directory
-/// gives two `Absent` results. A directory that the read cannot open without
-/// a symlink follow gives two `Unreadable` results.
+/// Read the owned and the legacy fallback markers through one handle of the
+/// database directory. Boot refuses unless both are [`MarkerInspect::Absent`],
+/// whatever owner the owned marker records. A missing directory gives two
+/// `Absent` results, and a directory that cannot be opened two `Unreadable`.
 pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
     let owned = fallback.owned_path();
     let legacy = marker_path(&fallback.dir);
@@ -252,15 +248,11 @@ pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
     }
 }
 
-/// Write the owned fallback marker of `fallback`.
-///
-/// The document records the absolute keystore path that the writer resolves
-/// now, or no owner when that path has no UTF-8 form. The write
-/// holds the fallback lock of the directory. It does not replace an entry at
-/// the owned path unless that entry is a marker with the same owner: it
-/// returns `AlreadyExists` with the path and keeps the entry. The write is
-/// temp file, fsync, rename, and fsync of the directory, all through one
-/// handle of the directory. Nothing writes the legacy name.
+/// Write the owned fallback marker of `fallback` under the fallback lock,
+/// with the absolute keystore path that the writer resolves now as its owner
+/// (no owner when that path is not UTF-8). An entry at the owned path that
+/// is not a marker with the same owner stays: the write returns
+/// `AlreadyExists` with the path. Nothing writes the legacy name.
 pub fn write_fallback_marker(
     fallback: &FallbackMarkerPath,
     keystore_dir: &Path,
@@ -329,25 +321,13 @@ pub enum FallbackClear {
     OtherOwner { path: PathBuf, owner: String },
 }
 
-/// Remove the owned fallback marker of `fallback` when it belongs to
-/// `keystore_dir`.
-///
-/// The clear holds the fallback lock of the directory and uses one handle
-/// of the directory for the reads and the unlink. The owned marker is
-/// removed only when the owner that it records is the absolute path that a
-/// write for `keystore_dir` records now. The function does not resolve the
-/// recorded owner again. An owned marker of another keystore
-/// stays, and the result gives [`FallbackClear::OtherOwner`]. These entries
-/// stay, and the function returns `InvalidData` with the path and the
-/// recovery step:
-///
-/// - an owned marker that cannot be read or does not parse, because its
-///   owner is unknown;
-/// - an owned marker that records no owner;
-/// - a legacy marker, which records no owner.
-///
-/// A removal fsyncs the directory. The result has at most one entry. An
-/// empty result means that no owned marker exists.
+/// Remove the owned fallback marker of `fallback` under the fallback lock,
+/// only when its recorded owner is the path that a write for `keystore_dir`
+/// records now. The recorded owner is not resolved again. A marker of another
+/// keystore stays ([`FallbackClear::OtherOwner`]). An owned marker that
+/// cannot be read, does not parse or records no owner, and a legacy marker,
+/// stay: the function returns `InvalidData` with the path and the recovery
+/// step. The result has at most one entry; empty means no owned marker.
 pub fn clear_fallback_marker(
     fallback: &FallbackMarkerPath,
     keystore_dir: &Path,
@@ -449,11 +429,9 @@ fn inspect_file(path: PathBuf, file: MarkerFile) -> MarkerInspect {
     }
 }
 
-/// A directory that this process resolved one time.
-///
-/// Each read, temp create, rename, unlink, lock and fsync of a marker in the
-/// directory goes through the handle. A later change to the path does not
-/// move these steps to a different directory.
+/// A directory that this process resolved one time. Each marker read, temp
+/// create, rename, unlink, lock and fsync in it uses this handle, so a later
+/// change to the path does not move these steps to a different directory.
 #[cfg(unix)]
 struct MarkerDir {
     /// The directory, opened with `O_RDONLY`.
@@ -464,12 +442,11 @@ struct MarkerDir {
 
 #[cfg(unix)]
 impl MarkerDir {
-    /// Open `dir`. `None` when it does not exist. An empty path is `.`.
-    ///
-    /// `canonicalize` gives the real path one time. A walk from `/` then
-    /// opens each name of that path with `O_NOFOLLOW` and `O_DIRECTORY`. If a
-    /// symlink or a file replaces a name after `canonicalize`, the walk
-    /// fails, so the handle is the directory that `canonicalize` found.
+    /// Open `dir` (`None` when it does not exist; an empty path is `.`).
+    /// `canonicalize` gives the real path one time, and a walk from `/` opens
+    /// each name of it with `O_NOFOLLOW | O_DIRECTORY` (`O_PATH` on Linux:
+    /// search permission is enough). A symlink or a file that replaces a name
+    /// after `canonicalize` stops the walk.
     fn open(dir: &Path) -> io::Result<Option<Self>> {
         let path = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
         let real = match fs::canonicalize(path) {
@@ -479,7 +456,6 @@ impl MarkerDir {
         };
         #[cfg(test)]
         run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, &real);
-        // On Linux, `O_PATH` needs only search permission on a directory of the walk.
         #[cfg(target_os = "linux")]
         let search = libc::O_PATH;
         #[cfg(not(target_os = "linux"))]
@@ -529,12 +505,9 @@ impl MarkerDir {
         Ok(file)
     }
 
-    /// Write `body` to `name`: a new temp file, fsync, rename, and fsync of
-    /// the directory.
-    ///
-    /// The temp name is `.rvc.doppelganger_tmp.<pid>.<nanos>.tmp`, at most 57
-    /// bytes. Its exclusive create does not open an entry that exists. A step
-    /// that fails removes only the temp file that this call created and did
+    /// Write `body` to `name`: temp file `.rvc.doppelganger_tmp.<pid>.<nanos>.tmp`
+    /// (at most 57 bytes, exclusive create), fsync, rename, directory fsync. A
+    /// failed step removes only the temp file that this call created and did
     /// not rename.
     fn replace(&self, name: &OsStr, body: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -2510,6 +2483,64 @@ mod tests {
         }
     }
 
+    /// Each row gives one state of the fallback paths. The read and the clear
+    /// must give these results:
+    ///
+    /// - The database directory does not exist: `Absent`, and no marker.
+    /// - A file is in the path of the directory: `Unreadable`, and an error.
+    /// - A symlink is at the owned path: `Unreadable`, and an error.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_reads_fail_closed_for_each_directory_state() {
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        fs::write(root.path().join("file"), b"x").expect("The test must write a file.");
+        std::os::unix::fs::symlink("missing", slash.join(".rvc.doppelganger_detected.a.sqlite"))
+            .expect("The test must create a symlink at the owned path.");
+        let rows = [
+            ("a missing directory", root.path().join("missing"), false),
+            ("a directory path under a file", root.path().join("file").join("db"), true),
+            ("a symlink at the owned path", slash, true),
+        ];
+        for (case, dir, refused) in rows {
+            let fallback = FallbackMarkerPath { slashing_db_path: dir.join("a.sqlite"), dir };
+            let owned = inspect_fallback(&fallback).owned;
+            let cleared = clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string());
+            if refused {
+                assert!(
+                    matches!(owned, MarkerInspect::Unreadable { .. }) && cleared.is_err(),
+                    "The read must give Unreadable and the clear must fail for {case}. The \
+                     results are {owned:?} and {cleared:?}."
+                );
+            } else {
+                assert!(
+                    matches!(owned, MarkerInspect::Absent) && cleared == Ok(vec![]),
+                    "The read must give Absent and the clear must find no marker for {case}. \
+                     The results are {owned:?} and {cleared:?}."
+                );
+            }
+        }
+    }
+
+    /// A directory is at the keystore marker path, so the rename of the
+    /// write fails. The write must return an error, and its temp file must
+    /// not stay.
+    #[test]
+    fn marker_write_reports_a_failed_rename_and_removes_its_temp_file() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        fs::create_dir_all(marker_path(dir.path()).join("entry"))
+            .expect("The test must create a directory at the marker path.");
+
+        let result = write_marker(dir.path(), &sample_marker());
+
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .expect("The test must read the directory.")
+            .map(|entry| entry.expect("The test must read an entry.").file_name().into_string())
+            .collect::<Result<_, _>>()
+            .expect("The names must be valid UTF-8.");
+        assert!(result.is_err(), "The write must fail. The result is {result:?}.");
+        assert_eq!(names, [MARKER_FILENAME], "The temp file of the write must not stay.");
+    }
+
     /// The owned path of `a.sqlite` holds an entry that is not a marker of
     /// the keystore `keys`. Each row requires these results:
     ///
@@ -2590,13 +2621,9 @@ mod tests {
         );
     }
 
-    /// Before the exclusive open of the temp file, the hook creates an entry
-    /// at the temp path. A marker of the same keystore is at the owned path.
-    /// The test requires these results:
-    ///
-    /// - The write returns an error.
-    /// - The entry at the temp path keeps its bytes.
-    /// - The owned marker keeps its bytes.
+    /// Before the exclusive open of the temp file, the hook creates an entry at
+    /// the temp path. A marker of the same keystore is at the owned path. The
+    /// write must fail, and the entry and the marker must keep their bytes.
     #[test]
     fn fallback_write_keeps_an_entry_that_it_did_not_create() {
         let (_root, [keys, slash]) = temp_dirs(["keys", "slash"]);
@@ -2695,13 +2722,9 @@ mod tests {
         );
     }
 
-    /// The hook runs after the writer resolves the database directory. It
-    /// moves that directory and puts a symlink to another directory at the
-    /// old path. The test requires these results:
-    ///
-    /// - The write returns an error.
-    /// - The other directory has no marker.
-    /// - The moved directory has no marker.
+    /// After the writer resolves the database directory, the hook moves it and
+    /// puts a symlink to another directory at the old path. The write must
+    /// fail, and the two directories must have no marker.
     #[cfg(unix)]
     #[test]
     fn fallback_write_refuses_a_directory_that_changes_after_the_resolve() {

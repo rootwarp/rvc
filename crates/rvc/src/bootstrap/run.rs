@@ -698,26 +698,24 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
                 "failed to persist doppelganger detection marker during shutdown"
             );
             if let Some(fallback) = &detection.fallback {
-                match crate::detection_marker::write_fallback_marker(
+                if crate::detection_marker::write_fallback_marker(
                     fallback,
                     &detection.keystore_dir,
                     &marker,
-                ) {
-                    Ok(()) => {
-                        detection.machine.mark_detection_persisted();
-                        error!(
-                            path = %fallback.owned_path().display(),
-                            "persisted doppelganger detection marker beside the slashing database"
-                        );
-                    }
-                    Err(fallback_err) => {
-                        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                        error!(
-                            error = %fallback_err,
-                            path = %fallback.owned_path().display(),
-                            "failed to persist the fallback doppelganger detection marker"
-                        );
-                    }
+                )
+                .is_ok()
+                {
+                    detection.machine.mark_detection_persisted();
+                    error!(
+                        path = %fallback.owned_path().display(),
+                        "persisted doppelganger detection marker beside the slashing database"
+                    );
+                } else {
+                    crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+                    error!(
+                        path = %fallback.owned_path().display(),
+                        "failed to persist the fallback doppelganger detection marker"
+                    );
                 }
             }
         }
