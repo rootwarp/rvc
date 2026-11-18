@@ -688,7 +688,7 @@ Client library for connecting `bin/rvc` to `bin/rvc-signer` via gRPC with mTLS:
 Provides distributed tracing infrastructure using OpenTelemetry:
 
 - **`TelemetryConfig`** — Endpoint, exporter kind, sample rate, batch processor tuning (max queue size, max export batch size).
-- **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace, gated behind `gcp-trace` feature).
+- **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace through the OTLP endpoint of the Telemetry API with ADC auth, gated behind `gcp-trace` feature).
 - **`init_tracing`** — Sets up `tracing-opentelemetry` layer with `ParentBased(TraceIdRatioBased)` sampler. Returns `TracingGuard`.
 - **`TracingGuard`** — RAII `#[must_use]` guard that flushes pending spans on drop (5-second timeout).
 - **W3C propagation** — Injects `traceparent` into outbound beacon-node HTTP headers and, behind feature `grpc`, into outbound gRPC signer metadata.

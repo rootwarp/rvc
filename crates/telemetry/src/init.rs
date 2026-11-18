@@ -60,57 +60,33 @@ fn build_provider(
     resource: Resource,
     sampler: Sampler,
 ) -> Result<SdkTracerProvider> {
-    match config.exporter {
-        ExporterKind::Otlp => {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let (exporter, resource) = match config.exporter {
+        ExporterKind::Otlp => (
+            opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_endpoint(&config.endpoint)
-                .build()?;
-
-            let mut batch_config = BatchConfigBuilder::default();
-            if let Some(queue_size) = config.max_queue_size {
-                batch_config = batch_config.with_max_queue_size(queue_size);
-            }
-            if let Some(batch_size) = config.max_export_batch_size {
-                batch_config = batch_config.with_max_export_batch_size(batch_size);
-            }
-            let processor = BatchSpanProcessor::builder(exporter)
-                .with_batch_config(batch_config.build())
-                .build();
-
-            Ok(SdkTracerProvider::builder()
-                .with_sampler(sampler)
-                .with_resource(resource)
-                .with_span_processor(processor)
-                .build())
-        }
+                .build()?,
+            resource,
+        ),
         #[cfg(feature = "gcp-trace")]
-        ExporterKind::Gcp => build_gcp_provider(resource, sampler),
+        ExporterKind::Gcp => crate::gcp::exporter(resource)?,
+    };
+
+    let mut batch_config = BatchConfigBuilder::default();
+    if let Some(queue_size) = config.max_queue_size {
+        batch_config = batch_config.with_max_queue_size(queue_size);
     }
-}
+    if let Some(batch_size) = config.max_export_batch_size {
+        batch_config = batch_config.with_max_export_batch_size(batch_size);
+    }
+    let processor =
+        BatchSpanProcessor::builder(exporter).with_batch_config(batch_config.build()).build();
 
-#[cfg(feature = "gcp-trace")]
-fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerProvider> {
-    let handle = tokio::runtime::Handle::current();
-
-    tokio::task::block_in_place(|| {
-        let gcp_builder = handle
-            .block_on(
-                opentelemetry_gcloud_trace::GcpCloudTraceExporterBuilder::for_default_project_id(),
-            )
-            .map_err(|e| anyhow::anyhow!("GCP project ID detection failed: {e}"))?;
-
-        let provider_builder =
-            SdkTracerProvider::builder().with_sampler(sampler).with_resource(resource.clone());
-
-        let provider = handle
-            .block_on(
-                gcp_builder.with_resource(resource).create_provider_from_builder(provider_builder),
-            )
-            .map_err(|e| anyhow::anyhow!("GCP Cloud Trace exporter initialization failed: {e}"))?;
-
-        Ok(provider)
-    })
+    Ok(SdkTracerProvider::builder()
+        .with_sampler(sampler)
+        .with_resource(resource)
+        .with_span_processor(processor)
+        .build())
 }
 
 /// Build an [`EnvFilter`](tracing_subscriber::EnvFilter) honoring the rs-vc

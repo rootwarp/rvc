@@ -20,6 +20,21 @@ The user `rvc` (uid 10001, gid 10001), the volumes, the ports, the entrypoints, 
 
 CI now runs `cargo deny check advisories sources` next to `cargo audit` on pull requests. The check fails on unsound, unmaintained, and yanked crates, and on a source other than crates.io. The new `deny.toml` and `.cargo/audit.toml` ignore the same five advisories. Each ignore has a reason and a review date (2027-01-26). A test makes sure that the two lists stay equal.
 
+## Dependency advisory: chrono is removed, and the `gcp` exporter uses the Telemetry API
+
+`cargo deny` failed on RUSTSEC-2026-0543 (chrono is unmaintained). chrono came from `logroller` (the log file writer) and from `opentelemetry-gcloud-trace` (the `gcp-trace` feature). This release removes the two crates. It adds no ignore entry.
+
+- The log file writer is now in `rvc-telemetry`. The file names (`<file>`, `<file>.N`, `<file>.N.gz`), the size limit, the `max_files` count and the gzip compression on a background thread do not change.
+- `tracing_exporter = "gcp"` now sends OTLP/HTTP to `https://telemetry.googleapis.com/v1/traces` with Application Default Credentials. The feature name `gcp-trace` and the project ID search do not change. The exporter now also uses `tracing_max_queue_size` and `tracing_max_export_batch_size`.
+
+### Operator changes for `tracing_exporter = "gcp"`
+
+1. Enable the Telemetry API (`telemetry.googleapis.com`) in the project.
+2. The IAM role can change. Give the service account a role that can write traces to the Telemetry API, for example `roles/telemetry.tracesWriter`.
+3. The span attribute names become the OpenTelemetry names. The old exporter also copied the resource attributes into the labels of each span. Examine your Cloud Trace filters and dashboards.
+
+See `docs/running-guide.md` ("With OpenTelemetry Tracing").
+
 ## Two beacon nodes must agree on the parent header
 
 At t=0 of each slot, rvc gets the header of the parent block from the beacon nodes. Before this change, the first node that answered decided the parent set. One wrong node could restrict the block parents to its own root, or reject every parent, also when an honest node was available.

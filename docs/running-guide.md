@@ -735,6 +735,25 @@ rvc start -c config.toml \
   --tracing-sample-rate 0.01
 ```
 
+The `gcp` exporter sends OTLP/HTTP to the Cloud Telemetry API
+(`https://telemetry.googleapis.com/v1/traces`). It ignores `--tracing-endpoint`.
+It uses Application Default Credentials (ADC). It finds the project ID in this
+order: `GCP_PROJECT`, `PROJECT_ID`, `GCP_PROJECT_ID`, the `quota_project_id` of
+the ADC file, and the metadata server. It sets the `gcp.project_id` resource
+attribute.
+
+Operator changes from v0.8.0 (the exporter used the Cloud Trace API before):
+
+1. Enable the Telemetry API in the project:
+   `gcloud services enable telemetry.googleapis.com`.
+2. The IAM role can change. Give the service account a role that can write
+   traces to the Telemetry API, for example `roles/telemetry.tracesWriter`.
+   Check the role name in the Google Cloud documentation.
+3. The span attribute names become the OpenTelemetry names. The old exporter
+   also copied the resource attributes (`service.name`, `service.version`,
+   `network.name`) into the labels of each span. Examine your Cloud Trace
+   filters and dashboards after the upgrade.
+
 #### Local Jaeger v2 (docker compose `tracing` profile)
 
 Bare `docker compose up` stays on `rvc` + `rvc-signer` only. Jaeger v2 is

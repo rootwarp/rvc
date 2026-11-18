@@ -15,22 +15,19 @@ pub struct FileAppenderConfig {
     pub level: String,
 }
 
-/// Creates a file logging layer with size-based rotation via `logroller`.
+/// Creates a file logging layer with size-based rotation and optional gzip.
+///
+/// The file names and the retention rule are the same as in `logroller` 0.1:
+/// `<filename>`, `<filename>.N` and `<filename>.N.gz`, and `max_files` includes
+/// the active file.
 ///
 /// Returns a boxed `Layer` for composing into the subscriber stack, and a
 /// `WorkerGuard` that must be held for the application lifetime.
 pub fn create_file_layer(
     config: &FileAppenderConfig,
 ) -> Result<(Box<dyn Layer<Registry> + Send + Sync>, WorkerGuard)> {
-    let mut builder = logroller::LogRollerBuilder::new(&config.directory, &config.filename)
-        .rotation(logroller::Rotation::SizeBased(logroller::RotationSize::MB(config.max_size_mb)))
-        .max_keep_files(config.max_files as u64);
-
-    if config.compress {
-        builder = builder.compression(logroller::Compression::Gzip);
-    }
-
-    let roller = builder.build().map_err(|e| anyhow::anyhow!("Failed to build log roller: {e}"))?;
+    let roller = crate::rolling::RollingWriter::open(config)
+        .map_err(|e| anyhow::anyhow!("Failed to open log file: {e}"))?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(roller);
     let layer = build_layer(non_blocking, &config.level);

@@ -1,21 +1,32 @@
 //! Google Cloud Trace export through the OTLP endpoint of the Telemetry API.
 //!
-//! RED stub: the exporter does not exist yet. The tests below define it.
-#![allow(dead_code, unused_imports, unused_variables)]
+//! The exporter sends OTLP/HTTP protobuf to [`GCP_TRACES_ENDPOINT`]. It gets
+//! the auth headers from Application Default Credentials (ADC) for each
+//! request, and it adds the `gcp.project_id` resource attribute.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use google_cloud_auth::credentials::{CacheableResource, Credentials};
+use google_cloud_auth::credentials::{Builder, CacheableResource, Credentials};
+use opentelemetry::KeyValue;
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
-use opentelemetry_otlp::SpanExporter;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use tokio::runtime::Handle;
 
 /// OTLP/HTTP traces endpoint of the Google Cloud Telemetry API.
 pub const GCP_TRACES_ENDPOINT: &str = "https://telemetry.googleapis.com/v1/traces";
 
+/// Environment variables that give the project ID, in priority order.
+const PROJECT_ENV_VARS: [&str; 3] = ["GCP_PROJECT", "PROJECT_ID", "GCP_PROJECT_ID"];
+const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Sends each OTLP request on the Tokio runtime with the ADC auth headers.
+///
+/// The batch span processor exports on its own thread with no Tokio reactor.
+/// Thus the client runs the token fetch and the request on `runtime`.
 #[derive(Debug)]
 struct GcpHttpClient {
     http: reqwest::Client,
@@ -26,8 +37,38 @@ struct GcpHttpClient {
 #[async_trait::async_trait]
 impl HttpClient for GcpHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        Ok(Response::new(Bytes::new()))
+        let (http, credentials) = (self.http.clone(), self.credentials.clone());
+        let send = async move {
+            let mut request = request;
+            match credentials.headers(Default::default()).await? {
+                CacheableResource::New { data, .. } => request.headers_mut().extend(data),
+                CacheableResource::NotModified => return Err("ADC gave no auth headers".into()),
+            }
+            let response = http.execute(request.try_into()?).await?;
+            let status = response.status();
+            Ok(Response::builder().status(status).body(response.bytes().await?)?)
+        };
+        self.runtime.spawn(send).await?
     }
+}
+
+/// Builds the Cloud Trace span exporter and adds `gcp.project_id` to `resource`.
+///
+/// Must run on a multi-thread Tokio runtime.
+pub(crate) fn exporter(resource: Resource) -> Result<(SpanExporter, Resource)> {
+    let runtime = Handle::try_current().map_err(|e| anyhow!("GCP exporter needs Tokio: {e}"))?;
+    let env = adc_env();
+    let project_id = tokio::task::block_in_place(|| runtime.block_on(detect_project_id(&env)))
+        .ok_or_else(|| {
+            anyhow!(
+                "GCP project ID detection failed: set GCP_PROJECT, PROJECT_ID or GCP_PROJECT_ID"
+            )
+        })?;
+    // google-cloud-auth uses reqwest with no TLS provider. Use ring, as the workspace does.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let credentials =
+        Builder::default().build().map_err(|e| anyhow!("GCP credentials failed: {e}"))?;
+    build_exporter(GCP_TRACES_ENDPOINT, credentials, runtime, project_id, resource)
 }
 
 fn build_exporter(
@@ -37,23 +78,75 @@ fn build_exporter(
     project_id: String,
     resource: Resource,
 ) -> Result<(SpanExporter, Resource)> {
-    Err(anyhow!("RED stub"))
+    let http = reqwest::Client::builder()
+        .timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+        .build()?;
+    let exporter = SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_http_client(GcpHttpClient { http, credentials, runtime })
+        .build()?;
+    let resource = Resource::builder_empty()
+        .with_attributes(resource.iter().map(|(k, v)| KeyValue::new(k.clone(), v.clone())))
+        .with_attribute(KeyValue::new("gcp.project_id", project_id))
+        .build();
+    Ok((exporter, resource))
 }
 
+/// Reads the environment variables that gcloud-sdk read for the project ID.
+/// Each name is a literal, thus the env allow-list gate can classify it.
 fn adc_env() -> HashMap<&'static str, String> {
-    HashMap::new()
+    [
+        ("GCP_PROJECT", std::env::var("GCP_PROJECT")),
+        ("PROJECT_ID", std::env::var("PROJECT_ID")),
+        ("GCP_PROJECT_ID", std::env::var("GCP_PROJECT_ID")),
+        ("GOOGLE_APPLICATION_CREDENTIALS", std::env::var("GOOGLE_APPLICATION_CREDENTIALS")),
+        ("HOME", std::env::var("HOME")),
+        ("GCE_METADATA_HOST", std::env::var("GCE_METADATA_HOST")),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| Some((name, value.ok()?)))
+    .collect()
 }
 
+/// Finds the project ID in the order of the removed gcloud-sdk exporter:
+///
+/// 1. The first of [`PROJECT_ENV_VARS`] that is set.
+/// 2. `quota_project_id` in the ADC file: `GOOGLE_APPLICATION_CREDENTIALS`,
+///    else `$HOME/.config/gcloud/application_default_credentials.json`.
+/// 3. The metadata server (`GCE_METADATA_HOST`, else `metadata.google.internal`).
 async fn detect_project_id(env: &HashMap<&str, String>) -> Option<String> {
-    None
+    if let Some(id) = PROJECT_ENV_VARS.iter().find_map(|name| env.get(name)) {
+        return Some(id.clone());
+    }
+    let adc = env.get("GOOGLE_APPLICATION_CREDENTIALS").cloned().or_else(|| {
+        let home = env.get("HOME")?;
+        Some(format!("{home}/.config/gcloud/application_default_credentials.json"))
+    });
+    if let Some(id) = adc.and_then(|path| quota_project_id(Path::new(&path))) {
+        return Some(id);
+    }
+    let host = env.get("GCE_METADATA_HOST").map_or("metadata.google.internal", String::as_str);
+    metadata_project_id(host).await
 }
 
 fn quota_project_id(path: &Path) -> Option<String> {
-    None
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    json.get("quota_project_id")?.as_str().map(str::to_owned)
 }
 
 async fn metadata_project_id(host: &str) -> Option<String> {
-    None
+    let response = reqwest::Client::new()
+        .get(format!("http://{host}/computeMetadata/v1/project/project-id"))
+        .header("Metadata-Flavor", "Google")
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let id = response.text().await.ok()?.trim().to_owned();
+    (!id.is_empty()).then_some(id)
 }
 
 #[cfg(test)]

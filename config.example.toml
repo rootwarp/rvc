@@ -142,5 +142,7 @@ log_level = "info"
 # tracing_service_name = "rvc"
 
 # GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
-# Uses Application Default Credentials (ADC) — no endpoint needed.
+# Sends OTLP to the Telemetry API (https://telemetry.googleapis.com/v1/traces)
+# with Application Default Credentials (ADC). tracing_endpoint is ignored.
+# Enable telemetry.googleapis.com first (see docs/running-guide.md).
 # On shutdown, pending spans are flushed with a 5-second timeout.

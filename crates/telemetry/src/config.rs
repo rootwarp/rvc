@@ -8,7 +8,7 @@ pub enum ExporterKind {
     /// OpenTelemetry Protocol (OTLP) over HTTP.
     #[default]
     Otlp,
-    /// Google Cloud Trace exporter (requires `gcp-trace` feature).
+    /// Google Cloud Trace through the Telemetry API OTLP endpoint (requires `gcp-trace`).
     #[cfg(feature = "gcp-trace")]
     Gcp,
 }

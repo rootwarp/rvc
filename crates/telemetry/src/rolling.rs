@@ -1,15 +1,27 @@
 //! Size-based rolling file writer for the file log layer.
 //!
-//! RED stub: the writer does not exist yet. The tests below define it.
-#![allow(dead_code, unused_imports, unused_variables)]
+//! The writer keeps the file names and the retention rule of `logroller` 0.1:
+//!
+//! - The active file is `<name>`. A rotation renames it to `<name>.1` and
+//!   moves each older `<name>.N` and `<name>.N.gz` to index `N + 1`.
+//! - A rotation occurs after a write that makes the active file
+//!   `max_size_mb` MiB or larger.
+//! - After a rotation, a background thread compresses `<name>.1` to
+//!   `<name>.1.gz` (when compression is on). Then it removes each rotated
+//!   file with an index of `max_files` or more.
+//! - While that thread runs, the writer does not rotate again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
 use crate::file_appender::FileAppenderConfig;
 
+/// The names and the retention limit of one rolling log file.
 #[derive(Debug, Clone)]
 struct Layout {
     dir: PathBuf,
@@ -19,27 +31,133 @@ struct Layout {
 }
 
 impl Layout {
+    fn active(&self) -> PathBuf {
+        self.dir.join(&self.name)
+    }
+
+    fn rotated(&self, index: usize, gz: bool) -> PathBuf {
+        let suffix = if gz { ".gz" } else { "" };
+        self.dir.join(format!("{}.{index}{suffix}", self.name))
+    }
+
+    /// Returns `N` for `<name>.N` and `<name>.N.gz`.
     fn index_of(&self, file_name: &str) -> Option<usize> {
-        None
+        let rest = file_name.strip_prefix(self.name.as_str())?.strip_prefix('.')?;
+        rest.strip_suffix(".gz").unwrap_or(rest).parse().ok()
+    }
+
+    fn rotated_files(&self) -> io::Result<Vec<(usize, PathBuf)>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if let Some(index) = entry.file_name().to_str().and_then(|n| self.index_of(n)) {
+                files.push((index, entry.path()));
+            }
+        }
+        Ok(files)
+    }
+
+    /// Compresses `<name>.1` and removes the files above the retention limit.
+    fn clean_up(&self) -> io::Result<()> {
+        #[cfg(test)]
+        let _gate = tests::CLEANUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.compress {
+            gzip(&self.rotated(1, false), &self.rotated(1, true))?;
+        }
+        for (index, path) in self.rotated_files()? {
+            if index >= self.max_files {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 }
 
+fn gzip(source: &Path, target: &Path) -> io::Result<()> {
+    let mut encoder = GzEncoder::new(BufWriter::new(File::create(target)?), Compression::default());
+    io::copy(&mut File::open(source)?, &mut encoder)?;
+    encoder.finish()?.flush()?;
+    fs::remove_file(source)
+}
+
+fn open_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn rename_if_present(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// A writer that rotates `<directory>/<filename>` by size. See the module docs.
 #[derive(Debug)]
 pub(crate) struct RollingWriter {
+    layout: Layout,
+    max_bytes: u64,
+    file: File,
+    size: u64,
+    next_index: usize,
     cleanup: Option<JoinHandle<()>>,
 }
 
 impl RollingWriter {
+    /// Opens the active file in append mode. Creates the directory if necessary.
     pub(crate) fn open(config: &FileAppenderConfig) -> io::Result<Self> {
-        Err(io::ErrorKind::Unsupported.into())
+        let layout = Layout {
+            dir: PathBuf::from(&config.directory),
+            name: config.filename.clone(),
+            max_files: config.max_files,
+            compress: config.compress,
+        };
+        fs::create_dir_all(&layout.dir)?;
+        let file = open_append(&layout.active())?;
+        let highest = layout.rotated_files()?.into_iter().map(|(i, _)| i).max().unwrap_or(0);
+        Ok(Self {
+            max_bytes: config.max_size_mb.saturating_mul(1024 * 1024),
+            size: file.metadata()?.len(),
+            next_index: (highest + 1).min(layout.max_files),
+            file,
+            layout,
+            cleanup: None,
+        })
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        for index in (1..self.next_index).rev() {
+            for gz in [false, true] {
+                let to = self.layout.rotated(index + 1, gz);
+                rename_if_present(&self.layout.rotated(index, gz), &to)?;
+            }
+        }
+        fs::rename(self.layout.active(), self.layout.rotated(1, false))?;
+        self.file = open_append(&self.layout.active())?;
+        self.size = 0;
+        self.next_index = (self.next_index + 1).min(self.layout.max_files);
+        let layout = self.layout.clone();
+        let cleanup = thread::Builder::new().name("rvc-log-cleanup".into()).spawn(move || {
+            if let Err(e) = layout.clean_up() {
+                eprintln!("log cleanup failed for {}: {e}", layout.active().display());
+            }
+        })?;
+        self.cleanup = Some(cleanup);
+        Ok(())
     }
 }
 
 impl Write for RollingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::Unsupported.into())
+        let written = self.file.write(buf)?;
+        self.size += written as u64;
+        let busy = self.cleanup.as_ref().is_some_and(|c| !c.is_finished());
+        if !busy && self.size >= self.max_bytes {
+            self.rotate()?;
+        }
+        Ok(written)
     }
 
+    /// `File` has no buffer, thus there is nothing to flush.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
