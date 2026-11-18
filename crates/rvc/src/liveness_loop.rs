@@ -3853,7 +3853,7 @@ mod tests {
 
     /// Marker and fallback writes fail. The pre-allocated record is overwritten
     /// in place, the drain exits 12, and the next boot refuses that record.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn in_place_record_survives_marker_and_fallback_write_failure() {
         let _guard = crate::detection_marker::arm_marker_write_failures(u32::MAX);
         let keys = tempfile::tempdir().expect("keys");
@@ -3877,7 +3877,7 @@ mod tests {
             )
             .await
         });
-        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
             "a durable in-place record must exit 12, got {res:?}"
@@ -3915,7 +3915,7 @@ mod tests {
     /// - The drain of instance A returns exit 12.
     /// - The boot of instance B with `b.sqlite` does not exit 12.
     /// - The boot of instance A with `a.sqlite` exits 12.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn fallback_marker_of_one_instance_does_not_refuse_another_sharing_the_db_dir() {
         let shared = tempfile::tempdir().expect("The test must create the database directory.");
         let root_a = tempfile::tempdir().expect("The test must create the root of instance A.");
@@ -3944,7 +3944,7 @@ mod tests {
             .await
         });
 
-        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
 
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
@@ -4180,6 +4180,23 @@ mod tests {
             joined = task => joined.expect("drain task"),
             _ = rx => panic!("drain did not finish within {bound:?}"),
         }
+    }
+
+    /// The limit for a drain task in paused Tokio time. It does not use the
+    /// wall clock.
+    const PAUSED_DRAIN_LIMIT: Duration = Duration::from_secs(30);
+
+    /// Wait until `task` finishes. Use this only in a test with paused time.
+    /// The join handle is the completion signal. The limit is
+    /// [`PAUSED_DRAIN_LIMIT`] of paused time, which goes forward only while
+    /// the runtime has no task that can run.
+    async fn join_in_paused_time<T>(task: tokio::task::JoinHandle<T>) -> T {
+        let joined = tokio::time::timeout(PAUSED_DRAIN_LIMIT, task).await;
+        assert!(
+            joined.is_ok(),
+            "The drain task must finish within {PAUSED_DRAIN_LIMIT:?} of paused time."
+        );
+        joined.ok().and_then(Result::ok).expect("The drain task must not panic.")
     }
 
     fn missing_marker_dir(label: &str) -> std::path::PathBuf {
