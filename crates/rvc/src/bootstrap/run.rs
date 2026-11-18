@@ -1392,8 +1392,8 @@ mod tests {
         );
     }
 
-    /// Boot refuses the owned fallback marker of its slashing database. The
-    /// test writes the marker as raw JSON, so it does not use the writer.
+    /// Boot returns exit code 12 if the owned fallback marker exists. The
+    /// test writes the marker directly as JSON.
     #[tokio::test(flavor = "current_thread")]
     async fn boot_refuses_an_owned_fallback_marker() {
         let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
@@ -1427,12 +1427,12 @@ mod tests {
             rx,
         )
         .await
-        .expect_err("The boot must fail.");
+        .expect_err("Boot must return an error for this fixture.");
 
         assert_eq!(
             err.exit_code(),
             EXIT_DOPPELGANGER_DETECTED,
-            "The boot must exit 12 for the owned fallback marker {}. The error is: {err}",
+            "Boot must return exit code 12 when it finds the marker at {}. The error is {err}.",
             owned.display()
         );
     }

@@ -3907,22 +3907,21 @@ mod tests {
         assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
     }
 
-    /// Instances A and B keep their slashing databases in one directory.
-    /// The keystore directory of instance A does not exist, so the drain of
-    /// instance A writes only the fallback marker of `a.sqlite`. The test
-    /// requires these results:
+    /// Instances A and B use one directory for their databases. The keystore
+    /// directory of instance A is absent. The drain of instance A writes only
+    /// the fallback marker for `a.sqlite`. The test requires these results:
     ///
-    /// - The drain of instance A returns exit 12.
-    /// - The boot of instance B with `b.sqlite` does not exit 12.
-    /// - The boot of instance A with `a.sqlite` exits 12.
+    /// - The drain of instance A must return the doppelganger detection error.
+    /// - Boot for instance B must proceed past the marker check.
+    /// - Boot for instance A must return exit code 12.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn fallback_marker_of_one_instance_does_not_refuse_another_sharing_the_db_dir() {
         let shared = tempfile::tempdir().expect("The test must create the database directory.");
-        let root_a = tempfile::tempdir().expect("The test must create the root of instance A.");
+        let root_a = tempfile::tempdir().expect("The test must create the parent of keystore A.");
         let keys_a = root_a.path().join("keys");
         let db_a = shared.path().join("a.sqlite");
         let fallback = crate::detection_marker::FallbackMarkerPath::for_config(&keys_a, &db_a)
-            .expect("Instance A must have a fallback marker beside its database.");
+            .expect("The test must find a fallback path beside the database.");
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
         let keystore = keys_a.clone();
@@ -3948,22 +3947,23 @@ mod tests {
 
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
-            "The drain of instance A must return exit 12. The result is {res:?}."
+            "The drain of instance A must return the doppelganger detection error. The result \
+             is {res:?}."
         );
         let keys_b = tempfile::tempdir().expect("The test must create the keystore of instance B.");
         let err = boot_refusing(keys_b.path(), Some(shared.path().join("b.sqlite"))).await;
         assert_ne!(
             err.exit_code(),
             EXIT_DOPPELGANGER_DETECTED,
-            "The boot of instance B must not exit 12 for the detection of instance A. The \
-             error is: {err}"
+            "Instance B must not exit with code 12 when only instance A has a fallback marker. \
+             The error is {err}."
         );
         std::fs::create_dir(&keys_a).expect("The test must create the keystore of instance A.");
         let err = boot_refusing(&keys_a, Some(db_a)).await;
         assert_eq!(
             err.exit_code(),
             EXIT_DOPPELGANGER_DETECTED,
-            "The boot of instance A must exit 12. The error is: {err}"
+            "Boot for instance A must return exit code 12. The error is {err}."
         );
     }
 
@@ -4278,7 +4278,7 @@ mod tests {
         crate::bootstrap::DetectionShutdown { machine, keystore_dir, fallback, epoch_clock }
     }
 
-    /// Return the fallback marker of the database `slashing.sqlite` in `dir`.
+    /// Return the fallback path for `slashing.sqlite` in `dir`.
     fn fallback_in(dir: &std::path::Path) -> crate::detection_marker::FallbackMarkerPath {
         crate::detection_marker::FallbackMarkerPath {
             dir: dir.to_path_buf(),
