@@ -7,10 +7,12 @@
 //! overwrites that file in place (`pwrite`, then `fsync`). An in-place
 //! overwrite does not allocate a new directory entry. On copy-on-write or
 //! thin storage (btrfs, ZFS, thin LVM) it can still allocate a new block.
-//! The keystore marker and, when that directory is different, the same marker
-//! beside the slashing database are additional paths. A write is durable only
-//! after its `fsync` returns `Ok`, and a rename also needs the directory
-//! `fsync`. A later read is not a substitute. Exit 12 follows that
+//! The keystore marker and, when that directory is different, a marker beside
+//! the slashing database are additional paths. The marker beside the database
+//! is named after the database file and records the keystore directory, so
+//! two instances that share a database directory do not share it. A write is
+//! durable only after its `fsync` returns `Ok`, and a rename also needs the
+//! directory `fsync`. A later read is not a substitute. Exit 12 follows that
 //! acknowledgement. A `SIGKILL` before the first of them is durable loses
 //! the latch. The next start refuses to run while a marker is present or the
 //! record is `detected`, including when a file cannot be read, is a symlink,
@@ -79,6 +81,10 @@ struct MarkerDocument {
     epoch: u64,
     unix_secs: u64,
     pubkeys: Vec<String>,
+    /// Keystore directory that owns a fallback marker. The keystore marker
+    /// and a version-1 document without the field have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keystore_dir: Option<String>,
 }
 
 /// `Removed` when a marker file was unlinked. `Absent` when there was none.
@@ -98,9 +104,9 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
 
 /// Parent of `slashing_db_path` when that directory is not `keystore_dir`.
 ///
-/// The fallback marker uses [`MARKER_FILENAME`] in this directory. The same
-/// directory as the keystore is not a second disk, so the caller keeps
-/// retrying the keystore write instead.
+/// The fallback marker in this directory has the name that
+/// [`fallback_marker_name`] gives. The same directory as the keystore is not
+/// a second disk, so the caller keeps retrying the keystore write instead.
 pub fn fallback_marker_dir(keystore_dir: &Path, slashing_db_path: &Path) -> Option<PathBuf> {
     let parent = slashing_db_path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
     if same_dir(parent, keystore_dir) {
@@ -117,9 +123,14 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// File name of the fallback marker of the database at `slashing_db_path`.
-pub fn fallback_marker_name(_slashing_db_path: &Path) -> String {
-    MARKER_FILENAME.to_string()
+/// File name of the fallback marker of the database at `slashing_db_path`:
+/// [`MARKER_FILENAME`], a dot, and the file name of the database.
+///
+/// Two databases in one directory get two names. The legacy name
+/// [`MARKER_FILENAME`] in that directory has no owner and is only read.
+pub fn fallback_marker_name(slashing_db_path: &Path) -> String {
+    let db_name = slashing_db_path.file_name().unwrap_or_default().to_string_lossy();
+    format!("{MARKER_FILENAME}.{db_name}")
 }
 
 /// The fallback marker of one slashing database.
@@ -152,17 +163,33 @@ pub struct FallbackInspect {
 }
 
 /// Read the owned fallback marker and the legacy fallback marker.
+///
+/// Boot refuses when either one is not [`MarkerInspect::Absent`]. The owner
+/// that the owned marker records does not change that.
 pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
     FallbackInspect { owned: inspect_at(&fallback.owned_path()), legacy: inspect(&fallback.dir) }
 }
 
-/// Write the owned fallback marker of `fallback`.
+/// Write the owned fallback marker of `fallback`: temp file, fsync, rename,
+/// fsync the directory.
+///
+/// The document records `keystore_dir` as its owner: the canonical path, or
+/// the path as given when it does not resolve (the drain writes this marker
+/// when the keystore write fails). Nothing writes the legacy name.
 pub fn write_fallback_marker(
     fallback: &FallbackMarkerPath,
-    _keystore_dir: &Path,
+    keystore_dir: &Path,
     marker: &DetectionMarker,
 ) -> io::Result<()> {
-    write_marker(&fallback.dir, marker)
+    let body = encode_marker(marker, Some(marker_owner_of(keystore_dir)))?;
+    atomic_write(&fallback.dir, &fallback_marker_name(&fallback.slashing_db_path), &body)
+}
+
+fn marker_owner_of(keystore_dir: &Path) -> String {
+    fs::canonicalize(keystore_dir)
+        .unwrap_or_else(|_| keystore_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// What [`clear_fallback_marker`] did with one fallback marker.
@@ -177,11 +204,49 @@ pub enum FallbackClear {
 }
 
 /// Remove the fallback markers of `fallback` that belong to `keystore_dir`.
+///
+/// The owned marker is removed when it records no owner, or when its owner
+/// and `keystore_dir` are the same directory after canonicalization. An
+/// owned marker of another keystore stays, and the result gives
+/// [`FallbackClear::OtherOwner`]. An owned marker that cannot be read or
+/// does not parse stays, because its owner is unknown: this returns
+/// `InvalidData` and names its path. The legacy marker has no owner and is
+/// removed. Each removal fsyncs the directory. An empty result means that
+/// neither name exists.
 pub fn clear_fallback_marker(
     fallback: &FallbackMarkerPath,
-    _keystore_dir: &Path,
+    keystore_dir: &Path,
 ) -> io::Result<Vec<FallbackClear>> {
+    let path = fallback.owned_path();
     let mut cleared = Vec::new();
+    let owner = match doppelganger::marker_file::read_marker_file(&path) {
+        doppelganger::marker_file::MarkerFile::Absent => None,
+        doppelganger::marker_file::MarkerFile::Bytes(bytes) => Some(marker_owner(&bytes)),
+        doppelganger::marker_file::MarkerFile::Unreadable(source) => Some(Err(source.to_string())),
+    };
+    match owner {
+        None => {}
+        Some(Err(reason)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the fallback detection marker {path} cannot be read or does not parse \
+                     ({reason}), so its owner is unknown. Make sure that no other validator \
+                     client uses this slashing database, remove {path}, then run \
+                     `rvc doppelganger clear-detection` again",
+                    path = path.display()
+                ),
+            ));
+        }
+        Some(Ok(Some(owner))) if !same_dir(Path::new(&owner), keystore_dir) => {
+            cleared.push(FallbackClear::OtherOwner { path, owner });
+        }
+        Some(Ok(_)) => {
+            fs::remove_file(&path)?;
+            sync_dir(&fallback.dir)?;
+            cleared.push(FallbackClear::Removed { path });
+        }
+    }
     if let ClearOutcome::Removed = clear_marker(&fallback.dir)? {
         cleared.push(FallbackClear::LegacyRemoved { path: marker_path(&fallback.dir) });
     }
@@ -261,7 +326,12 @@ pub fn blocks_window_skip(data_dir: &Path) -> bool {
 ///
 /// Pubkeys are stored as `0x` plus 96 lowercase hex digits. An empty list is
 /// still written so a detection with no parsed key refuses the next start.
+/// The keystore marker records no owner.
 pub fn write_marker(data_dir: &Path, marker: &DetectionMarker) -> io::Result<()> {
+    atomic_write(data_dir, MARKER_FILENAME, &encode_marker(marker, None)?)
+}
+
+fn encode_marker(marker: &DetectionMarker, keystore_dir: Option<String>) -> io::Result<Vec<u8>> {
     #[cfg(test)]
     if take_marker_write_failure() {
         return Err(io::Error::new(io::ErrorKind::StorageFull, "injected marker write failure"));
@@ -280,10 +350,9 @@ pub fn write_marker(data_dir: &Path, marker: &DetectionMarker) -> io::Result<()>
         epoch: marker.epoch,
         unix_secs: marker.unix_secs,
         pubkeys,
+        keystore_dir,
     };
-    let body = serde_json::to_vec_pretty(&doc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    atomic_write(data_dir, MARKER_FILENAME, &body)
+    serde_json::to_vec_pretty(&doc).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn atomic_write(data_dir: &Path, filename: &str, body: &[u8]) -> io::Result<()> {
@@ -1186,7 +1255,8 @@ fn run_before_record_link() {
     }
 }
 
-/// Fail the next `count` [`write_marker`] calls on this thread.
+/// Fail the next `count` [`write_marker`] and [`write_fallback_marker`]
+/// calls on this thread.
 ///
 /// `u32::MAX` keeps failing until the guard drops. The in-place record write
 /// is not affected.
@@ -1525,6 +1595,15 @@ fn parse_marker(bytes: &[u8]) -> Result<DetectionMarker, String> {
         pubkeys.push(normalized);
     }
     Ok(DetectionMarker { epoch: doc.epoch, unix_secs: doc.unix_secs, pubkeys })
+}
+
+/// The owner that a valid marker records. `Err` when `bytes` is not a marker
+/// that [`parse_marker`] accepts.
+fn marker_owner(bytes: &[u8]) -> Result<Option<String>, String> {
+    parse_marker(bytes)?;
+    let doc: MarkerDocument =
+        serde_json::from_slice(bytes).map_err(|e| format!("marker json: {e}"))?;
+    Ok(doc.keystore_dir)
 }
 
 fn normalize_pubkey(raw: &str) -> Option<String> {

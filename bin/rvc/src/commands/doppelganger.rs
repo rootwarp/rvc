@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::bail;
-use rvc::detection_marker::{self, ClearOutcome};
+use rvc::detection_marker::{self, ClearOutcome, FallbackClear};
 use rvc::startup;
 
 /// Remove `.rvc.doppelganger_detected` from the validator data directory.
@@ -18,11 +18,16 @@ use rvc::startup;
 /// command does not replace a record that it cannot read or a record that
 /// changes after its read, and the marker stays. A symlink, directory or
 /// FIFO at that path still needs `rm`: the command returns an error that
-/// names the path, and the marker stays. When
-/// `slashing_db_path` is set and its directory is not `datadir`, the fallback
-/// marker in that directory is removed too. The keystore marker is unlinked
-/// last. Deleting only that marker by hand does not write the force-window
-/// file, does not clear a detected record, and does not force the window.
+/// names the path, and the marker stays. When `slashing_db_path` is set and
+/// its directory is not `datadir`, the command removes the fallback marker of
+/// that database when it belongs to `datadir` or records no owner. It keeps a
+/// fallback marker of another keystore and prints its path and owner. It
+/// removes a legacy `.rvc.doppelganger_detected` in that directory, which
+/// records no owner. A fallback marker of that database that does not parse
+/// stops the command, and the keystore marker stays. The keystore marker is
+/// unlinked last. Deleting only that marker by hand does not write the
+/// force-window file, does not clear a detected record, and does not force
+/// the window.
 pub fn execute_clear_detection(
     datadir: &Path,
     slashing_db_path: Option<&Path>,
@@ -55,8 +60,27 @@ pub fn execute_clear_detection(
         );
     }
     if let Some(db_path) = slashing_db_path {
-        if let Some(dir) = detection_marker::fallback_marker_dir(datadir, db_path) {
-            detection_marker::clear_marker(&dir)?;
+        if let Some(fallback) = detection_marker::FallbackMarkerPath::for_config(datadir, db_path) {
+            for cleared in detection_marker::clear_fallback_marker(&fallback, datadir)? {
+                match cleared {
+                    FallbackClear::Removed { path } => {
+                        println!("removed the fallback detection marker at {}.", path.display());
+                    }
+                    FallbackClear::OtherOwner { path, owner } => {
+                        println!(
+                            "kept the fallback detection marker at {} because it belongs to \
+                             the keystore directory {owner}.",
+                            path.display()
+                        );
+                    }
+                    FallbackClear::LegacyRemoved { path } => {
+                        println!(
+                            "removed the legacy fallback detection marker at {} (no owner recorded).",
+                            path.display()
+                        );
+                    }
+                }
+            }
         }
     }
     match detection_marker::clear_marker(datadir)? {

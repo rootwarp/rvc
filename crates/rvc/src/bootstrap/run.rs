@@ -717,16 +717,26 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
 
 /// Exit 12 before a signer or the keymanager API is built when a detection
 /// marker or a detected record is present in the keystore directory or, when
-/// that directory is different, a marker is beside the slashing database.
+/// that directory is different, the owned fallback marker of this database or
+/// a legacy fallback marker is beside the slashing database.
 pub(crate) fn refuse_if_detection_records(
     keystore_dir: &std::path::Path,
     slashing_db_path: &std::path::Path,
 ) -> Result<(), BootstrapError> {
     refuse_if_detection_record(keystore_dir)?;
-    refuse_if_detection_marker(keystore_dir)?;
-    if let Some(dir) = crate::detection_marker::fallback_marker_dir(keystore_dir, slashing_db_path)
+    refuse_if_detection_marker(
+        &crate::detection_marker::marker_path(keystore_dir),
+        crate::detection_marker::inspect(keystore_dir),
+    )?;
+    if let Some(fallback) =
+        crate::detection_marker::FallbackMarkerPath::for_config(keystore_dir, slashing_db_path)
     {
-        refuse_if_detection_marker(&dir)?;
+        let found = crate::detection_marker::inspect_fallback(&fallback);
+        refuse_if_detection_marker(&fallback.owned_path(), found.owned)?;
+        refuse_if_detection_marker(
+            &crate::detection_marker::marker_path(&fallback.dir),
+            found.legacy,
+        )?;
     }
     Ok(())
 }
@@ -762,10 +772,14 @@ fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), Bootstra
     }
 }
 
-/// Exit 12 before a signer or the keymanager API is built when a detection
-/// marker is present, unreadable, or not a valid marker.
-pub(crate) fn refuse_if_detection_marker(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
-    match crate::detection_marker::inspect(data_dir) {
+/// Exit 12 before a signer or the keymanager API is built when the detection
+/// marker that `found` describes at `path` is present, unreadable, or not a
+/// valid marker.
+fn refuse_if_detection_marker(
+    path: &std::path::Path,
+    found: crate::detection_marker::MarkerInspect,
+) -> Result<(), BootstrapError> {
+    match found {
         crate::detection_marker::MarkerInspect::Absent => Ok(()),
         crate::detection_marker::MarkerInspect::Present(marker) => {
             for pubkey in &marker.pubkeys {
@@ -773,7 +787,7 @@ pub(crate) fn refuse_if_detection_marker(data_dir: &std::path::Path) -> Result<(
                     pubkey = %TruncatedPubkey::new(pubkey),
                     epoch = marker.epoch,
                     unix_secs = marker.unix_secs,
-                    path = %crate::detection_marker::marker_path(data_dir).display(),
+                    path = %path.display(),
                     "doppelganger detection marker is present; refusing to start. {}",
                     DETECTION_CLEAR_HINT
                 );
@@ -781,7 +795,7 @@ pub(crate) fn refuse_if_detection_marker(data_dir: &std::path::Path) -> Result<(
             if marker.pubkeys.is_empty() {
                 error!(
                     epoch = marker.epoch,
-                    path = %crate::detection_marker::marker_path(data_dir).display(),
+                    path = %path.display(),
                     "doppelganger detection marker listed no keys; refusing to start. {}",
                     DETECTION_CLEAR_HINT
                 );
