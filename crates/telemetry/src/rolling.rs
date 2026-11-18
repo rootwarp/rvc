@@ -250,6 +250,11 @@ pub(crate) mod tests {
         }
     }
 
+    fn layout(dir: &Path) -> Layout {
+        let dir = Arc::new(rustix::fs::open(dir, OFlags::RDONLY, Mode::empty()).unwrap());
+        Layout { dir, name: "app.log".to_string(), max_files: 5, compress: false }
+    }
+
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -467,11 +472,12 @@ pub(crate) mod tests {
 
         fs::remove_file(&active).unwrap();
         assert!(std::process::Command::new("mkfifo").arg(&active).status().unwrap().success());
-        let config = config(dir.path(), 5, false);
+        let layout = layout(dir.path());
         let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || tx.send(RollingWriter::open(&config).map(drop)));
+        thread::spawn(move || tx.send(layout.open("app.log", OFlags::RDONLY).map(drop)));
         let opened = rx.recv_timeout(Duration::from_secs(10)).expect("The open must not block.");
-        assert!(opened.is_err(), "The writer must reject a FIFO.");
+        let error = opened.expect_err("The writer must reject a FIFO.");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "A FIFO is not a regular file.");
     }
 
     #[test]
@@ -492,12 +498,7 @@ pub(crate) mod tests {
 
     #[test]
     fn index_of_reads_only_rotated_names() {
-        let layout = Layout {
-            dir: Arc::new(rustix::fs::open(".", OFlags::RDONLY, Mode::empty()).unwrap()),
-            name: "app.log".to_string(),
-            max_files: 5,
-            compress: false,
-        };
+        let layout = layout(Path::new("."));
         assert_eq!(layout.index_of("app.log.3"), Some(3));
         assert_eq!(layout.index_of("app.log.12.gz"), Some(12));
         for other in ["app.log", "app.log.gz", "app.logx.1", "app.log.1.tmp", "a.app.log.1"] {
