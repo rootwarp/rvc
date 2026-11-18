@@ -20,11 +20,12 @@ use rvc::startup;
 /// FIFO at that path still needs `rm`: the command returns an error that
 /// names the path, and the marker stays. When `slashing_db_path` is set and
 /// its directory is not `datadir`, the command removes the fallback marker of
-/// that database when it belongs to `datadir` or records no owner. It keeps a
-/// fallback marker of another keystore and prints its path and owner. It
-/// removes a legacy `.rvc.doppelganger_detected` in that directory, which
-/// records no owner. A fallback marker of that database that does not parse
-/// stops the command, and the keystore marker stays. The keystore marker is
+/// that database when it belongs to `datadir`. It keeps a fallback marker of
+/// another keystore and prints its path and owner. These entries stop the
+/// command with an error that gives the path and the recovery step, and the
+/// keystore marker stays: a fallback marker of that database that cannot be
+/// read, does not parse, or records no owner, and a legacy
+/// `.rvc.doppelganger_detected` in that directory. The keystore marker is
 /// unlinked last. Deleting only that marker by hand does not write the
 /// force-window file, does not clear a detected record, and does not force
 /// the window.
@@ -70,12 +71,6 @@ pub fn execute_clear_detection(
                         println!(
                             "kept the fallback detection marker at {} because it belongs to \
                              the keystore directory {owner}.",
-                            path.display()
-                        );
-                    }
-                    FallbackClear::LegacyRemoved { path } => {
-                        println!(
-                            "removed the legacy fallback detection marker at {} (no owner recorded).",
                             path.display()
                         );
                     }

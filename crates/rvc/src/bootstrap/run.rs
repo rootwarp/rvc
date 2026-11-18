@@ -116,6 +116,17 @@ async fn run_with_clock<C: SlotClock + 'static>(
         "Starting validator client"
     );
 
+    if let Err(err) = crate::detection_marker::check_slashing_db_name(
+        &config.keystore_path,
+        &config.slashing_db_path,
+    ) {
+        error!(
+            path = %config.slashing_db_path.display(),
+            error = %err,
+            "the slashing database file name cannot get a detection marker; refusing to start"
+        );
+        return Err(BootstrapError::InvalidConfig(err.to_string()));
+    }
     refuse_if_detection_records(&config.keystore_path, &config.slashing_db_path)?;
     if config.doppelganger_detection {
         ensure_marker_dir_writable(&config.keystore_path)?;
@@ -687,24 +698,26 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
                 "failed to persist doppelganger detection marker during shutdown"
             );
             if let Some(fallback) = &detection.fallback {
-                if crate::detection_marker::write_fallback_marker(
+                match crate::detection_marker::write_fallback_marker(
                     fallback,
                     &detection.keystore_dir,
                     &marker,
-                )
-                .is_ok()
-                {
-                    detection.machine.mark_detection_persisted();
-                    error!(
-                        path = %fallback.owned_path().display(),
-                        "persisted doppelganger detection marker beside the slashing database"
-                    );
-                } else {
-                    crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                    error!(
-                        path = %fallback.owned_path().display(),
-                        "failed to persist the fallback doppelganger detection marker"
-                    );
+                ) {
+                    Ok(()) => {
+                        detection.machine.mark_detection_persisted();
+                        error!(
+                            path = %fallback.owned_path().display(),
+                            "persisted doppelganger detection marker beside the slashing database"
+                        );
+                    }
+                    Err(fallback_err) => {
+                        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+                        error!(
+                            error = %fallback_err,
+                            path = %fallback.owned_path().display(),
+                            "failed to persist the fallback doppelganger detection marker"
+                        );
+                    }
                 }
             }
         }

@@ -58,11 +58,17 @@ pub fn read_marker_file(path: &Path) -> MarkerFile {
         }
     });
 
-    let file = match open_nofollow(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return MarkerFile::Absent,
-        Err(source) => return MarkerFile::Unreadable(source),
-    };
+    match open_nofollow(path) {
+        Ok(file) => read_open_marker(file),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => MarkerFile::Absent,
+        Err(source) => MarkerFile::Unreadable(source),
+    }
+}
+
+/// Read a marker through `file`, which the caller opened with `O_NOFOLLOW`
+/// and `O_NONBLOCK`. Anything but a regular file within the size cap is
+/// unreadable.
+pub fn read_open_marker(file: File) -> MarkerFile {
     // `File::metadata` is `fstat` of this fd, not another lookup of the path.
     match file.metadata() {
         Ok(meta) if meta.is_file() => {}

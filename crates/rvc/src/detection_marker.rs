@@ -10,7 +10,11 @@
 //! The keystore marker and, when that directory is different, a marker beside
 //! the slashing database are additional paths. The marker beside the database
 //! is named after the database file and records the keystore directory, so
-//! two instances that share a database directory do not share it. A write is
+//! two instances that share a database directory do not share it. Its writes
+//! and clears hold one lock for that directory and use one directory handle.
+//! `clear-detection` keeps a marker beside the database that records no owner
+//! and a legacy `.rvc.doppelganger_detected` there; the error gives the
+//! recovery step. A write is
 //! durable only after its `fsync` returns `Ok`, and a rename also needs the
 //! directory `fsync`. A later read is not a substitute. Exit 12 follows that
 //! acknowledgement. A `SIGKILL` before the first of them is durable loses
@@ -32,11 +36,13 @@
 
 #[cfg(any(test, feature = "test-utils"))]
 use std::cell::{Cell, RefCell};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use doppelganger::marker_file::MarkerFile;
 use serde::{Deserialize, Serialize};
 
 /// File name under the validator data directory.
@@ -124,23 +130,66 @@ fn same_dir(left: &Path, right: &Path) -> bool {
 }
 
 /// File name of the lock that serializes the writes and the clears of the
-/// fallback markers in one database directory.
+/// fallback markers in one database directory. The file stays after the
+/// lock ends.
 pub const FALLBACK_LOCK_FILENAME: &str = ".rvc.doppelganger_lock";
 
+/// A slashing database file name that starts with one of these prefixes is
+/// refused. rvc uses the names in this name space for its detection files.
+const RESERVED_NAME_PREFIXES: [&str; 2] = [".rvc.doppelganger", "..rvc.doppelganger"];
+
+/// The longest file name in one directory on Linux file systems such as
+/// ext4, XFS and btrfs.
+const MAX_NAME_BYTES: usize = 255;
+
 /// Refuse a slashing database file name that rvc cannot protect.
+///
+/// A name in the name space of the detection files is refused, because a
+/// marker write could replace that database. When the database directory
+/// gets a fallback marker, a name whose fallback marker name has more than
+/// 255 bytes is refused, because no fallback marker can be
+/// written for that database. Boot calls this before SQLite opens the
+/// database.
 pub fn check_slashing_db_name(keystore_dir: &Path, slashing_db_path: &Path) -> io::Result<()> {
-    let _ = (keystore_dir, slashing_db_path);
+    let name = slashing_db_path.file_name().unwrap_or_default().as_encoded_bytes();
+    if RESERVED_NAME_PREFIXES.iter().any(|prefix| name.starts_with(prefix.as_bytes())) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the file name of the slashing database {} is in the name space of the rvc \
+                 detection files ({}). Use a different file name",
+                slashing_db_path.display(),
+                RESERVED_NAME_PREFIXES[0]
+            ),
+        ));
+    }
+    let len = fallback_marker_name(slashing_db_path).len();
+    if len > MAX_NAME_BYTES
+        && FallbackMarkerPath::for_config(keystore_dir, slashing_db_path).is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the fallback detection marker name for the slashing database {} has {len} \
+                 bytes, but a file name can have at most {MAX_NAME_BYTES} bytes. Use a shorter \
+                 database file name",
+                slashing_db_path.display()
+            ),
+        ));
+    }
     Ok(())
 }
 
 /// File name of the fallback marker of the database at `slashing_db_path`:
 /// [`MARKER_FILENAME`], a dot, and the file name of the database.
 ///
-/// Two databases in one directory get two names. The legacy name
+/// The name keeps the native bytes of the database file name, so two
+/// databases in one directory get two names. The legacy name
 /// [`MARKER_FILENAME`] in that directory has no owner and is only read.
-pub fn fallback_marker_name(slashing_db_path: &Path) -> String {
-    let db_name = slashing_db_path.file_name().unwrap_or_default().to_string_lossy();
-    format!("{MARKER_FILENAME}.{db_name}")
+pub fn fallback_marker_name(slashing_db_path: &Path) -> OsString {
+    let mut name = OsString::from(format!("{MARKER_FILENAME}."));
+    name.push(slashing_db_path.file_name().unwrap_or_default());
+    name
 }
 
 /// The fallback marker of one slashing database.
@@ -172,97 +221,218 @@ pub struct FallbackInspect {
     pub legacy: MarkerInspect,
 }
 
-/// Read the owned fallback marker and the legacy fallback marker.
+/// Read the owned fallback marker and the legacy fallback marker through one
+/// handle of the database directory.
 ///
 /// Boot refuses when either one is not [`MarkerInspect::Absent`]. The owner
-/// that the owned marker records does not change that.
+/// that the owned marker records does not change that. A missing directory
+/// gives two `Absent` results. A directory that the read cannot open without
+/// a symlink follow gives two `Unreadable` results.
 pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
-    FallbackInspect { owned: inspect_at(&fallback.owned_path()), legacy: inspect(&fallback.dir) }
+    let owned = fallback.owned_path();
+    let legacy = marker_path(&fallback.dir);
+    #[cfg(unix)]
+    {
+        match MarkerDir::open(&fallback.dir) {
+            Ok(None) => {
+                FallbackInspect { owned: MarkerInspect::Absent, legacy: MarkerInspect::Absent }
+            }
+            Ok(Some(dir)) => FallbackInspect {
+                owned: inspect_file(
+                    owned,
+                    dir.read(&fallback_marker_name(&fallback.slashing_db_path)),
+                ),
+                legacy: inspect_file(legacy, dir.read(OsStr::new(MARKER_FILENAME))),
+            },
+            Err(source) => FallbackInspect {
+                owned: MarkerInspect::Unreadable {
+                    path: owned,
+                    source: io::Error::new(source.kind(), source.to_string()),
+                },
+                legacy: MarkerInspect::Unreadable { path: legacy, source },
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        FallbackInspect { owned: inspect_at(&owned), legacy: inspect_at(&legacy) }
+    }
 }
 
-/// Write the owned fallback marker of `fallback`: temp file, fsync, rename,
-/// fsync the directory.
+/// Write the owned fallback marker of `fallback`.
 ///
-/// The document records `keystore_dir` as its owner: the canonical path, or
-/// the path as given when it does not resolve (the drain writes this marker
-/// when the keystore write fails). Nothing writes the legacy name.
+/// The document records the absolute keystore path that the writer resolves
+/// now, or no owner when that path has no UTF-8 form. The write
+/// holds the fallback lock of the directory. It does not replace an entry at
+/// the owned path unless that entry is a marker with the same owner: it
+/// returns `AlreadyExists` with the path and keeps the entry. The write is
+/// temp file, fsync, rename, and fsync of the directory, all through one
+/// handle of the directory. Nothing writes the legacy name.
 pub fn write_fallback_marker(
     fallback: &FallbackMarkerPath,
     keystore_dir: &Path,
     marker: &DetectionMarker,
 ) -> io::Result<()> {
-    let body = encode_marker(marker, Some(marker_owner_of(keystore_dir)))?;
-    atomic_write(&fallback.dir, &fallback_marker_name(&fallback.slashing_db_path), &body)
+    #[cfg(unix)]
+    {
+        let owner = resolved_owner(keystore_dir);
+        let body = encode_marker(marker, owner.clone())?;
+        let dir = MarkerDir::open(&fallback.dir)?
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let _lock = dir.lock()?;
+        let name = fallback_marker_name(&fallback.slashing_db_path);
+        let update = match dir.read(&name) {
+            MarkerFile::Absent => true,
+            MarkerFile::Bytes(bytes) => owner.is_some() && marker_owner(&bytes) == Ok(owner),
+            MarkerFile::Unreadable(_) => false,
+        };
+        if !update {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is not a fallback detection marker of this keystore, so the write does \
+                     not replace it",
+                    fallback.owned_path().display()
+                ),
+            ));
+        }
+        dir.replace(&name, &body)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fallback, keystore_dir, marker);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "a fallback marker needs a Unix platform"))
+    }
 }
 
-fn marker_owner_of(keystore_dir: &Path) -> String {
-    fs::canonicalize(keystore_dir)
-        .unwrap_or_else(|_| keystore_dir.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+/// The owner that a fallback marker of `keystore_dir` records: the absolute
+/// keystore path, resolved now.
+///
+/// `canonicalize` resolves the longest part of the path that exists, and
+/// the names that do not exist yet follow it. The drain writes the fallback
+/// marker when the keystore write fails, so the keystore directory can be
+/// missing. `None` when the path has no such form or is not valid UTF-8. A
+/// clear keeps a marker that records no owner.
+fn resolved_owner(keystore_dir: &Path) -> Option<String> {
+    let absolute = std::path::absolute(keystore_dir).ok()?;
+    let mut base = absolute.as_path();
+    let mut missing = Vec::new();
+    let real = loop {
+        match fs::canonicalize(base) {
+            Ok(real) => break real,
+            Err(_) => {
+                missing.push(base.file_name()?);
+                base = base.parent()?;
+            }
+        }
+    };
+    let resolved = missing.iter().rev().fold(real, |path, name| path.join(name));
+    resolved.into_os_string().into_string().ok()
 }
 
-/// What [`clear_fallback_marker`] did with one fallback marker.
+/// What [`clear_fallback_marker`] did with the owned fallback marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FallbackClear {
     /// The owned marker of this keystore was removed.
     Removed { path: PathBuf },
     /// The owned marker names another keystore and stays.
     OtherOwner { path: PathBuf, owner: String },
-    /// The legacy marker, which has no owner, was removed.
-    LegacyRemoved { path: PathBuf },
 }
 
-/// Remove the fallback markers of `fallback` that belong to `keystore_dir`.
+/// Remove the owned fallback marker of `fallback` when it belongs to
+/// `keystore_dir`.
 ///
-/// The owned marker is removed when it records no owner, or when its owner
-/// and `keystore_dir` are the same directory after canonicalization. An
-/// owned marker of another keystore stays, and the result gives
-/// [`FallbackClear::OtherOwner`]. An owned marker that cannot be read or
-/// does not parse stays, because its owner is unknown: this returns
-/// `InvalidData` and names its path. The legacy marker has no owner and is
-/// removed. Each removal fsyncs the directory. An empty result means that
-/// neither name exists.
+/// The clear holds the fallback lock of the directory and uses one handle
+/// of the directory for the reads and the unlink. The owned marker is
+/// removed only when the owner that it records is the absolute path that a
+/// write for `keystore_dir` records now. The function does not resolve the
+/// recorded owner again. An owned marker of another keystore
+/// stays, and the result gives [`FallbackClear::OtherOwner`]. These entries
+/// stay, and the function returns `InvalidData` with the path and the
+/// recovery step:
+///
+/// - an owned marker that cannot be read or does not parse, because its
+///   owner is unknown;
+/// - an owned marker that records no owner;
+/// - a legacy marker, which records no owner.
+///
+/// A removal fsyncs the directory. The result has at most one entry. An
+/// empty result means that no owned marker exists.
 pub fn clear_fallback_marker(
     fallback: &FallbackMarkerPath,
     keystore_dir: &Path,
 ) -> io::Result<Vec<FallbackClear>> {
-    let path = fallback.owned_path();
-    let mut cleared = Vec::new();
-    let owner = match doppelganger::marker_file::read_marker_file(&path) {
-        doppelganger::marker_file::MarkerFile::Absent => None,
-        doppelganger::marker_file::MarkerFile::Bytes(bytes) => Some(marker_owner(&bytes)),
-        doppelganger::marker_file::MarkerFile::Unreadable(source) => Some(Err(source.to_string())),
-    };
-    match owner {
-        None => {}
-        Some(Err(reason)) => {
+    #[cfg(unix)]
+    {
+        let Some(dir) = MarkerDir::open(&fallback.dir)? else {
+            return Ok(Vec::new());
+        };
+        let _lock = dir.lock()?;
+        let path = fallback.owned_path();
+        let name = fallback_marker_name(&fallback.slashing_db_path);
+        let owner = match dir.read(&name) {
+            MarkerFile::Absent => None,
+            MarkerFile::Bytes(bytes) => Some(marker_owner(&bytes)),
+            MarkerFile::Unreadable(source) => Some(Err(source.to_string())),
+        };
+        let owner = match owner {
+            None => None,
+            Some(Err(reason)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the fallback detection marker {path} cannot be read or does not parse \
+                         ({reason}), so its owner is unknown. Make sure that no other validator \
+                         client uses this slashing database, remove {path}, then run \
+                         `rvc doppelganger clear-detection` again",
+                        path = path.display()
+                    ),
+                ));
+            }
+            Some(Ok(None)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    no_owner_message(&path, &fallback.dir),
+                ));
+            }
+            Some(Ok(Some(owner))) => Some(owner),
+        };
+        if !matches!(dir.read(OsStr::new(MARKER_FILENAME)), MarkerFile::Absent) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "the fallback detection marker {path} cannot be read or does not parse \
-                     ({reason}), so its owner is unknown. Make sure that no other validator \
-                     client uses this slashing database, remove {path}, then run \
-                     `rvc doppelganger clear-detection` again",
-                    path = path.display()
-                ),
+                no_owner_message(&marker_path(&fallback.dir), &fallback.dir),
             ));
         }
-        Some(Ok(Some(owner))) if !same_dir(Path::new(&owner), keystore_dir) => {
-            cleared.push(FallbackClear::OtherOwner { path, owner });
+        let Some(owner) = owner else {
+            return Ok(Vec::new());
+        };
+        if resolved_owner(keystore_dir).as_ref() != Some(&owner) {
+            return Ok(vec![FallbackClear::OtherOwner { path, owner }]);
         }
-        Some(Ok(_)) => {
-            #[cfg(test)]
-            run_record_path_hook(&BEFORE_FALLBACK_UNLINK, &path);
-            fs::remove_file(&path)?;
-            sync_dir(&fallback.dir)?;
-            cleared.push(FallbackClear::Removed { path });
-        }
+        #[cfg(test)]
+        run_record_path_hook(&BEFORE_FALLBACK_UNLINK, &path);
+        dir.unlink(&name)?;
+        sync_file(&dir.file)?;
+        Ok(vec![FallbackClear::Removed { path }])
     }
-    if let ClearOutcome::Removed = clear_marker(&fallback.dir)? {
-        cleared.push(FallbackClear::LegacyRemoved { path: marker_path(&fallback.dir) });
+    #[cfg(not(unix))]
+    {
+        let _ = (fallback, keystore_dir);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "a fallback marker needs a Unix platform"))
     }
-    Ok(cleared)
+}
+
+/// The error text for a fallback marker at `path` in `dir` that records no
+/// owner: a legacy marker, or an owned marker without `keystore_dir`.
+fn no_owner_message(path: &Path, dir: &Path) -> String {
+    format!(
+        "the fallback detection marker {path} records no owner, so this command does not remove \
+         it. Stop each validator client whose slashing database is in {dir}, and make sure that \
+         its validators do not run in another place. Remove {path}. Then run `rvc doppelganger \
+         clear-detection` for each of those clients before it starts again",
+        path = path.display(),
+        dir = dir.display()
+    )
 }
 
 /// Read the marker. A missing file is [`MarkerInspect::Absent`].
@@ -274,16 +444,190 @@ pub fn inspect(data_dir: &Path) -> MarkerInspect {
 
 /// Read the marker at `path`. A missing file is [`MarkerInspect::Absent`].
 pub fn inspect_at(path: &Path) -> MarkerInspect {
-    let path = path.to_path_buf();
-    match doppelganger::marker_file::read_marker_file(&path) {
-        doppelganger::marker_file::MarkerFile::Absent => MarkerInspect::Absent,
-        doppelganger::marker_file::MarkerFile::Unreadable(source) => {
-            MarkerInspect::Unreadable { path, source }
-        }
-        doppelganger::marker_file::MarkerFile::Bytes(bytes) => match parse_marker(&bytes) {
+    inspect_file(path.to_path_buf(), doppelganger::marker_file::read_marker_file(path))
+}
+
+/// What a read of the marker at `path` found, as a [`MarkerInspect`].
+fn inspect_file(path: PathBuf, file: MarkerFile) -> MarkerInspect {
+    match file {
+        MarkerFile::Absent => MarkerInspect::Absent,
+        MarkerFile::Unreadable(source) => MarkerInspect::Unreadable { path, source },
+        MarkerFile::Bytes(bytes) => match parse_marker(&bytes) {
             Ok(marker) => MarkerInspect::Present(marker),
             Err(reason) => MarkerInspect::Corrupt { path, reason },
         },
+    }
+}
+
+/// A directory that this process resolved one time.
+///
+/// Each read, temp create, rename, unlink, lock and fsync of a marker in the
+/// directory goes through the handle. A later change to the path does not
+/// move these steps to a different directory.
+#[cfg(unix)]
+struct MarkerDir {
+    /// The directory, opened with `O_RDONLY`.
+    file: File,
+    /// The path as configured, for messages and test hooks.
+    path: PathBuf,
+}
+
+/// The flags of a directory in the walk of [`MarkerDir::open`]. On Linux,
+/// `O_PATH` needs only search permission on the directory.
+#[cfg(target_os = "linux")]
+const DIR_WALK: libc::c_int = libc::O_PATH;
+#[cfg(all(unix, not(target_os = "linux")))]
+const DIR_WALK: libc::c_int = libc::O_RDONLY;
+
+#[cfg(unix)]
+impl MarkerDir {
+    /// Open `dir`. `None` when it does not exist. An empty path is `.`.
+    ///
+    /// `canonicalize` gives the real path one time. A walk from `/` then
+    /// opens each name of that path with `O_NOFOLLOW` and `O_DIRECTORY`. If a
+    /// symlink or a file replaces a name after `canonicalize`, the walk
+    /// fails, so the handle is the directory that `canonicalize` found.
+    fn open(dir: &Path) -> io::Result<Option<Self>> {
+        let path = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let real = match fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        #[cfg(test)]
+        run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, &real);
+        let mut walk = open_at(None, OsStr::new("/"), &[DIR_WALK, libc::O_DIRECTORY])?;
+        for name in real.components().skip(1) {
+            let flags = [DIR_WALK, libc::O_DIRECTORY, libc::O_NOFOLLOW];
+            walk = open_at(Some(&walk), name.as_os_str(), &flags)?;
+        }
+        let file = open_at(Some(&walk), OsStr::new("."), &[libc::O_RDONLY, libc::O_DIRECTORY])?;
+        Ok(Some(Self { file, path: path.to_path_buf() }))
+    }
+
+    /// Read the entry `name` without a symlink follow and without a block
+    /// on a FIFO, by the rule of [`doppelganger::marker_file`].
+    fn read(&self, name: &OsStr) -> MarkerFile {
+        let flags = [libc::O_RDONLY, libc::O_NOFOLLOW, libc::O_NONBLOCK];
+        match open_at(Some(&self.file), name, &flags) {
+            Ok(file) => doppelganger::marker_file::read_open_marker(file),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => MarkerFile::Absent,
+            Err(err) => MarkerFile::Unreadable(err),
+        }
+    }
+
+    /// Take the fallback lock of this directory without a wait. The lock
+    /// ends when the returned file closes.
+    #[allow(unsafe_code)]
+    fn lock(&self) -> io::Result<File> {
+        use std::ops::BitOr;
+        use std::os::fd::AsRawFd;
+        let flags = [libc::O_RDWR, libc::O_CREAT, libc::O_NOFOLLOW];
+        let file = open_at(Some(&self.file), OsStr::new(FALLBACK_LOCK_FILENAME), &flags)?;
+        let operation = [libc::LOCK_EX, libc::LOCK_NB].into_iter().fold(0, BitOr::bitor);
+        // SAFETY: `file` keeps the descriptor open during the call. flock
+        // takes no pointer.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "the fallback detection marker lock {} cannot be taken: {err}. Another \
+                     process can hold it for a short time. Do the step again",
+                    self.path.join(FALLBACK_LOCK_FILENAME).display()
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Write `body` to `name`: a new temp file, fsync, rename, and fsync of
+    /// the directory.
+    ///
+    /// The temp name is `.rvc.doppelganger_tmp.<pid>.<nanos>.tmp`, at most 57
+    /// bytes. Its exclusive create does not open an entry that exists. A step
+    /// that fails removes only the temp file that this call created and did
+    /// not rename.
+    fn replace(&self, name: &OsStr, body: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = OsString::from(format!(
+            ".rvc.doppelganger_tmp.{}.{}.tmp",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        ));
+        #[cfg(test)]
+        run_record_path_hook(&BEFORE_MARKER_TEMP_OPEN, &self.path.join(&temp));
+        let flags = [libc::O_WRONLY, libc::O_CREAT, libc::O_EXCL, libc::O_NOFOLLOW];
+        let mut file = open_at(Some(&self.file), &temp, &flags)?;
+        let staged = file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(body))
+            .and_then(|()| sync_file(&file))
+            .and_then(|()| self.rename(&temp, name));
+        if let Err(err) = staged {
+            let _ = self.unlink(&temp);
+            return Err(err);
+        }
+        sync_file(&self.file)
+    }
+
+    /// Rename the entry `from` to `to` in this directory.
+    #[allow(unsafe_code)]
+    fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let (from, to) = (c_name(from)?, c_name(to)?);
+        let fd = self.file.as_raw_fd();
+        // SAFETY: `from` and `to` are NUL-terminated strings that live during
+        // the call, and `self.file` keeps `fd` open.
+        cvt(unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) })
+    }
+
+    /// Remove the entry `name` from this directory.
+    #[allow(unsafe_code)]
+    fn unlink(&self, name: &OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let name = c_name(name)?;
+        // SAFETY: `name` is a NUL-terminated string that lives during the
+        // call, and `self.file` keeps the descriptor open.
+        cvt(unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) })
+    }
+}
+
+/// Open `name` relative to `dir`, or to the working directory when `dir` is
+/// `None`, with `flags` and `O_CLOEXEC`. A create gets mode `0600`.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_at(dir: Option<&File>, name: &OsStr, flags: &[libc::c_int]) -> io::Result<File> {
+    use std::ops::BitOr;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = c_name(name)?;
+    let base = dir.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    let flags = flags.iter().copied().fold(libc::O_CLOEXEC, BitOr::bitor);
+    let mode: libc::c_uint = 0o600;
+    // SAFETY: `name` is a NUL-terminated string that lives during the call,
+    // and `dir` keeps `base` open. The mode is a plain integer.
+    let fd = unsafe { libc::openat(base, name.as_ptr(), flags, mode) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new descriptor that nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// `name` as a C string. A name with a NUL byte is `InvalidInput`.
+#[cfg(unix)]
+fn c_name(name: &OsStr) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name.as_encoded_bytes())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+}
+
+/// `Ok` for a libc result of 0. Else the error of the last call.
+#[cfg(unix)]
+fn cvt(result: libc::c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -367,35 +711,21 @@ fn encode_marker(marker: &DetectionMarker, keystore_dir: Option<String>) -> io::
     serde_json::to_vec_pretty(&doc).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Write `body` to `filename` in `data_dir` with [`MarkerDir::replace`], the
+/// marker writer that the fallback marker also uses. The keystore marker and
+/// the force-window file use this function.
 fn atomic_write(data_dir: &Path, filename: &str, body: &[u8]) -> io::Result<()> {
-    #[cfg(test)]
-    run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, data_dir);
-    let final_path = data_dir.join(filename);
-    let tmp_path = data_dir.join(format!(
-        ".{filename}.{}.{}.tmp",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
-    ));
-    #[cfg(test)]
-    run_record_path_hook(&BEFORE_MARKER_TEMP_OPEN, &tmp_path);
-    let write_result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(body)?;
-        sync_file(&file)?;
-        drop(file);
-        fs::rename(&tmp_path, &final_path)?;
-        sync_dir(data_dir)?;
-        Ok(())
-    })();
-    if write_result.is_err() && tmp_path.exists() {
-        let _ = fs::remove_file(&tmp_path);
+    #[cfg(unix)]
+    {
+        let dir =
+            MarkerDir::open(data_dir)?.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        dir.replace(OsStr::new(filename), body)
     }
-    write_result
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, filename, body);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "a marker write needs a Unix platform"))
+    }
 }
 
 /// Unlink the marker and fsync the directory. A missing file is success.
@@ -1111,9 +1441,9 @@ thread_local! {
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
 }
 
-/// Run `hook` one time on this thread, after a marker writer resolves its
-/// directory and before it opens that directory. The hook gets the
-/// resolved directory.
+/// Run `hook` one time on this thread, after [`MarkerDir::open`] resolves
+/// its directory and before the walk opens that directory. The hook gets
+/// the resolved directory.
 ///
 /// The guard removes the hook when it drops, if the hook did not run.
 #[cfg(test)]
@@ -1123,8 +1453,8 @@ pub(crate) fn arm_after_marker_dir_resolve(
     arm_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, hook)
 }
 
-/// Run `hook` one time on this thread, before a marker writer opens its
-/// temp file. The hook gets the temp path.
+/// Run `hook` one time on this thread, before [`MarkerDir::replace`] opens
+/// its temp file. The hook gets the temp path.
 ///
 /// The guard removes the hook when it drops, if the hook did not run.
 #[cfg(test)]
