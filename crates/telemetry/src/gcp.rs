@@ -15,6 +15,7 @@ use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 /// OTLP/HTTP traces endpoint of the Google Cloud Telemetry API.
 pub const GCP_TRACES_ENDPOINT: &str = "https://telemetry.googleapis.com/v1/traces";
@@ -29,12 +30,22 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The batch span processor exports on its own thread with no Tokio reactor.
 /// Thus the client runs the token fetch and the request on `runtime`. At the
-/// [`EXPORT_TIMEOUT`] deadline, the task drops the two requests.
+/// [`EXPORT_TIMEOUT`] deadline, the task drops the two requests. If the caller
+/// drops the export first, [`AbortOnDrop`] stops the task.
 #[derive(Debug)]
 struct GcpHttpClient {
     http: reqwest::Client,
     credentials: Credentials,
     runtime: Handle,
+}
+
+/// Aborts the task when the caller drops the future that awaits it.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[async_trait::async_trait]
@@ -52,7 +63,8 @@ impl HttpClient for GcpHttpClient {
             Ok(Response::builder().status(status).body(response.bytes().await?)?)
         };
         let task = self.runtime.spawn(async { tokio::time::timeout(EXPORT_TIMEOUT, send).await });
-        match task.await? {
+        let mut task = AbortOnDrop(task);
+        match (&mut task.0).await? {
             Ok(response) => response,
             Err(_) => Err("the ADC token and trace requests did not end in 10 s".into()),
         }
