@@ -10,34 +10,39 @@
 //!   `<name>.1.gz` (when compression is on). Then it removes each rotated
 //!   file with an index of `max_files` or more.
 //! - While that thread runs, the writer does not rotate again.
+//!
+//! The writer opens the log directory one time. Each later file operation uses
+//! that handle and does not follow a symlink. Each file that the writer opens
+//! must be a regular file of the process user, and it gets mode 0600.
 
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rustix::fs::{AtFlags, Dir, Mode, OFlags};
 
 use crate::file_appender::FileAppenderConfig;
 
-/// The names and the retention limit of one rolling log file.
+/// The directory handle, the names and the retention limit of one rolling log file.
 #[derive(Debug, Clone)]
 struct Layout {
-    dir: PathBuf,
+    dir: Arc<OwnedFd>,
     name: String,
     max_files: usize,
     compress: bool,
 }
 
 impl Layout {
-    fn active(&self) -> PathBuf {
-        self.dir.join(&self.name)
-    }
-
-    fn rotated(&self, index: usize, gz: bool) -> PathBuf {
+    fn rotated(&self, index: usize, gz: bool) -> String {
         let suffix = if gz { ".gz" } else { "" };
-        self.dir.join(format!("{}.{index}{suffix}", self.name))
+        format!("{}.{index}{suffix}", self.name)
     }
 
     /// Returns `N` for `<name>.N` and `<name>.N.gz`.
@@ -46,15 +51,50 @@ impl Layout {
         rest.strip_suffix(".gz").unwrap_or(rest).parse().ok()
     }
 
-    fn rotated_files(&self) -> io::Result<Vec<(usize, PathBuf)>> {
+    fn rotated_files(&self) -> io::Result<Vec<(usize, String)>> {
         let mut files = Vec::new();
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if let Some(index) = entry.file_name().to_str().and_then(|n| self.index_of(n)) {
-                files.push((index, entry.path()));
+        for entry in Dir::read_from(&*self.dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Some(index) = self.index_of(&name) {
+                files.push((index, name));
             }
         }
         Ok(files)
+    }
+
+    /// Opens `name` in the log directory. Rejects a symlink, a file that is not
+    /// a regular file, and a file of a different user. `NONBLOCK` stops a FIFO
+    /// from blocking the open.
+    fn open(&self, name: &str, flags: OFlags) -> io::Result<File> {
+        let flags = OFlags::from_iter([flags, OFlags::NOFOLLOW, OFlags::NONBLOCK, OFlags::CLOEXEC]);
+        let mode = Mode::from_raw_mode(0o600);
+        let file = File::from(rustix::fs::openat(&*self.dir, name, flags, mode)?);
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != owner_uid() {
+            let message = format!("log file {name} is not a regular file of this user");
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+
+    fn open_active(&self) -> io::Result<File> {
+        self.open(&self.name, OFlags::from_iter([OFlags::WRONLY, OFlags::APPEND, OFlags::CREATE]))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        Ok(rustix::fs::renameat(&*self.dir, from, &*self.dir, to)?)
+    }
+
+    fn rename_if_present(&self, from: &str, to: &str) -> io::Result<()> {
+        match self.rename(from, to) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        Ok(rustix::fs::unlinkat(&*self.dir, name, AtFlags::empty())?)
     }
 
     /// Compresses `<name>.1` and removes the files above the retention limit.
@@ -62,33 +102,34 @@ impl Layout {
         #[cfg(test)]
         let _gate = tests::CLEANUP_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.compress {
-            gzip(&self.rotated(1, false), &self.rotated(1, true))?;
+            self.gzip(&self.rotated(1, false), &self.rotated(1, true))?;
         }
-        for (index, path) in self.rotated_files()? {
+        for (index, name) in self.rotated_files()? {
             if index >= self.max_files {
-                fs::remove_file(path)?;
+                self.remove(&name)?;
             }
         }
         Ok(())
     }
-}
 
-fn gzip(source: &Path, target: &Path) -> io::Result<()> {
-    let mut encoder = GzEncoder::new(BufWriter::new(File::create(target)?), Compression::default());
-    io::copy(&mut File::open(source)?, &mut encoder)?;
-    encoder.finish()?.flush()?;
-    fs::remove_file(source)
-}
-
-fn open_append(path: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
-}
-
-fn rename_if_present(from: &Path, to: &Path) -> io::Result<()> {
-    match fs::rename(from, to) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
+    fn gzip(&self, source: &str, target: &str) -> io::Result<()> {
+        let mut input = self.open(source, OFlags::RDONLY)?;
+        let output = self.open(target, OFlags::from_iter([OFlags::WRONLY, OFlags::CREATE]))?;
+        output.set_len(0)?;
+        let mut encoder = GzEncoder::new(BufWriter::new(output), Compression::default());
+        io::copy(&mut input, &mut encoder)?;
+        encoder.finish()?.flush()?;
+        self.remove(source)
     }
+}
+
+/// Each log file must have this owner: the effective UID of the process.
+fn owner_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = tests::OWNER_UID.with(std::cell::Cell::get) {
+        return uid;
+    }
+    rustix::process::geteuid().as_raw()
 }
 
 /// A writer that rotates `<directory>/<filename>` by size. See the module docs.
@@ -104,20 +145,27 @@ pub(crate) struct RollingWriter {
 
 impl RollingWriter {
     /// Opens the active file in append mode. Creates the directory if necessary.
+    /// The file name must be one path component.
     pub(crate) fn open(config: &FileAppenderConfig) -> io::Result<Self> {
+        let name = config.filename.as_str();
+        if Path::new(name).file_name() != Some(OsStr::new(name)) {
+            let message = format!("log file name {name:?} must be one path component");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        fs::create_dir_all(&config.directory)?;
+        let dir_flags = OFlags::from_iter([OFlags::RDONLY, OFlags::DIRECTORY, OFlags::CLOEXEC]);
         let layout = Layout {
-            dir: PathBuf::from(&config.directory),
-            name: config.filename.clone(),
+            dir: Arc::new(rustix::fs::open(config.directory.as_str(), dir_flags, Mode::empty())?),
+            name: name.to_owned(),
             max_files: config.max_files,
             compress: config.compress,
         };
-        fs::create_dir_all(&layout.dir)?;
-        let file = open_append(&layout.active())?;
+        let file = layout.open_active()?;
         let highest = layout.rotated_files()?.into_iter().map(|(i, _)| i).max().unwrap_or(0);
         Ok(Self {
             max_bytes: config.max_size_mb.saturating_mul(1024 * 1024),
             size: file.metadata()?.len(),
-            next_index: (highest + 1).min(layout.max_files),
+            next_index: highest.saturating_add(1).min(layout.max_files),
             file,
             layout,
             cleanup: None,
@@ -128,17 +176,17 @@ impl RollingWriter {
         for index in (1..self.next_index).rev() {
             for gz in [false, true] {
                 let to = self.layout.rotated(index + 1, gz);
-                rename_if_present(&self.layout.rotated(index, gz), &to)?;
+                self.layout.rename_if_present(&self.layout.rotated(index, gz), &to)?;
             }
         }
-        fs::rename(self.layout.active(), self.layout.rotated(1, false))?;
-        self.file = open_append(&self.layout.active())?;
+        self.layout.rename(&self.layout.name, &self.layout.rotated(1, false))?;
+        self.file = self.layout.open_active()?;
         self.size = 0;
-        self.next_index = (self.next_index + 1).min(self.layout.max_files);
+        self.next_index = self.next_index.saturating_add(1).min(self.layout.max_files);
         let layout = self.layout.clone();
         let cleanup = thread::Builder::new().name("rvc-log-cleanup".into()).spawn(move || {
             if let Err(e) = layout.clean_up() {
-                eprintln!("log cleanup failed for {}: {e}", layout.active().display());
+                eprintln!("log cleanup failed for {}: {e}", layout.name);
             }
         })?;
         self.cleanup = Some(cleanup);
@@ -445,7 +493,7 @@ pub(crate) mod tests {
     #[test]
     fn index_of_reads_only_rotated_names() {
         let layout = Layout {
-            dir: PathBuf::new(),
+            dir: Arc::new(rustix::fs::open(".", OFlags::RDONLY, Mode::empty()).unwrap()),
             name: "app.log".to_string(),
             max_files: 5,
             compress: false,

@@ -22,11 +22,14 @@ pub const GCP_TRACES_ENDPOINT: &str = "https://telemetry.googleapis.com/v1/trace
 /// Environment variables that give the project ID, in priority order.
 const PROJECT_ENV_VARS: [&str; 3] = ["GCP_PROJECT", "PROJECT_ID", "GCP_PROJECT_ID"];
 const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
+/// The deadline for the ADC token request and the trace request together.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Sends each OTLP request on the Tokio runtime with the ADC auth headers.
 ///
 /// The batch span processor exports on its own thread with no Tokio reactor.
-/// Thus the client runs the token fetch and the request on `runtime`.
+/// Thus the client runs the token fetch and the request on `runtime`. At the
+/// [`EXPORT_TIMEOUT`] deadline, the task drops the two requests.
 #[derive(Debug)]
 struct GcpHttpClient {
     http: reqwest::Client,
@@ -48,7 +51,11 @@ impl HttpClient for GcpHttpClient {
             let status = response.status();
             Ok(Response::builder().status(status).body(response.bytes().await?)?)
         };
-        self.runtime.spawn(send).await?
+        let task = self.runtime.spawn(async { tokio::time::timeout(EXPORT_TIMEOUT, send).await });
+        match task.await? {
+            Ok(response) => response,
+            Err(_) => Err("the ADC token and trace requests did not end in 10 s".into()),
+        }
     }
 }
 
@@ -64,11 +71,21 @@ pub(crate) fn exporter(resource: Resource) -> Result<(SpanExporter, Resource)> {
                 "GCP project ID detection failed: set GCP_PROJECT, PROJECT_ID or GCP_PROJECT_ID"
             )
         })?;
+    let (endpoint, credentials) = destination()?;
+    build_exporter(&endpoint, credentials, runtime, project_id, resource)
+}
+
+/// Returns the production endpoint and the ADC credentials.
+fn destination() -> Result<(String, Credentials)> {
+    #[cfg(test)]
+    if let Some(local) = tests::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Ok(local);
+    }
     // google-cloud-auth uses reqwest with no TLS provider. Use ring, as the workspace does.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let credentials =
         Builder::default().build().map_err(|e| anyhow!("GCP credentials failed: {e}"))?;
-    build_exporter(GCP_TRACES_ENDPOINT, credentials, runtime, project_id, resource)
+    Ok((GCP_TRACES_ENDPOINT.to_owned(), credentials))
 }
 
 fn build_exporter(
@@ -80,6 +97,7 @@ fn build_exporter(
 ) -> Result<(SpanExporter, Resource)> {
     let http = reqwest::Client::builder()
         .timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let exporter = SpanExporter::builder()
         .with_http()
@@ -126,8 +144,11 @@ async fn detect_project_id(env: &HashMap<&str, String>) -> Option<String> {
     if let Some(id) = adc.and_then(|path| quota_project_id(Path::new(&path))) {
         return Some(id);
     }
-    let host = env.get("GCE_METADATA_HOST").map_or("metadata.google.internal", String::as_str);
-    metadata_project_id(host).await
+    metadata_project_id(metadata_host(env)).await
+}
+
+fn metadata_host<'a>(env: &'a HashMap<&str, String>) -> &'a str {
+    env.get("GCE_METADATA_HOST").map_or("metadata.google.internal", String::as_str)
 }
 
 fn quota_project_id(path: &Path) -> Option<String> {
@@ -225,6 +246,7 @@ pub(crate) mod tests {
     #[test]
     fn production_destinations_use_tls_and_the_google_hosts() {
         assert_eq!(GCP_TRACES_ENDPOINT, "https://telemetry.googleapis.com/v1/traces");
+        assert_eq!(metadata_host(&HashMap::new()), "metadata.google.internal");
     }
 
     #[tokio::test]
@@ -395,10 +417,14 @@ pub(crate) mod tests {
             let header = |name: &str| request.headers.get(name).and_then(|v| v.to_str().ok());
             assert_eq!(request.method, "POST", "Request {n} must be a POST.");
             assert_eq!(request.url.path(), "/v1/traces", "Request {n} must use the trace path.");
-            assert_eq!(header("content-type"), Some("application/x-protobuf"));
             let token = format!("Bearer token-{n}");
-            assert!(header("authorization") == Some(&*token), "Request {n} must use ADC call {n}.");
-            assert_eq!(header("x-goog-user-project"), Some("quota-p"), "Request {n} quota header.");
+            for (name, value) in [
+                ("content-type", "application/x-protobuf"),
+                ("authorization", token.as_str()),
+                ("x-goog-user-project", "quota-p"),
+            ] {
+                assert!(header(name) == Some(value), "Request {n} must have {name}: {value}.");
+            }
             for text in ["gcp.project_id", "env-project", &format!("batch-{n}")] {
                 assert!(contains(&request.body, text), "Request {n} must contain {text:?}.");
             }

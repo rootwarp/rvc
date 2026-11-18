@@ -144,5 +144,6 @@ log_level = "info"
 # GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
 # Sends OTLP to the Telemetry API (https://telemetry.googleapis.com/v1/traces)
 # with Application Default Credentials (ADC). tracing_endpoint is ignored.
-# Enable telemetry.googleapis.com first (see docs/running-guide.md).
+# Enable telemetry.googleapis.com and keep cloudtrace.googleapis.com enabled.
+# For the IAM roles and the quota project, see docs/running-guide.md.
 # On shutdown, pending spans are flushed with a 5-second timeout.

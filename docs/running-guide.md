@@ -744,15 +744,21 @@ attribute.
 
 Operator changes from v0.8.0 (the exporter used the Cloud Trace API before):
 
-1. Enable the Telemetry API in the project:
+1. Enable the Telemetry API in the destination project:
    `gcloud services enable telemetry.googleapis.com`.
-2. The IAM role can change. Give the service account a role that can write
-   traces to the Telemetry API, for example `roles/telemetry.tracesWriter`.
-   Check the role name in the Google Cloud documentation.
-3. The span attribute names become the OpenTelemetry names. The old exporter
-   also copied the resource attributes (`service.name`, `service.version`,
-   `network.name`) into the labels of each span. Examine your Cloud Trace
-   filters and dashboards after the upgrade.
+2. Keep the Cloud Trace API (`cloudtrace.googleapis.com`) enabled in the
+   destination project. If it is disabled, Google discards the trace data.
+3. Grant `roles/telemetry.tracesWriter` to the application principal on the
+   destination project.
+4. Grant `roles/serviceusage.serviceUsageConsumer` to that principal on the
+   quota project.
+5. For user ADC credentials, set a quota project:
+   `gcloud auth application-default set-quota-project <project>`.
+6. Set `GCP_PROJECT` when the destination project is not the ADC quota project.
+7. The exporter keeps the OpenTelemetry span attribute names. The resource
+   attributes (`service.name`, `service.version`, `network.name`) now stay in
+   the OTLP resource, not in the label map of each span. Examine your Cloud
+   Trace filters and dashboards after the upgrade.
 
 #### Local Jaeger v2 (docker compose `tracing` profile)
 

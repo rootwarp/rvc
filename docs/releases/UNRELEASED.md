@@ -25,13 +25,18 @@ CI now runs `cargo deny check advisories sources` next to `cargo audit` on pull 
 `cargo deny` failed on RUSTSEC-2026-0543 (chrono is unmaintained). chrono came from `logroller` (the log file writer) and from `opentelemetry-gcloud-trace` (the `gcp-trace` feature). This release removes the two crates. It adds no ignore entry.
 
 - The log file writer is now in `rvc-telemetry`. The file names (`<file>`, `<file>.N`, `<file>.N.gz`), the size limit, the `max_files` count and the gzip compression on a background thread do not change.
+- The log file writer gives mode 0600 to the active file and to each new `.gz` file. It does not open a symlink, a FIFO, or a file of a different user. Older archives keep their mode.
 - `tracing_exporter = "gcp"` now sends OTLP/HTTP to `https://telemetry.googleapis.com/v1/traces` with Application Default Credentials. The feature name `gcp-trace` and the project ID search do not change. The exporter now also uses `tracing_max_queue_size` and `tracing_max_export_batch_size`.
 
 ### Operator changes for `tracing_exporter = "gcp"`
 
-1. Enable the Telemetry API (`telemetry.googleapis.com`) in the project.
-2. The IAM role can change. Give the service account a role that can write traces to the Telemetry API, for example `roles/telemetry.tracesWriter`.
-3. The span attribute names become the OpenTelemetry names. The old exporter also copied the resource attributes into the labels of each span. Examine your Cloud Trace filters and dashboards.
+1. Enable the Telemetry API (`telemetry.googleapis.com`) in the destination project.
+2. Keep the Cloud Trace API (`cloudtrace.googleapis.com`) enabled. If it is disabled, Google discards the trace data.
+3. Grant `roles/telemetry.tracesWriter` to the application principal on the destination project.
+4. Grant `roles/serviceusage.serviceUsageConsumer` to that principal on the quota project.
+5. For user ADC credentials, set a quota project.
+6. Set `GCP_PROJECT` when the destination project is not the ADC quota project.
+7. The exporter keeps the OpenTelemetry span attribute names. Resource attributes now stay in the OTLP resource, not in the label map of each span. Examine your Cloud Trace filters and dashboards.
 
 See `docs/running-guide.md` ("With OpenTelemetry Tracing").
 
