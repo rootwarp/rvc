@@ -17,6 +17,14 @@
 //! Virtual time does not move during a beacon-node call. The SSE stream is
 //! not in the ledger. A std-thread watchdog stops a test that hangs. The
 //! watchdog is not an assertion.
+//!
+//! `orchestrator_at_slot` is the second harness (W4-E6b3). It starts
+//! `DutyOrchestrator::run` and the epoch boundary runner with in-process
+//! doubles and no server. The builder-flag tests use it, because they write
+//! to the live `ValidatorStore` and count the registration signatures. The
+//! public bootstrap path does not give these two items to a test.
+
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -24,15 +32,38 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use beacon::{BeaconClient, BeaconClientConfig};
-use bn_manager::OperationTimeouts;
-use crypto::{EncryptionKdf, Keystore, SecretKey};
+use async_trait::async_trait;
+use beacon::{BeaconClient, BeaconClientConfig, DependentRootResponse};
+use bn_manager::{
+    BeaconNodeClient, MockBeaconNodeClient, OperationTimeouts, Propagator,
+    SignedValidatorRegistration,
+};
+use builder::{BuilderService, RegistrationSigner};
+use common::pipeline_fixture::NoopBlockBeacon;
+use crypto::{
+    CompositeSigner, EncryptionKdf, KeyManager, Keystore, LocalSigner, PublicKey, SecretKey,
+    Signature,
+};
+use duty_tracker::DutyTracker;
+use eth_types::{
+    BuilderRequestAuth, ForkSchedule, ProposerPreferences, Root, ValidatorRegistrationV1,
+};
+use keymanager_api::traits::ValidatorManager;
+use rvc::background_tasks::config_url::{
+    ProposerConfigApplier, ValidatorConfigUpdate as UrlUpdate,
+};
 use rvc::bootstrap::{run_with_slot_clock, BootstrapError, RunOptions, TaskExecutor};
 use rvc::config::{Config, Network};
+use rvc::keymanager_adapters::ValidatorManagerAdapter;
+use rvc::orchestrator::{
+    DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorError, OrchestratorHandle,
+};
 use serde_json::{json, Value};
+use signer::{always_enabled, SignerError, SignerService, ValidatorSigner};
+use slashing::SlashingDb;
 use tempfile::TempDir;
-use timing::{SlotClock, TimingError};
-use tokio::sync::Notify;
+use timing::{DeadlineBps, DeadlineSchedule, SlotClock, TimingError};
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +73,7 @@ use tracing::subscriber::DefaultGuard;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
+use validator_store::{ValidatorConfig, ValidatorStore};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -68,6 +100,12 @@ const METRICS_TASK: &str = "metrics_server";
 /// seconds.
 const WATCHDOG: Duration = Duration::from_secs(120);
 const RECORDING: &str = "The wiremock server must record the requests.";
+const SLOT: Duration = Duration::from_millis(SLOT_MS);
+/// The builder-flag tests start at the first slot of this epoch, epoch E.
+const EPOCH_E: u64 = 3;
+/// These are the secret-key bytes of the builder-enabled keys A and B.
+const KEY_A: [u8; 32] = [0x2b; 32];
+const KEY_B: [u8; 32] = [0x2c; 32];
 
 /// #652: a restart at slot 10 sends the prepare and the committee
 /// subscriptions of epochs 0 and 1 to the beacon node before slot 32.
@@ -180,6 +218,125 @@ fn signatures_by_key(entries: &[Value]) -> BTreeMap<String, Value> {
             (pubkey.to_owned(), entry["signature"].clone())
         })
         .collect()
+}
+
+/// W4-E6b3 (654-AC10, 696-5). No keymanager route sets `builder_proposals`.
+/// Thus the test uses the keymanager DELETE, which is the runtime keymanager
+/// writer. The epoch E POST carries keys A and B. Then
+/// `ValidatorManagerAdapter::remove_validator` removes key A. These
+/// conditions must hold for the epoch E+1 POST:
+///
+/// - The POST does not carry key A.
+/// - The signer makes no new registration signature.
+/// - The POST carries only key B, with its epoch-E registration.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_builder_flag_off_via_keymanager_evicts_registration() {
+    let opts = OrchestratorOpts { builder_keys: vec![KEY_A, KEY_B] };
+    let mut orch = orchestrator_at_slot(EPOCH_E * SLOTS_PER_EPOCH, opts).await;
+    let (a, b) = (orch.pubkeys[0], orch.pubkeys[1]);
+    let epoch_e = orch.registration_post(1).await;
+    assert_eq!(keys_of(&epoch_e), BTreeSet::from([a, b]), "The epoch E POST must carry A and B.");
+    let signed = orch.signer.total();
+
+    let removed = ValidatorManagerAdapter::new(Arc::clone(&orch.store)).remove_validator(&a);
+    assert_eq!(removed, Ok(true), "The keymanager DELETE must remove key A from the store.");
+    orch.advance_to_epoch(EPOCH_E + 1).await;
+    let epoch_e1 = orch.registration_post(2).await;
+
+    assert!(
+        !keys_of(&epoch_e1).contains(&a),
+        "The epoch E+1 POST must not carry key A after the keymanager DELETE."
+    );
+    assert_eq!(
+        orch.signer.since(signed),
+        Vec::<[u8; 48]>::new(),
+        "The signer must make no new registration signature in epoch E+1."
+    );
+    assert_eq!(
+        epoch_e1,
+        entries_of(&epoch_e, &b),
+        "The epoch E+1 POST must carry only key B, with its epoch-E registration."
+    );
+    orch.shut_down().await;
+}
+
+/// W4-E6b3 (654-AC11, 696-5). The proposer-config URL writer sets the builder
+/// flag of key A to off, and then to on. The epoch E POST carries keys A and
+/// B. These conditions must hold:
+///
+/// - After `builder_enabled: false`, the epoch E+1 POST does not carry key A.
+/// - The signer makes no new registration signature in epoch E+1.
+/// - The epoch E+1 POST carries only key B, with its epoch-E registration.
+/// - After `builder_enabled: true`, the epoch E+2 POST carries key A.
+/// - The signer makes one new registration signature in epoch E+2, for key A.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_builder_flag_off_via_proposer_config_url_evicts_registration() {
+    let opts = OrchestratorOpts { builder_keys: vec![KEY_A, KEY_B] };
+    let mut orch = orchestrator_at_slot(EPOCH_E * SLOTS_PER_EPOCH, opts).await;
+    let (a, b) = (orch.pubkeys[0], orch.pubkeys[1]);
+    let mut applier = ProposerConfigApplier::new();
+    let epoch_e = orch.registration_post(1).await;
+    assert_eq!(keys_of(&epoch_e), BTreeSet::from([a, b]), "The epoch E POST must carry A and B.");
+    let signed = orch.signer.total();
+
+    applier.apply(&orch.store, Some(vec![builder_flag(&a, false)]), None);
+    orch.advance_to_epoch(EPOCH_E + 1).await;
+    let epoch_e1 = orch.registration_post(2).await;
+
+    assert!(
+        !keys_of(&epoch_e1).contains(&a),
+        "The epoch E+1 POST must not carry key A after builder_enabled false."
+    );
+    assert_eq!(
+        orch.signer.since(signed),
+        Vec::<[u8; 48]>::new(),
+        "The signer must make no new registration signature in epoch E+1."
+    );
+    assert_eq!(
+        epoch_e1,
+        entries_of(&epoch_e, &b),
+        "The epoch E+1 POST must carry only key B, with its epoch-E registration."
+    );
+    let signed = orch.signer.total();
+
+    applier.apply(&orch.store, Some(vec![builder_flag(&a, true)]), None);
+    orch.advance_to_epoch(EPOCH_E + 2).await;
+    let epoch_e2 = orch.registration_post(3).await;
+
+    assert!(
+        keys_of(&epoch_e2).contains(&a),
+        "The epoch E+2 POST must carry key A after builder_enabled true."
+    );
+    assert_eq!(
+        orch.signer.since(signed),
+        vec![a],
+        "The signer must make one new registration signature in epoch E+2, for key A."
+    );
+    orch.shut_down().await;
+}
+
+/// Returns the `message.pubkey` of each registration.
+fn keys_of(posted: &[SignedValidatorRegistration]) -> BTreeSet<[u8; 48]> {
+    posted.iter().map(|entry| entry.message.pubkey).collect()
+}
+
+/// Returns the registrations of `pubkey` in `posted`.
+fn entries_of(
+    posted: &[SignedValidatorRegistration],
+    pubkey: &[u8; 48],
+) -> Vec<SignedValidatorRegistration> {
+    posted.iter().filter(|entry| entry.message.pubkey == *pubkey).cloned().collect()
+}
+
+/// Returns a proposer-config URL entry that sets only the builder flag of
+/// `pubkey`.
+fn builder_flag(pubkey: &[u8; 48], enabled: bool) -> UrlUpdate {
+    UrlUpdate {
+        pubkey: format!("0x{}", hex::encode(pubkey)),
+        fee_recipient: None,
+        builder_enabled: Some(enabled),
+        gas_limit: None,
+    }
 }
 
 /// This is the harness self-test. The server holds the answer, so the call stays
@@ -805,4 +962,218 @@ async fn mount_beacon_node(server: &MockServer, pubkey: &str) {
         .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream"))
         .mount(server)
         .await;
+}
+
+/// `orchestrator_at_slot` reads these options.
+struct OrchestratorOpts {
+    /// The store holds one builder-enabled key for each of these secret keys.
+    builder_keys: Vec<[u8; 32]>,
+}
+
+/// This is one `DutyOrchestrator::run` and its epoch boundary runner, with
+/// in-process doubles.
+struct Orchestrated {
+    store: Arc<ValidatorStore>,
+    mock: Arc<MockBeaconNodeClient>,
+    signer: Arc<CountingSigner>,
+    handle: OrchestratorHandle,
+    /// These are the pubkeys of `OrchestratorOpts::builder_keys`, in order.
+    pubkeys: Vec<[u8; 48]>,
+    /// This is the number of registration POSTs that the mock received.
+    posts: watch::Receiver<usize>,
+    /// This is the slot at the current paused time.
+    slot: u64,
+    run: JoinHandle<Result<(), OrchestratorError>>,
+    runner: JoinHandle<()>,
+}
+
+/// Starts `DutyOrchestrator::run` and the epoch boundary runner at the start
+/// of `slot`. The fork schedule has no Gloas epoch, thus the registration
+/// step sends a POST in each epoch. Each duty phase is due at slot start, and
+/// each epoch has no duties.
+async fn orchestrator_at_slot(slot: u64, opts: OrchestratorOpts) -> Orchestrated {
+    let (posted, posts) = watch::channel(0);
+    let mock = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_, _| Ok(no_duties()))
+            .with_get_proposer_duties(|_| Ok(no_duties()))
+            .with_prepare_beacon_proposer(|_| Ok(()))
+            .with_submit_beacon_committee_subscriptions(|_| Ok(()))
+            .with_register_validators(move |_| {
+                posted.send_modify(|count| *count += 1);
+                Ok(())
+            }),
+    );
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+    let store = Arc::new(ValidatorStore::new([0x11; 20], 30_000_000));
+    let mut key_manager = KeyManager::new();
+    let mut pubkey_map = HashMap::new();
+    let mut pubkeys = Vec::new();
+    for bytes in opts.builder_keys {
+        let secret = SecretKey::from_bytes(&bytes).expect("Each secret key must be valid.");
+        let pubkey = secret.public_key();
+        let mut config = ValidatorConfig::new(pubkey.to_bytes());
+        config.builder_proposals = true;
+        store.add_validator(config).expect("The store must add each key.");
+        pubkeys.push(pubkey.to_bytes());
+        pubkey_map.insert(pubkey.to_bytes(), pubkey);
+        key_manager.insert(secret);
+    }
+    let slashing = SlashingDb::open_in_memory().expect("The test must open the slashing DB.");
+    let service = SignerService::new(
+        Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+        Arc::new(slashing),
+    );
+    let service = Arc::new(service.with_enablement(always_enabled()));
+    let signer = Arc::new(CountingSigner { inner: Arc::clone(&service), signed: Mutex::default() });
+    let schedule = Arc::new(ForkSchedule::unscheduled_gloas());
+    let builder = BuilderService::new(
+        signer.clone(),
+        Arc::new(beacon.clone()),
+        Arc::clone(&store),
+        schedule.genesis_fork_version,
+        Arc::clone(&schedule),
+    );
+    let at_slot_start = DeadlineBps {
+        attestation: 0,
+        aggregate: 0,
+        sync_message: 0,
+        contribution: 0,
+        payload: 0,
+        payload_attestation: 0,
+    };
+    let config = OrchestratorConfig::new([0x11; 32], schedule)
+        .with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start));
+    let indices: Vec<String> = (0..pubkeys.len()).map(|index| index.to_string()).collect();
+    let deps = OrchestratorDeps::for_test(
+        Arc::new(PausedSlotClock { origin: Instant::now(), start_slot: slot }),
+        Arc::new(DutyTracker::new(mock.clone(), indices.clone())),
+        service,
+        Arc::new(Propagator::new(Arc::clone(&mock))),
+        beacon,
+        Arc::new(NoopBlockBeacon),
+        Some(Arc::new(builder)),
+        Arc::clone(&store),
+        config,
+        Arc::new(parking_lot::RwLock::new(pubkey_map)),
+    );
+    for (pubkey, index) in pubkeys.iter().zip(indices) {
+        deps.pubkey_index.write().insert(*pubkey, index);
+    }
+    let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let runner = orchestrator.take_epoch_boundary_runner().expect("The runner must be present.");
+    let runner = tokio::spawn(runner.run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    Orchestrated { store, mock, signer, handle, pubkeys, posts, slot, run, runner }
+}
+
+impl Orchestrated {
+    /// Moves paused time to the start of `epoch`, one whole slot for each
+    /// `tokio::time::advance` call.
+    async fn advance_to_epoch(&mut self, epoch: u64) {
+        while self.slot < epoch * SLOTS_PER_EPOCH {
+            tokio::time::advance(SLOT).await;
+            self.slot += 1;
+        }
+    }
+
+    /// Waits in the current slot until the mock has `count` registration
+    /// POSTs. Returns the body of POST number `count`.
+    async fn registration_post(&mut self, count: usize) -> Vec<SignedValidatorRegistration> {
+        let arrived = tokio::time::timeout(SLOT / 2, self.posts.wait_for(|posts| *posts >= count))
+            .await
+            .map(|seen| seen.map(|_| ()));
+        assert!(
+            matches!(arrived, Ok(Ok(()))),
+            "The beacon node must receive registration POST {count} in slot {}.",
+            self.slot
+        );
+        self.mock.register_validators_calls().swap_remove(count - 1)
+    }
+
+    /// Requests the shutdown. Asserts that `run` returns `Ok` and that the
+    /// runner task ends.
+    async fn shut_down(self) {
+        self.handle.shutdown();
+        let result = self.run.await.expect("The run task must not panic.");
+        assert!(
+            result.is_ok(),
+            "DutyOrchestrator::run must return Ok after the shutdown: {result:?}"
+        );
+        self.runner.await.expect("The runner task must not panic.");
+    }
+}
+
+/// Returns a duty answer that has no duties.
+fn no_duties<T>() -> DependentRootResponse<Vec<T>> {
+    DependentRootResponse {
+        dependent_root: root("00"),
+        execution_optimistic: false,
+        data: Vec::new(),
+    }
+}
+
+/// This `RegistrationSigner` records the key of each builder registration
+/// that it signs. The real `SignerService` makes each signature.
+struct CountingSigner {
+    inner: Arc<SignerService>,
+    signed: Mutex<Vec<[u8; 48]>>,
+}
+
+impl CountingSigner {
+    fn signed(&self) -> MutexGuard<'_, Vec<[u8; 48]>> {
+        self.signed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns the number of registration signatures.
+    fn total(&self) -> usize {
+        self.signed().len()
+    }
+
+    /// Returns the key of each registration signature after the first `from`.
+    fn since(&self, from: usize) -> Vec<[u8; 48]> {
+        self.signed()[from..].to_vec()
+    }
+}
+
+#[async_trait]
+impl RegistrationSigner for CountingSigner {
+    async fn sign_builder_registration(
+        &self,
+        registration: &ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        self.signed().push(pubkey.to_bytes());
+        ValidatorSigner::sign_builder_registration(&*self.inner, registration, pubkey, fork_version)
+            .await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let inner = &*self.inner;
+        ValidatorSigner::sign_proposer_preferences(
+            inner,
+            prefs,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        ValidatorSigner::sign_builder_request_auth(&*self.inner, auth, pubkey, genesis_fork_version)
+            .await
+    }
 }
