@@ -154,10 +154,10 @@ mod tests {
         let no_owner = br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#;
         let owned = ".rvc.doppelganger_detected.a.sqlite";
         let rows: [(&str, &str, Option<&[u8]>); 4] = [
-            ("a legacy marker", MARKER_FILENAME, Some(no_owner.as_slice())),
             ("an owned file that does not parse", owned, Some(b"{".as_slice())),
-            ("an owned marker that records no owner", owned, Some(no_owner.as_slice())),
             ("an owned directory", owned, None),
+            ("an owned marker that records no owner", owned, Some(no_owner.as_slice())),
+            ("a legacy marker", MARKER_FILENAME, Some(no_owner.as_slice())),
         ];
         for (case, name, bytes) in rows {
             let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
