@@ -462,13 +462,6 @@ struct MarkerDir {
     path: PathBuf,
 }
 
-/// The flags of a directory in the walk of [`MarkerDir::open`]. On Linux,
-/// `O_PATH` needs only search permission on the directory.
-#[cfg(target_os = "linux")]
-const DIR_WALK: libc::c_int = libc::O_PATH;
-#[cfg(all(unix, not(target_os = "linux")))]
-const DIR_WALK: libc::c_int = libc::O_RDONLY;
-
 #[cfg(unix)]
 impl MarkerDir {
     /// Open `dir`. `None` when it does not exist. An empty path is `.`.
@@ -486,9 +479,14 @@ impl MarkerDir {
         };
         #[cfg(test)]
         run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, &real);
-        let mut walk = open_at(None, OsStr::new("/"), &[DIR_WALK, libc::O_DIRECTORY])?;
+        // On Linux, `O_PATH` needs only search permission on a directory of the walk.
+        #[cfg(target_os = "linux")]
+        let search = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let search = libc::O_RDONLY;
+        let mut walk = open_at(None, OsStr::new("/"), &[search, libc::O_DIRECTORY])?;
         for name in real.components().skip(1) {
-            let flags = [DIR_WALK, libc::O_DIRECTORY, libc::O_NOFOLLOW];
+            let flags = [search, libc::O_DIRECTORY, libc::O_NOFOLLOW];
             walk = open_at(Some(&walk), name.as_os_str(), &flags)?;
         }
         let file = open_at(Some(&walk), OsStr::new("."), &[libc::O_RDONLY, libc::O_DIRECTORY])?;
@@ -2761,7 +2759,12 @@ mod tests {
                 "..rvc.doppelganger_record.1.2.tmp".to_string(),
                 Some("name space"),
             ),
-            ("a name without the first dot", &slash, "rvc.doppelganger.sqlite".to_string(), None),
+            (
+                "the marker name without its first dot",
+                &slash,
+                format!("{}.sqlite", MARKER_FILENAME.trim_start_matches('.')),
+                None,
+            ),
         ];
         for (case, dir, name, reason) in rows {
             let result = check_slashing_db_name(&keys, &dir.join(&name))
