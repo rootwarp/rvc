@@ -1521,7 +1521,9 @@ mod tests {
     /// Each row boots with a second name of a database and gives the exit
     /// code and a text of the error. A name with a `.` component selects the
     /// same fallback marker, so boot returns exit code 12. Boot refuses each
-    /// other name with exit code 1.
+    /// other name with exit code 1. This includes a database directory that
+    /// is a symlink to the keystore directory: boot does not skip the
+    /// fallback check for it.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn boot_refuses_a_second_name_of_a_database_with_a_fallback_marker() {
@@ -1548,8 +1550,16 @@ mod tests {
             .expect("The test must create a hard link of the database file.");
         std::os::unix::fs::symlink(&slash, root.path().join("link"))
             .expect("The test must create a symlink to the database directory.");
+        std::os::unix::fs::symlink(&keys, root.path().join("keys-link"))
+            .expect("The test must create a symlink to the keystore directory.");
         let detected = EXIT_DOPPELGANGER_DETECTED;
         let rows = [
+            (
+                "a symlink to the keystore directory",
+                root.path().join("keys-link/a.sqlite"),
+                1,
+                "no symlink",
+            ),
             ("a symlink to the database file", other.join("a.sqlite"), 1, "one link"),
             ("a hard link of the database file", other.join("h.sqlite"), 1, "one link"),
             ("the first name of a file with two links", slash.join("h.sqlite"), 1, "one link"),
@@ -1565,6 +1575,35 @@ mod tests {
                 err.exit_code() == code && err.to_string().contains(text),
                 "Boot must return exit code {code} and an error with the text \"{text}\" for \
                  {case}. The error is: {err}"
+            );
+        }
+    }
+
+    /// The owned fallback marker of `slashing.sqlite` is in the directory
+    /// `slash`. `arm_walk_start` makes `slash` the working directory of each
+    /// walk, so the test does not change the working directory of the
+    /// process. For the names `./slashing.sqlite` and `slashing.sqlite`, boot
+    /// must return exit code 12.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_an_owned_fallback_marker_of_a_bare_db_name() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let body = serde_json::json!({ "version": 1, "epoch": 3, "unix_secs": 4, "pubkeys": [] });
+        std::fs::write(
+            slash.path().join(".rvc.doppelganger_detected.slashing.sqlite"),
+            body.to_string(),
+        )
+        .expect("The test must write the owned fallback marker.");
+        let _start = crate::detection_marker::arm_walk_start(slash.path());
+
+        for name in ["./slashing.sqlite", "slashing.sqlite"] {
+            let err = boot_with_db(keys.path(), std::path::Path::new(name), false).await;
+
+            assert_eq!(
+                err.exit_code(),
+                EXIT_DOPPELGANGER_DETECTED,
+                "Boot must return exit code 12 for the database name {name}. The error is: {err}"
             );
         }
     }

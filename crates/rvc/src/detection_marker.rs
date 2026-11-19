@@ -469,7 +469,10 @@ impl MarkerDir {
             );
             io::Error::new(err.kind(), text)
         };
+        #[cfg(not(test))]
         let mut walk = None;
+        #[cfg(test)]
+        let mut walk = walk_start()?;
         for part in dir.components() {
             if matches!(part, std::path::Component::ParentDir | std::path::Component::Prefix(_)) {
                 let err = io::Error::new(io::ErrorKind::InvalidInput, "the path has a `..`");
@@ -1445,6 +1448,43 @@ thread_local! {
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static WALK_START: RefCell<Option<File>> = const { RefCell::new(None) };
+}
+
+/// Start each walk of a relative path on this thread at `dir`, in place of
+/// the working directory. A walk then gives the result that it gives when
+/// `dir` is the working directory. A test that uses this function does not
+/// change the working directory of the process, so it does not change the
+/// result of a different test.
+///
+/// The guard ends the override when it drops.
+#[cfg(all(test, unix))]
+pub(crate) fn arm_walk_start(dir: &Path) -> WalkStartGuard {
+    let start = File::open(dir).expect("The test must open the start directory of the walk.");
+    WALK_START.with(|slot| *slot.borrow_mut() = Some(start));
+    WalkStartGuard
+}
+
+/// A new handle of the start directory that [`arm_walk_start`] set on this
+/// thread. `None` is the working directory.
+#[cfg(all(test, unix))]
+fn walk_start() -> io::Result<Option<File>> {
+    WALK_START.with(|slot| slot.borrow().as_ref().map(File::try_clone).transpose())
+}
+
+/// The guard ends the start directory of [`arm_walk_start`] when it drops.
+#[cfg(all(test, unix))]
+pub(crate) struct WalkStartGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for WalkStartGuard {
+    fn drop(&mut self) {
+        WALK_START.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// Run `hook` one time on this thread, before [`MarkerDir::replace`] opens
 /// its temp file. The hook gets the temp path.
 ///
@@ -2136,19 +2176,63 @@ mod tests {
         assert!(blocks_window_skip(&not_a_dir));
     }
 
+    /// The fallback directory is the parent of the database, or `.` for a
+    /// bare file name. The selection compares the directories that the walk
+    /// opens. [`arm_walk_start`] gives the working directory of each walk.
+    /// The test requires these results:
+    ///
+    /// - The names `slashing.sqlite` and `./slashing.sqlite` select `.` and
+    ///   the same marker when the working directory is not the keystore
+    ///   directory.
+    /// - A database in a different directory selects that directory.
+    /// - A database in the keystore directory selects no directory. A bare
+    ///   file name and a relative path of the keystore directory give the
+    ///   same result.
+    #[cfg(unix)]
     #[test]
     fn fallback_dir_is_the_slashing_parent_only_when_it_differs() {
-        let root = tempfile::tempdir().expect("temp");
-        let keys = root.path().join("keys");
-        let slash = root.path().join("slash");
-        fs::create_dir_all(&keys).expect("keys");
-        fs::create_dir_all(&slash).expect("slash");
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let selected = |name: &str| {
+            FallbackMarkerPath::for_config(&keys, Path::new(name))
+                .map(|found| (found.dir.clone(), found.owned_path()))
+        };
+        let in_cwd = Some((
+            PathBuf::from("."),
+            PathBuf::from("./.rvc.doppelganger_detected.slashing.sqlite"),
+        ));
+        let start = arm_walk_start(&slash);
+
+        assert_eq!(
+            [selected("slashing.sqlite"), selected("./slashing.sqlite")],
+            [in_cwd.clone(), in_cwd],
+            "The names slashing.sqlite and ./slashing.sqlite must select the working directory \
+             and the same marker."
+        );
         assert_eq!(
             fallback_marker_dir(&keys, &slash.join("slashing.sqlite")).as_deref(),
-            Some(slash.as_path())
+            Some(slash.as_path()),
+            "A database in a different directory must select that directory."
         );
-        assert_eq!(fallback_marker_dir(&keys, &keys.join("slashing.sqlite")), None);
-        assert_eq!(fallback_marker_dir(&keys, Path::new("slashing.sqlite")), None);
+        assert_eq!(
+            fallback_marker_dir(&keys, &keys.join("slashing.sqlite")),
+            None,
+            "A database in the keystore directory must select no directory."
+        );
+        drop(start);
+        let start = arm_walk_start(&keys);
+        assert_eq!(
+            fallback_marker_dir(&keys, Path::new("slashing.sqlite")),
+            None,
+            "A bare file name must select no directory when the working directory is the \
+             keystore directory."
+        );
+        drop(start);
+        let _start = arm_walk_start(root.path());
+        assert_eq!(
+            fallback_marker_dir(&keys, Path::new("keys/slashing.sqlite")),
+            None,
+            "A relative path of the keystore directory must select no directory."
+        );
     }
 
     /// The reader returns `Present` for a version-1 marker without
@@ -2255,7 +2339,7 @@ mod tests {
     /// requires these results:
     ///
     /// 1. When a different keystore owns the marker, the function keeps the
-    ///    marker. It returns the marker path and the canonical path of that
+    ///    marker. It returns the marker path and the absolute path of that
     ///    keystore.
     /// 2. When this keystore owns the marker and a legacy marker exists, the
     ///    function keeps the two markers. It returns `InvalidData` with the
@@ -2264,7 +2348,7 @@ mod tests {
     ///    it.
     /// 4. When the marker records no owner, the function keeps it. It returns
     ///    `InvalidData` with the marker path and the recovery step.
-    /// 5. When the marker does not parse, the function keeps it. It returns
+    /// 5. When the marker has invalid JSON, the function keeps it. It returns
     ///    `InvalidData` with the marker path.
     #[test]
     fn clear_fallback_marker_removes_only_an_owned_marker_of_this_keystore() {
@@ -2279,8 +2363,8 @@ mod tests {
             .expect("The test must find a fallback path beside the database.");
         let owned = fallback.owned_path();
         let marker = DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![pubkey()] };
-        let canonical_other = fs::canonicalize(&other)
-            .expect("The test must read the canonical path of the other keystore.")
+        let absolute_other = std::path::absolute(&other)
+            .expect("The test must make the path of the other keystore absolute.")
             .to_string_lossy()
             .into_owned();
 
@@ -2288,8 +2372,8 @@ mod tests {
             .expect("The test must write the marker of the other keystore.");
         assert_eq!(
             clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
-            Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner: canonical_other }]),
-            "The function must keep the marker of the other keystore and return the canonical \
+            Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner: absolute_other }]),
+            "The function must keep the marker of the other keystore and return the absolute \
              path of that keystore."
         );
         assert!(
@@ -2343,17 +2427,17 @@ mod tests {
             "The function must keep the marker with no owner."
         );
 
-        fs::write(&owned, b"{").expect("The test must write a marker that does not parse.");
+        fs::write(&owned, b"{").expect("The test must write a marker with invalid JSON.");
         let text = invalid_data_text(clear_fallback_marker(&fallback, &keys));
         assert!(
             text.contains(&owned.display().to_string()) && text.contains("does not parse"),
-            "The function must return InvalidData with the path of the marker that does not \
-             parse. The text is: {text}"
+            "The function must return InvalidData with the path of the marker with invalid JSON. \
+             The text is: {text}"
         );
         assert_eq!(
             fs::read(&owned).map_err(|err| err.to_string()),
             Ok(b"{".to_vec()),
-            "The function must keep the marker that does not parse."
+            "The function must keep the marker with invalid JSON."
         );
     }
 
@@ -2595,6 +2679,93 @@ mod tests {
                 "The marker must keep its bytes after the steps for {case}."
             );
         }
+    }
+
+    /// A symlink can make two paths of one directory. The walk does not
+    /// follow it, so the selection cannot show that the database directory
+    /// is the keystore directory. The owned marker of `a.sqlite` is in `keys`
+    /// and in `slash`. Each row gives a configuration with a symlink:
+    ///
+    /// - The database directory is a symlink to the keystore directory.
+    /// - The keystore path is a symlink to the database directory.
+    ///
+    /// For each row, the test requires these results:
+    ///
+    /// - The selection gives the configured database directory.
+    /// - The read does not give `Absent` for the owned marker.
+    /// - The clear fails.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_selection_does_not_skip_a_directory_behind_a_symlink() {
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let (keys_link, slash_link) =
+            (root.path().join("keys-link"), root.path().join("slash-link"));
+        std::os::unix::fs::symlink(&keys, &slash_link)
+            .expect("The test must create a symlink to the keystore directory.");
+        std::os::unix::fs::symlink(&slash, &keys_link)
+            .expect("The test must create a symlink to the database directory.");
+        let no_owner = br#"{"version":1,"epoch":1,"unix_secs":2,"pubkeys":[]}"#;
+        for dir in [&keys, &slash] {
+            fs::write(dir.join(fallback_marker_name(Path::new("a.sqlite"))), no_owner)
+                .expect("The test must write the owned marker.");
+        }
+        let rows = [
+            ("a database directory that is a symlink to the keystore", &keys, &slash_link),
+            ("a keystore path that is a symlink to the database directory", &keys_link, &slash),
+        ];
+        for (case, keystore, dir) in rows {
+            let selected = FallbackMarkerPath::for_config(keystore, &dir.join("a.sqlite"));
+            assert_eq!(
+                selected.as_ref().map(|found| &found.dir),
+                Some(dir),
+                "The selection must give the database directory for {case}. The result is \
+                 {selected:?}."
+            );
+            let fallback = selected.expect("The selection must give a directory.");
+
+            let found = inspect_fallback(&fallback);
+            let cleared = clear_fallback_marker(&fallback, keystore).map_err(|err| err.to_string());
+
+            assert!(
+                !matches!(found.owned, MarkerInspect::Absent),
+                "The read must not give Absent for the owned marker for {case}. The result is \
+                 {found:?}."
+            );
+            assert!(cleared.is_err(), "The clear must fail for {case}. The result is {cleared:?}.");
+        }
+    }
+
+    /// The keystore path `keys-link` is a symlink to `keys`. The writer
+    /// records the keystore path as an absolute path and does not resolve
+    /// the symlink. The test requires these results:
+    ///
+    /// - A clear for `keys` keeps the marker. It returns the path of
+    ///   `keys-link` as the owner.
+    /// - A clear for `keys-link/` (with a trailing slash) removes the marker.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_owner_keeps_a_symlink_in_the_keystore_path() {
+        let (root, [keys, slash]) = temp_dirs(["keys", "slash"]);
+        let link = root.path().join("keys-link");
+        std::os::unix::fs::symlink(&keys, &link)
+            .expect("The test must create a symlink to the keystore directory.");
+        let fallback = fallback_of(&keys, &slash);
+        let owned = fallback.owned_path();
+        let owner = link.to_str().expect("The test path must be valid UTF-8.").to_string();
+        write_fallback_marker(&fallback, &link, &sample_marker())
+            .expect("The test must write the marker.");
+
+        assert_eq!(
+            clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string()),
+            Ok(vec![FallbackClear::OtherOwner { path: owned.clone(), owner }]),
+            "A clear for keys must keep the marker and return the path of the symlink as the \
+             owner."
+        );
+        assert_eq!(
+            clear_fallback_marker(&fallback, &link.join("")).map_err(|err| err.to_string()),
+            Ok(vec![FallbackClear::Removed { path: owned }]),
+            "A clear for the path of the symlink with a trailing slash must remove the marker."
+        );
     }
 
     /// A directory is at the keystore marker path, so the rename of the
