@@ -676,6 +676,13 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     ));
     let write_result = (|| {
+        #[cfg(test)]
+        if probe_fails_for(data_dir) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected marker directory probe failure",
+            ));
+        }
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
         file.write_all(b"ok")?;
         sync_file(&file)?;
@@ -1466,6 +1473,7 @@ thread_local! {
     static FSYNC_TARGET_FAILURE: Cell<Option<(FileId, u32)>> = const { Cell::new(None) };
     static BEFORE_MARKER_TEMP_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
+    static PROBE_FAILURE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1741,6 +1749,24 @@ pub(crate) fn arm_preallocate_failure() -> PreallocateFailGuard {
     PreallocateFailGuard
 }
 
+/// Fail each [`probe_marker_dir_writable`] call for the directory `dir` on
+/// this thread with `PermissionDenied`. The probe fails before it creates
+/// its temp file, so it leaves no file. A probe of a different path runs
+/// normally. The match compares the path components.
+///
+/// The guard stops these failures when it drops.
+#[cfg(test)]
+pub(crate) fn arm_probe_failure(dir: &Path) -> ProbeFailGuard {
+    PROBE_FAILURE_DIR.with(|slot| *slot.borrow_mut() = Some(dir.to_path_buf()));
+    ProbeFailGuard
+}
+
+/// `true` when [`arm_probe_failure`] armed the directory `dir` on this thread.
+#[cfg(test)]
+fn probe_fails_for(dir: &Path) -> bool {
+    PROBE_FAILURE_DIR.with(|slot| slot.borrow().as_deref() == Some(dir))
+}
+
 #[cfg(test)]
 fn take_marker_write_failure() -> bool {
     MARKER_WRITE_FAILS_LEFT.with(|left| {
@@ -1821,6 +1847,17 @@ pub(crate) struct PreallocateFailGuard;
 impl Drop for PreallocateFailGuard {
     fn drop(&mut self) {
         PREALLOCATE_FAILS.with(|fail| fail.set(false));
+    }
+}
+
+/// The guard stops the injected probe failures when it drops.
+#[cfg(test)]
+pub(crate) struct ProbeFailGuard;
+
+#[cfg(test)]
+impl Drop for ProbeFailGuard {
+    fn drop(&mut self) {
+        PROBE_FAILURE_DIR.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -2257,6 +2294,35 @@ mod tests {
             fallback_marker_dir(&keys, Path::new("keys/slashing.sqlite")),
             None,
             "A relative path of the keystore directory must select no directory."
+        );
+    }
+
+    /// `fallback_marker_dir` uses `.` as the directory of a bare file name.
+    /// [`arm_walk_start`] gives the working directory of each walk. The test
+    /// requires these results:
+    ///
+    /// - When the keystore is in a different directory, the names
+    ///   `slashing.sqlite` and `./slashing.sqlite` select `.`.
+    /// - When the keystore is `.`, the two names select no directory.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_dir_treats_an_empty_parent_as_cwd() {
+        let (_root, [keys, cwd]) = temp_dirs(["keys", "cwd"]);
+        let _start = arm_walk_start(&cwd);
+        let selected = |keystore: &Path| {
+            ["slashing.sqlite", "./slashing.sqlite"]
+                .map(|name| fallback_marker_dir(keystore, Path::new(name)))
+        };
+
+        assert_eq!(
+            selected(&keys),
+            [Some(PathBuf::from(".")), Some(PathBuf::from("."))],
+            "When the keystore is in a different directory, the two names must select `.`."
+        );
+        assert_eq!(
+            selected(Path::new(".")),
+            [None, None],
+            "When the keystore is `.`, the two names must select no directory."
         );
     }
 

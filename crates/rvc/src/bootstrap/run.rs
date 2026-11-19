@@ -1703,6 +1703,218 @@ mod tests {
         assert!(!err.to_string().contains("writable"), "{err}");
     }
 
+    /// Run boot with `config` and the default run options. Return the boot
+    /// error.
+    async fn boot_error(config: Config) -> BootstrapError {
+        let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+        let options = RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: OperationTimeouts::default(),
+        };
+        run(config, options, executor, rx).await.expect_err("Boot must return an error.")
+    }
+
+    /// Return a record of `RECORD_LEN` bytes with the state `detected`.
+    fn detected_record() -> Vec<u8> {
+        let mut bytes = b"version=1\nstate=detected\nepoch=5\nunix_secs=6\n".to_vec();
+        bytes.resize(crate::detection_marker::RECORD_LEN, 0);
+        bytes
+    }
+
+    /// Each row writes one item of detection evidence for the keystore `keys`
+    /// and the database `<slash>/slashing.sqlite`. Then boot runs with
+    /// detection off. Two more boots use these fixtures:
+    ///
+    /// - Detection is on, and a hook writes a `detected` record after the
+    ///   boot check of the record and before the link of the new record.
+    /// - The database path is the bare name `slashing.sqlite`, and the record
+    ///   is `detected`.
+    ///
+    /// For each boot, the test requires these results:
+    ///
+    /// - Boot returns exit code 12.
+    /// - A refusal log contains `--datadir <keys> --slashing-db-path <db>
+    ///   --confirm`. Each path is absolute. For the bare name, `<db>` is the
+    ///   name in the working directory of the process.
+    ///
+    /// The test collects each failed boot, so a failure lists all of them.
+    #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
+    async fn boot_refusal_prints_the_resolved_clear_command() {
+        use crate::detection_marker::{
+            arm_before_record_link, marker_path, record_path, write_marker, DetectionMarker,
+            MARKER_FILENAME, RECORD_LEN,
+        };
+        use std::path::Path;
+        const NO_KEYS: &str = r#"{"version":1,"epoch":3,"unix_secs":4,"pubkeys":[]}"#;
+        type Setup = fn(&Path, &Path);
+        let rows: [(&str, Setup); 8] = [
+            ("a keystore marker with a key", |keys, _| {
+                let pubkeys = vec![format!("0x{}", "cd".repeat(48))];
+                write_marker(keys, &DetectionMarker { epoch: 1, unix_secs: 2, pubkeys })
+                    .expect("The test must write the keystore marker.");
+            }),
+            ("a keystore marker with no key", |keys, _| {
+                std::fs::write(marker_path(keys), NO_KEYS)
+                    .expect("The test must write the keystore marker.");
+            }),
+            ("a corrupt keystore marker", |keys, _| {
+                std::fs::write(marker_path(keys), b"{")
+                    .expect("The test must write the corrupt marker.");
+            }),
+            ("an unreadable keystore marker", |keys, _| {
+                std::fs::create_dir(marker_path(keys))
+                    .expect("The test must create a directory at the marker path.");
+            }),
+            ("a detected record", |keys, _| {
+                std::fs::write(record_path(keys), detected_record())
+                    .expect("The test must write the detected record.");
+            }),
+            ("a record that does not parse", |keys, _| {
+                std::fs::write(record_path(keys), vec![0u8; RECORD_LEN])
+                    .expect("The test must write the zero-filled record.");
+            }),
+            ("an owned fallback marker", |_, slash| {
+                std::fs::write(slash.join(".rvc.doppelganger_detected.slashing.sqlite"), NO_KEYS)
+                    .expect("The test must write the owned fallback marker.");
+            }),
+            ("a legacy fallback marker", |_, slash| {
+                std::fs::write(slash.join(MARKER_FILENAME), NO_KEYS)
+                    .expect("The test must write the legacy fallback marker.");
+            }),
+        ];
+        let mut failed = Vec::new();
+        let mut check = |case: &str, err: BootstrapError, keys: &Path, db: &Path| {
+            let command = format!(
+                "--datadir {} --slashing-db-path {} --confirm",
+                keys.display(),
+                db.display()
+            );
+            if err.exit_code() != EXIT_DOPPELGANGER_DETECTED || !logs_contain(&command) {
+                failed.push(format!("{case}: exit code {}, error \"{err}\"", err.exit_code()));
+            }
+        };
+        let config = |keys: &Path, db: &Path, detection: bool| Config {
+            keystore_path: keys.to_path_buf(),
+            slashing_db_path: db.to_path_buf(),
+            doppelganger_detection: detection,
+            ..Default::default()
+        };
+
+        for (case, setup) in rows {
+            let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+            let slash = tempfile::tempdir().expect("The test must create the database directory.");
+            let db = slash.path().join("slashing.sqlite");
+            setup(keys.path(), slash.path());
+            let err = boot_error(config(keys.path(), &db, false)).await;
+            check(case, err, keys.path(), &db);
+        }
+
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let db = slash.path().join("slashing.sqlite");
+        let record = record_path(keys.path());
+        let link = arm_before_record_link(move || {
+            std::fs::write(&record, detected_record())
+                .expect("The hook must write the detected record.");
+        });
+        let err = boot_error(config(keys.path(), &db, true)).await;
+        drop(link);
+        check("a record that is detected before the link", err, keys.path(), &db);
+
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        std::fs::write(record_path(keys.path()), detected_record())
+            .expect("The test must write the detected record.");
+        let bare = Path::new("slashing.sqlite");
+        let err = boot_error(config(keys.path(), bare, false)).await;
+        let cwd = std::env::current_dir().expect("The test must read the working directory.");
+        check("a bare database name", err, keys.path(), &cwd.join(bare));
+
+        assert!(
+            failed.is_empty(),
+            "Each refusal must exit 12 and log the clear-detection command with the absolute \
+             keystore and database paths. These boots do not: {failed:#?}"
+        );
+    }
+
+    /// Return a keystore directory, a database directory with a valid
+    /// database, and a boot config for the two. The genesis validators root
+    /// `0xzz` stops boot after the slashing database step and before a
+    /// network call.
+    fn fallback_probe_fixture(detection: bool) -> (tempfile::TempDir, tempfile::TempDir, Config) {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let db = slash.path().join("slashing.sqlite");
+        try_seed_slashing_db(&db);
+        let config = Config {
+            keystore_path: keys.path().to_path_buf(),
+            slashing_db_path: db,
+            genesis_validators_root: Some("0xzz".to_string()),
+            doppelganger_detection: detection,
+            ..Default::default()
+        };
+        (keys, slash, config)
+    }
+
+    /// Detection is on. The keystore directory takes the probe, and the hook
+    /// fails the probe of the database directory. The test requires these
+    /// results:
+    ///
+    /// - Boot returns exit code 1.
+    /// - The error names the slashing database directory and contains
+    ///   "writable".
+    /// - No probe file stays in the database directory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_when_the_fallback_dir_cannot_hold_a_marker() {
+        let (_keys, slash, config) = fallback_probe_fixture(true);
+        let _probe = crate::detection_marker::arm_probe_failure(slash.path());
+
+        let err = boot_error(config).await;
+
+        let text = err.to_string();
+        let dir = format!("slashing database directory {}", slash.path().display());
+        assert!(
+            err.exit_code() == 1 && text.contains(&dir) && text.contains("writable"),
+            "Boot must return exit code 1 with an error that contains \"{dir}\" and \
+             \"writable\". The exit code is {}. The error is: {text}",
+            err.exit_code()
+        );
+        let probes: Vec<String> = sorted_names(slash.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".probe"))
+            .collect();
+        assert!(
+            probes.is_empty(),
+            "The failed probe must leave no probe file in the database directory: {probes:?}"
+        );
+    }
+
+    /// Detection is off, and the hook fails the probe of the database
+    /// directory. Boot must not probe that directory. The test requires these
+    /// results:
+    ///
+    /// - Boot stops at the genesis validators root.
+    /// - The error does not name the database directory.
+    /// - The error does not contain "writable".
+    #[tokio::test(flavor = "current_thread")]
+    async fn detection_off_does_not_probe_the_fallback_dir() {
+        let (_keys, slash, config) = fallback_probe_fixture(false);
+        let _probe = crate::detection_marker::arm_probe_failure(slash.path());
+
+        let err = boot_error(config).await;
+
+        let text = err.to_string();
+        let dir = slash.path().display().to_string();
+        assert!(
+            text.contains("genesis validators root")
+                && !text.contains(&dir)
+                && !text.contains("writable"),
+            "With detection off, boot must stop at the genesis validators root, and the error \
+             must not name {dir} or contain \"writable\". The error is: {text}"
+        );
+    }
+
     async fn boot_with_keystore(dir: &std::path::Path) -> BootstrapError {
         let config = crate::config::Config {
             keystore_path: dir.to_path_buf(),
