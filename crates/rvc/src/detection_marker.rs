@@ -625,53 +625,113 @@ impl MarkerDir {
         cvt(unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) })
     }
 
-    /// Prove that this directory can hold a marker: create a temp entry
-    /// (exclusive create), write it, fsync it, remove it, and fsync this
-    /// directory. Each step uses this handle, so the probe does not look up
-    /// the path again.
+    /// Create the directory `name` in this directory with mode `0700`. The
+    /// call fails when the name exists.
+    #[allow(unsafe_code)]
+    fn mkdir(&self, name: &OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let name = c_name(name)?;
+        // SAFETY: `name` is a NUL-terminated string that lives during the
+        // call, and `self.file` keeps the descriptor open.
+        cvt(unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) })
+    }
+
+    /// Remove the empty directory `name` from this directory. The call
+    /// removes nothing when the entry is not a directory or is not empty.
+    #[allow(unsafe_code)]
+    fn rmdir(&self, name: &OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let name = c_name(name)?;
+        let fd = self.file.as_raw_fd();
+        // SAFETY: `name` is a NUL-terminated string that lives during the
+        // call, and `self.file` keeps the descriptor open.
+        cvt(unsafe { libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR) })
+    }
+
+    /// Prove that this directory can hold a marker. Each step uses a handle,
+    /// so the probe does not look up the path again:
+    ///
+    /// 1. Create a private subdirectory (`mkdirat`, mode `0700`) with a
+    ///    unique name.
+    /// 2. Open it with `O_NOFOLLOW | O_DIRECTORY`. Check that it is the
+    ///    directory of step 1 ([`MarkerDir::check_created_dir`]).
+    /// 3. In the subdirectory, create a file (exclusive create), write it,
+    ///    fsync it, and remove it.
+    /// 4. Remove the empty subdirectory, and fsync this directory.
+    ///
+    /// A failed step stops the probe with an error. After an error in step 1
+    /// or step 2, the probe removes nothing.
     fn probe(&self) -> io::Result<()> {
         let name = OsString::from(format!(
             ".{MARKER_FILENAME}.{}.{}.probe",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
         ));
+        let entry = self.path.join(&name);
+        let at = |step: &str, err: io::Error| {
+            io::Error::new(
+                err.kind(),
+                format!("the probe directory {} {step}: {err}", entry.display()),
+            )
+        };
         #[cfg(test)]
-        run_probe_step(&self.path, ProbeStep::BeforeCreate, &self.path.join(&name));
+        run_probe_step(&self.path, ProbeStep::Create, &entry);
+        self.mkdir(&name).map_err(|err| at("cannot be created", err))?;
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::Open, &entry);
+        let flags = [libc::O_RDONLY, libc::O_DIRECTORY, libc::O_NOFOLLOW];
+        let file =
+            open_at(Some(&self.file), &name, &flags).map_err(|err| at("cannot be opened", err))?;
+        let sub = Self { file, path: entry.clone() };
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::Check, &entry);
+        self.check_created_dir(&name, &sub.file)?;
+        let file_name = OsStr::new("probe");
         let flags = [libc::O_WRONLY, libc::O_CREAT, libc::O_EXCL, libc::O_NOFOLLOW];
-        let mut file = open_at(Some(&self.file), &name, &flags)?;
-        #[cfg(test)]
-        run_probe_step(&self.path, ProbeStep::BeforeOpen, &self.path.join(&name));
-        let written = file.write_all(b"ok").and_then(|()| sync_file(&file));
-        let removed = self.remove_created(&name, &file);
-        written.and(removed)?;
+        let probed = open_at(Some(&sub.file), file_name, &flags).and_then(|mut file| {
+            let written = file.write_all(b"ok").and_then(|()| sync_file(&file));
+            #[cfg(test)]
+            run_probe_step(&self.path, ProbeStep::Remove, &entry);
+            written.and(sub.unlink(file_name))
+        });
+        let removed = self.rmdir(&name).map_err(|err| at("cannot be removed", err));
+        probed.and(removed)?;
         sync_file(&self.file)
     }
 
-    /// Remove the entry `name` only when it is `created`, the file that the
-    /// probe opened: `fstat` must give the same device and inode numbers for
-    /// the two. Else the entry stays, and the result is an error.
-    fn remove_created(&self, name: &OsStr, created: &File) -> io::Result<()> {
+    /// Check that `sub`, the open entry `name` of this directory, is the
+    /// private directory that [`MarkerDir::probe`] created. `mkdirat` gives
+    /// no handle, so the check uses these facts:
+    ///
+    /// - The entry `name` has the device and inode numbers of `sub`.
+    /// - The effective uid of this process owns `sub`.
+    /// - The mode of `sub` gives no access to the group or to other users.
+    ///
+    /// Only a process with this uid, or with a privilege that overrides file
+    /// permissions, can make a different directory that passes the check.
+    /// When a fact is false, the result is an error, and the entry stays.
+    #[allow(unsafe_code)]
+    fn check_created_dir(&self, name: &OsStr, sub: &File) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
-        #[cfg(test)]
-        run_probe_step(&self.path, ProbeStep::BeforeCheck, &self.path.join(name));
         #[cfg(target_os = "linux")]
         let flags = [libc::O_PATH, libc::O_NOFOLLOW];
         #[cfg(not(target_os = "linux"))]
         let flags = [libc::O_RDONLY, libc::O_NOFOLLOW, libc::O_NONBLOCK];
-        let id = |meta: fs::Metadata| (meta.dev(), meta.ino());
-        if id(open_at(Some(&self.file), name, &flags)?.metadata()?) != id(created.metadata()?) {
+        let (named, meta) = (open_at(Some(&self.file), name, &flags)?.metadata()?, sub.metadata()?);
+        // SAFETY: geteuid only reads the effective user ID of this process.
+        let euid = unsafe { libc::geteuid() };
+        let id = |meta: &fs::Metadata| (meta.dev(), meta.ino());
+        if id(&named) != id(&meta) || meta.uid() != euid || meta.mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "the probe entry {} is not the file that the probe created, so the probe \
-                     does not remove it",
+                    "the probe directory {} is not the private directory that the probe \
+                     created, so the probe does not remove it",
                     self.path.join(name).display()
                 ),
             ));
         }
-        #[cfg(test)]
-        run_probe_step(&self.path, ProbeStep::BeforeRemove, &self.path.join(name));
-        self.unlink(name)
+        Ok(())
     }
 }
 
@@ -750,9 +810,11 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
 
 /// Prove that the slashing database directory `dir` can hold a fallback
 /// marker. The walk that the marker read, write and clear use (no symlink, no
-/// `..`) opens `dir` one time. Each step of the probe then uses that handle.
-/// The probe removes its temp entry only while the entry is the file that it
-/// created. Else the entry stays, and the probe returns an error.
+/// `..`) opens `dir` one time. Through that handle, the probe makes a private
+/// subdirectory, writes and fsyncs a file in it, and removes the file and the
+/// subdirectory. The only removal by name in `dir` is the removal of the
+/// subdirectory, and that removal cannot remove a file or a directory that is
+/// not empty.
 pub fn probe_fallback_dir_writable(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1860,20 +1922,20 @@ fn note_probe(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A step of [`probe_fallback_dir_writable`] where a test hook can run.
+/// A step of [`probe_fallback_dir_writable`]. The hook of [`arm_probe_step`]
+/// runs immediately before the step.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeStep {
-    /// Before the probe creates its entry in the database directory.
-    BeforeCreate,
-    /// After the probe creates its entry and before it opens that entry.
-    BeforeOpen,
-    /// After the probe opens its entry and before it checks the identity of
-    /// that entry.
-    BeforeCheck,
-    /// After the identity check and the fsync of the probe file, and before
-    /// the probe removes its entries.
-    BeforeRemove,
+    /// The probe creates its entry in the database directory.
+    Create,
+    /// The probe opens its entry. The entry exists at this step.
+    Open,
+    /// The probe checks the identity of its open entry.
+    Check,
+    /// The probe removes its entries. The identity check and the fsync of
+    /// the probe file are complete at this step.
+    Remove,
 }
 
 /// Run `hook` one time on this thread, at the step `step` of

@@ -2209,23 +2209,23 @@ mod tests {
         let rows = [
             (
                 "an empty directory with mode 0700 before the create",
-                ProbeStep::BeforeCreate,
+                ProbeStep::Create,
                 Other::Dir(0o700),
             ),
             (
                 "an empty directory with mode 0755 before the open",
-                ProbeStep::BeforeOpen,
+                ProbeStep::Open,
                 Other::Dir(0o755),
             ),
             (
                 "an empty directory with mode 0700 before the identity check",
-                ProbeStep::BeforeCheck,
+                ProbeStep::Check,
                 Other::Dir(0o700),
             ),
-            ("a file after the identity check", ProbeStep::BeforeRemove, Other::File),
+            ("a file after the identity check", ProbeStep::Remove, Other::File),
             (
                 "a directory with a file after the identity check",
-                ProbeStep::BeforeRemove,
+                ProbeStep::Remove,
                 Other::DirWithFile,
             ),
         ];
@@ -2235,7 +2235,7 @@ mod tests {
             let made = std::rc::Rc::new(std::cell::RefCell::new(None));
             let record = std::rc::Rc::clone(&made);
             let _hook = arm_probe_step(slash.path(), step, move |entry| {
-                if step != ProbeStep::BeforeCreate {
+                if step != ProbeStep::Create {
                     std::fs::rename(entry, entry.with_extension("moved"))
                         .expect("The hook must move the probe entry.");
                 }
