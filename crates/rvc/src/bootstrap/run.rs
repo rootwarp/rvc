@@ -130,7 +130,13 @@ async fn run_with_clock<C: SlotClock + 'static>(
     refuse_if_detection_records(&config.keystore_path, &config.slashing_db_path)?;
     if config.doppelganger_detection {
         ensure_marker_dir_writable(&config.keystore_path)?;
-        ensure_detection_record(&config.keystore_path)?;
+        if let Some(fallback) = crate::detection_marker::FallbackMarkerPath::for_config(
+            &config.keystore_path,
+            &config.slashing_db_path,
+        ) {
+            ensure_fallback_dir_writable(&fallback.dir)?;
+        }
+        ensure_detection_record(&config.keystore_path, &config.slashing_db_path)?;
     }
 
     let health_status = new_health_status();
@@ -625,11 +631,30 @@ pub(crate) async fn await_shutdown_and_drain_with_signal(
 /// How long the drain waits between attempts when nothing durable exists yet.
 const MARKER_SHUTDOWN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Operator hint included in a refuse-to-start log. The fallback marker, when
-/// one was written, sits beside the slashing database.
-const DETECTION_CLEAR_HINT: &str = "Clear it with `rvc doppelganger clear-detection \
-     --datadir <data dir> --slashing-db-path <slashing db> --confirm` \
-     after the other instance is gone";
+/// Operator hint included in a refuse-to-start log: the `clear-detection`
+/// command for the keystore `keystore_dir` and the slashing database
+/// `slashing_db_path`. The fallback marker, when one was written, sits beside
+/// the slashing database.
+///
+/// Each path is the [`crate::detection_marker::absolute_path`] of the
+/// configured path, so the command works from any working directory, and its
+/// `--datadir` is the owner that a fallback marker of this process records.
+/// A path without an absolute form is printed as configured. The text goes
+/// only to the log: no selection, read, write or clear uses it.
+fn detection_clear_hint(
+    keystore_dir: &std::path::Path,
+    slashing_db_path: &std::path::Path,
+) -> String {
+    let shown = |path: &std::path::Path| {
+        crate::detection_marker::absolute_path(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    format!(
+        "Clear it with `rvc doppelganger clear-detection --datadir {} --slashing-db-path {} \
+         --confirm` after the other instance is gone",
+        shown(keystore_dir).display(),
+        shown(slashing_db_path).display()
+    )
+}
 
 /// Write a durable detection record once the latch is set.
 ///
@@ -729,24 +754,28 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
 /// Exit 12 before a signer or the keymanager API is built when a detection
 /// marker or a detected record is present in the keystore directory or, when
 /// that directory is different, the owned fallback marker of this database or
-/// a legacy fallback marker is beside the slashing database.
+/// a legacy fallback marker is beside the slashing database. Each refusal log
+/// gives the `clear-detection` command of the two paths.
 pub(crate) fn refuse_if_detection_records(
     keystore_dir: &std::path::Path,
     slashing_db_path: &std::path::Path,
 ) -> Result<(), BootstrapError> {
-    refuse_if_detection_record(keystore_dir)?;
+    let hint = detection_clear_hint(keystore_dir, slashing_db_path);
+    refuse_if_detection_record(keystore_dir, &hint)?;
     refuse_if_detection_marker(
         &crate::detection_marker::marker_path(keystore_dir),
         crate::detection_marker::inspect(keystore_dir),
+        &hint,
     )?;
     if let Some(fallback) =
         crate::detection_marker::FallbackMarkerPath::for_config(keystore_dir, slashing_db_path)
     {
         let found = crate::detection_marker::inspect_fallback(&fallback);
-        refuse_if_detection_marker(&fallback.owned_path(), found.owned)?;
+        refuse_if_detection_marker(&fallback.owned_path(), found.owned, &hint)?;
         refuse_if_detection_marker(
             &crate::detection_marker::marker_path(&fallback.dir),
             found.legacy,
+            &hint,
         )?;
     }
     Ok(())
@@ -754,9 +783,12 @@ pub(crate) fn refuse_if_detection_records(
 
 /// Exit 12 when the pre-allocated record is `detected` or cannot be trusted.
 ///
-/// Each refusal log gives the `clear-detection` command. That command
+/// Each refusal log gives `hint`, the `clear-detection` command. That command
 /// replaces a record that does not parse when it is a regular file.
-fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+fn refuse_if_detection_record(
+    data_dir: &std::path::Path,
+    hint: &str,
+) -> Result<(), BootstrapError> {
     match crate::detection_marker::inspect_record(data_dir) {
         crate::detection_marker::RecordInspect::Absent
         | crate::detection_marker::RecordInspect::Clear => Ok(()),
@@ -766,7 +798,7 @@ fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), Bootstra
                 unix_secs,
                 path = %crate::detection_marker::record_path(data_dir).display(),
                 "doppelganger detection record is in the detected state; refusing to start. {}",
-                DETECTION_CLEAR_HINT
+                hint
             );
             Err(BootstrapError::DoppelgangerDetected)
         }
@@ -776,7 +808,7 @@ fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), Bootstra
                 reason,
                 "doppelganger detection record cannot be read or does not parse; refusing to \
                  start. A symlink, directory or FIFO at that path must be removed first. {}",
-                DETECTION_CLEAR_HINT
+                hint
             );
             Err(BootstrapError::DoppelgangerDetected)
         }
@@ -785,10 +817,11 @@ fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), Bootstra
 
 /// Exit 12 before a signer or the keymanager API is built when the detection
 /// marker that `found` describes at `path` is present, unreadable, or not a
-/// valid marker.
+/// valid marker. Each refusal log gives `hint`, the `clear-detection` command.
 fn refuse_if_detection_marker(
     path: &std::path::Path,
     found: crate::detection_marker::MarkerInspect,
+    hint: &str,
 ) -> Result<(), BootstrapError> {
     match found {
         crate::detection_marker::MarkerInspect::Absent => Ok(()),
@@ -800,7 +833,7 @@ fn refuse_if_detection_marker(
                     unix_secs = marker.unix_secs,
                     path = %path.display(),
                     "doppelganger detection marker is present; refusing to start. {}",
-                    DETECTION_CLEAR_HINT
+                    hint
                 );
             }
             if marker.pubkeys.is_empty() {
@@ -808,7 +841,7 @@ fn refuse_if_detection_marker(
                     epoch = marker.epoch,
                     path = %path.display(),
                     "doppelganger detection marker listed no keys; refusing to start. {}",
-                    DETECTION_CLEAR_HINT
+                    hint
                 );
             }
             Err(BootstrapError::DoppelgangerDetected)
@@ -817,7 +850,8 @@ fn refuse_if_detection_marker(
             error!(
                 path = %path.display(),
                 reason,
-                "doppelganger detection marker is corrupt; refusing to start"
+                "doppelganger detection marker is corrupt; refusing to start. {}",
+                hint
             );
             Err(BootstrapError::DoppelgangerDetected)
         }
@@ -825,7 +859,8 @@ fn refuse_if_detection_marker(
             error!(
                 path = %path.display(),
                 error = %source,
-                "doppelganger detection marker is unreadable; refusing to start"
+                "doppelganger detection marker is unreadable; refusing to start. {}",
+                hint
             );
             Err(BootstrapError::DoppelgangerDetected)
         }
@@ -835,14 +870,19 @@ fn refuse_if_detection_marker(
 /// Detection stays on only when the fixed-size record can be pre-allocated.
 ///
 /// A failure here is exit 1. The process cannot promise to latch a later
-/// detection if that overwrite has nowhere to land.
-fn ensure_detection_record(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+/// detection if that overwrite has nowhere to land. A record that is
+/// `detected` by then is exit 12, and the log gives the `clear-detection`
+/// command for the keystore `data_dir` and the database `slashing_db_path`.
+fn ensure_detection_record(
+    data_dir: &std::path::Path,
+    slashing_db_path: &std::path::Path,
+) -> Result<(), BootstrapError> {
     if let Err(err) = crate::detection_marker::preallocate_detection_record(data_dir) {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             error!(
                 path = %crate::detection_marker::record_path(data_dir).display(),
                 "doppelganger detection record is already in the detected state; refusing to start. {}",
-                DETECTION_CLEAR_HINT
+                detection_clear_hint(data_dir, slashing_db_path)
             );
             return Err(BootstrapError::DoppelgangerDetected);
         }
@@ -875,6 +915,26 @@ fn ensure_marker_dir_writable(data_dir: &std::path::Path) -> Result<(), Bootstra
         )));
     }
     Ok(())
+}
+
+/// Detection stays on only when the slashing database directory `dir` can
+/// take a durable write. Boot calls this only when that directory is not the
+/// keystore directory: the drain writes the fallback marker there when the
+/// keystore write fails. A failure here is exit 1.
+fn ensure_fallback_dir_writable(dir: &std::path::Path) -> Result<(), BootstrapError> {
+    crate::detection_marker::probe_marker_dir_writable(dir).map_err(|err| {
+        error!(
+            path = %dir.display(),
+            error = %err,
+            "doppelganger detection is enabled but the slashing database directory cannot hold \
+             the fallback detection marker"
+        );
+        BootstrapError::InvalidConfig(format!(
+            "the slashing database directory {} must be writable while doppelganger detection \
+             is enabled, because the fallback detection marker is written there: {err}",
+            dir.display()
+        ))
+    })
 }
 
 async fn shutdown_signal() {

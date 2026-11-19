@@ -326,16 +326,23 @@ pub fn write_fallback_marker(
     }
 }
 
-/// The owner that a fallback marker of `keystore_dir` records: the keystore
-/// path made absolute with the working directory now, with no `.` component
-/// and no trailing slash. The function reads no file system entry, so the
-/// keystore directory can be missing (the drain writes the marker when the
-/// keystore write fails). It does not resolve a symlink or a `..`: a second
-/// path of one keystore records a different owner, and a clear through that
-/// path keeps the marker. `None` when the path is empty or not valid UTF-8.
+/// `path` made absolute with the working directory now, with no `.`
+/// component and no trailing slash. The function reads no file system
+/// entry, and it does not resolve a symlink or a `..`. A fallback marker
+/// records its keystore in this form, and a boot refusal prints the paths of
+/// its `clear-detection` command in this form.
+pub(crate) fn absolute_path(path: &Path) -> io::Result<PathBuf> {
+    Ok(std::path::absolute(path)?.components().collect())
+}
+
+/// The owner that a fallback marker of `keystore_dir` records: the
+/// [`absolute_path`] of the keystore. The keystore directory can be missing
+/// (the drain writes the marker when the keystore write fails). A second
+/// path of one keystore (a symlink or a `..`) records a different owner, and
+/// a clear through that path keeps the marker. `None` when the path is empty
+/// or not valid UTF-8.
 fn resolved_owner(keystore_dir: &Path) -> Option<String> {
-    let absolute: PathBuf = std::path::absolute(keystore_dir).ok()?.components().collect();
-    absolute.into_os_string().into_string().ok()
+    absolute_path(keystore_dir).ok()?.into_os_string().into_string().ok()
 }
 
 /// What [`clear_fallback_marker`] did with the owned fallback marker.
