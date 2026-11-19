@@ -671,6 +671,8 @@ pub fn force_window_path(data_dir: &Path) -> PathBuf {
 
 /// Prove `data_dir` can hold a marker: create a temp file, fsync, and remove it.
 pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    note_probe(data_dir)?;
     if !data_dir.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -683,17 +685,12 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
     ));
     let write_result = (|| {
-        #[cfg(test)]
-        if probe_fails_for(data_dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "injected marker directory probe failure",
-            ));
-        }
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
         file.write_all(b"ok")?;
         sync_file(&file)?;
         drop(file);
+        #[cfg(test)]
+        run_before_probe_unlink(data_dir, &tmp_path);
         fs::remove_file(&tmp_path)?;
         sync_dir(data_dir)?;
         Ok(())
@@ -1481,6 +1478,9 @@ thread_local! {
     static BEFORE_MARKER_TEMP_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static PROBE_FAILURE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static PROBE_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
+    static BEFORE_PROBE_UNLINK: RefCell<Option<(PathBuf, RecordPathHook)>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1756,12 +1756,12 @@ pub(crate) fn arm_preallocate_failure() -> PreallocateFailGuard {
     PreallocateFailGuard
 }
 
-/// Fail each [`probe_marker_dir_writable`] call for the directory `dir` on
-/// this thread with `PermissionDenied`. The probe fails before it creates
-/// its temp file, so it leaves no file. A probe of a different path runs
-/// normally. The match compares the path components.
+/// Fail each probe of the marker directory `dir` on this thread with
+/// `PermissionDenied`. The probe fails before it opens the directory, so it
+/// leaves no file. The hook does not change the probe of a different path.
+/// The match compares the path components.
 ///
-/// The guard stops these failures when it drops.
+/// `ProbeFailGuard::drop` stops the probe failures that the hook injects.
 #[cfg(test)]
 pub(crate) fn arm_probe_failure(dir: &Path) -> ProbeFailGuard {
     PROBE_FAILURE_DIR.with(|slot| *slot.borrow_mut() = Some(dir.to_path_buf()));
@@ -1772,6 +1772,60 @@ pub(crate) fn arm_probe_failure(dir: &Path) -> ProbeFailGuard {
 #[cfg(test)]
 fn probe_fails_for(dir: &Path) -> bool {
     PROBE_FAILURE_DIR.with(|slot| slot.borrow().as_deref() == Some(dir))
+}
+
+/// Return the number of marker directory probes on this thread. The number
+/// includes each probe that fails.
+#[cfg(test)]
+pub(crate) fn probe_attempts() -> u32 {
+    PROBE_ATTEMPTS.with(Cell::get)
+}
+
+/// Add one probe of the marker directory `dir` to the count of this thread.
+/// Return the error of [`arm_probe_failure`] when it armed `dir`.
+#[cfg(test)]
+fn note_probe(dir: &Path) -> io::Result<()> {
+    PROBE_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    if probe_fails_for(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected marker directory probe failure",
+        ));
+    }
+    Ok(())
+}
+
+/// Run `hook` one time on this thread, in the probe of the marker directory
+/// `dir`. The hook runs after the probe syncs its temp entry and before the
+/// probe removes that entry. The hook gets the path of the entry. A probe
+/// of a different path does not run it.
+///
+/// The guard removes the hook when it drops, if the hook did not run.
+#[cfg(test)]
+pub(crate) fn arm_before_probe_unlink(
+    dir: &Path,
+    hook: impl FnOnce(&Path) + 'static,
+) -> ProbeUnlinkHookGuard {
+    BEFORE_PROBE_UNLINK.with(|slot| *slot.borrow_mut() = Some((dir.to_path_buf(), Box::new(hook))));
+    ProbeUnlinkHookGuard
+}
+
+/// Run the hook of [`arm_before_probe_unlink`] when it armed `dir`. The hook
+/// gets the probe entry `entry`.
+#[cfg(test)]
+fn run_before_probe_unlink(dir: &Path, entry: &Path) {
+    let armed = BEFORE_PROBE_UNLINK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let matches = slot.as_ref().is_some_and(|(armed, _)| armed.as_path() == dir);
+        if matches {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, hook)) = armed {
+        hook(entry);
+    }
 }
 
 #[cfg(test)]
@@ -1857,7 +1911,7 @@ impl Drop for PreallocateFailGuard {
     }
 }
 
-/// The guard stops the injected probe failures when it drops.
+/// `ProbeFailGuard::drop` stops the probe failures that the hook injects.
 #[cfg(test)]
 pub(crate) struct ProbeFailGuard;
 
@@ -1865,6 +1919,17 @@ pub(crate) struct ProbeFailGuard;
 impl Drop for ProbeFailGuard {
     fn drop(&mut self) {
         PROBE_FAILURE_DIR.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// `ProbeUnlinkHookGuard::drop` removes the probe hook if it did not run.
+#[cfg(test)]
+pub(crate) struct ProbeUnlinkHookGuard;
+
+#[cfg(test)]
+impl Drop for ProbeUnlinkHookGuard {
+    fn drop(&mut self) {
+        BEFORE_PROBE_UNLINK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -2324,12 +2389,13 @@ mod tests {
         assert_eq!(
             selected(&keys),
             [Some(PathBuf::from(".")), Some(PathBuf::from("."))],
-            "When the keystore is in a different directory, the two names must select `.`."
+            "For a keystore in a different directory, `fallback_marker_dir` must return \
+             `Some(\".\")` for each name."
         );
         assert_eq!(
             selected(Path::new(".")),
             [None, None],
-            "When the keystore is `.`, the two names must select no directory."
+            "For a keystore in `.`, `fallback_marker_dir` must return `None` for each name."
         );
     }
 

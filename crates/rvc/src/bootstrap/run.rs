@@ -1782,29 +1782,169 @@ mod tests {
         bytes
     }
 
+    /// Split `command` into words by the POSIX shell rules for single quotes
+    /// and a backslash. Outside quotes, a space ends a word. The function
+    /// returns an error for these items:
+    ///
+    /// - A single quote that does not end.
+    /// - A backslash at the end of the command.
+    /// - An unquoted character that is not a letter, a digit, `-`, `_`, `.`
+    ///   or `/`. The shell can give such a character a special meaning.
+    fn shell_words(command: &str) -> Result<Vec<String>, String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = command.chars();
+        while let Some(c) = chars.next() {
+            if c == ' ' {
+                words.extend(word.take());
+                continue;
+            }
+            let text = word.get_or_insert_with(String::new);
+            if c == '\'' {
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(quoted) => text.push(quoted),
+                        None => {
+                            return Err(format!(
+                                "The command has a single quote that does not end: {command}"
+                            ));
+                        }
+                    }
+                }
+            } else if c == '\\' {
+                let escaped = chars
+                    .next()
+                    .ok_or_else(|| format!("The command ends with a backslash: {command}"))?;
+                text.push(escaped);
+            } else if c.is_ascii_alphanumeric() || "-_./".contains(c) {
+                text.push(c);
+            } else {
+                return Err(format!(
+                    "The command has the unquoted character {c:?}, and the shell can give it a \
+                     special meaning: {command}"
+                ));
+            }
+        }
+        words.extend(word);
+        Ok(words)
+    }
+
+    /// Return the `clear-detection` command of each refusal hint in `lines`,
+    /// split into shell words.
+    fn printed_commands(lines: &[&str]) -> Vec<Result<Vec<String>, String>> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("Clear it with `")?;
+                let (command, _) = rest.split_once("` after the other instance is gone")?;
+                Some(shell_words(command))
+            })
+            .collect()
+    }
+
+    /// Return the arguments of the clear command for the keystore `keys` and
+    /// the database `db`.
+    fn clear_command(keys: &std::path::Path, db: &std::path::Path) -> Vec<String> {
+        let [keys, db] = [keys, db]
+            .map(|path| path.to_str().expect("The test paths must be UTF-8.").to_string());
+        ["rvc", "doppelganger", "clear-detection", "--datadir", &keys]
+            .into_iter()
+            .chain(["--slashing-db-path", &db, "--confirm"])
+            .map(String::from)
+            .collect()
+    }
+
+    /// The start of the name of each temporary directory of the hint tests:
+    /// a space, a single quote and the characters `$`, `;`, `` ` `` and `&`.
+    const SHELL_CHARACTERS: &str = "dir '$;`&";
+
+    /// Return a new temporary directory. Its name starts with
+    /// [`SHELL_CHARACTERS`].
+    fn shell_char_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(SHELL_CHARACTERS)
+            .tempdir()
+            .expect("The test must create a temporary directory.")
+    }
+
+    /// The hint gives each path as one shell word. The hint gives no command
+    /// when it cannot show a path exactly. The test requires these results:
+    ///
+    /// - The test parser splits a known command into the known words. The
+    ///   parser rejects an unquoted `;` and a single quote that does not end.
+    /// - For paths with a space, a single quote and the characters `$`, `;`,
+    ///   `` ` `` and `&`, the shell words of the command are the expected
+    ///   arguments.
+    /// - For a keystore path or a database path that is not UTF-8 or that has
+    ///   a line feed, the hint has no command. The hint tells the operator to
+    ///   type each path.
+    #[cfg(unix)]
+    #[test]
+    fn clear_hint_gives_each_path_as_one_shell_word() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+        assert_eq!(
+            shell_words(r"a 'b c' d\ e'' 'f'\''g'"),
+            Ok(["a", "b c", "d e", "f'g"].map(String::from).to_vec()),
+            "The test parser must split the known command into the known words."
+        );
+        assert!(
+            shell_words("a;b").is_err() && shell_words("'a").is_err(),
+            "The test parser must reject an unquoted `;` and a single quote that does not end."
+        );
+
+        let keys = Path::new("/srv/my keys/it's $HOME;`id`&x");
+        let db = Path::new("/srv/'db'/a'b.sqlite");
+        let hint = detection_clear_hint(keys, db);
+        assert_eq!(
+            printed_commands(&[hint.as_str()]),
+            vec![Ok(clear_command(keys, db))],
+            "The shell words of the command must be the expected arguments. The hint is: {hint}"
+        );
+
+        let not_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/srv/keys-\xff"));
+        let line_feed = Path::new("/srv/keys\nx");
+        for (keys, db) in [(not_utf8, db), (line_feed, db), (keys, not_utf8), (keys, line_feed)] {
+            let hint = detection_clear_hint(keys, db);
+            assert!(
+                printed_commands(&[hint.as_str()]).is_empty() && hint.contains("type each path"),
+                "The hint must have no command and must tell the operator to type each path. \
+                 The hint is: {hint}"
+            );
+        }
+    }
+
     /// Each row writes one item of detection evidence for the keystore `keys`
     /// and the database `<slash>/slashing.sqlite`. Then boot runs with
-    /// detection off. Two more boots use these fixtures:
+    /// detection off. The name of each temporary directory starts with
+    /// [`SHELL_CHARACTERS`]. Three more boots use these fixtures:
     ///
-    /// - Detection is on, and a hook writes a `detected` record after the
-    ///   boot check of the record and before the link of the new record.
+    /// - Detection is on. A hook writes a detected record after boot checks
+    ///   the record. The hook runs before boot links the new record.
     /// - The database path is the bare name `slashing.sqlite`, and the record
     ///   is `detected`.
+    /// - The keystore path has a symlink, and a marker of that keystore is at
+    ///   the owned fallback path.
     ///
     /// For each boot, the test requires these results:
     ///
     /// - Boot returns exit code 12.
-    /// - A refusal log contains `--datadir <keys> --slashing-db-path <db>
-    ///   --confirm`. Each path is absolute. For the bare name, `<db>` is the
-    ///   name in the working directory of the process.
+    /// - A refusal log gives a command with these shell words: `rvc
+    ///   doppelganger clear-detection --datadir <keys> --slashing-db-path
+    ///   <db> --confirm`. Each path is absolute. For the bare name, `<db>` is
+    ///   the name in the working directory of the process. For the symlink,
+    ///   `<keys>` is the keystore that the marker records.
     ///
-    /// The test collects each failed boot, so a failure lists all of them.
+    /// The test records each boot that fails a check. The assertion lists
+    /// these boots.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[tracing_test::traced_test]
     async fn boot_refusal_prints_the_resolved_clear_command() {
         use crate::detection_marker::{
-            arm_before_record_link, marker_path, record_path, write_marker, DetectionMarker,
-            MARKER_FILENAME, RECORD_LEN,
+            arm_before_record_link, marker_path, record_path, write_fallback_marker, write_marker,
+            DetectionMarker, FallbackMarkerPath, MARKER_FILENAME, RECORD_LEN,
         };
         use std::path::Path;
         const NO_KEYS: &str = r#"{"version":1,"epoch":3,"unix_secs":4,"pubkeys":[]}"#;
@@ -1835,9 +1975,9 @@ mod tests {
                 std::fs::write(record_path(keys), vec![0u8; RECORD_LEN])
                     .expect("The test must write the zero-filled record.");
             }),
-            ("an owned fallback marker", |_, slash| {
+            ("a marker at the owned fallback path", |_, slash| {
                 std::fs::write(slash.join(".rvc.doppelganger_detected.slashing.sqlite"), NO_KEYS)
-                    .expect("The test must write the owned fallback marker.");
+                    .expect("The test must write a marker at the owned fallback path.");
             }),
             ("a legacy fallback marker", |_, slash| {
                 std::fs::write(slash.join(MARKER_FILENAME), NO_KEYS)
@@ -1846,12 +1986,13 @@ mod tests {
         ];
         let mut failed = Vec::new();
         let mut check = |case: &str, err: BootstrapError, keys: &Path, db: &Path| {
-            let command = format!(
-                "--datadir {} --slashing-db-path {} --confirm",
-                keys.display(),
-                db.display()
-            );
-            if err.exit_code() != EXIT_DOPPELGANGER_DETECTED || !logs_contain(&command) {
+            let expected = Ok(clear_command(keys, db));
+            let printed = std::cell::Cell::new(false);
+            logs_assert(|lines| {
+                printed.set(printed_commands(lines).contains(&expected));
+                Ok(())
+            });
+            if err.exit_code() != EXIT_DOPPELGANGER_DETECTED || !printed.get() {
                 failed.push(format!("{case}: exit code {}, error \"{err}\"", err.exit_code()));
             }
         };
@@ -1863,16 +2004,16 @@ mod tests {
         };
 
         for (case, setup) in rows {
-            let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
-            let slash = tempfile::tempdir().expect("The test must create the database directory.");
+            let keys = shell_char_tempdir();
+            let slash = shell_char_tempdir();
             let db = slash.path().join("slashing.sqlite");
             setup(keys.path(), slash.path());
             let err = boot_error(config(keys.path(), &db, false)).await;
             check(case, err, keys.path(), &db);
         }
 
-        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
-        let slash = tempfile::tempdir().expect("The test must create the database directory.");
+        let keys = shell_char_tempdir();
+        let slash = shell_char_tempdir();
         let db = slash.path().join("slashing.sqlite");
         let record = record_path(keys.path());
         let link = arm_before_record_link(move || {
@@ -1883,7 +2024,7 @@ mod tests {
         drop(link);
         check("a record that is detected before the link", err, keys.path(), &db);
 
-        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let keys = shell_char_tempdir();
         std::fs::write(record_path(keys.path()), detected_record())
             .expect("The test must write the detected record.");
         let bare = Path::new("slashing.sqlite");
@@ -1891,10 +2032,30 @@ mod tests {
         let cwd = std::env::current_dir().expect("The test must read the working directory.");
         check("a bare database name", err, keys.path(), &cwd.join(bare));
 
+        let root = shell_char_tempdir();
+        let keys = root.path().join("keys-link");
+        std::fs::create_dir(root.path().join("keys"))
+            .expect("The test must create the keystore directory.");
+        std::os::unix::fs::symlink("keys", &keys)
+            .expect("The test must create the keystore symlink.");
+        let slash = shell_char_tempdir();
+        let db = slash.path().join("slashing.sqlite");
+        let fallback = FallbackMarkerPath::for_config(&keys, &db)
+            .expect("The database directory must get a fallback marker.");
+        let marker = DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: Vec::new() };
+        write_fallback_marker(&fallback, &keys, &marker)
+            .expect("The test must write a marker at the owned fallback path.");
+        let bytes = std::fs::read(fallback.owned_path()).expect("The test must read the marker.");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("The marker must be a JSON document.");
+        let owner = body["keystore_dir"].as_str().expect("The marker must record its keystore.");
+        let err = boot_error(config(&keys, &db, false)).await;
+        check("a keystore path with a symlink", err, Path::new(owner), &db);
+
         assert!(
             failed.is_empty(),
-            "Each refusal must exit 12 and log the clear-detection command with the absolute \
-             keystore and database paths. These boots do not: {failed:#?}"
+            "Each refusal must exit 12 and log the complete clear-detection command. Each \
+             absolute path must be one shell word. These boots do not: {failed:#?}"
         );
     }
 
@@ -1950,28 +2111,119 @@ mod tests {
         );
     }
 
-    /// Detection is off, and the hook fails the probe of the database
-    /// directory. Boot must not probe that directory. The test requires these
-    /// results:
+    /// Detection is on. The database path is relative, and each walk starts
+    /// in a temporary directory that is not the working directory of the
+    /// process. Thus a probe that opens the database directory again by its
+    /// path does not find it. The keystore path is absolute. The hook fails
+    /// the record step. The test requires these results:
     ///
-    /// - Boot stops at the genesis validators root.
-    /// - The error does not name the database directory.
-    /// - The error does not contain "writable".
+    /// - Boot passes the probe of the database directory and returns the
+    ///   error of the record step.
+    /// - No probe entry stays in the database directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_probes_the_fallback_dir_through_the_handle_of_the_walk() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let root = tempfile::tempdir().expect("The test must create the start directory.");
+        let slash = tempfile::tempdir_in(root.path())
+            .expect("The test must create the database directory.");
+        let name = slash.path().file_name().expect("The database directory must have a name.");
+        let _start = crate::detection_marker::arm_walk_start(root.path());
+        let _record = crate::detection_marker::arm_preallocate_failure();
+        let config = Config {
+            keystore_path: keys.path().to_path_buf(),
+            slashing_db_path: std::path::Path::new(name).join("slashing.sqlite"),
+            doppelganger_detection: true,
+            ..Default::default()
+        };
+
+        let err = boot_error(config).await;
+
+        let text = err.to_string();
+        assert!(
+            err.exit_code() == 1 && text.contains("cannot preallocate"),
+            "Boot must probe the database directory through the handle of the walk. Then boot \
+             must return the error of the record step. The exit code is {}. The error is: {text}",
+            err.exit_code()
+        );
+        let probes: Vec<String> = sorted_names(slash.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".probe"))
+            .collect();
+        assert!(
+            probes.is_empty(),
+            "The probe must remove its entry from the database directory: {probes:?}"
+        );
+    }
+
+    /// Detection is on. The probe of the database directory writes and syncs
+    /// its entry. Then a hook replaces that entry with a different file. The
+    /// test requires these results:
+    ///
+    /// - Boot returns exit code 1, and the error names the database
+    ///   directory.
+    /// - The different file stays at the name of the probe entry.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_when_the_probe_entry_is_not_the_file_that_it_created() {
+        let (_keys, slash, config) = fallback_probe_fixture(true);
+        let _swap = crate::detection_marker::arm_before_probe_unlink(slash.path(), |entry| {
+            let other = entry.with_extension("other");
+            std::fs::write(&other, b"other").expect("The hook must write the different file.");
+            std::fs::rename(&other, entry)
+                .expect("The hook must move the different file to the probe entry.");
+        });
+
+        let err = boot_error(config).await;
+
+        let text = err.to_string();
+        let dir = format!("slashing database directory {}", slash.path().display());
+        assert!(
+            err.exit_code() == 1 && text.contains(&dir),
+            "Boot must return exit code 1 with an error that contains \"{dir}\". The exit code \
+             is {}. The error is: {text}",
+            err.exit_code()
+        );
+        let kept: Vec<Vec<u8>> = sorted_names(slash.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".probe"))
+            .map(|name| std::fs::read(slash.path().join(name)).expect("The test must read it."))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![b"other".to_vec()],
+            "The probe must keep the different file at the name of the probe entry."
+        );
+    }
+
+    /// Detection is off, and the hook fails the probe of the database
+    /// directory. The test requires these results:
+    ///
+    /// - The probe count of this thread does not change.
+    /// - Boot stops when it checks the genesis validators root.
+    /// - The error omits the database directory and the word "writable".
     #[tokio::test(flavor = "current_thread")]
     async fn detection_off_does_not_probe_the_fallback_dir() {
         let (_keys, slash, config) = fallback_probe_fixture(false);
         let _probe = crate::detection_marker::arm_probe_failure(slash.path());
+        let before = crate::detection_marker::probe_attempts();
 
         let err = boot_error(config).await;
 
+        let after = crate::detection_marker::probe_attempts();
+        assert_eq!(
+            after, before,
+            "With detection off, boot must not probe a directory. The probe count must stay \
+             at {before}."
+        );
         let text = err.to_string();
         let dir = slash.path().display().to_string();
         assert!(
             text.contains("genesis validators root")
                 && !text.contains(&dir)
                 && !text.contains("writable"),
-            "With detection off, boot must stop at the genesis validators root, and the error \
-             must not name {dir} or contain \"writable\". The error is: {text}"
+            "With detection off, boot must stop when it checks the genesis validators root. The \
+             error must omit {dir} and the word \"writable\". The error is: {text}"
         );
     }
 
