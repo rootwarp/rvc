@@ -624,6 +624,49 @@ impl MarkerDir {
         // call, and `self.file` keeps the descriptor open.
         cvt(unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) })
     }
+
+    /// Prove that this directory can hold a marker: create a temp entry
+    /// (exclusive create), write it, fsync it, remove it, and fsync this
+    /// directory. Each step uses this handle, so the probe does not look up
+    /// the path again.
+    fn probe(&self) -> io::Result<()> {
+        let name = OsString::from(format!(
+            ".{MARKER_FILENAME}.{}.{}.probe",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        ));
+        let flags = [libc::O_WRONLY, libc::O_CREAT, libc::O_EXCL, libc::O_NOFOLLOW];
+        let mut file = open_at(Some(&self.file), &name, &flags)?;
+        let written = file.write_all(b"ok").and_then(|()| sync_file(&file));
+        let removed = self.remove_created(&name, &file);
+        written.and(removed)?;
+        sync_file(&self.file)
+    }
+
+    /// Remove the entry `name` only when it is `created`, the file that the
+    /// probe opened: `fstat` must give the same device and inode numbers for
+    /// the two. Else the entry stays, and the result is an error.
+    fn remove_created(&self, name: &OsStr, created: &File) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(test)]
+        run_before_probe_unlink(&self.path, &self.path.join(name));
+        #[cfg(target_os = "linux")]
+        let flags = [libc::O_PATH, libc::O_NOFOLLOW];
+        #[cfg(not(target_os = "linux"))]
+        let flags = [libc::O_RDONLY, libc::O_NOFOLLOW, libc::O_NONBLOCK];
+        let id = |meta: fs::Metadata| (meta.dev(), meta.ino());
+        if id(open_at(Some(&self.file), name, &flags)?.metadata()?) != id(created.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "the probe entry {} is not the file that the probe created, so the probe \
+                     does not remove it",
+                    self.path.join(name).display()
+                ),
+            ));
+        }
+        self.unlink(name)
+    }
 }
 
 /// Open `name` relative to `dir`, or to the working directory when `dir` is
@@ -689,8 +732,6 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
         file.write_all(b"ok")?;
         sync_file(&file)?;
         drop(file);
-        #[cfg(test)]
-        run_before_probe_unlink(data_dir, &tmp_path);
         fs::remove_file(&tmp_path)?;
         sync_dir(data_dir)?;
         Ok(())
@@ -699,6 +740,24 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
     }
     write_result
+}
+
+/// Prove that the slashing database directory `dir` can hold a fallback
+/// marker. The walk that the marker read, write and clear use (no symlink, no
+/// `..`) opens `dir` one time. Each step of the probe then uses that handle.
+/// The probe removes its temp entry only while the entry is the file that it
+/// created. Else the entry stays, and the probe returns an error.
+pub fn probe_fallback_dir_writable(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        note_probe(dir)?;
+        MarkerDir::open(dir)?.probe()
+    }
+    #[cfg(not(unix))]
+    {
+        probe_marker_dir_writable(dir)
+    }
 }
 
 /// Write the one-shot force-window file. The next boot does not restart-skip
@@ -1795,10 +1854,10 @@ fn note_probe(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `hook` one time on this thread, in the probe of the marker directory
-/// `dir`. The hook runs after the probe syncs its temp entry and before the
-/// probe removes that entry. The hook gets the path of the entry. A probe
-/// of a different path does not run it.
+/// Run `hook` one time on this thread, in [`probe_fallback_dir_writable`]
+/// for the directory `dir`. The hook runs after the probe syncs its temp
+/// entry and before the probe checks and removes that entry. The hook gets
+/// the path of the entry. A probe of a different path does not run it.
 ///
 /// The guard removes the hook when it drops, if the hook did not run.
 #[cfg(test)]

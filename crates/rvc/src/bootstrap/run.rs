@@ -639,21 +639,38 @@ const MARKER_SHUTDOWN_RETRY: std::time::Duration = std::time::Duration::from_sec
 /// Each path is the [`crate::detection_marker::absolute_path`] of the
 /// configured path, so the command works from any working directory, and its
 /// `--datadir` is the owner that a fallback marker of this process records.
-/// A path without an absolute form is printed as configured. The text goes
+/// A path without an absolute form is printed as configured. Each path is
+/// one shell word ([`shell_word`]). When a path cannot be one, the hint
+/// prints no command and asks the operator to type each path. The text goes
 /// only to the log: no selection, read, write or clear uses it.
 fn detection_clear_hint(
     keystore_dir: &std::path::Path,
     slashing_db_path: &std::path::Path,
 ) -> String {
     let shown = |path: &std::path::Path| {
-        crate::detection_marker::absolute_path(path).unwrap_or_else(|_| path.to_path_buf())
+        shell_word(
+            &crate::detection_marker::absolute_path(path).unwrap_or_else(|_| path.to_path_buf()),
+        )
     };
-    format!(
-        "Clear it with `rvc doppelganger clear-detection --datadir {} --slashing-db-path {} \
-         --confirm` after the other instance is gone",
-        shown(keystore_dir).display(),
-        shown(slashing_db_path).display()
-    )
+    match (shown(keystore_dir), shown(slashing_db_path)) {
+        (Some(keystore), Some(db)) => format!(
+            "Clear it with `rvc doppelganger clear-detection --datadir {keystore} \
+             --slashing-db-path {db} --confirm` after the other instance is gone"
+        ),
+        _ => "Clear it after the other instance is gone: run `rvc doppelganger clear-detection` \
+              with `--datadir` set to the keystore directory, `--slashing-db-path` set to the \
+              slashing database, and `--confirm`. This log cannot show these paths as exact \
+              shell text, so type each path yourself"
+            .to_string(),
+    }
+}
+
+/// `path` as one POSIX shell word: the path text in single quotes, with
+/// each `'` written as `'\''`. `None` when the path is not UTF-8 or has a
+/// control character, because a log line cannot show such a path exactly.
+fn shell_word(path: &std::path::Path) -> Option<String> {
+    let text = path.to_str().filter(|text| !text.contains(char::is_control))?;
+    Some(format!("'{}'", text.replace('\'', r"'\''")))
 }
 
 /// Write a durable detection record once the latch is set.
@@ -922,7 +939,7 @@ fn ensure_marker_dir_writable(data_dir: &std::path::Path) -> Result<(), Bootstra
 /// keystore directory: the drain writes the fallback marker there when the
 /// keystore write fails. A failure here is exit 1.
 fn ensure_fallback_dir_writable(dir: &std::path::Path) -> Result<(), BootstrapError> {
-    crate::detection_marker::probe_marker_dir_writable(dir).map_err(|err| {
+    crate::detection_marker::probe_fallback_dir_writable(dir).map_err(|err| {
         error!(
             path = %dir.display(),
             error = %err,
