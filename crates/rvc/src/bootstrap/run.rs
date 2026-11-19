@@ -2173,43 +2173,104 @@ mod tests {
         );
     }
 
-    /// Detection is on. The probe of the database directory writes and syncs
-    /// its entry. Then a hook replaces that entry with a different file. The
-    /// test requires these results:
+    /// Detection is on. At one step of the probe of the database directory, a
+    /// hook moves the probe entry to a different name. Then the hook puts a
+    /// different entry at the name of the probe entry. The rows are:
+    ///
+    /// - Before the create, an empty directory with mode 0700 gets the name.
+    ///   The hook moves no entry.
+    /// - Before the open, an empty directory with mode 0755 gets the name.
+    /// - Before the identity check, an empty directory with mode 0700 gets
+    ///   the name.
+    /// - After the identity check and before the removal, a file gets the
+    ///   name.
+    /// - After the identity check and before the removal, a directory with a
+    ///   file gets the name.
+    ///
+    /// For each row, the test requires these results:
     ///
     /// - Boot returns exit code 1, and the error names the database
     ///   directory.
-    /// - The different file stays at the name of the probe entry.
+    /// - The different entry stays at the name of the probe entry.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn boot_refuses_when_the_probe_entry_is_not_the_file_that_it_created() {
-        let (_keys, slash, config) = fallback_probe_fixture(true);
-        let _swap = crate::detection_marker::arm_before_probe_unlink(slash.path(), |entry| {
-            let other = entry.with_extension("other");
-            std::fs::write(&other, b"other").expect("The hook must write the different file.");
-            std::fs::rename(&other, entry)
-                .expect("The hook must move the different file to the probe entry.");
-        });
+    async fn boot_keeps_an_entry_that_replaces_the_probe_entry() {
+        use crate::detection_marker::{arm_probe_step, ProbeStep};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        #[derive(Clone, Copy)]
+        enum Other {
+            Dir(u32),
+            File,
+            DirWithFile,
+        }
+        fn entry_id(path: &std::path::Path) -> Option<(u64, u64)> {
+            std::fs::symlink_metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+        }
+        let rows = [
+            (
+                "an empty directory with mode 0700 before the create",
+                ProbeStep::BeforeCreate,
+                Other::Dir(0o700),
+            ),
+            (
+                "an empty directory with mode 0755 before the open",
+                ProbeStep::BeforeOpen,
+                Other::Dir(0o755),
+            ),
+            (
+                "an empty directory with mode 0700 before the identity check",
+                ProbeStep::BeforeCheck,
+                Other::Dir(0o700),
+            ),
+            ("a file after the identity check", ProbeStep::BeforeRemove, Other::File),
+            (
+                "a directory with a file after the identity check",
+                ProbeStep::BeforeRemove,
+                Other::DirWithFile,
+            ),
+        ];
+        let mut failed = Vec::new();
+        for (row, step, other) in rows {
+            let (_keys, slash, config) = fallback_probe_fixture(true);
+            let made = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let record = std::rc::Rc::clone(&made);
+            let _hook = arm_probe_step(slash.path(), step, move |entry| {
+                if step != ProbeStep::BeforeCreate {
+                    std::fs::rename(entry, entry.with_extension("moved"))
+                        .expect("The hook must move the probe entry.");
+                }
+                let put = match other {
+                    Other::File => std::fs::write(entry, b"other"),
+                    Other::Dir(mode) => std::fs::create_dir(entry).and_then(|()| {
+                        std::fs::set_permissions(entry, std::fs::Permissions::from_mode(mode))
+                    }),
+                    Other::DirWithFile => std::fs::create_dir(entry)
+                        .and_then(|()| std::fs::write(entry.join("other"), b"other")),
+                };
+                put.expect("The hook must put the different entry at the name of the probe entry.");
+                *record.borrow_mut() = Some((entry.to_path_buf(), entry_id(entry)));
+            });
 
-        let err = boot_error(config).await;
+            let err = boot_error(config).await;
 
-        let text = err.to_string();
-        let dir = format!("slashing database directory {}", slash.path().display());
+            let text = err.to_string();
+            let dir = format!("slashing database directory {}", slash.path().display());
+            let kept = made
+                .borrow()
+                .as_ref()
+                .is_some_and(|(entry, id)| id.is_some() && entry_id(entry) == *id);
+            if err.exit_code() != 1 || !text.contains(&dir) || !kept {
+                failed.push(format!(
+                    "{row}: exit code {}, different entry kept {kept}, error {text}",
+                    err.exit_code()
+                ));
+            }
+        }
         assert!(
-            err.exit_code() == 1 && text.contains(&dir),
-            "Boot must return exit code 1 with an error that contains \"{dir}\". The exit code \
-             is {}. The error is: {text}",
-            err.exit_code()
-        );
-        let kept: Vec<Vec<u8>> = sorted_names(slash.path())
-            .into_iter()
-            .filter(|name| name.ends_with(".probe"))
-            .map(|name| std::fs::read(slash.path().join(name)).expect("The test must read it."))
-            .collect();
-        assert_eq!(
-            kept,
-            vec![b"other".to_vec()],
-            "The probe must keep the different file at the name of the probe entry."
+            failed.is_empty(),
+            "Each boot must return exit code 1 with an error that names the database directory. \
+             Each boot must keep the different entry at the name of the probe entry. These boots \
+             do not: {failed:#?}"
         );
     }
 

@@ -635,8 +635,12 @@ impl MarkerDir {
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
         ));
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::BeforeCreate, &self.path.join(&name));
         let flags = [libc::O_WRONLY, libc::O_CREAT, libc::O_EXCL, libc::O_NOFOLLOW];
         let mut file = open_at(Some(&self.file), &name, &flags)?;
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::BeforeOpen, &self.path.join(&name));
         let written = file.write_all(b"ok").and_then(|()| sync_file(&file));
         let removed = self.remove_created(&name, &file);
         written.and(removed)?;
@@ -649,7 +653,7 @@ impl MarkerDir {
     fn remove_created(&self, name: &OsStr, created: &File) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         #[cfg(test)]
-        run_before_probe_unlink(&self.path, &self.path.join(name));
+        run_probe_step(&self.path, ProbeStep::BeforeCheck, &self.path.join(name));
         #[cfg(target_os = "linux")]
         let flags = [libc::O_PATH, libc::O_NOFOLLOW];
         #[cfg(not(target_os = "linux"))]
@@ -665,6 +669,8 @@ impl MarkerDir {
                 ),
             ));
         }
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::BeforeRemove, &self.path.join(name));
         self.unlink(name)
     }
 }
@@ -1538,7 +1544,7 @@ thread_local! {
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static PROBE_FAILURE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static PROBE_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
-    static BEFORE_PROBE_UNLINK: RefCell<Option<(PathBuf, RecordPathHook)>> =
+    static PROBE_STEP_HOOK: RefCell<Option<(PathBuf, ProbeStep, RecordPathHook)>> =
         const { RefCell::new(None) };
 }
 
@@ -1854,35 +1860,47 @@ fn note_probe(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `hook` one time on this thread, in [`probe_fallback_dir_writable`]
-/// for the directory `dir`. The hook runs after the probe syncs its temp
-/// entry and before the probe checks and removes that entry. The hook gets
-/// the path of the entry. A probe of a different path does not run it.
-///
-/// The guard removes the hook when it drops, if the hook did not run.
+/// A step of [`probe_fallback_dir_writable`] where a test hook can run.
 #[cfg(test)]
-pub(crate) fn arm_before_probe_unlink(
-    dir: &Path,
-    hook: impl FnOnce(&Path) + 'static,
-) -> ProbeUnlinkHookGuard {
-    BEFORE_PROBE_UNLINK.with(|slot| *slot.borrow_mut() = Some((dir.to_path_buf(), Box::new(hook))));
-    ProbeUnlinkHookGuard
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeStep {
+    /// Before the probe creates its entry in the database directory.
+    BeforeCreate,
+    /// After the probe creates its entry and before it opens that entry.
+    BeforeOpen,
+    /// After the probe opens its entry and before it checks the identity of
+    /// that entry.
+    BeforeCheck,
+    /// After the identity check and the fsync of the probe file, and before
+    /// the probe removes its entries.
+    BeforeRemove,
 }
 
-/// Run the hook of [`arm_before_probe_unlink`] when it armed `dir`. The hook
-/// gets the probe entry `entry`.
+/// Run `hook` one time on this thread, at the step `step` of
+/// [`probe_fallback_dir_writable`] for the directory `dir`. The hook gets
+/// the path of the probe entry in `dir`. A probe of a different path does
+/// not run it.
+///
+/// `ProbeStepHookGuard::drop` removes the hook if the hook did not run.
 #[cfg(test)]
-fn run_before_probe_unlink(dir: &Path, entry: &Path) {
-    let armed = BEFORE_PROBE_UNLINK.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let matches = slot.as_ref().is_some_and(|(armed, _)| armed.as_path() == dir);
-        if matches {
-            slot.take()
-        } else {
-            None
-        }
+pub(crate) fn arm_probe_step(
+    dir: &Path,
+    step: ProbeStep,
+    hook: impl FnOnce(&Path) + 'static,
+) -> ProbeStepHookGuard {
+    let armed = (dir.to_path_buf(), step, Box::new(hook) as RecordPathHook);
+    PROBE_STEP_HOOK.with(|slot| *slot.borrow_mut() = Some(armed));
+    ProbeStepHookGuard
+}
+
+/// Run the hook of [`arm_probe_step`] when it armed `dir` and `step`. The
+/// hook gets the probe entry `entry`.
+#[cfg(test)]
+fn run_probe_step(dir: &Path, step: ProbeStep, entry: &Path) {
+    let armed = PROBE_STEP_HOOK.with(|slot| {
+        slot.borrow_mut().take_if(|(at, armed, _)| at.as_path() == dir && *armed == step)
     });
-    if let Some((_, hook)) = armed {
+    if let Some((_, _, hook)) = armed {
         hook(entry);
     }
 }
@@ -1981,14 +1999,14 @@ impl Drop for ProbeFailGuard {
     }
 }
 
-/// `ProbeUnlinkHookGuard::drop` removes the probe hook if it did not run.
+/// `ProbeStepHookGuard::drop` removes the hook if the hook did not run.
 #[cfg(test)]
-pub(crate) struct ProbeUnlinkHookGuard;
+pub(crate) struct ProbeStepHookGuard;
 
 #[cfg(test)]
-impl Drop for ProbeUnlinkHookGuard {
+impl Drop for ProbeStepHookGuard {
     fn drop(&mut self) {
-        BEFORE_PROBE_UNLINK.with(|slot| *slot.borrow_mut() = None);
+        PROBE_STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
