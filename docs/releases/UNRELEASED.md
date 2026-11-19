@@ -1180,21 +1180,20 @@ Each epoch-boundary step that talks to the beacon node has its own timeout. A ti
 
 When the pool admits no beacon node, "liveness query failed" is logged once per epoch at warn. The loop logs each repeat in that epoch at debug.
 
-## W4.3 migration: behavior changes and operator actions
+## W4.3 migration: changes and steps for operators
 
-W4.3 has no breaking change. No setting, file format, or API response changes. Some changes can change the load on a relay, a trace query, or a log alert. Each item names the section above that describes it.
+Existing configuration files, data files, and API clients work with W4.3. Check the registration settings, trace queries, and log alerts as described below. Each item names the section above that describes it.
 
-1. **The builder registration batch settings now apply.** Section: "Builder registrations: cache signed registrations, re-send each epoch, re-sign only changes, evict flag-off keys, report failed batches, apply the batch knobs". The process sends registrations in batches of `validator_registration_batch_size`, with `validator_registration_batch_delay` milliseconds between the batches. If you changed one of these two values from its default, check the value before you upgrade.
-2. **Epoch-boundary work has its own task and its own root span.** Section: "Epoch boundary runner: its own Orchestrator-tier task, woken by every processed slot, boot epoch included". A trace query that finds epoch-boundary work under `slot.process` must select the root `epoch.boundary` span. The task shows in `rvc_tasks_running{task="epoch.boundary.runner"}`.
-3. **New and changed WARN lines.** Sections: "Epoch boundary runner: per-step timeouts, and one warn naming the steps that did not finish in the epoch", "Epoch boundary runner: prepare and subscription calls return typed results, and partial index resolution is not "done"", "Index resolver: an immediate first pass, a per-slot wake that retries while empty or failed, and a boot-error warn" and "Liveness loop: warn "liveness query failed" once per epoch while duties are halted, and drop a dead parameter and a stale rustdoc link". Update the log alerts for these lines:
-   - `epoch-boundary steps did not finish before the epoch ended` names the steps that did not finish. A local key with no validator index yet causes this WARN one time in each epoch. An alert on this WARN must not fail for a key that waits for activation.
-   - `index resolver get_validators failed; retrying at the next slot` shows each failed `get_validators` call. `validator index resolution failed at boot; duties stay empty until the index resolver succeeds` shows a failed index lookup at boot when doppelganger detection is off.
-   - "liveness query failed" is a WARN one time in each epoch. The other lines in that epoch are at debug. An alert that counts this WARN gets one line in each epoch.
+1. **The builder registration batch settings now apply.** Section: "Builder registrations: cache signed registrations, re-send each epoch, re-sign only changes, evict flag-off keys, report failed batches, apply the batch knobs". A positive `validator_registration_batch_size` sets the maximum number of registrations per batch. A value of 0 sends all registrations in one batch. `validator_registration_batch_delay` sets the delay in milliseconds between batches. The defaults are 500 registrations and 500 ms. Before you upgrade, check both values if you use a value that differs from its default.
+2. **Epoch-boundary work has its own task and its own root span.** Section: "Epoch boundary runner: its own Orchestrator-tier task, woken by every processed slot, boot epoch included". Use the root `epoch.boundary` span in queries for epoch-boundary work. The executor records the task in `rvc_tasks_running{task="epoch.boundary.runner"}`.
+3. **New and changed WARN messages.** Update alerts for the WARN messages below. See the sections above for W4-E3b and W4-E3c (their headings start with "Epoch boundary runner"), W4-E7a (its heading starts with "Index resolver"), and W4-D4c (its heading starts with "Liveness loop").
+   - When the runner starts a later epoch, it logs one WARN if the previous epoch has unfinished steps. Match `epoch-boundary steps did not finish before the epoch ended`. Check `abandoned_steps` and `last_outcomes`. If `PrepareProposers` is `NotReady`, check for keys that are pending activation. Keep alerts for failed steps and other unfinished steps.
+   - For a failed lookup of unresolved indices, match `index resolver get_validators failed; retrying at the next slot`. After a revocation, match `index resolver revalidation failed; indices stay hidden; retrying at the next slot` for a failed revalidation. If doppelganger detection is off, a failed startup lookup logs `validator index resolution failed at boot; duties stay empty until the index resolver succeeds`.
+   - For liveness failures, match the message prefix `liveness query failed`. The first failed query in each tick epoch logs a WARN. Each later failed query in that tick epoch logs at DEBUG. A tick epoch with no failed query logs no such WARN.
 
-These changes need no operator action:
+Operators do not need to make changes for the items below:
 
-- The epoch-boundary task gets its own duties when the duty cache is empty.
-- A failed or not-ready epoch-boundary step retries at the next slot of the same epoch.
-- After a beacon node is revoked, the process does not use its cached duties or validator indices. Until the indices are checked again, the process signs nothing for those keys. This time is normally one slot or less.
+- The epoch-boundary task fetches duties that are absent from the cache. It retries failed or not-ready steps at the next processed slot of the same epoch.
+- A beacon node revocation invalidates the cached duties and validator indices. Signing for the affected keys stops until revalidation succeeds. Revalidation usually succeeds within one slot.
 - Startup preparation is the boot epoch of the epoch-boundary task.
-- A doppelganger boot that moves into epoch 1 keeps its keys in the monitoring window. The liveness loop does not count a not-live answer against the old epoch.
+- If startup crosses from epoch 0 into epoch 1, rvc keeps the keys in the monitoring window. The liveness loop skips not-live decrements if the epoch changes before it applies the query results.
