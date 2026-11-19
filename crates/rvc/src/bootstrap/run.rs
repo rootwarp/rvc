@@ -1516,6 +1516,59 @@ mod tests {
         }
     }
 
+    /// The databases `<slash>/a.sqlite` and `<slash>/h.sqlite` have owned
+    /// fallback markers. `<other>/h.sqlite` is a hard link of `h.sqlite`.
+    /// Each row boots with a second name of a database and gives the exit
+    /// code and a text of the error. A name with a `.` component selects the
+    /// same fallback marker, so boot returns exit code 12. Boot refuses each
+    /// other name with exit code 1.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_refuses_a_second_name_of_a_database_with_a_fallback_marker() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let [keys, slash, other] = ["keys", "slash", "other"].map(|name| root.path().join(name));
+        for dir in [&keys, &slash, &other] {
+            std::fs::create_dir(dir).expect("The test must create a directory.");
+        }
+        let body = serde_json::json!({
+            "version": 1,
+            "epoch": 3,
+            "unix_secs": 4,
+            "pubkeys": [],
+            "keystore_dir": keys.to_string_lossy(),
+        });
+        for name in ["a.sqlite", "h.sqlite"] {
+            std::fs::write(slash.join(name), b"db").expect("The test must write a database.");
+            let owned = slash.join(format!(".rvc.doppelganger_detected.{name}"));
+            std::fs::write(owned, body.to_string()).expect("The test must write the marker.");
+        }
+        std::os::unix::fs::symlink(slash.join("a.sqlite"), other.join("a.sqlite"))
+            .expect("The test must create a symlink to the database file.");
+        std::fs::hard_link(slash.join("h.sqlite"), other.join("h.sqlite"))
+            .expect("The test must create a hard link of the database file.");
+        std::os::unix::fs::symlink(&slash, root.path().join("link"))
+            .expect("The test must create a symlink to the database directory.");
+        let detected = EXIT_DOPPELGANGER_DETECTED;
+        let rows = [
+            ("a symlink to the database file", other.join("a.sqlite"), 1, "one link"),
+            ("a hard link of the database file", other.join("h.sqlite"), 1, "one link"),
+            ("the first name of a file with two links", slash.join("h.sqlite"), 1, "one link"),
+            ("a symlink in the directory path", root.path().join("link/a.sqlite"), 1, "no symlink"),
+            ("a `..` in the directory path", other.join("../slash/a.sqlite"), 1, "no symlink"),
+            ("a missing database directory", root.path().join("no/a.sqlite"), 1, "no symlink"),
+            ("a `.` in the directory path", slash.join("./a.sqlite"), detected, "detected"),
+        ];
+        for (case, db, code, text) in rows {
+            let err = boot_with_db(&keys, &db, false).await;
+
+            assert!(
+                err.exit_code() == code && err.to_string().contains(text),
+                "Boot must return exit code {code} and an error with the text \"{text}\" for \
+                 {case}. The error is: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn detection_enabled_refuses_a_keystore_dir_that_cannot_hold_the_marker() {
         let missing = std::env::temp_dir().join(format!(

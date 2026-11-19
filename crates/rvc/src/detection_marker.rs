@@ -2483,12 +2483,10 @@ mod tests {
         }
     }
 
-    /// Each row gives one state of the fallback paths. The read and the clear
-    /// must give these results:
-    ///
-    /// - The database directory does not exist: `Absent`, and no marker.
-    /// - A file is in the path of the directory: `Unreadable`, and an error.
-    /// - A symlink is at the owned path: `Unreadable`, and an error.
+    /// Each row gives one state of the fallback paths: a missing database
+    /// directory, a file in the path of the directory, or a symlink at the
+    /// owned path. For each row, the read must give `Unreadable` and the
+    /// clear must fail.
     #[cfg(unix)]
     #[test]
     fn fallback_reads_fail_closed_for_each_directory_state() {
@@ -2497,27 +2495,74 @@ mod tests {
         std::os::unix::fs::symlink("missing", slash.join(".rvc.doppelganger_detected.a.sqlite"))
             .expect("The test must create a symlink at the owned path.");
         let rows = [
-            ("a missing directory", root.path().join("missing"), false),
-            ("a directory path under a file", root.path().join("file").join("db"), true),
-            ("a symlink at the owned path", slash, true),
+            ("a missing directory", root.path().join("missing")),
+            ("a directory path under a file", root.path().join("file").join("db")),
+            ("a symlink at the owned path", slash),
         ];
-        for (case, dir, refused) in rows {
+        for (case, dir) in rows {
             let fallback = FallbackMarkerPath { slashing_db_path: dir.join("a.sqlite"), dir };
             let owned = inspect_fallback(&fallback).owned;
             let cleared = clear_fallback_marker(&fallback, &keys).map_err(|err| err.to_string());
-            if refused {
-                assert!(
-                    matches!(owned, MarkerInspect::Unreadable { .. }) && cleared.is_err(),
-                    "The read must give Unreadable and the clear must fail for {case}. The \
-                     results are {owned:?} and {cleared:?}."
-                );
-            } else {
-                assert!(
-                    matches!(owned, MarkerInspect::Absent) && cleared == Ok(vec![]),
-                    "The read must give Absent and the clear must find no marker for {case}. \
-                     The results are {owned:?} and {cleared:?}."
-                );
-            }
+            assert!(
+                matches!(owned, MarkerInspect::Unreadable { .. }) && cleared.is_err(),
+                "The read must give Unreadable and the clear must fail for {case}. The results \
+                 are {owned:?} and {cleared:?}."
+            );
+        }
+    }
+
+    /// The owned fallback marker of `<real>/slash/a.sqlite` exists. Each row
+    /// gives a second path of the database directory: a symlink in an
+    /// intermediate component, a symlink at the last component, or a `..`
+    /// component. For each row, the test requires these results:
+    ///
+    /// - The read gives `Unreadable` for the owned marker and the legacy
+    ///   marker.
+    /// - The write and the clear fail.
+    /// - The marker keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_paths_with_a_symlink_or_a_parent_name_are_refused() {
+        let (root, [keys, real]) = temp_dirs(["keys", "real"]);
+        let slash = real.join("slash");
+        fs::create_dir(&slash).expect("The test must create the database directory.");
+        let fallback = fallback_of(&keys, &slash);
+        write_fallback_marker(&fallback, &keys, &sample_marker())
+            .expect("The test must write the marker.");
+        let before = fs::read(fallback.owned_path()).map_err(|err| err.to_string());
+        std::os::unix::fs::symlink(&real, root.path().join("link"))
+            .expect("The test must create a symlink to the parent directory.");
+        std::os::unix::fs::symlink(&slash, real.join("slash-link"))
+            .expect("The test must create a symlink to the database directory.");
+        let rows = [
+            ("a symlink in an intermediate component", root.path().join("link").join("slash")),
+            ("a symlink at the last component", real.join("slash-link")),
+            ("a `..` component", keys.join("..").join("real").join("slash")),
+        ];
+        for (case, dir) in rows {
+            let alias = FallbackMarkerPath { slashing_db_path: dir.join("a.sqlite"), dir };
+            let update = DetectionMarker { epoch: 9, ..sample_marker() };
+
+            let found = inspect_fallback(&alias);
+            let written = write_fallback_marker(&alias, &keys, &update).map_err(|e| e.to_string());
+            let cleared = clear_fallback_marker(&alias, &keys).map_err(|err| err.to_string());
+
+            assert!(
+                matches!(found.owned, MarkerInspect::Unreadable { .. })
+                    && matches!(found.legacy, MarkerInspect::Unreadable { .. }),
+                "The read must give Unreadable for the two markers for {case}. The result is \
+                 {found:?}."
+            );
+            assert!(
+                written.is_err() && cleared.is_err(),
+                "The write and the clear must fail for {case}. The results are {written:?} and \
+                 {cleared:?}."
+            );
+            assert_eq!(
+                fs::read(fallback.owned_path()).map_err(|err| err.to_string()),
+                before,
+                "The marker must keep its bytes after the steps for {case}."
+            );
         }
     }
 
@@ -2788,6 +2833,7 @@ mod tests {
                 format!("{}.sqlite", MARKER_FILENAME.trim_start_matches('.')),
                 None,
             ),
+            ("a name with a NUL byte", &slash, "a\0.sqlite".to_string(), Some("nul byte")),
         ];
         for (case, dir, name, reason) in rows {
             let result = check_slashing_db_name(&keys, &dir.join(&name))
@@ -2819,6 +2865,54 @@ mod tests {
             matches!(inspect_fallback(&fallback).owned, MarkerInspect::Present(_)),
             "A read must give Present for the owned marker of 228 bytes."
         );
+    }
+
+    /// The database `<slash>/a.sqlite` has an owned fallback marker. A
+    /// symlink and a hard link in `other` give the database two more names.
+    /// For each of the three names, the test requires these results:
+    ///
+    /// - The check refuses the name and gives the reason "one link".
+    /// - The clear fails.
+    /// - The marker keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn second_names_of_a_database_are_refused_by_the_check_and_the_clear() {
+        let (_root, [keys, slash, other]) = temp_dirs(["keys", "slash", "other"]);
+        let db = slash.join("a.sqlite");
+        fs::write(&db, b"db").expect("The test must write the database file.");
+        let fallback = fallback_of(&keys, &slash);
+        write_fallback_marker(&fallback, &keys, &sample_marker())
+            .expect("The test must write the marker.");
+        let before = fs::read(fallback.owned_path()).map_err(|err| err.to_string());
+        std::os::unix::fs::symlink(&db, other.join("link.sqlite"))
+            .expect("The test must create a symlink to the database file.");
+        fs::hard_link(&db, other.join("hard.sqlite"))
+            .expect("The test must create a hard link of the database file.");
+
+        for name in [other.join("link.sqlite"), other.join("hard.sqlite"), db] {
+            let checked = check_slashing_db_name(&keys, &name).map_err(|err| err.to_string());
+            let alias = FallbackMarkerPath::for_config(&keys, &name)
+                .expect("The test must find a fallback path beside the database.");
+            let cleared = clear_fallback_marker(&alias, &keys).map_err(|err| err.to_string());
+
+            assert!(
+                matches!(&checked, Err(text) if text.contains("one link")),
+                "The check must refuse {} and give the reason \"one link\". The result is \
+                 {checked:?}.",
+                name.display()
+            );
+            assert!(
+                cleared.is_err(),
+                "The clear for {} must fail. The result is {cleared:?}.",
+                name.display()
+            );
+            assert_eq!(
+                fs::read(fallback.owned_path()).map_err(|err| err.to_string()),
+                before,
+                "The marker must keep its bytes after the clear for {}.",
+                name.display()
+            );
+        }
     }
 
     #[test]
