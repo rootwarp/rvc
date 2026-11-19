@@ -12,10 +12,13 @@
 //! is named after the database file and records the keystore directory, so
 //! two instances that share a database directory do not share it. Its writes
 //! and clears hold one lock and use one directory handle, which a walk that
-//! follows no symlink opens. Boot refuses a second name of a database (a
-//! symlink, a hard link or a `..`), so it has one marker name. A write is
-//! durable only after its `fsync` returns `Ok`, and a rename also needs the
-//! directory `fsync`. A later read is not a substitute. Exit 12 follows that
+//! follows no symlink opens. The selection of that directory uses the same
+//! walk, and boot reads the marker unless the two handles show that the
+//! database directory is the keystore directory. Boot refuses a second name
+//! of a database (a symlink, a hard link or a `..`), so it has one marker
+//! name. A write is durable only after its `fsync` returns `Ok`, and a
+//! rename also needs the directory `fsync`. A later read is not a
+//! substitute. Exit 12 follows that
 //! acknowledgement. A `SIGKILL` before the first of them is durable loses
 //! the latch. The next start refuses to run while a marker is present or the
 //! record is `detected`, including when a file cannot be read, is a symlink,
@@ -107,24 +110,50 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(MARKER_FILENAME)
 }
 
-/// Parent of `slashing_db_path` when that directory is not `keystore_dir`.
+/// The directory of the fallback marker of `slashing_db_path`: the parent of
+/// the database, or `.` for a bare file name. `None` when that directory is
+/// `keystore_dir`.
 ///
-/// The fallback marker in this directory has the name that
-/// [`fallback_marker_name`] gives. The same directory as the keystore is not
-/// a second disk, so the caller keeps retrying the keystore write instead.
+/// The selection opens the two directories with the walk that the read, the
+/// write and the clear use (no path resolution, no symlink, no `..`). Then it
+/// compares the device and inode numbers that `fstat` gives for the two
+/// handles. It does not compare paths. When a walk or an `fstat` fails, the
+/// selection cannot show that the two are one directory. It then gives the
+/// directory, so the caller reads the fallback and fails closed. The fallback
+/// marker in this directory has the name that [`fallback_marker_name`]
+/// gives. The keystore directory is not a second disk, so for it the caller
+/// keeps retrying the keystore write instead.
 pub fn fallback_marker_dir(keystore_dir: &Path, slashing_db_path: &Path) -> Option<PathBuf> {
-    let parent = slashing_db_path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
-    if same_dir(parent, keystore_dir) {
+    let dir = match slashing_db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if same_dir(dir, keystore_dir) {
         None
     } else {
-        Some(parent.to_path_buf())
+        Some(dir.to_path_buf())
     }
 }
 
+/// `true` only when the walk opens `left` and `right` and `fstat` gives the
+/// same device and inode numbers for the two handles. An error gives `false`.
 fn same_dir(left: &Path, right: &Path) -> bool {
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let id = |dir: &Path| -> io::Result<(u64, u64)> {
+            let meta = MarkerDir::open(dir)?.file.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        };
+        match (id(left), id(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
     }
 }
 
@@ -198,7 +227,7 @@ pub fn fallback_marker_name(slashing_db_path: &Path) -> OsString {
 /// The fallback marker of one slashing database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackMarkerPath {
-    /// Parent of the slashing database.
+    /// Parent of the slashing database, or `.` for a bare file name.
     pub dir: PathBuf,
     /// The slashing database. Its file name names the owned marker.
     pub slashing_db_path: PathBuf,
@@ -297,26 +326,16 @@ pub fn write_fallback_marker(
     }
 }
 
-/// The owner that a fallback marker of `keystore_dir` records: the absolute
-/// keystore path, resolved now. `canonicalize` resolves the longest part that
-/// exists, and the missing names follow it, because the drain writes the
-/// marker when the keystore write fails. `None` when the path has no such
-/// form or is not valid UTF-8.
+/// The owner that a fallback marker of `keystore_dir` records: the keystore
+/// path made absolute with the working directory now, with no `.` component
+/// and no trailing slash. The function reads no file system entry, so the
+/// keystore directory can be missing (the drain writes the marker when the
+/// keystore write fails). It does not resolve a symlink or a `..`: a second
+/// path of one keystore records a different owner, and a clear through that
+/// path keeps the marker. `None` when the path is empty or not valid UTF-8.
 fn resolved_owner(keystore_dir: &Path) -> Option<String> {
-    let absolute = std::path::absolute(keystore_dir).ok()?;
-    let mut base = absolute.as_path();
-    let mut missing = Vec::new();
-    let real = loop {
-        match fs::canonicalize(base) {
-            Ok(real) => break real,
-            Err(_) => {
-                missing.push(base.file_name()?);
-                base = base.parent()?;
-            }
-        }
-    };
-    let resolved = missing.iter().rev().fold(real, |path, name| path.join(name));
-    resolved.into_os_string().into_string().ok()
+    let absolute: PathBuf = std::path::absolute(keystore_dir).ok()?.components().collect();
+    absolute.into_os_string().into_string().ok()
 }
 
 /// What [`clear_fallback_marker`] did with the owned fallback marker.
@@ -450,12 +469,13 @@ struct MarkerDir {
 
 #[cfg(unix)]
 impl MarkerDir {
-    /// Open the database directory `dir` with a walk that resolves nothing
-    /// first and follows no symlink. The walk starts at `/` for an absolute
-    /// path and at the working directory for a relative path, and opens each
-    /// name with `O_NOFOLLOW | O_DIRECTORY` (`O_PATH` on Linux: search
-    /// permission is enough). A missing name, a symlink, a file or a `..` in
-    /// the path stops the walk with an error.
+    /// Open the database directory `dir` (or, for the selection in
+    /// [`fallback_marker_dir`], the keystore directory) with a walk that
+    /// resolves nothing first and follows no symlink. The walk starts at `/`
+    /// for an absolute path and at the working directory for a relative
+    /// path, and opens each name with `O_NOFOLLOW | O_DIRECTORY` (`O_PATH` on
+    /// Linux: search permission is enough). A missing name, a symlink, a file
+    /// or a `..` in the path stops the walk with an error.
     fn open(dir: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let search = libc::O_PATH;
@@ -1448,7 +1468,8 @@ thread_local! {
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 thread_local! {
     static WALK_START: RefCell<Option<File>> = const { RefCell::new(None) };
 }
@@ -1460,7 +1481,8 @@ thread_local! {
 /// result of a different test.
 ///
 /// The guard ends the override when it drops.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn arm_walk_start(dir: &Path) -> WalkStartGuard {
     let start = File::open(dir).expect("The test must open the start directory of the walk.");
     WALK_START.with(|slot| *slot.borrow_mut() = Some(start));
@@ -1469,16 +1491,19 @@ pub(crate) fn arm_walk_start(dir: &Path) -> WalkStartGuard {
 
 /// A new handle of the start directory that [`arm_walk_start`] set on this
 /// thread. `None` is the working directory.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 fn walk_start() -> io::Result<Option<File>> {
     WALK_START.with(|slot| slot.borrow().as_ref().map(File::try_clone).transpose())
 }
 
 /// The guard ends the start directory of [`arm_walk_start`] when it drops.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) struct WalkStartGuard;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 impl Drop for WalkStartGuard {
     fn drop(&mut self) {
         WALK_START.with(|slot| *slot.borrow_mut() = None);

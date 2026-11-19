@@ -19,8 +19,9 @@ use rvc::startup;
 /// changes after its read, and the marker stays. A symlink, directory or
 /// FIFO at that path still needs `rm`: the command returns an error that
 /// names the path, and the marker stays. When `slashing_db_path` is set and
-/// its directory is not `datadir`, the command removes the fallback marker of
-/// that database when it belongs to `datadir`. It keeps a fallback marker of
+/// the directory walk does not show that its directory (`.` for a bare file
+/// name) is `datadir`, the command removes the fallback marker of that
+/// database when it belongs to `datadir`. It keeps a fallback marker of
 /// another keystore and prints its path and owner. These entries stop the
 /// command with an error that gives the path and the recovery step, and the
 /// keystore marker stays: a fallback marker of that database that cannot be
