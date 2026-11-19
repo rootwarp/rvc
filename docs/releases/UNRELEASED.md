@@ -181,9 +181,13 @@ counts as a health error until the node imports the block. Sending the
 envelope only to the nodes that accepted the block stays parked until Gloas
 is scheduled.
 
-## Startup proposer preparation ends when the orchestrator returns
+## Startup preparation is the boot epoch of the epoch-boundary task
 
-`DutyOrchestrator::run` polls startup proposer preparation beside the slot loop. That future is dropped when `run` returns, including on shutdown. A slow `prepare_beacon_proposer` still does not hold the slot loop. Before genesis the epoch is 0. A failed prepare or register retries once per slot until both succeed or `run` returns.
+`DutyOrchestrator::run` is the slot loop alone. The startup future that it polled beside the slot loop is deleted. Startup preparation now runs as the boot epoch of the epoch-boundary task. Its passes in the boot epoch send `prepare_beacon_proposer` and the builder registration, and a failed step is retried at each processed slot of that epoch. A start before genesis prepares epoch 0 before slot 0. A slow `prepare_beacon_proposer` does not hold the slot loop, and a step in flight is dropped on shutdown.
+
+A proposal before the boot prepare lands uses the beacon node's default fee recipient. Under `fee_recipient_policy = sign` (the default) it is signed with the penalty WARN and counted in `RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL` (`rvc_produce_block_fee_recipient_penalty_total`). Under `reject` it is dropped.
+
+With no validator index at boot, the builder registration is sent once in the boot epoch, not once per slot. A batch that the relay refuses still reports success, so the boot epoch does not send it again. W4-E6a reports that failure and retries it without a new signature.
 
 ## A hard-rejected block does not improve beacon-node health
 
@@ -924,11 +928,7 @@ signable block is held, including a fee-penalized one, it is returned 50 ms
 before the outer backstop (the budget plus 250 ms), so a beacon node that
 never answers cannot turn it into an operation timeout.
 
-`prepare_beacon_proposer` and `register_validator` run on their own task from
-startup, including before genesis (epoch 0), with no builder jitter. A
-failure retries once per slot until both succeed. A slow beacon node on that
-task does not hold the slot loop. The epoch-boundary send still runs after
-that slot's proposal.
+`prepare_beacon_proposer` and `register_validator` are sent by the epoch-boundary task. At startup they are steps of its boot epoch, including epoch 0 before genesis, and the boot-epoch registration has no builder jitter. A failed step is retried at the next processed slot of the same epoch. A slow beacon node on that task does not hold the slot loop. Each pass starts after the duties of the slot that woke it.
 
 The first round of a duty keeps the usual tier selection, then drops any
 beacon node below small lag, any optimistic node, and any node whose
@@ -1131,3 +1131,70 @@ These changes can stop a start, refuse a command, or change a response or a metr
 4. **Attester selection-proof rejections have their own metric label.** Section: "Signer: a syn-based signing-duty source pin, and the attester selection proof gets its own rejection label". A query or alert that relied on `sync_aggregator_selection_data` to see attester selection-proof rejections must also select `sign_type="aggregation_slot"`.
 
 These need no operator action. The signer-server refuses an attestation whose source epoch is above its target epoch (HTTP 412, gRPC and DVT peer `FAILED_PRECONDITION`); the validator client never sends one, and importing an interchange that holds such a record is unchanged. A key deleted mid-window keeps the doppelganger force window, so the next start can run one more full forward window. The admission boundary text and the `SigningGate` admission error change no setting or `rvc-signer` server response.
+
+## Builder registrations: cache signed registrations, re-send each epoch, re-sign only changes, evict flag-off keys, report failed batches, apply the batch knobs
+
+**Builder registration batching now applies.** `validator_registration_batch_size` (default 500 keys) and `validator_registration_batch_delay` (default 500 ms) were parsed but ignored, so every new or changed registration went to the beacon node in one POST. They now apply: registrations are sent in batches of `validator_registration_batch_size`, with `validator_registration_batch_delay` milliseconds between batches. Until W4-E6a, a single registration round is still cut at 10 s. At the defaults, a round can send at most about 20 batches (about 10,000 builder keys) before that cut. Batches already sent stay registered, and the keys the cut left out are sent in a later round. Operators with more builder keys can raise `validator_registration_batch_size`.
+
+## Index resolver: an immediate first pass, a per-slot wake that retries while empty or failed, and a boot-error warn
+
+**Index resolver: immediate first pass and per-slot retry (W4-E7a, #862).** The index resolver now makes its first pass at startup, not one epoch later, and wakes every slot. After a failed `get_validators` call it retries at the next slot wake instead of backing off for an epoch, and every failed call logs a WARN (`index resolver get_validators failed; retrying at the next slot`). A key that a successful answer leaves out (for example, pending activation) is still queried at most once per epoch. A slot wake with nothing to do makes no beacon-node call. With doppelganger detection off, a failed index lookup at boot now logs a WARN (`validator index resolution failed at boot; duties stay empty until the index resolver succeeds`) instead of being dropped; boot continues, and the resolver fills the registry once the beacon node answers. With doppelganger detection on, that boot failure still stops startup, as before.
+
+## Epoch boundary runner: its own Orchestrator-tier task, woken by every processed slot, boot epoch included
+
+Epoch-boundary work now runs on its own task at the first processed slot of every epoch, including the epoch the validator client starts in: the circuit-breaker reset, the reorg check, `prepare_beacon_proposer`, and committee subscriptions for the current and next epoch. It is no longer dropped when the slot loop's post-duty window is short, and it no longer waits for slot 0 of the next epoch. After a restart in the middle of an epoch the steps run in that epoch, not at the next epoch's slot 0. The task is registered with the executor as `epoch.boundary.runner` (`rvc_tasks_running{task="epoch.boundary.runner"}`). In traces each pass is a root `epoch.boundary` span linked to that task's span, not a child of `slot.process`.
+
+## Duty caches: every write stamped with the revocation generation captured before its BN request and re-checked under the cache lock (protocol, attester cache and its reorg refresh)
+
+A revoked beacon node no longer leaves its cached duties in service. Attester duties cached before the revocation read as uncached and are fetched again from an admitted node. An attester duty answer that arrives after a revocation started during its request is discarded.
+
+## Epoch boundary runner: its own bounded duty fetch, so a cold cache with a zero post-duty window still subscribes in that epoch
+
+The epoch-boundary task fetches its own duties when the cache is cold, so a slow beacon node or a short post-duty window no longer delays committee subscriptions to the next epoch.
+
+## Epoch boundary runner: step outcomes, and a failed or not-ready step retried at the next slot of the same epoch
+
+**Epoch-boundary steps retry within the epoch.** A failed or not-ready epoch-boundary step (for example a `prepare_beacon_proposer` POST that the beacon node answers with 503, or committee subscriptions whose duties are not cached yet) now retries at the next slot of the same epoch, and steps that already succeeded are not repeated. Retries stop at the end of the epoch; the next epoch runs its own steps. Previously only the duty fetch and the subscription readiness wait were retried; every other step ran once per epoch, so a prepare failure at the epoch's first slot left the fee recipient unset at the beacon node until the next epoch.
+
+## Index registry: stamped with the revocation generation it was validated under; revalidated after a revocation
+
+**Doppelganger and duties: validator indices are re-checked after a beacon node is revoked.** The validator client used to keep using validator indices it had read from a beacon node even after that node was revoked (for example, found on the wrong chain). Now the index set is stamped with the revocation it was read under. After a revocation, duty fetches use no indices and doppelganger liveness treats the keys as unobserved until the indices are re-checked after a beacon node is revoked, normally within one slot. Nothing is signed for those keys in that gap, and doppelganger keeps them pending. An index that the remaining beacon nodes no longer report is dropped. Proposer preparation is gated by a follow-up change (W4-E7e).
+
+## Epoch boundary runner: per-step timeouts, and one warn naming the steps that did not finish in the epoch
+
+Each epoch-boundary step that talks to the beacon node has its own timeout. A timed-out step retries next processed slot, retaining completed subscription progress and owed reorg broadcasts. Both inner subscription POST and outer step timeouts count Failed. At the next epoch, one warning, `epoch-boundary steps did not finish before the epoch ended`, names unfinished steps and their last outcomes. Epochs the runner never observed are not warned about.
+
+## Epoch boundary runner: prepare and subscription calls return typed results, and partial index resolution is not "done"
+
+`prepare_beacon_proposer` is now re-sent within the epoch when more validator indices resolve, so a key whose index arrives a few slots into the epoch gets its fee recipient for that epoch. A failed committee-subscription POST is retried at the next slot instead of being dropped for the epoch. A local key with no validator index yet makes one end-of-epoch warn per epoch naming the prepare-proposers step; this is expected for keys still pending activation.
+
+## Doppelganger boot: re-read the epoch after the boot awaits, so a boot that crosses into epoch 1 does not take the epoch-0 Safe bypass
+
+**Doppelganger boot (W4-D4a, #869).** The boot keeps the epoch-0 Safe bypass only if the epoch, re-checked after the boot reads, is still 0. A boot that moves into epoch 1 or later keeps its keys in the monitoring window. The keys register Pending at the epoch that the boot reads after its last beacon-node request. A boot that starts outside epoch 0 still sends no `/eth/v1/node/syncing` request.
+
+## Liveness loop: decide the not-live decrement under the machine lock, and drive tests through the same tick path as production
+
+**Doppelganger liveness (W4-D4b, #870).** The liveness loop now reads the epoch under the machine lock before it counts a not-live answer. If the epoch changed after the queries started, the tick skips every not-live decrement. A live answer still detects. Thus the loop never counts a not-live answer against the old epoch, and a key cannot become Safe one epoch too early.
+
+## Liveness loop: warn "liveness query failed" once per epoch while duties are halted, and drop a dead parameter and a stale rustdoc link
+
+When the pool admits no beacon node, "liveness query failed" is logged once per epoch at warn. The loop logs each repeat in that epoch at debug.
+
+## W4.3 migration: behavior changes and operator actions
+
+W4.3 has no breaking change. No setting, file format, or API response changes. Some changes can change the load on a relay, a trace query, or a log alert. Each item names the section above that describes it.
+
+1. **The builder registration batch settings now apply.** Section: "Builder registrations: cache signed registrations, re-send each epoch, re-sign only changes, evict flag-off keys, report failed batches, apply the batch knobs". The process sends registrations in batches of `validator_registration_batch_size`, with `validator_registration_batch_delay` milliseconds between the batches. If you changed one of these two values from its default, check the value before you upgrade.
+2. **Epoch-boundary work has its own task and its own root span.** Section: "Epoch boundary runner: its own Orchestrator-tier task, woken by every processed slot, boot epoch included". A trace query that finds epoch-boundary work under `slot.process` must select the root `epoch.boundary` span. The task shows in `rvc_tasks_running{task="epoch.boundary.runner"}`.
+3. **New and changed WARN lines.** Sections: "Epoch boundary runner: per-step timeouts, and one warn naming the steps that did not finish in the epoch", "Epoch boundary runner: prepare and subscription calls return typed results, and partial index resolution is not "done"", "Index resolver: an immediate first pass, a per-slot wake that retries while empty or failed, and a boot-error warn" and "Liveness loop: warn "liveness query failed" once per epoch while duties are halted, and drop a dead parameter and a stale rustdoc link". Update the log alerts for these lines:
+   - `epoch-boundary steps did not finish before the epoch ended` names the steps that did not finish. A local key with no validator index yet causes this WARN one time in each epoch. An alert on this WARN must not fail for a key that waits for activation.
+   - `index resolver get_validators failed; retrying at the next slot` shows each failed `get_validators` call. `validator index resolution failed at boot; duties stay empty until the index resolver succeeds` shows a failed index lookup at boot when doppelganger detection is off.
+   - "liveness query failed" is a WARN one time in each epoch. The other lines in that epoch are at debug. An alert that counts this WARN gets one line in each epoch.
+
+These changes need no operator action:
+
+- The epoch-boundary task gets its own duties when the duty cache is empty.
+- A failed or not-ready epoch-boundary step retries at the next slot of the same epoch.
+- After a beacon node is revoked, the process does not use its cached duties or validator indices. Until the indices are checked again, the process signs nothing for those keys. This time is normally one slot or less.
+- Startup preparation is the boot epoch of the epoch-boundary task.
+- A doppelganger boot that moves into epoch 1 keeps its keys in the monitoring window. The liveness loop does not count a not-live answer against the old epoch.
