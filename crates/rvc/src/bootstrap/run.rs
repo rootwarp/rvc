@@ -2274,6 +2274,59 @@ mod tests {
         );
     }
 
+    /// Detection is on. A hook reads the probe entry of the database directory
+    /// after the identity check and before the removal. The test requires these
+    /// results:
+    ///
+    /// - The probe entry is a directory with mode 0700 that holds one file.
+    /// - Boot passes the probe and stops when it checks the genesis validators
+    ///   root.
+    /// - No probe entry stays in the database directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_probes_with_a_file_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_keys, slash, config) = fallback_probe_fixture(true);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = std::rc::Rc::clone(&seen);
+        let step = crate::detection_marker::ProbeStep::Remove;
+        let _hook = crate::detection_marker::arm_probe_step(slash.path(), step, move |entry| {
+            let meta = std::fs::symlink_metadata(entry).ok().filter(std::fs::Metadata::is_dir);
+            let mode = meta.map(|meta| meta.permissions().mode() & 0o777);
+            let files = std::fs::read_dir(entry).ok().map(|names| {
+                names
+                    .map(|name| {
+                        name.and_then(|name| name.file_type()).is_ok_and(|kind| kind.is_file())
+                    })
+                    .collect::<Vec<bool>>()
+            });
+            *record.borrow_mut() = Some((mode, files));
+        });
+
+        let err = boot_error(config).await;
+
+        assert_eq!(
+            *seen.borrow(),
+            Some((Some(0o700), Some(vec![true]))),
+            "Before the removal, the probe entry must be a directory with mode 0700 that holds \
+             one file."
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("genesis validators root"),
+            "Boot must pass the probe and stop when it checks the genesis validators root. The \
+             error is: {text}"
+        );
+        let probes: Vec<String> = sorted_names(slash.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".probe"))
+            .collect();
+        assert!(
+            probes.is_empty(),
+            "The probe must remove its entry from the database directory: {probes:?}"
+        );
+    }
+
     /// Detection is off, and the hook fails the probe of the database
     /// directory. The test requires these results:
     ///
