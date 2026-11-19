@@ -11,7 +11,9 @@
 //! the slashing database are additional paths. The marker beside the database
 //! is named after the database file and records the keystore directory, so
 //! two instances that share a database directory do not share it. Its writes
-//! and clears hold one lock and use one directory handle. A write is
+//! and clears hold one lock and use one directory handle, which a walk that
+//! follows no symlink opens. Boot refuses a second name of a database (a
+//! symlink, a hard link or a `..`), so it has one marker name. A write is
 //! durable only after its `fsync` returns `Ok`, and a rename also needs the
 //! directory `fsync`. A later read is not a substitute. Exit 12 follows that
 //! acknowledgement. A `SIGKILL` before the first of them is durable loses
@@ -138,10 +140,14 @@ const RESERVED_NAME_PREFIXES: [&str; 2] = [".rvc.doppelganger", "..rvc.doppelgan
 /// The longest file name on Linux file systems such as ext4, XFS and btrfs.
 const MAX_NAME_BYTES: usize = 255;
 
-/// Refuse a slashing database file name that rvc cannot protect: a name in
-/// the name space of the detection files, and, when the database directory
-/// gets a fallback marker, a name whose marker name has more than 255 bytes.
-/// Boot calls this before SQLite opens the database.
+/// Refuse a slashing database name that rvc cannot protect: a file name in
+/// the name space of the detection files and, when the database directory
+/// gets a fallback marker, a name that does not give one clear marker name.
+/// That is a marker name of more than 255 bytes, a database directory that
+/// the walk with no symlink cannot open (a missing directory, or a symlink
+/// or a `..` in its path), and a database file that is a symlink, is not a
+/// regular file or has more than one link. Boot calls this before SQLite
+/// opens the database.
 pub fn check_slashing_db_name(keystore_dir: &Path, slashing_db_path: &Path) -> io::Result<()> {
     let name = slashing_db_path.file_name().unwrap_or_default().as_encoded_bytes();
     if RESERVED_NAME_PREFIXES.iter().any(|prefix| name.starts_with(prefix.as_bytes())) {
@@ -155,10 +161,11 @@ pub fn check_slashing_db_name(keystore_dir: &Path, slashing_db_path: &Path) -> i
             ),
         ));
     }
+    let Some(fallback) = FallbackMarkerPath::for_config(keystore_dir, slashing_db_path) else {
+        return Ok(());
+    };
     let len = fallback_marker_name(slashing_db_path).len();
-    if len > MAX_NAME_BYTES
-        && FallbackMarkerPath::for_config(keystore_dir, slashing_db_path).is_some()
-    {
+    if len > MAX_NAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -169,6 +176,10 @@ pub fn check_slashing_db_name(keystore_dir: &Path, slashing_db_path: &Path) -> i
             ),
         ));
     }
+    #[cfg(unix)]
+    MarkerDir::open(&fallback.dir)?.check_db_entry(slashing_db_path)?;
+    #[cfg(not(unix))]
+    let _ = fallback;
     Ok(())
 }
 
@@ -215,18 +226,15 @@ pub struct FallbackInspect {
 
 /// Read the owned and the legacy fallback markers through one handle of the
 /// database directory. Boot refuses unless both are [`MarkerInspect::Absent`],
-/// whatever owner the owned marker records. A missing directory gives two
-/// `Absent` results, and a directory that cannot be opened two `Unreadable`.
+/// whatever owner the owned marker records. A directory that the walk with no
+/// symlink cannot open, a missing one too, gives two `Unreadable` results.
 pub fn inspect_fallback(fallback: &FallbackMarkerPath) -> FallbackInspect {
     let owned = fallback.owned_path();
     let legacy = marker_path(&fallback.dir);
     #[cfg(unix)]
     {
         match MarkerDir::open(&fallback.dir) {
-            Ok(None) => {
-                FallbackInspect { owned: MarkerInspect::Absent, legacy: MarkerInspect::Absent }
-            }
-            Ok(Some(dir)) => FallbackInspect {
+            Ok(dir) => FallbackInspect {
                 owned: inspect_file(
                     owned,
                     dir.read(&fallback_marker_name(&fallback.slashing_db_path)),
@@ -262,8 +270,7 @@ pub fn write_fallback_marker(
     {
         let owner = resolved_owner(keystore_dir);
         let body = encode_marker(marker, owner.clone())?;
-        let dir = MarkerDir::open(&fallback.dir)?
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let dir = MarkerDir::open(&fallback.dir)?;
         let _lock = dir.lock()?;
         let name = fallback_marker_name(&fallback.slashing_db_path);
         let update = match dir.read(&name) {
@@ -327,16 +334,17 @@ pub enum FallbackClear {
 /// keystore stays ([`FallbackClear::OtherOwner`]). An owned marker that
 /// cannot be read, does not parse or records no owner, and a legacy marker,
 /// stay: the function returns `InvalidData` with the path and the recovery
-/// step. The result has at most one entry; empty means no owned marker.
+/// step. The result has at most one entry; empty means no owned marker. As
+/// [`check_slashing_db_name`] does, the clear fails when the walk cannot open
+/// the database directory, or when the database file has a second name.
 pub fn clear_fallback_marker(
     fallback: &FallbackMarkerPath,
     keystore_dir: &Path,
 ) -> io::Result<Vec<FallbackClear>> {
     #[cfg(unix)]
     {
-        let Some(dir) = MarkerDir::open(&fallback.dir)? else {
-            return Ok(Vec::new());
-        };
+        let dir = MarkerDir::open(&fallback.dir)?;
+        dir.check_db_entry(&fallback.slashing_db_path)?;
         let _lock = dir.lock()?;
         let path = fallback.owned_path();
         let name = fallback_marker_name(&fallback.slashing_db_path);
@@ -429,7 +437,7 @@ fn inspect_file(path: PathBuf, file: MarkerFile) -> MarkerInspect {
     }
 }
 
-/// A directory that this process resolved one time. Each marker read, temp
+/// A directory that this process opened one time. Each marker read, temp
 /// create, rename, unlink, lock and fsync in it uses this handle, so a later
 /// change to the path does not move these steps to a different directory.
 #[cfg(unix)]
@@ -442,31 +450,65 @@ struct MarkerDir {
 
 #[cfg(unix)]
 impl MarkerDir {
-    /// Open `dir` (`None` when it does not exist; an empty path is `.`).
-    /// `canonicalize` gives the real path one time, and a walk from `/` opens
-    /// each name of it with `O_NOFOLLOW | O_DIRECTORY` (`O_PATH` on Linux:
-    /// search permission is enough). A symlink or a file that replaces a name
-    /// after `canonicalize` stops the walk.
-    fn open(dir: &Path) -> io::Result<Option<Self>> {
-        let path = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        let real = match fs::canonicalize(path) {
-            Ok(real) => real,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        #[cfg(test)]
-        run_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, &real);
+    /// Open the database directory `dir` with a walk that resolves nothing
+    /// first and follows no symlink. The walk starts at `/` for an absolute
+    /// path and at the working directory for a relative path, and opens each
+    /// name with `O_NOFOLLOW | O_DIRECTORY` (`O_PATH` on Linux: search
+    /// permission is enough). A missing name, a symlink, a file or a `..` in
+    /// the path stops the walk with an error.
+    fn open(dir: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let search = libc::O_PATH;
         #[cfg(not(target_os = "linux"))]
         let search = libc::O_RDONLY;
-        let mut walk = open_at(None, OsStr::new("/"), &[search, libc::O_DIRECTORY])?;
-        for name in real.components().skip(1) {
+        let context = |err: io::Error| {
+            let text = format!(
+                "the slashing database directory {} must exist and have no symlink and no `..` \
+                 in its path: {err}",
+                dir.display()
+            );
+            io::Error::new(err.kind(), text)
+        };
+        let mut walk = None;
+        for part in dir.components() {
+            if matches!(part, std::path::Component::ParentDir | std::path::Component::Prefix(_)) {
+                let err = io::Error::new(io::ErrorKind::InvalidInput, "the path has a `..`");
+                return Err(context(err));
+            }
             let flags = [search, libc::O_DIRECTORY, libc::O_NOFOLLOW];
-            walk = open_at(Some(&walk), name.as_os_str(), &flags)?;
+            walk = Some(open_at(walk.as_ref(), part.as_os_str(), &flags).map_err(context)?);
         }
-        let file = open_at(Some(&walk), OsStr::new("."), &[libc::O_RDONLY, libc::O_DIRECTORY])?;
-        Ok(Some(Self { file, path: path.to_path_buf() }))
+        let flags = [libc::O_RDONLY, libc::O_DIRECTORY];
+        let file = open_at(walk.as_ref(), OsStr::new("."), &flags).map_err(context)?;
+        Ok(Self { file, path: dir.to_path_buf() })
+    }
+
+    /// Refuse a database file `db_path` in this directory that has a second
+    /// name: a symlink, an entry that is not a regular file, or a file with
+    /// more than one link. A missing file (a new database) passes.
+    fn check_db_entry(&self, db_path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(target_os = "linux")]
+        let flags = [libc::O_PATH, libc::O_NOFOLLOW];
+        #[cfg(not(target_os = "linux"))]
+        let flags = [libc::O_RDONLY, libc::O_NOFOLLOW, libc::O_NONBLOCK];
+        let name = db_path.file_name().unwrap_or_default();
+        let meta = match open_at(Some(&self.file), name, &flags) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            opened => opened?.metadata()?,
+        };
+        if meta.is_file() && meta.nlink() == 1 {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the slashing database {} must be a regular file with one link, not a symlink \
+                 and not a file with a second hard link, because its fallback detection marker \
+                 is found by this one name",
+                db_path.display()
+            ),
+        ))
     }
 
     /// Read the entry `name` without a symlink follow and without a block
@@ -674,13 +716,15 @@ fn encode_marker(marker: &DetectionMarker, keystore_dir: Option<String>) -> io::
 
 /// Write `body` to `filename` in `data_dir` with [`MarkerDir::replace`], the
 /// marker writer that the fallback marker also uses. The keystore marker and
-/// the force-window file use this function.
+/// the force-window file use this function. It opens the keystore directory
+/// by its path, as boot does for its reads of the keystore marker; the walk
+/// with no symlink is for the database directory.
 fn atomic_write(data_dir: &Path, filename: &str, body: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let dir =
-            MarkerDir::open(data_dir)?.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        dir.replace(OsStr::new(filename), body)
+        let path = if data_dir.as_os_str().is_empty() { Path::new(".") } else { data_dir };
+        let file = open_at(None, path.as_os_str(), &[libc::O_RDONLY, libc::O_DIRECTORY])?;
+        MarkerDir { file, path: path.to_path_buf() }.replace(OsStr::new(filename), body)
     }
     #[cfg(not(unix))]
     {
@@ -1397,21 +1441,8 @@ thread_local! {
     static AFTER_RECORD_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static FSYNC_TARGETS: RefCell<Vec<FileId>> = const { RefCell::new(Vec::new()) };
     static FSYNC_TARGET_FAILURE: Cell<Option<(FileId, u32)>> = const { Cell::new(None) };
-    static AFTER_MARKER_DIR_RESOLVE: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static BEFORE_MARKER_TEMP_OPEN: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
     static BEFORE_FALLBACK_UNLINK: RefCell<Option<RecordPathHook>> = const { RefCell::new(None) };
-}
-
-/// Run `hook` one time on this thread, after [`MarkerDir::open`] resolves
-/// its directory and before the walk opens that directory. The hook gets
-/// the resolved directory.
-///
-/// The guard removes the hook when it drops, if the hook did not run.
-#[cfg(test)]
-pub(crate) fn arm_after_marker_dir_resolve(
-    hook: impl FnOnce(&Path) + 'static,
-) -> RecordPathHookGuard {
-    arm_record_path_hook(&AFTER_MARKER_DIR_RESOLVE, hook)
 }
 
 /// Run `hook` one time on this thread, before [`MarkerDir::replace`] opens
@@ -2764,40 +2795,6 @@ mod tests {
         assert!(
             matches!(inspect_at(&second.join(&name)), MarkerInspect::Absent),
             "The clear must remove the marker from the directory that it opened."
-        );
-    }
-
-    /// After the writer resolves the database directory, the hook moves it and
-    /// puts a symlink to another directory at the old path. The write must
-    /// fail, and the two directories must have no marker.
-    #[cfg(unix)]
-    #[test]
-    fn fallback_write_refuses_a_directory_that_changes_after_the_resolve() {
-        let (root, [keys, slash, elsewhere]) = temp_dirs(["keys", "slash", "elsewhere"]);
-        let moved = root.path().join("moved");
-        let fallback = fallback_of(&keys, &slash);
-        let name = fallback_marker_name(&fallback.slashing_db_path);
-        let (from, to, target) = (slash.clone(), moved.clone(), elsewhere.clone());
-        let _hook = arm_after_marker_dir_resolve(move |_| {
-            fs::rename(&from, &to).expect("The hook must move the database directory.");
-            std::os::unix::fs::symlink(&target, &from)
-                .expect("The hook must create a symlink at the old path.");
-        });
-
-        let result = write_fallback_marker(&fallback, &keys, &sample_marker());
-
-        assert!(
-            result.is_err(),
-            "The write must fail when a symlink replaces the directory after the resolve. The \
-             result is {result:?}."
-        );
-        assert!(
-            matches!(inspect_at(&elsewhere.join(&name)), MarkerInspect::Absent),
-            "The other directory must have no marker."
-        );
-        assert!(
-            matches!(inspect_at(&moved.join(&name)), MarkerInspect::Absent),
-            "The moved directory must have no marker."
         );
     }
 

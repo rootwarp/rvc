@@ -123,7 +123,7 @@ async fn run_with_clock<C: SlotClock + 'static>(
         error!(
             path = %config.slashing_db_path.display(),
             error = %err,
-            "the slashing database file name cannot get a detection marker; refusing to start"
+            "the slashing database path gives no clear detection marker name; refusing to start"
         );
         return Err(BootstrapError::InvalidConfig(err.to_string()));
     }

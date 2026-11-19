@@ -25,8 +25,9 @@ use rvc::startup;
 /// command with an error that gives the path and the recovery step, and the
 /// keystore marker stays: a fallback marker of that database that cannot be
 /// read, does not parse, or records no owner, and a legacy
-/// `.rvc.doppelganger_detected` in that directory. The keystore marker is
-/// unlinked last. Deleting only that marker by hand does not write the
+/// `.rvc.doppelganger_detected` in that directory. The command also stops
+/// when the database directory has a symlink or a `..` in its path, or when
+/// the database file has a second name. The keystore marker is unlinked last. Deleting only that marker by hand does not write the
 /// force-window file, does not clear a detected record, and does not force
 /// the window.
 pub fn execute_clear_detection(
