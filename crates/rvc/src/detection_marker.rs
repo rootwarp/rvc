@@ -1675,6 +1675,7 @@ thread_local! {
 #[cfg(target_os = "linux")]
 thread_local! {
     static UNNAMED_PROBE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+    static UNNAMED_PROBE_WRITE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2043,6 +2044,18 @@ fn take_unnamed_probe_error() -> Option<i32> {
     UNNAMED_PROBE_ERROR.with(Cell::take)
 }
 
+/// Make the write of the next probe file with no name on this thread fail
+/// with the error number `errno`. The write runs, and the probe gets the
+/// error in place of the result.
+///
+/// `UnnamedProbeWriteErrorGuard::drop` removes the error if no probe used it.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) fn arm_unnamed_probe_write_error(errno: i32) -> UnnamedProbeWriteErrorGuard {
+    UNNAMED_PROBE_WRITE_ERROR.with(|slot| slot.set(Some(errno)));
+    UnnamedProbeWriteErrorGuard
+}
+
 /// Run `hook` one time on this thread, at the step `step` of
 /// [`probe_fallback_dir_writable`] for the directory `dir`. The hook gets
 /// the path of the probe entry in `dir`. A probe of a different path does
@@ -2187,6 +2200,19 @@ pub(crate) struct UnnamedProbeErrorGuard;
 impl Drop for UnnamedProbeErrorGuard {
     fn drop(&mut self) {
         UNNAMED_PROBE_ERROR.with(|slot| slot.set(None));
+    }
+}
+
+/// `UnnamedProbeWriteErrorGuard::drop` removes the error if no probe used it.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) struct UnnamedProbeWriteErrorGuard;
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+impl Drop for UnnamedProbeWriteErrorGuard {
+    fn drop(&mut self) {
+        UNNAMED_PROBE_WRITE_ERROR.with(|slot| slot.set(None));
     }
 }
 

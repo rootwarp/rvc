@@ -2420,6 +2420,7 @@ mod tests {
     ///
     /// - The `O_TMPFILE` open fails with `EACCES`.
     /// - The `O_TMPFILE` open fails with `EIO`.
+    /// - The write of the file with no name fails with `ENOSPC`.
     /// - The fsync of the file with no name fails with `EIO`.
     /// - The fsync of the database directory fails with `EIO`.
     ///
@@ -2431,19 +2432,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn boot_stops_at_each_error_of_the_unnamed_probe() {
         use crate::detection_marker::{
-            arm_fsync_failures_after, arm_unnamed_probe_error, fallback_probes,
+            arm_fsync_failures_after, arm_unnamed_probe_error, arm_unnamed_probe_write_error,
+            fallback_probes,
         };
         // The probe of the keystore directory does two fsyncs before this probe.
         let rows = [
-            ("an EACCES open", Some(libc::EACCES), None),
-            ("an EIO open", Some(libc::EIO), None),
-            ("an EIO fsync of the file", None, Some(2)),
-            ("an EIO fsync of the directory", None, Some(3)),
+            ("an EACCES open", Some(libc::EACCES), None, None),
+            ("an EIO open", Some(libc::EIO), None, None),
+            ("an ENOSPC write of the file", None, Some(libc::ENOSPC), None),
+            ("an EIO fsync of the file", None, None, Some(2)),
+            ("an EIO fsync of the directory", None, None, Some(3)),
         ];
         let mut failed = Vec::new();
-        for (row, errno, skip) in rows {
+        for (row, open, write, skip) in rows {
             let (_keys, slash, config) = fallback_probe_fixture(true);
-            let _open = errno.map(arm_unnamed_probe_error);
+            let _open = open.map(arm_unnamed_probe_error);
+            let _write = write.map(arm_unnamed_probe_write_error);
             let _sync = skip.map(|skip| arm_fsync_failures_after(skip, 1));
             let fallbacks = fallback_probes();
 
