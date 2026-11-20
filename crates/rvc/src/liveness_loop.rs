@@ -1587,12 +1587,138 @@ mod tests {
         );
         spawn_liveness_loop(
             spawn.expect(
-                "A machine with an empty registry and a pubkey map must give a built loop. \
-                 IndexResolver resolves the indices of pending keys, not this loop.",
+                "`prepare_liveness_loop` must build the loop when the index registry is empty \
+                 and a public-key map is available. IndexResolver resolves the indices of \
+                 pending keys, not this loop.",
             ),
             &exec,
         );
         let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
+    }
+
+    /// Return a beacon node in the test process and a count of its liveness
+    /// requests. Each answer gives `is_live` for each requested index.
+    fn counted_liveness(
+        is_live: bool,
+    ) -> (Arc<dyn LivenessApi>, tokio::sync::watch::Receiver<usize>) {
+        let (count, requests) = tokio::sync::watch::channel(0usize);
+        let beacon =
+            MockBeaconNodeClient::new().with_post_validator_liveness(move |_epoch, indices| {
+                count.send_modify(|requests| *requests += 1);
+                let data =
+                    indices.into_iter().map(|index| ValidatorLiveness { index, is_live }).collect();
+                Ok(ValidatorLivenessResponse { data })
+            });
+        (Arc::new(beacon), requests)
+    }
+
+    /// Register one pending key with the index "1" on `machine`. Build the
+    /// production loop with `prepare_liveness_loop`, with `dir` as the keystore
+    /// directory. Then start it with `spawn_liveness_loop` on `executor`.
+    fn spawn_production_loop(
+        machine: &Arc<ForwardWindowMachine>,
+        beacon: Arc<dyn LivenessApi>,
+        dir: &std::path::Path,
+        executor: &TaskExecutor,
+    ) {
+        let pk = new_pk();
+        machine.register(&pk, 0);
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "1".to_string());
+        let clock =
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000));
+        let prepared = prepare_liveness_loop(
+            Some(Arc::clone(machine)),
+            beacon,
+            reg,
+            None,
+            clock,
+            executor,
+            Some((dir.to_path_buf(), Arc::new(TrackedKeys::new()))),
+        )
+        .expect("`prepare_liveness_loop` must build the loop when a machine is available.");
+        spawn_liveness_loop(prepared, executor);
+    }
+
+    /// W4-D2c fix1: the task that `spawn_liveness_loop` registers must run the
+    /// loop. The loop must send a liveness request for the indexed key before
+    /// its task ends. Then the drain must join the task. The test does not use
+    /// a timeout: the request count or the end of the task stops the wait.
+    #[tokio::test]
+    async fn spawned_production_loop_sends_a_liveness_request_before_the_drain() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let (beacon, mut requests) = counted_liveness(false);
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_production_loop(&machine(), beacon, dir.path(), &executor);
+
+        tokio::select! {
+            biased;
+            _ = requests.wait_for(|count| *count > 0) => {}
+            () = executor.wait_until_work_finished("liveness_loop") => {}
+        }
+        assert!(
+            *requests.borrow() > 0,
+            "The liveness loop must send a liveness request before its task ends."
+        );
+        assert!(
+            !executor.work_finished("liveness_loop"),
+            "The liveness loop must continue to run after its first liveness request."
+        );
+        let outcome = executor.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
+        assert!(
+            outcome.joined.contains(&"liveness_loop"),
+            "The drain must join the liveness loop. The drain joined {:?} and aborted {:?}.",
+            outcome.joined,
+            outcome.aborted
+        );
+    }
+
+    /// W4-D2c fix1: the production loop sees a live key. Before its next
+    /// liveness request, the loop must:
+    ///
+    /// 1. Latch the detection.
+    /// 2. Write the detection marker in the keystore directory.
+    /// 3. Request exit 12 through the executor.
+    ///
+    /// The paused clock moves the loop to its next request at once if no
+    /// exit request comes.
+    #[tokio::test(start_paused = true)]
+    async fn spawned_production_loop_writes_the_marker_and_requests_the_exit() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let m = machine();
+        let (beacon, mut requests) = counted_liveness(true);
+        let (executor, mut shutdown_rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_production_loop(&m, beacon, dir.path(), &executor);
+
+        let reason = tokio::select! {
+            biased;
+            reason = shutdown_rx.recv() => reason,
+            _ = requests.wait_for(|count| *count > 1) => None,
+            () = executor.wait_until_work_finished("liveness_loop") => None,
+        };
+        assert!(m.detected_latch(), "The liveness loop must latch the detection of a live key.");
+        assert!(
+            matches!(
+                crate::detection_marker::inspect(dir.path()),
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The liveness loop must write the detection marker in the keystore directory."
+        );
+        assert!(
+            matches!(
+                reason,
+                Some(crate::bootstrap::executor::ShutdownReason::DoppelgangerDetected)
+            ) && executor.doppelganger_exit_requested(),
+            "The liveness loop must request exit 12 through the executor before its next \
+             liveness request. The shutdown reason is {reason:?}."
+        );
+        let outcome = executor.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
+        assert!(
+            outcome.joined.contains(&"liveness_loop"),
+            "The drain must join the liveness loop. The drain joined {:?} and aborted {:?}.",
+            outcome.joined,
+            outcome.aborted
+        );
     }
 
     /// Production `run` must not refresh indices. The refresh method is `cfg(test)`.

@@ -646,13 +646,70 @@ mod tests {
             .await;
         mock_public_keys(&server, &[pk]).await;
 
-        let (config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        let (mut config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        config.doppelganger_detection = false;
         let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 1);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 1);
         assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 1);
         assert!(!logs_contain("does not support sign type"));
+    }
+
+    /// W4-D2c fix1: with doppelganger detection on, the key-load probe must
+    /// not send a sign request for a key that the signer has loaded. The
+    /// forward-window gate does not exist yet, and the probe does not use it.
+    /// The probe then reports each type as unknown.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_capability_probe_signs_with_no_loaded_key_while_detection_is_on() {
+        let _lock = probe_metric_lock().await;
+        let pk = loaded_pubkey_hex();
+        let loaded_sign_path = format!("/api/v1/eth2/sign/{pk}");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(loaded_sign_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "Key not found"})),
+            )
+            .mount(&server)
+            .await;
+        mock_public_keys(&server, &[pk]).await;
+
+        let (mut config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        config.doppelganger_detection = true;
+        let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
+        load_signing_keys(&config, &denylist).await.expect("Startup must succeed.");
+
+        let requests = server.received_requests().await.expect("The mock must record requests.");
+        let loaded_signs = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == loaded_sign_path
+            })
+            .count();
+        assert_eq!(
+            loaded_signs, 0,
+            "With doppelganger detection on, the probe must not send a sign request for a \
+             loaded key. The probe sent {loaded_signs}."
+        );
+        for sign_type in signer_sign_type::ALL {
+            assert_eq!(
+                capability(sign_type),
+                0,
+                "The probe must report {sign_type} as unknown when it cannot sign."
+            );
+        }
+        assert!(
+            logs_contain("doppelganger detection is on"),
+            "The probe log must give the reason for the unknown result."
+        );
     }
 
     #[tokio::test]
@@ -679,7 +736,8 @@ mod tests {
             .await;
         mock_public_keys(&server, &[pk]).await;
 
-        let (config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        let (mut config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        config.doppelganger_detection = false;
         let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);

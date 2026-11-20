@@ -862,15 +862,15 @@ mod tests {
              registered tasks are {:?}.",
             executor.registry_entries()
         );
-        // The drain cancels the token before the loop task runs for the
-        // first time. The loop must stop on start. The timeout is hang
-        // protection only.
+        // The drain cancels the token before the loop starts. The loop must
+        // exit when it sees the canceled token. The timeout limits the test
+        // time.
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             executor.shutdown(crate::bootstrap::executor::TierBudget::default()),
         )
         .await
-        .expect("liveness task must terminate on shutdown token");
+        .expect("The drain did not finish within 5 s.");
         assert!(
             outcome.joined.contains(&"liveness_loop"),
             "The liveness loop must stop on the shutdown token, and the drain must join it. The \

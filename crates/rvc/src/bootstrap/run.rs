@@ -1165,7 +1165,8 @@ mod tests {
                 budget: short_budget(),
                 detection: None,
             },
-            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install."),
+            ShutdownSignal::install()
+                .expect("`ShutdownSignal::install` must register both signal handlers."),
         )
         .await;
 
@@ -1204,7 +1205,8 @@ mod tests {
                 budget: short_budget(),
                 detection: None,
             },
-            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install."),
+            ShutdownSignal::install()
+                .expect("`ShutdownSignal::install` must register both signal handlers."),
         )
         .await;
 
@@ -1305,8 +1307,8 @@ mod tests {
     async fn shutdown_signal_install_registers_both_handlers() {
         use tokio::signal::unix::SignalKind;
 
-        let _signal =
-            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install.");
+        let _signal = ShutdownSignal::install()
+            .expect("`ShutdownSignal::install` must register both signal handlers.");
         let status = std::fs::read_to_string("/proc/self/status")
             .expect("The test must read /proc/self/status.");
         let caught = status
@@ -2809,13 +2811,14 @@ mod tests {
         code
     }
 
-    /// Return the text between the outer braces of `async fn run_with_clock<`
-    /// in `src`, with no `//` comments. The brace scan skips string literals.
-    /// `None` when the function or its closing brace is missing.
-    fn boot_body(src: &str) -> Option<String> {
-        let code = without_line_comments(src);
-        let start = code.find("async fn run_with_clock<")?;
-        let open = start + code[start..].find('{')?;
+    /// Return the index of the bracket that closes the `open_char` at the
+    /// byte index `open` in `code`. The scan skips string literals. Return
+    /// `None` if the closing bracket is missing.
+    fn closing_bracket(
+        code: &str,
+        open: usize,
+        (open_char, close_char): (char, char),
+    ) -> Option<usize> {
         let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
         for (at, c) in code[open..].char_indices() {
             if in_string {
@@ -2826,21 +2829,63 @@ mod tests {
                 } else if c == '"' {
                     in_string = false;
                 }
-                continue;
-            }
-            match c {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(code[open + 1..open + at].to_string());
-                    }
+            } else if c == '"' {
+                in_string = true;
+            } else if c == open_char {
+                depth += 1;
+            } else if c == close_char {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + at);
                 }
-                _ => {}
             }
         }
         None
+    }
+
+    /// Return the text between the outer braces of `async fn run_with_clock<`
+    /// in `src`, with no `//` comments. The brace scan skips string literals.
+    /// Return `None` if the function or its closing brace is missing.
+    fn boot_body(src: &str) -> Option<String> {
+        let code = without_line_comments(src);
+        let start = code.find("async fn run_with_clock<")?;
+        let open = start + code[start..].find('{')?;
+        let close = closing_bracket(&code, open, ('{', '}'))?;
+        Some(code[open + 1..close].to_string())
+    }
+
+    /// Return the byte index of each `return` keyword in `text`.
+    fn return_keywords(text: &str) -> Vec<usize> {
+        let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        text.match_indices("return")
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                !ident(text[..at].chars().next_back())
+                    && !ident(text[at + "return".len()..].chars().next())
+            })
+            .collect()
+    }
+
+    /// Return the first token in `text` that can leave the boot function
+    /// before the drain ends: `return`, `?`, `.unwrap(`, `.expect(` or
+    /// `panic!(`.
+    fn early_exit(text: &str) -> Option<&'static str> {
+        if !return_keywords(text).is_empty() {
+            return Some("return");
+        }
+        ["?", ".unwrap(", ".expect(", "panic!("].into_iter().find(|token| text.contains(token))
+    }
+
+    /// Return the line of `text` at the byte index `at`, after the line
+    /// before it.
+    fn lines_at(text: &str, at: usize) -> String {
+        let line = text[..at].matches('\n').count();
+        text.lines()
+            .skip(line.saturating_sub(1))
+            .take(2)
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Check the start rule of the liveness loop in the boot `body`. Return
@@ -2851,13 +2896,15 @@ mod tests {
     ///    `ShutdownSignal::install(` and `take_epoch_boundary_runner(`.
     /// 3. That call comes before `"duty_orchestrator"`, and
     ///    `"duty_orchestrator"` comes before `await_shutdown_and_drain(`.
-    /// 4. The text from that call to `await_shutdown_and_drain(` has no `?`
-    ///    and no `return Err`.
+    /// 4. The text from that call to the closing parenthesis of the drain
+    ///    call has no early exit (see [`early_exit`]). This text includes
+    ///    the drain arguments.
     fn liveness_start_rule(body: &str) -> Result<(), String> {
         let spawns = body.matches("spawn_liveness_loop(").count();
         if spawns != 1 {
             return Err(format!(
-                "The boot body must call spawn_liveness_loop( one time. It calls it {spawns} times."
+                "The boot function must call `spawn_liveness_loop` one time. The scan found \
+                 {spawns} calls."
             ));
         }
         let spawn_at = body.find("spawn_liveness_loop(").unwrap_or_default();
@@ -2886,21 +2933,133 @@ mod tests {
                     .to_string(),
             );
         }
-        let window = &body[spawn_at..drain_at];
-        if window.contains('?') || window.contains("return Err") {
+        let open = drain_at + "await_shutdown_and_drain".len();
+        let Some(drain_end) = closing_bracket(body, open, ('(', ')')) else {
+            return Err("The drain call must have a closing parenthesis.".to_string());
+        };
+        let window = &body[spawn_at..=drain_end];
+        if let Some(exit) = early_exit(window) {
             return Err(format!(
-                "The text from spawn_liveness_loop( to the drain must have no `?` and no \
-                 `return Err`. The text is: {window}"
+                "From spawn_liveness_loop( to the end of the drain call, the boot function must \
+                 not return early or panic. The text has `{exit}`: {window}"
             ));
         }
         Ok(())
     }
 
-    /// W4-D2c: the boot body starts the liveness loop after its last
-    /// fallible step and after the SIGINT and SIGTERM handlers are
-    /// installed. From the loop start to the drain, nothing returns with `?`
-    /// or `return Err`. The fixtures make sure that the brace scan finds a
-    /// body and that the rule check rejects each wrong order.
+    /// Check the error exits of the boot `body` after the first task spawn.
+    /// Return the first rule that `body` breaks:
+    ///
+    /// 1. `body` calls `spawn_index_resolver(`, the first task spawn.
+    /// 2. `body` calls `spawn_liveness_loop(` after the first task spawn.
+    /// 3. The text from the first task spawn to the loop start has no `?`.
+    /// 4. Each `return` in that text returns
+    ///    `Err(stop_boot_tasks(executor, ..))`.
+    fn boot_error_rule(body: &str) -> Result<(), String> {
+        let Some(first_spawn_at) = body.find("spawn_index_resolver(") else {
+            return Err("The boot function must call spawn_index_resolver(.".to_string());
+        };
+        let Some(loop_at) = body.find("spawn_liveness_loop(") else {
+            return Err("The boot function must call spawn_liveness_loop(.".to_string());
+        };
+        if loop_at < first_spawn_at {
+            return Err("spawn_liveness_loop( must come after spawn_index_resolver(.".to_string());
+        }
+        let window = &body[first_spawn_at..loop_at];
+        if let Some(at) = window.find('?') {
+            return Err(format!(
+                "After the first task spawn, a boot error must not return with `?`. The text \
+                 is: {}",
+                lines_at(window, at)
+            ));
+        }
+        for at in return_keywords(window) {
+            let exit: String = window[at..].chars().filter(|c| !c.is_whitespace()).collect();
+            if !exit.starts_with("returnErr(stop_boot_tasks(executor,") {
+                return Err(format!(
+                    "After the first task spawn, each boot error must return through \
+                     stop_boot_tasks. The text is: {}",
+                    lines_at(window, at)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// W4-D2c fix1: after the first task spawn, each boot error stops the
+    /// spawned tasks before the boot function returns. The fixtures make sure
+    /// that the rule check rejects each early exit that skips the task stop.
+    #[test]
+    fn boot_errors_after_the_first_task_spawn_stop_the_tasks() {
+        for (case, fixture) in [
+            (
+                "a `?` before the first spawn",
+                "a()?; spawn_index_resolver(); spawn_liveness_loop(t);",
+            ),
+            (
+                "an error that stops the tasks",
+                "spawn_index_resolver(); match f() { Ok(v) => v, Err(err) => return \
+                 Err(stop_boot_tasks(executor, err).await), }; spawn_liveness_loop(t);",
+            ),
+            (
+                "a stop on more than one line",
+                "spawn_index_resolver(); return Err(\n stop_boot_tasks(executor, e).await\n); \
+                 spawn_liveness_loop(t);",
+            ),
+        ] {
+            assert_eq!(boot_error_rule(fixture), Ok(()), "The rule check must accept {case}.");
+        }
+        for (case, fixture, reason) in [
+            (
+                "a body with no first spawn",
+                "f()?; spawn_liveness_loop(t);",
+                "spawn_index_resolver(",
+            ),
+            ("a body with no loop start", "spawn_index_resolver(); f()?;", "spawn_liveness_loop(."),
+            (
+                "a loop start before the first spawn",
+                "spawn_liveness_loop(t); spawn_index_resolver();",
+                "must come after",
+            ),
+            (
+                "a `?` after the first spawn",
+                "spawn_index_resolver(); f()?; spawn_liveness_loop(t);",
+                "`?`",
+            ),
+            (
+                "a `return Err` that skips the task stop",
+                "spawn_index_resolver(); if e { return Err(e); } spawn_liveness_loop(t);",
+                "stop_boot_tasks",
+            ),
+            (
+                "a `return` of a local `Result`",
+                "spawn_index_resolver(); if r.is_err() { return r; } spawn_liveness_loop(t);",
+                "stop_boot_tasks",
+            ),
+        ] {
+            let found = boot_error_rule(fixture);
+            assert!(
+                found.as_ref().is_err_and(|err| err.contains(reason)),
+                "The rule check must reject {case}. The result is {found:?}."
+            );
+        }
+
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("The production code must come first.");
+        let body = boot_body(prod).expect("The brace scan must find the body of run_with_clock.");
+        assert_eq!(
+            boot_error_rule(&body),
+            Ok(()),
+            "Each boot error after the first task spawn must stop the spawned tasks before the \
+             boot function returns."
+        );
+    }
+
+    /// W4-D2c: the boot function starts the loop after the last step that can
+    /// fail. It installs both signal handlers before it starts the loop.
+    /// From the loop start to the end of the drain call, the boot function
+    /// does not return early or panic. The fixtures make sure that the brace
+    /// scan finds a body and that the rule check rejects each wrong order.
     #[test]
     fn liveness_loop_starts_after_the_last_fallible_boot_step() {
         assert_eq!(
@@ -2995,6 +3154,47 @@ mod tests {
             ),
         ] {
             assert!(liveness_start_rule(&fixture).is_err(), "The rule check must reject {case}.");
+        }
+
+        let orchestrator = "spawn_result(\"duty_orchestrator\");";
+        assert_eq!(
+            liveness_start_rule(&format!(
+                "{pre} spawn_liveness_loop(t); {orchestrator} \
+                 await_shutdown_and_drain(Inputs {{ a: f(x), b: \")\" }}, signal).await; res?;"
+            )),
+            Ok(()),
+            "The scan must end at the parenthesis that closes the drain call."
+        );
+        for (case, fixture, exit) in [
+            (
+                "a `?` in a drain argument",
+                format!(
+                    "{pre} spawn_liveness_loop(t); {orchestrator} \
+                     await_shutdown_and_drain(Inputs {{ budget: {{ check()?; b }} }}, signal);"
+                ),
+                "`?`",
+            ),
+            (
+                "a `return` of a local `Result` after the loop start",
+                format!("{pre} spawn_liveness_loop(t); let r = f(); if r.is_err() {{ return r; }} {after}"),
+                "`return`",
+            ),
+            (
+                "an `expect` after the loop start",
+                format!("{pre} spawn_liveness_loop(t); a.expect(\"x\"); {after}"),
+                "`.expect(`",
+            ),
+            (
+                "a drain call with no closing parenthesis",
+                format!("{pre} spawn_liveness_loop(t); {orchestrator} await_shutdown_and_drain(a"),
+                "closing parenthesis",
+            ),
+        ] {
+            let found = liveness_start_rule(&fixture);
+            assert!(
+                found.as_ref().is_err_and(|err| err.contains(exit)),
+                "The rule check must reject {case}. The result is {found:?}."
+            );
         }
 
         let src = include_str!("run.rs");

@@ -156,7 +156,7 @@ async fn test_restart_shutdown_joins_the_runner_and_returns() {
 /// The runner's boot-epoch step registers the key when the builder is on.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_restart_at_slot_10_registers_in_that_epoch_when_the_builder_is_on() {
-    let boot = boot_at_slot(10, BootOpts { builder: true }).await;
+    let boot = boot_at_slot(10, BootOpts { builder: true, ..BootOpts::default() }).await;
     let ledger = boot.recorders.ledger.clone();
     watched(&ledger, async move {
         boot.step_to(31, 11_900).await;
@@ -182,7 +182,7 @@ async fn test_restart_at_slot_10_registers_in_that_epoch_when_the_builder_is_on(
 /// coordinator tests count them.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_registration_reaches_bn_in_restart_epoch_and_every_epoch_after() {
-    let boot = boot_at_slot(10, BootOpts { builder: true }).await;
+    let boot = boot_at_slot(10, BootOpts { builder: true, ..BootOpts::default() }).await;
     let ledger = boot.recorders.ledger.clone();
     watched(&ledger, async move {
         boot.step_to(31, 11_900).await;
@@ -468,11 +468,47 @@ async fn assert_subscribed(boot: &Boot) {
     }
 }
 
+/// W4-D2c fix1: the Keymanager step fails after boot spawns the index
+/// resolver. Boot must cancel the process token and join the resolver before
+/// it returns the error. Nextest runs each test in its own process, so the
+/// running-task gauge counts only the tasks of this boot.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn boot_error_after_the_first_spawn_stops_the_index_resolver() {
+    let boot =
+        boot_at_slot(10, BootOpts { missing_keymanager_token: true, ..BootOpts::default() }).await;
+    let Boot { run, token, recorders, .. } = boot;
+    watched(&recorders.ledger, async {
+        let running =
+            |task: &str| metrics::definitions::RVC_TASKS_RUNNING.with_label_values(&[task]).get();
+        let result = run.await.expect("The boot task must not panic.");
+        let (resolvers, loops) = (running("index.resolve"), running("liveness_loop"));
+        let cancelled = token.is_cancelled();
+        token.cancel();
+        assert!(
+            matches!(
+                result,
+                Err(BootstrapError::Keymanager(
+                    rvc::keymanager_adapters::SpawnKeymanagerApiError::Token(_)
+                ))
+            ),
+            "Boot must return the Keymanager token error. The result is {result:?}."
+        );
+        assert_eq!(loops, 0, "Boot must not start the liveness loop before the token error.");
+        assert_eq!(resolvers, 0, "Boot must stop the index resolver before it returns an error.");
+        assert!(cancelled, "Boot must cancel the process token before it returns an error.");
+    })
+    .await;
+}
+
 /// `boot_at_slot` reads these options.
 #[derive(Clone, Copy, Default)]
 struct BootOpts {
     /// This is the `builder_proposals` value of the key in the validators file.
     builder: bool,
+    /// Detection and the Keymanager API are on, and the Keymanager token file
+    /// is in a directory that does not exist. Boot then fails at the
+    /// Keymanager step, after it spawns the index resolver.
+    missing_keymanager_token: bool,
 }
 
 /// This is one `run_with_slot_clock` process with a wiremock beacon node.
@@ -511,7 +547,7 @@ async fn boot_at_slot(start_slot: u64, opts: BootOpts) -> Boot {
 
     let server = MockServer::start().await;
     mount_beacon_node(&server, &pubkey).await;
-    let config = Config {
+    let mut config = Config {
         beacon_url: server.uri(),
         beacon_nodes: vec![server.uri()],
         network: Network::Custom,
@@ -527,6 +563,12 @@ async fn boot_at_slot(start_slot: u64, opts: BootOpts) -> Boot {
         validators_config: Some(validators_config),
         ..Default::default()
     };
+    if opts.missing_keymanager_token {
+        config.doppelganger_detection = true;
+        config.keymanager.enabled = true;
+        config.keymanager.address = Some("127.0.0.1:0".into());
+        config.keymanager.token_file = Some(dir.path().join("absent").join("token"));
+    }
     let options = RunOptions {
         strict_permissions: false,
         strict_slashing_semantics: false,
