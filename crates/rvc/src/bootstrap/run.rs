@@ -32,6 +32,7 @@ use crate::deletion_denylist::DeletionDenylist;
 use crate::index_resolver::{spawn_index_resolver, IndexResolverDeps};
 use crate::key_admission::{AdmissionSource, KeyAdmissionService};
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
+use crate::liveness_loop::spawn_liveness_loop;
 use crate::orchestrator::OrchestratorHandle;
 use crate::startup;
 
@@ -214,7 +215,8 @@ async fn run_with_clock<C: SlotClock + 'static>(
         }
     };
 
-    // Step 6: SEC-2b/2c enablement + liveness loop (P1-7 registered on executor).
+    // Step 6: SEC-2b/2c enablement. The liveness loop is built here and
+    // spawned after the last fallible step (P1-7 registered on executor).
     let enablement = wire_signing_enablement(
         &config,
         &loaded_keys,
@@ -260,7 +262,7 @@ async fn run_with_clock<C: SlotClock + 'static>(
         forward_window_machine,
         epoch_clock,
         pubkey_map: _,
-        liveness_task: _,
+        liveness_task,
         pubkey_index,
         tracked_keys,
     } = enablement;
@@ -454,6 +456,14 @@ async fn run_with_clock<C: SlotClock + 'static>(
     };
     executor.spawn("epoch.boundary.runner", ShutdownTier::Orchestrator, boundary.run());
 
+    // The last fallible boot step. From the loop start on, the only way out
+    // of `run` is the drain, so a latch reaches `persist_latched_detection`.
+    // SIGINT and SIGTERM have a handler before the loop can latch.
+    let signal = ShutdownSignal::install()?;
+    if let Some(task) = liveness_task {
+        spawn_liveness_loop(task, &executor);
+    }
+
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
     // detached: already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B.
     executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async move {
@@ -471,14 +481,17 @@ async fn run_with_clock<C: SlotClock + 'static>(
         ),
         epoch_clock: Arc::clone(&epoch_clock),
     });
-    let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
-        executor,
-        orchestrator_handle,
-        shutdown_rx,
-        shutdown_token,
-        budget: TierBudget::default(),
-        detection,
-    })
+    let (outcome, res) = await_shutdown_and_drain(
+        ShutdownInputs {
+            executor,
+            orchestrator_handle,
+            shutdown_rx,
+            shutdown_token,
+            budget: TierBudget::default(),
+            detection,
+        },
+        signal,
+    )
     .await;
     info!(
         joined = ?outcome.joined,
@@ -537,16 +550,25 @@ pub(crate) struct DetectionShutdown {
 /// clear, this keeps retrying and does not return `Ok` or exit 16. `SIGKILL`
 /// before the first successful fsync loses the latch. Signal, token, and
 /// [`ShutdownReason::Success`] return `Ok` when the latch is clear.
+///
+/// `signal` is the operator-signal arm. [`run`] installs it before the
+/// liveness loop starts, so its handlers already catch SIGINT and SIGTERM.
 pub(crate) async fn await_shutdown_and_drain(
     inputs: ShutdownInputs,
+    mut signal: ShutdownSignal,
 ) -> (ShutdownOutcome, Result<(), BootstrapError>) {
-    await_shutdown_and_drain_with_signal(inputs, shutdown_signal()).await
+    await_shutdown_and_drain_with_signal(inputs, async move {
+        let name = signal.recv().await;
+        info!("Received {name}");
+    })
+    .await
 }
 
 /// Same as [`await_shutdown_and_drain`], with the operator-signal arm replaced.
 ///
-/// Production passes [`shutdown_signal`]. Tests pass a ready or pending future
-/// so the signal arm does not install a process-wide SIGINT handler.
+/// Production passes the future of a [`ShutdownSignal`]. Tests pass a ready
+/// or pending future so the signal arm does not install a process-wide
+/// SIGINT handler.
 pub(crate) async fn await_shutdown_and_drain_with_signal(
     inputs: ShutdownInputs,
     signal: impl Future<Output = ()>,
@@ -954,28 +976,62 @@ fn ensure_fallback_dir_writable(dir: &std::path::Path) -> Result<(), BootstrapEr
     })
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
-    };
-
+/// The SIGINT and SIGTERM handlers of the drain.
+///
+/// [`Self::install`] registers both handlers before it returns. A signal
+/// that comes later waits for [`Self::recv`] and does not stop the process
+/// by the default action. [`run`] installs the handlers just before the
+/// liveness loop starts. Earlier boot steps keep the default action, so
+/// Ctrl+C still stops a boot that has latched nothing.
+pub(crate) struct ShutdownSignal {
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    interrupt: tokio::signal::windows::CtrlC,
+}
 
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Received SIGINT (Ctrl+C)");
+impl ShutdownSignal {
+    /// Register the SIGINT and SIGTERM handlers now (Ctrl+C when the target
+    /// is not Unix).
+    ///
+    /// # Errors
+    ///
+    /// [`BootstrapError::InvalidConfig`] (exit 1) when a handler cannot be
+    /// registered. Boot then stops before the liveness loop starts.
+    pub(crate) fn install() -> Result<Self, BootstrapError> {
+        let failed = |err: std::io::Error| {
+            BootstrapError::InvalidConfig(format!(
+                "cannot install the SIGINT and SIGTERM handlers: {err}"
+            ))
+        };
+        #[cfg(unix)]
+        let installed = {
+            use tokio::signal::unix::{signal, SignalKind};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).map_err(failed)?,
+                terminate: signal(SignalKind::terminate()).map_err(failed)?,
+            }
+        };
+        #[cfg(not(unix))]
+        let installed = Self { interrupt: tokio::signal::windows::ctrl_c().map_err(failed)? };
+        Ok(installed)
+    }
+
+    /// Wait for the next SIGINT or SIGTERM and return its name.
+    pub(crate) async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => "SIGINT",
+                _ = self.terminate.recv() => "SIGTERM",
+            }
         }
-        _ = terminate => {
-            info!("Received SIGTERM");
+        #[cfg(not(unix))]
+        {
+            self.interrupt.recv().await;
+            "SIGINT"
         }
     }
 }
@@ -1100,14 +1156,17 @@ mod tests {
             panic!("registered task failed");
         });
 
-        let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
-            executor,
-            orchestrator_handle: OrchestratorHandle::for_drain_test(),
-            shutdown_rx,
-            shutdown_token: token,
-            budget: short_budget(),
-            detection: None,
-        })
+        let (outcome, res) = await_shutdown_and_drain(
+            ShutdownInputs {
+                executor,
+                orchestrator_handle: OrchestratorHandle::for_drain_test(),
+                shutdown_rx,
+                shutdown_token: token,
+                budget: short_budget(),
+                detection: None,
+            },
+            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install."),
+        )
         .await;
 
         assert!(
@@ -1136,14 +1195,17 @@ mod tests {
             Err::<(), _>("orchestrator failed")
         });
 
-        let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
-            executor,
-            orchestrator_handle: OrchestratorHandle::for_drain_test(),
-            shutdown_rx,
-            shutdown_token: token,
-            budget: short_budget(),
-            detection: None,
-        })
+        let (outcome, res) = await_shutdown_and_drain(
+            ShutdownInputs {
+                executor,
+                orchestrator_handle: OrchestratorHandle::for_drain_test(),
+                shutdown_rx,
+                shutdown_token: token,
+                budget: short_budget(),
+                detection: None,
+            },
+            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install."),
+        )
         .await;
 
         assert!(
@@ -1232,6 +1294,37 @@ mod tests {
         )
         .await;
         assert_ok_with_drain(&outcome, &res);
+    }
+
+    /// W4-D2c: `ShutdownSignal::install` registers the SIGINT and the SIGTERM
+    /// handler before it returns. The test reads the caught-signal mask
+    /// (`SigCgt`) of this process and sends no signal. Nextest runs each test
+    /// in its own process, so no other test sets these bits.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_signal_install_registers_both_handlers() {
+        use tokio::signal::unix::SignalKind;
+
+        let _signal =
+            ShutdownSignal::install().expect("The SIGINT and SIGTERM handlers must install.");
+        let status = std::fs::read_to_string("/proc/self/status")
+            .expect("The test must read /proc/self/status.");
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .map(|mask| u64::from_str_radix(mask.trim(), 16))
+            .expect("The status must have a SigCgt line.")
+            .expect("The SigCgt mask must be a hexadecimal number.");
+        for (name, kind) in
+            [("SIGINT", SignalKind::interrupt()), ("SIGTERM", SignalKind::terminate())]
+        {
+            let bit = 1u64 << (kind.as_raw_value() - 1);
+            assert_ne!(
+                caught & bit,
+                0,
+                "{name} must have a handler when install returns. SigCgt is {caught:#018x}."
+            );
+        }
     }
 
     /// Shutdown while the runner's prepare POST is held: the drain joins

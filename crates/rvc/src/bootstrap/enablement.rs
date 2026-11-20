@@ -2,7 +2,8 @@
 //!
 //! Extracted from `bin/rvc` startup Step 6 (SEC-2b/2c): constructs the
 //! production [`SigningEnablement`] (fail-closed [`ForwardWindowMachine`] or
-//! operator opt-out) and spawns the per-slot liveness observation loop.
+//! operator opt-out) and builds the per-slot liveness observation loop.
+//! [`super::run`] spawns that loop after its last fallible boot step.
 //! Secret-provider refresh is spawned later in [`super::run`] once
 //! `validator_store` and `key_gen_tx` are in scope (ARCH-2a / VD-E1).
 
@@ -19,7 +20,7 @@ use super::executor::TaskExecutor;
 use super::keys::LoadedKeys;
 use super::BootstrapError;
 use crate::config::{Config, ServiceBuilder};
-use crate::liveness_loop::{spawn_liveness_loop, LivenessLoopSpawn};
+use crate::liveness_loop::{prepare_liveness_loop, LivenessLoopSpawn};
 use crate::orchestrator::PubkeyMap;
 use crate::pubkey_index::{
     parse_pubkey_bytes, pubkey_bytes_to_0x, PubkeyIndexRegistry, SharedPubkeyIndexRegistry,
@@ -42,7 +43,9 @@ pub struct EnablementHandles {
     pub epoch_clock: Arc<MonotonicEpochClock>,
     /// Byte-keyed pubkey map (same `Arc` as [`LoadedKeys::pubkey_map`]).
     pub pubkey_map: PubkeyMap,
-    /// Spawned SEC-2c liveness loop; `None` only when doppelganger is off.
+    /// Built SEC-2c liveness loop, not running yet; `None` only when
+    /// doppelganger is off. [`super::run::run`] spawns it after the last
+    /// fallible boot step.
     pub liveness_task: Option<LivenessLoopSpawn>,
     /// Shared pubkey ↔ validator-index registry for duty tracking, proposer
     /// preparation, and liveness. Empty when unresolved / no keys.
@@ -51,7 +54,10 @@ pub struct EnablementHandles {
     pub tracked_keys: Arc<TrackedKeys>,
 }
 
-/// Construct SEC-2b enablement and spawn the SEC-2c liveness loop.
+/// Construct SEC-2b enablement and build the SEC-2c liveness loop.
+///
+/// The loop does not run when this returns. `executor` gives the loop its
+/// cancel token and its exit request; [`super::run::run`] spawns it.
 ///
 /// # Behaviour preserved from `run_validator`
 ///
@@ -222,12 +228,14 @@ async fn wire_signing_enablement_body(
     // Shared with keymanager DELETE/import and forward-window sidecar cleanup.
     let tracked_keys = Arc::new(TrackedKeys::new());
 
-    // SEC-2c: spawn the per-slot liveness observation loop when doppelganger is on.
+    // SEC-2c: build the per-slot liveness observation loop when doppelganger is on.
+    // It does not run yet: `run` spawns it after the last fallible boot step,
+    // so a later boot error cannot leave a loop that latches with no drain.
     // bn_manager is Arc; clone for the loop and keep the original for later duties.
     // pubkey_map stays attached for the retained refresh helper. IndexResolver,
     // spawned from `run`, is the production index writer (ADR-R05).
     let liveness_task = if doppelganger_enabled {
-        spawn_liveness_loop(
+        prepare_liveness_loop(
             forward_window_machine.clone(),
             Arc::clone(&beacon.bn_manager) as Arc<dyn LivenessApi>,
             Arc::clone(&pubkey_index),
@@ -831,6 +839,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_liveness_task_cancels_on_shutdown_token() {
+        use crate::bootstrap::executor::ShutdownTier;
+
         let (_server, beacon) = mock_beacon(0).await;
         // Non-empty pubkey map so the loop starts (empty indices + pubkeys path).
         let sk = SecretKey::generate();
@@ -843,12 +853,18 @@ mod tests {
                 .await
                 .expect("phase");
 
-        assert!(handles.liveness_task.is_some(), "liveness loop should spawn with pubkeys");
+        let prepared =
+            handles.liveness_task.expect("Enablement must return the built liveness loop.");
+        crate::liveness_loop::spawn_liveness_loop(prepared, &executor);
         assert!(
-            executor.registered_names().contains(&"liveness_loop"),
-            "liveness_loop must be registered on the executor"
+            executor.registry_entries().contains(&("liveness_loop", ShutdownTier::Orchestrator)),
+            "spawn_liveness_loop must register liveness_loop on the Orchestrator tier. The \
+             registered tasks are {:?}.",
+            executor.registry_entries()
         );
-        // Loop must observe cancellation and exit without hanging.
+        // The drain cancels the token before the loop task runs for the
+        // first time. The loop must stop on start. The timeout is hang
+        // protection only.
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             executor.shutdown(crate::bootstrap::executor::TierBudget::default()),
@@ -856,8 +872,11 @@ mod tests {
         .await
         .expect("liveness task must terminate on shutdown token");
         assert!(
-            outcome.joined.contains(&"liveness_loop") || outcome.aborted.contains(&"liveness_loop"),
-            "liveness_loop must drain"
+            outcome.joined.contains(&"liveness_loop"),
+            "The liveness loop must stop on the shutdown token, and the drain must join it. The \
+             drain joined {:?} and aborted {:?}.",
+            outcome.joined,
+            outcome.aborted
         );
     }
 

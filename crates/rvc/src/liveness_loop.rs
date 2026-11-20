@@ -62,13 +62,14 @@ pub fn merge_validator_indices(
     registry.write().merge_hex_map(pubkey_to_index);
 }
 
-/// Handle returned by [`spawn_liveness_loop`].
-///
-/// The loop future is registered on the process [`TaskExecutor`] (ARCH-2g);
-/// this struct only carries the shared index registry for callers.
+/// A liveness loop that [`prepare_liveness_loop`] built and that does not run
+/// yet. [`spawn_liveness_loop`] registers it on the process [`TaskExecutor`]
+/// (ARCH-2g).
 pub struct LivenessLoopSpawn {
     /// Shared pubkey↔index registry (import/refresh may call [`merge_validator_indices`]).
     pub pubkey_index: SharedPubkeyIndexRegistry,
+    /// The built loop. It runs only after [`spawn_liveness_loop`].
+    loop_task: LivenessObservationLoop,
 }
 
 /// Process exit requested by the liveness loop.
@@ -108,7 +109,7 @@ pub struct LivenessObservationLoop {
     /// Tick epoch of the last failed query. Only the first failure in a
     /// tick epoch logs at warn.
     last_query_failure_warned: parking_lot::Mutex<Option<Epoch>>,
-    /// Drain request. Production [`spawn_liveness_loop`] always sets this.
+    /// Drain request. Production [`prepare_liveness_loop`] always sets this.
     exit_request: Option<Arc<dyn ExitRequest>>,
     /// Validator data directory for the detection marker. Production sets this
     /// to the keystore directory.
@@ -821,17 +822,18 @@ impl ClockSeam {
     }
 }
 
-/// Spawn the production liveness loop whenever a machine exists.
+/// Build the production liveness loop whenever a machine exists. The loop
+/// does not run until [`spawn_liveness_loop`] registers it.
 ///
-/// An empty registry still starts the loop. The loop makes no beacon-node
+/// An empty registry still builds the loop. The loop makes no beacon-node
 /// call until a pending key has an index. `pubkey_index` is the
 /// workspace-shared registry (same handle used by `prepare_proposers` / duty
 /// tracking). Production index refresh is
 /// [`crate::index_resolver::IndexResolver`]; `pubkey_map` stays attached for
 /// `LivenessObservationLoop::refresh_indices_for_test`.
 ///
-/// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
-pub fn spawn_liveness_loop(
+/// The loop takes its cancel token and its exit request from `executor`.
+pub fn prepare_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn LivenessApi>,
     pubkey_index: SharedPubkeyIndexRegistry,
@@ -842,13 +844,6 @@ pub fn spawn_liveness_loop(
     import_sidecar: Option<(std::path::PathBuf, Arc<TrackedKeys>)>,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
-    if pubkey_index.read().is_empty() {
-        info!(
-            "SEC-2c: starting liveness loop with empty indices \
-             (IndexResolver owns index refresh; pending activation / post-import)"
-        );
-    }
-
     let pubkey_index_ret = Arc::clone(&pubkey_index);
     let cancel = executor.token();
     let exit_request: Arc<dyn ExitRequest> = Arc::new(executor.shutdown_handle());
@@ -862,10 +857,25 @@ pub fn spawn_liveness_loop(
         loop_task = loop_task.with_detection_marker_dir(dir.clone());
         loop_task = loop_task.with_import_sidecar_dir(dir, tracked);
     }
+    Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret, loop_task })
+}
+
+/// Register the `prepared` loop on `executor` at Orchestrator tier
+/// (ARCH-2g P1-7). From here the loop can latch a detection.
+///
+/// Boot calls this after its last fallible step, so a latch that the loop
+/// sets always reaches the drain.
+pub fn spawn_liveness_loop(prepared: LivenessLoopSpawn, executor: &TaskExecutor) {
+    let LivenessLoopSpawn { pubkey_index, loop_task } = prepared;
+    if pubkey_index.read().is_empty() {
+        info!(
+            "SEC-2c: starting liveness loop with empty indices \
+             (IndexResolver owns index refresh; pending activation / post-import)"
+        );
+    }
     executor.spawn("liveness_loop", ShutdownTier::Orchestrator, async move {
         loop_task.run().await;
     });
-    Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret })
 }
 
 /// One tick's liveness answers, with the index registry freshness token their
@@ -1411,7 +1421,7 @@ mod tests {
         reg.write().insert(pk.to_bytes(), "1".to_string());
         let bn = Arc::new(all_not_live(&["1"]).0);
         let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
-        let handle = spawn_liveness_loop(
+        let handle = prepare_liveness_loop(
             Some(Arc::clone(&m)),
             bn,
             Arc::clone(&reg),
@@ -1425,12 +1435,15 @@ mod tests {
             &exec,
             None,
         );
-        assert!(handle.is_some(), "production loop must spawn with indices");
+        spawn_liveness_loop(
+            handle.expect("A machine and a registry with an index must give a built loop."),
+            &exec,
+        );
         let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
 
         let empty = PubkeyIndexRegistry::shared();
         let (exec2, _rx2) = TaskExecutor::new(CancellationToken::new());
-        let no_handle = spawn_liveness_loop(
+        let no_handle = prepare_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
@@ -1439,10 +1452,13 @@ mod tests {
             &exec2,
             None,
         );
-        assert!(no_handle.is_some(), "a machine with an empty registry still starts the loop");
+        spawn_liveness_loop(
+            no_handle.expect("A machine with an empty registry must give a built loop."),
+            &exec2,
+        );
 
         let (exec3, _rx3) = TaskExecutor::new(CancellationToken::new());
-        let no_machine = spawn_liveness_loop(
+        let no_machine = prepare_liveness_loop(
             None,
             Arc::new(all_not_live(&["1"]).0),
             Arc::clone(&reg),
@@ -1560,7 +1576,7 @@ mod tests {
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
         let empty = PubkeyIndexRegistry::shared();
         let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
-        let spawn = spawn_liveness_loop(
+        let spawn = prepare_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
@@ -1569,10 +1585,12 @@ mod tests {
             &exec,
             None,
         );
-        assert!(
-            spawn.is_some(),
-            "must start with an empty index set and a pubkey map; IndexResolver re-resolves \
-             pending-activation keys, not this loop"
+        spawn_liveness_loop(
+            spawn.expect(
+                "A machine with an empty registry and a pubkey map must give a built loop. \
+                 IndexResolver resolves the indices of pending keys, not this loop.",
+            ),
+            &exec,
         );
         let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
     }
