@@ -648,8 +648,57 @@ impl MarkerDir {
         cvt(unsafe { libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR) })
     }
 
-    /// Prove that this directory can hold a marker. Each step uses a handle,
-    /// so the probe does not look up the path again:
+    /// Prove that this directory can hold a marker. On Linux, the probe uses
+    /// a file with no name ([`MarkerDir::probe_unnamed`]), so it creates no
+    /// entry and removes no entry. Other systems, and a Linux file system
+    /// with no `O_TMPFILE`, use [`MarkerDir::probe_in_subdir`].
+    fn probe(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(probed) = self.probe_unnamed() {
+            return probed;
+        }
+        self.probe_in_subdir()
+    }
+
+    /// `openat(dir, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600)` through the
+    /// handle of this directory, then the write, the fsync of the file and
+    /// the fsync of this directory. The file closes at the end. `None` when
+    /// the open fails with `EOPNOTSUPP` (the file system has no `O_TMPFILE`)
+    /// or `EISDIR` (the kernel has no `O_TMPFILE`). Each other error stops
+    /// the probe.
+    #[cfg(target_os = "linux")]
+    fn probe_unnamed(&self) -> Option<io::Result<()>> {
+        let at = |step: &str, err: io::Error| {
+            let text =
+                format!("a probe file with no name in {} {step}: {err}", self.path.display());
+            io::Error::new(err.kind(), text)
+        };
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::Unnamed, &self.path);
+        let flags = [libc::O_TMPFILE, libc::O_WRONLY];
+        let opened = open_at(Some(&self.file), OsStr::new("."), &flags);
+        #[cfg(test)]
+        let opened =
+            take_unnamed_probe_error().map_or(opened, |n| Err(io::Error::from_raw_os_error(n)));
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EISDIR)) => {
+                return None;
+            }
+            Err(err) => return Some(Err(at("cannot be created", err))),
+        };
+        let written = file.write_all(b"ok").and_then(|()| sync_file(&file));
+        #[cfg(test)]
+        run_probe_step(&self.path, ProbeStep::SyncDir, &self.path);
+        Some(
+            written
+                .map_err(|err| at("cannot be written", err))
+                .and_then(|()| sync_file(&self.file)),
+        )
+    }
+
+    /// The probe in a private subdirectory. Each step uses a handle, so the
+    /// probe does not look up the path again:
     ///
     /// 1. Create a private subdirectory (`mkdirat`, mode `0700`) with a
     ///    unique name.
@@ -661,7 +710,7 @@ impl MarkerDir {
     ///
     /// A failed step stops the probe with an error. After an error in step 1
     /// or step 2, the probe removes nothing.
-    fn probe(&self) -> io::Result<()> {
+    fn probe_in_subdir(&self) -> io::Result<()> {
         #[cfg(test)]
         FALLBACK_PROBES.with(|count| count.set(count.get() + 1));
         let name = OsString::from(format!(
@@ -696,14 +745,22 @@ impl MarkerDir {
             run_probe_step(&self.path, ProbeStep::Remove, &entry);
             written.and(sub.unlink(file_name))
         });
+        // The removal uses the name, because POSIX has no call that removes a
+        // directory through its handle. Threat model: a process that can
+        // already write the database directory can move the subdirectory away
+        // after the check and put a new empty directory at the name. Then this
+        // call removes that empty directory, which that process made and can
+        // remove itself. `AT_REMOVEDIR` removes only an empty directory, so
+        // the probe does not touch a marker file or other data. Ash accepted
+        // this residual race in the review of PR #1016 (fix round 3).
         let removed = self.rmdir(&name).map_err(|err| at("cannot be removed", err));
         probed.and(removed)?;
         sync_file(&self.file)
     }
 
     /// Check that `sub`, the open entry `name` of this directory, is the
-    /// private directory that [`MarkerDir::probe`] created. `mkdirat` gives
-    /// no handle, so the check uses these facts:
+    /// private directory that [`MarkerDir::probe_in_subdir`] created.
+    /// `mkdirat` gives no handle, so the check uses these facts:
     ///
     /// - The entry `name` has the device and inode numbers of `sub`.
     /// - The effective uid of this process owns `sub`.
@@ -812,9 +869,10 @@ pub fn probe_marker_dir_writable(data_dir: &Path) -> io::Result<()> {
 
 /// Prove that the slashing database directory `dir` can hold a fallback
 /// marker. The walk that the marker read, write and clear use (no symlink, no
-/// `..`) opens `dir` one time. Through that handle, the probe makes a private
+/// `..`) opens `dir` one time. Through that handle, the probe writes and
+/// fsyncs a file with no name (Linux). The fallback makes a private
 /// subdirectory, writes and fsyncs a file in it, and removes the file and the
-/// subdirectory. The only removal by name in `dir` is the removal of the
+/// subdirectory. Its only removal by name in `dir` is the removal of the
 /// subdirectory, and that removal cannot remove a file or a directory that is
 /// not empty.
 pub fn probe_fallback_dir_writable(dir: &Path) -> io::Result<()> {
@@ -1976,6 +2034,13 @@ pub(crate) fn fallback_probes() -> u32 {
 pub(crate) fn arm_unnamed_probe_error(errno: i32) -> UnnamedProbeErrorGuard {
     UNNAMED_PROBE_ERROR.with(|slot| slot.set(Some(errno)));
     UnnamedProbeErrorGuard
+}
+
+/// Take the error of [`arm_unnamed_probe_error`].
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+fn take_unnamed_probe_error() -> Option<i32> {
+    UNNAMED_PROBE_ERROR.with(Cell::take)
 }
 
 /// Run `hook` one time on this thread, at the step `step` of
