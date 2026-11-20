@@ -801,6 +801,34 @@ mod tests {
         executor.token().cancel();
     }
 
+    /// Enablement builds the liveness loop and does not start it. A boot
+    /// step that fails after enablement then leaves no loop that can latch a
+    /// detection without the drain.
+    #[tokio::test]
+    async fn wire_signing_enablement_starts_no_liveness_loop() {
+        let (_server, beacon) = mock_beacon(0).await;
+        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let slashing_db =
+            Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open."));
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("Enablement must succeed with detection on and one key.");
+
+        assert!(
+            !executor.registered_names().contains(&"liveness_loop"),
+            "Enablement must not register the liveness loop. The registered tasks are {:?}.",
+            executor.registered_names()
+        );
+        assert!(
+            handles.liveness_task.is_some(),
+            "With detection on, enablement must return the built liveness loop."
+        );
+        executor.token().cancel();
+    }
+
     #[tokio::test]
     async fn test_liveness_task_cancels_on_shutdown_token() {
         let (_server, beacon) = mock_beacon(0).await;

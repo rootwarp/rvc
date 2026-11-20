@@ -2691,6 +2691,233 @@ mod tests {
         assert!(spawn_at < orch_at, "spawn the runner before the duty_orchestrator task");
     }
 
+    /// Return `src` without its `//` comments. A string literal stays as it is.
+    fn without_line_comments(src: &str) -> String {
+        let mut code = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        let mut in_string = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                code.push(c);
+                if c == '\\' {
+                    code.extend(chars.next());
+                } else if c == '"' {
+                    in_string = false;
+                }
+            } else if c == '/' && chars.peek() == Some(&'/') {
+                if chars.by_ref().any(|skipped| skipped == '\n') {
+                    code.push('\n');
+                }
+            } else {
+                in_string = c == '"';
+                code.push(c);
+            }
+        }
+        code
+    }
+
+    /// Return the text between the outer braces of `async fn run_with_clock<`
+    /// in `src`, with no `//` comments. The brace scan skips string literals.
+    /// `None` when the function or its closing brace is missing.
+    fn boot_body(src: &str) -> Option<String> {
+        let code = without_line_comments(src);
+        let start = code.find("async fn run_with_clock<")?;
+        let open = start + code[start..].find('{')?;
+        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+        for (at, c) in code[open..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(code[open + 1..open + at].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Check the start rule of the liveness loop in the boot `body`. Return
+    /// the first rule that `body` breaks:
+    ///
+    /// 1. `body` calls `spawn_liveness_loop(` one time.
+    /// 2. That call comes after each `spawn_background_tasks(`,
+    ///    `ShutdownSignal::install(` and `take_epoch_boundary_runner(`.
+    /// 3. That call comes before `"duty_orchestrator"`, and
+    ///    `"duty_orchestrator"` comes before `await_shutdown_and_drain(`.
+    /// 4. The text from that call to `await_shutdown_and_drain(` has no `?`
+    ///    and no `return Err`.
+    fn liveness_start_rule(body: &str) -> Result<(), String> {
+        let spawns = body.matches("spawn_liveness_loop(").count();
+        if spawns != 1 {
+            return Err(format!(
+                "The boot body must call spawn_liveness_loop( one time. It calls it {spawns} times."
+            ));
+        }
+        let spawn_at = body.find("spawn_liveness_loop(").unwrap_or_default();
+        for step in
+            ["spawn_background_tasks(", "ShutdownSignal::install(", "take_epoch_boundary_runner("]
+        {
+            match body.rfind(step) {
+                Some(step_at) if step_at < spawn_at => {}
+                Some(_) => return Err(format!("spawn_liveness_loop( must come after {step}.")),
+                None => return Err(format!("The boot body must call {step}.")),
+            }
+        }
+        let Some(orchestrator_at) = body.find("\"duty_orchestrator\"") else {
+            return Err("The boot body must spawn \"duty_orchestrator\".".to_string());
+        };
+        if orchestrator_at < spawn_at {
+            return Err("spawn_liveness_loop( must come before the \"duty_orchestrator\" spawn."
+                .to_string());
+        }
+        let Some(drain_at) = body.find("await_shutdown_and_drain(") else {
+            return Err("The boot body must call await_shutdown_and_drain(.".to_string());
+        };
+        if drain_at < orchestrator_at {
+            return Err(
+                "await_shutdown_and_drain( must come after the \"duty_orchestrator\" spawn."
+                    .to_string(),
+            );
+        }
+        let window = &body[spawn_at..drain_at];
+        if window.contains('?') || window.contains("return Err") {
+            return Err(format!(
+                "The text from spawn_liveness_loop( to the drain must have no `?` and no \
+                 `return Err`. The text is: {window}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// W4-D2c: the boot body starts the liveness loop after its last
+    /// fallible step and after the SIGINT and SIGTERM handlers are
+    /// installed. From the loop start to the drain, nothing returns with `?`
+    /// or `return Err`. The fixtures make sure that the brace scan finds a
+    /// body and that the rule check rejects each wrong order.
+    #[test]
+    fn liveness_loop_starts_after_the_last_fallible_boot_step() {
+        assert_eq!(
+            boot_body("async fn run_with_clock<C>() -> R {\n a { b } \"}\" // }\n}\nfn next() {}")
+                .as_deref(),
+            Some("\n a { b } \"}\" \n"),
+            "The brace scan must skip a comment and a string, and stop at the outer brace."
+        );
+        for (case, fixture) in [
+            ("a source without run_with_clock", "fn run() {}"),
+            ("a body with no closing brace", "async fn run_with_clock<C>() { a {"),
+        ] {
+            assert_eq!(boot_body(fixture), None, "The brace scan must reject {case}.");
+        }
+
+        let pre = "spawn_background_tasks(); take_epoch_boundary_runner(); \
+                   ShutdownSignal::install();";
+        let good = format!(
+            "{pre} spawn_liveness_loop(task); spawn_result(\"duty_orchestrator\"); \
+             await_shutdown_and_drain(inputs, signal);"
+        );
+        assert_eq!(
+            liveness_start_rule(&format!("a()?; {good} res?;")),
+            Ok(()),
+            "The rule check must accept the loop start after the last fallible step."
+        );
+        let after = "spawn_result(\"duty_orchestrator\"); await_shutdown_and_drain(inputs);";
+        for (case, fixture) in [
+            ("an empty body", String::new()),
+            ("a body with no loop start", format!("{pre} {after}")),
+            (
+                "a second loop start",
+                format!("{pre} spawn_liveness_loop(a); spawn_liveness_loop(b); {after}"),
+            ),
+            (
+                "a loop start before spawn_background_tasks",
+                "take_epoch_boundary_runner(); ShutdownSignal::install(); spawn_liveness_loop(t); \
+                 spawn_background_tasks(); spawn_result(\"duty_orchestrator\"); \
+                 await_shutdown_and_drain(inputs);"
+                    .to_string(),
+            ),
+            (
+                "a loop start before the handler install",
+                "spawn_background_tasks(); take_epoch_boundary_runner(); spawn_liveness_loop(t); \
+                 ShutdownSignal::install(); spawn_result(\"duty_orchestrator\"); \
+                 await_shutdown_and_drain(inputs);"
+                    .to_string(),
+            ),
+            (
+                "a body with no handler install",
+                format!(
+                    "spawn_background_tasks(); take_epoch_boundary_runner(); \
+                     spawn_liveness_loop(t); {after}"
+                ),
+            ),
+            (
+                "a loop start before the runner take",
+                "spawn_background_tasks(); ShutdownSignal::install(); spawn_liveness_loop(t); \
+                 take_epoch_boundary_runner(); spawn_result(\"duty_orchestrator\"); \
+                 await_shutdown_and_drain(inputs);"
+                    .to_string(),
+            ),
+            (
+                "a loop start after the duty_orchestrator spawn",
+                format!(
+                    "{pre} spawn_result(\"duty_orchestrator\"); spawn_liveness_loop(t); \
+                     await_shutdown_and_drain(inputs);"
+                ),
+            ),
+            (
+                "a body with no drain",
+                format!("{pre} spawn_liveness_loop(t); spawn_result(\"duty_orchestrator\");"),
+            ),
+            (
+                "a drain before the duty_orchestrator spawn",
+                format!(
+                    "{pre} spawn_liveness_loop(t); await_shutdown_and_drain(inputs); \
+                     spawn_result(\"duty_orchestrator\");"
+                ),
+            ),
+            ("a `?` after the loop start", format!("{pre} spawn_liveness_loop(t); b()?; {after}")),
+            (
+                "a `return Err` after the loop start",
+                format!("{pre} spawn_liveness_loop(t); if x {{ return Err(e); }} {after}"),
+            ),
+            (
+                "a `?` between the duty_orchestrator spawn and the drain",
+                format!(
+                    "{pre} spawn_liveness_loop(t); spawn_result(\"duty_orchestrator\"); b()?; \
+                     await_shutdown_and_drain(inputs);"
+                ),
+            ),
+        ] {
+            assert!(liveness_start_rule(&fixture).is_err(), "The rule check must reject {case}.");
+        }
+
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("The production code must come first.");
+        let body = boot_body(prod).expect("The brace scan must find the body of run_with_clock.");
+        assert!(
+            body.contains("wire_signing_enablement(") && body.contains("build_services("),
+            "The brace scan must find the boot body. The body is: {body}"
+        );
+        assert_eq!(
+            liveness_start_rule(&body),
+            Ok(()),
+            "run_with_clock must start the liveness loop after its last fallible step."
+        );
+    }
+
     /// W4-E4d: `run` is one call to the shared body with the identity clock
     /// picker. The build compiles the test entry point only for tests and
     /// `test-utils`, so the test path cannot drift from production.
