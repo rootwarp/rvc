@@ -674,6 +674,48 @@ mod tests {
         assert!(!logs_contain("does not support sign type"));
     }
 
+    /// W4-D2c fix1: with doppelganger detection off, one 404 from the key
+    /// that the signer has not loaded is sufficient for the loaded-key POST.
+    /// In each case, only `not_found` gets a 404 for that key. The other
+    /// types get a 400. The loaded key then confirms `not_found`.
+    #[tokio::test]
+    async fn test_capability_probe_uses_the_loaded_key_after_one_not_found_type() {
+        let _lock = probe_metric_lock().await;
+        for not_found in
+            [signer_sign_type::PAYLOAD_ATTESTATION, signer_sign_type::PROPOSER_PREFERENCES]
+        {
+            let pk = loaded_pubkey_hex();
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/api/v1/eth2/sign/{pk}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/api/v1/eth2/sign/.*"))
+                .and(body_string_contains(not_found))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/api/v1/eth2/sign/.*"))
+                .respond_with(ResponseTemplate::new(400))
+                .mount(&server)
+                .await;
+            mock_public_keys(&server, &[pk]).await;
+
+            let (mut config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+            config.doppelganger_detection = false;
+            let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
+            load_signing_keys(&config, &denylist).await.expect("Startup must succeed.");
+            assert_eq!(
+                capability(not_found),
+                1,
+                "The loaded key must confirm {not_found} when only {not_found} gets a 404."
+            );
+        }
+    }
+
     /// W4-D2c fix1: with doppelganger detection on, the key-load probe must
     /// not send a sign request for a key that the signer has loaded. The
     /// forward-window gate does not exist yet, and the probe does not use it.
