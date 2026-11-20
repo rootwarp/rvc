@@ -678,6 +678,8 @@ impl MarkerDir {
         let flags = [libc::O_TMPFILE, libc::O_WRONLY];
         let opened = open_at(Some(&self.file), OsStr::new("."), &flags);
         #[cfg(test)]
+        let opened = opened.map(UnnamedProbeFile);
+        #[cfg(test)]
         let opened =
             take_unnamed_probe_error().map_or(opened, |n| Err(io::Error::from_raw_os_error(n)));
         let mut file = match opened {
@@ -2054,6 +2056,43 @@ fn take_unnamed_probe_error() -> Option<i32> {
 pub(crate) fn arm_unnamed_probe_write_error(errno: i32) -> UnnamedProbeWriteErrorGuard {
     UNNAMED_PROBE_WRITE_ERROR.with(|slot| slot.set(Some(errno)));
     UnnamedProbeWriteErrorGuard
+}
+
+/// Take the error of [`arm_unnamed_probe_write_error`].
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+fn take_unnamed_probe_write_error() -> Option<i32> {
+    UNNAMED_PROBE_WRITE_ERROR.with(Cell::take)
+}
+
+/// The probe file with no name in the test build. A write gives the error of
+/// [`arm_unnamed_probe_write_error`] in place of its result. Each other use
+/// goes to the file through `Deref`, so the code of the probe does not change.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+struct UnnamedProbeFile(File);
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+impl Write for UnnamedProbeFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.0.write(buf);
+        take_unnamed_probe_write_error().map_or(written, |n| Err(io::Error::from_raw_os_error(n)))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for UnnamedProbeFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
 }
 
 /// Run `hook` one time on this thread, at the step `step` of
