@@ -1673,16 +1673,18 @@ mod tests {
         );
     }
 
-    /// W4-D2c fix1: the production loop sees a live key. Before its next
-    /// liveness request, the loop must:
+    /// W4-D2c fix1: the production loop sees a live key. In the tick of its
+    /// first liveness request, the loop must:
     ///
     /// 1. Latch the detection.
     /// 2. Write the detection marker in the keystore directory.
     /// 3. Request exit 12 through the executor.
     ///
-    /// The paused clock moves the loop to its next request at once if no
-    /// exit request comes.
-    #[tokio::test(start_paused = true)]
+    /// The runtime has one thread. The tick does not wait between the
+    /// liveness answer and the exit request. Thus the tick is complete when
+    /// the test continues after the first request. A latched key is not
+    /// pending, so the loop sends no second request.
+    #[tokio::test]
     async fn spawned_production_loop_writes_the_marker_and_requests_the_exit() {
         let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
         let m = machine();
@@ -1690,12 +1692,12 @@ mod tests {
         let (executor, mut shutdown_rx) = TaskExecutor::new(CancellationToken::new());
         spawn_production_loop(&m, beacon, dir.path(), &executor);
 
-        let reason = tokio::select! {
+        tokio::select! {
             biased;
-            reason = shutdown_rx.recv() => reason,
-            _ = requests.wait_for(|count| *count > 1) => None,
-            () = executor.wait_until_work_finished("liveness_loop") => None,
-        };
+            _ = requests.wait_for(|count| *count > 0) => {}
+            () = executor.wait_until_work_finished("liveness_loop") => {}
+        }
+        let reason = shutdown_rx.try_recv();
         assert!(m.detected_latch(), "The liveness loop must latch the detection of a live key.");
         assert!(
             matches!(
@@ -1705,12 +1707,10 @@ mod tests {
             "The liveness loop must write the detection marker in the keystore directory."
         );
         assert!(
-            matches!(
-                reason,
-                Some(crate::bootstrap::executor::ShutdownReason::DoppelgangerDetected)
-            ) && executor.doppelganger_exit_requested(),
-            "The liveness loop must request exit 12 through the executor before its next \
-             liveness request. The shutdown reason is {reason:?}."
+            matches!(reason, Ok(crate::bootstrap::executor::ShutdownReason::DoppelgangerDetected))
+                && executor.doppelganger_exit_requested(),
+            "The liveness loop must request exit 12 through the executor in the same tick. The \
+             shutdown reason is {reason:?}."
         );
         let outcome = executor.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
         assert!(
