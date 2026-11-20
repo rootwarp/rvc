@@ -223,7 +223,8 @@ pub static RVC_DOPPELGANGER_DETECTION_LATCH: LazyLock<IntGauge> = LazyLock::new(
 /// Failed attempts to persist `.rvc.doppelganger_detected`. A rising value
 /// means a marker write is still failing. Do not stop the process then:
 /// `SIGKILL` before the first durable record loses the latch. Exit 12 still
-/// follows when the in-place record or a marker is already durable.
+/// follows after a write of the in-place record or a marker and its fsync
+/// returned `Ok` in this process.
 pub static RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> =
     LazyLock::new(|| {
         define_int_counter(

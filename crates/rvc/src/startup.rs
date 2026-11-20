@@ -27,8 +27,9 @@ use crate::config::ConfigError;
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
 /// Doppelganger detected. The liveness loop requests this through the executor
-/// drain after `.rvc.doppelganger_detected` is durable. The next start reads
-/// that file and exits 12 again.
+/// drain after a write of the detection record or a marker and its fsync
+/// returned `Ok` in this process. The next start reads that record or marker
+/// and exits 12 again.
 pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;

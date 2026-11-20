@@ -4278,9 +4278,12 @@ mod tests {
     }
 
     /// The first marker write fails, the drain waits, and the retry exits 12.
+    /// W4-D3a (747-9): the failure counter grows by at least 1 across the
+    /// drain.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn shutdown_retries_a_failed_marker_write_then_exits_12() {
         let _guard = crate::detection_marker::arm_marker_write_failures(1);
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
         let keys = tempfile::tempdir().expect("keys");
         let m = latched_machine();
         let clock = test_clock();
@@ -4323,6 +4326,134 @@ mod tests {
             crate::detection_marker::inspect(keys.path()),
             crate::detection_marker::MarkerInspect::Present(_)
         ));
+        let after = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        assert!(
+            after.saturating_sub(before) >= 1,
+            "The failed marker write of the drain must increment \
+             rvc_doppelganger_marker_write_failures_total. The value before the drain is \
+             {before}, and the value after the drain is {after}."
+        );
+    }
+
+    /// W4-D3a (747-5): each fsync fails while the running loop sets the latch.
+    /// The page cache then shows a detected record. The test requires these
+    /// results:
+    ///
+    /// - The loop must not request exit 12.
+    /// - At 5 s, the drain must still run, and the durable flag must stay clear.
+    /// - After the fsync failures stop, the drain must return exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_fsync_failure_then_shutdown_keeps_retrying() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        crate::detection_marker::preallocate_detection_record(keys.path())
+            .expect("The test must preallocate the record.");
+        let guard = crate::detection_marker::arm_fsync_failures(u32::MAX);
+        let (m, task, executor, shutdown_rx, token, clock) = spawn_live_loop(keys.path());
+        for _ in 0..64 {
+            if m.detected_latch() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(m.detected_latch(), "The loop must set the latch while each fsync fails.");
+        assert!(
+            !executor.doppelganger_exit_requested(),
+            "The loop must not request exit 12 while each fsync fails."
+        );
+        let machine = Arc::clone(&m);
+        let keystore = keys.path().to_path_buf();
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(
+                    executor,
+                    shutdown_rx,
+                    token,
+                    Some(detection_shutdown(m, keystore, None, clock)),
+                ),
+                std::future::ready(()),
+            )
+            .await
+        });
+        advance_in_steps(5).await;
+
+        assert!(!drain.is_finished(), "The drain must not finish while each fsync fails.");
+        assert!(
+            matches!(
+                crate::detection_marker::inspect_record(keys.path()),
+                crate::detection_marker::RecordInspect::Detected { .. }
+            ),
+            "The page cache must show a detected record after the failed fsync."
+        );
+        assert!(
+            !machine.detection_persisted(),
+            "A detected record that the test reads back must not set the durable flag."
+        );
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after a write and its fsync return Ok. The result is \
+             {res:?}."
+        );
+        task.abort();
+    }
+
+    /// W4-D3a (747-8): the keystore directory and the fallback directory do
+    /// not exist, so each write of the drain fails. The test requires these
+    /// results:
+    ///
+    /// - At 10 s, the drain must still run.
+    /// - After the test creates the fallback directory, the drain must return
+    ///   exit 12, and the owned fallback marker must be present.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_waits_while_both_writes_fail_then_exits_12_once_the_fallback_exists() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let db_dir = root.path().join("db");
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection = detection_shutdown(
+            latched_machine(),
+            root.path().join("keys"),
+            Some(fallback_in(&db_dir)),
+            test_clock(),
+        );
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        advance_in_steps(10).await;
+
+        assert!(!drain.is_finished(), "The drain must not finish while both writes fail.");
+        std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the fallback write succeeds. The result is \
+             {res:?}."
+        );
+        assert!(
+            matches!(
+                crate::detection_marker::inspect_fallback(&fallback_in(&db_dir)).owned,
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The owned fallback marker must be present after the drain."
+        );
+    }
+
+    /// Move paused time forward by 1 s, `secs` times. Yield after each step,
+    /// so that the drain and the loop can run.
+    async fn advance_in_steps(secs: u64) {
+        for _ in 0..secs {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     /// A signal with the latch clear returns Ok and leaves the record clear.
@@ -4446,16 +4577,20 @@ mod tests {
         }
     }
 
-    async fn latched_loop_with_failing_marker(
-        missing: &std::path::Path,
-    ) -> (
+    /// The machine, the loop task, the executor, its shutdown receiver, the
+    /// process token and the clock of [`spawn_live_loop`].
+    type LiveLoop = (
         Arc<ForwardWindowMachine>,
         tokio::task::JoinHandle<()>,
         TaskExecutor,
         tokio::sync::mpsc::Receiver<crate::bootstrap::executor::ShutdownReason>,
         CancellationToken,
         Arc<MonotonicEpochClock>,
-    ) {
+    );
+
+    /// Spawn a liveness loop that gets a live answer for its key. The loop
+    /// writes the record and the marker in `marker_dir`.
+    fn spawn_live_loop(marker_dir: &std::path::Path) -> LiveLoop {
         let m = machine();
         let pk = new_pk();
         m.register(&pk, 0);
@@ -4474,9 +4609,14 @@ mod tests {
             token.clone(),
         )
         .with_slot_duration(Duration::from_secs(12))
-        .with_detection_marker_dir(missing.to_path_buf())
+        .with_detection_marker_dir(marker_dir.to_path_buf())
         .with_exit_request(Arc::new(executor.shutdown_handle()) as Arc<dyn ExitRequest>);
         let task = tokio::spawn(loop_.run());
+        (m, task, executor, shutdown_rx, token, clock)
+    }
+
+    async fn latched_loop_with_failing_marker(missing: &std::path::Path) -> LiveLoop {
+        let (m, task, executor, shutdown_rx, token, clock) = spawn_live_loop(missing);
         let started = std::time::Instant::now();
         loop {
             if m.detected_latch() && !executor.doppelganger_exit_requested() {

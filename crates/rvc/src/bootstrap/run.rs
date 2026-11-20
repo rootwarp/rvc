@@ -3740,12 +3740,85 @@ mod tests {
         );
     }
 
-    /// ARCH-2h: the production body joins tasks. The marker retry sleep is
-    /// covered by the behavioural drain test, not by counting `sleep` calls.
+    /// Return the name of the innermost `fn` whose body holds the byte index
+    /// `at` in `code`. The brace scan skips string literals. Return `None`
+    /// if no `fn` body holds `at`.
+    fn enclosing_fn(code: &str, at: usize) -> Option<&str> {
+        code[..at].rmatch_indices("fn ").find_map(|(start, _)| {
+            let open = start + code[start..].find('{')?;
+            let close = closing_bracket(code, open, ('{', '}'))?;
+            let name = code[start + "fn ".len()..]
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()?;
+            (open < at && at < close).then_some(name)
+        })
+    }
+
+    /// ARCH-2h: the production body joins tasks. It does not sleep in place
+    /// of a join. The scan removes the `//` comments first. The test requires
+    /// these results:
+    ///
+    /// - The production body has one `sleep(` call. That call is the retry
+    ///   wait in `persist_latched_detection`.
+    /// - In `await_shutdown_and_drain_with_signal`, `executor.shutdown(`
+    ///   comes before `persist_latched_detection(`.
+    /// - The production body calls `spawn_proposer_sync_monitor(` with
+    ///   `proposer_bn_manager`. A `use` line without the call fails this
+    ///   check.
+    ///
+    /// The fixtures make sure that the brace scan finds the innermost `fn`.
     #[test]
     fn test_run_rs_has_no_sleep_as_join_substitute() {
+        let at_sleep = |fixture: &'static str| {
+            enclosing_fn(fixture, fixture.find("sleep(").expect("The fixture must call sleep."))
+        };
+        assert_eq!(
+            at_sleep(
+                "fn a() { b(); }\nasync fn retry(x: &X) -> bool {\n loop {\n if f(\"}\") { fn \
+                 inner() {} }\n sleep(T).await;\n }\n}\nfn c() {}"
+            ),
+            Some("retry"),
+            "The brace scan must skip a string and a nested fn, and find the fn of the call."
+        );
+        for (case, fixture) in [
+            ("a call in no fn", "sleep(T);"),
+            ("a call after the last fn", "fn a() { b(); } sleep(T);"),
+            ("a fn with no closing brace", "fn a() { sleep(T);"),
+        ] {
+            assert_eq!(at_sleep(fixture), None, "The brace scan must reject {case}.");
+        }
+
         let src = include_str!("run.rs");
         let body = src.split("#[cfg(test)]").next().expect("production body before tests");
+        let code = without_line_comments(body);
+        let sleeps: Vec<usize> = code.match_indices("sleep(").map(|(at, _)| at).collect();
+        assert_eq!(
+            sleeps.len(),
+            1,
+            "The production body of run.rs must have one `sleep(` call. The scan found {} \
+             calls.",
+            sleeps.len()
+        );
+        assert_eq!(
+            enclosing_fn(&code, sleeps[0]),
+            Some("persist_latched_detection"),
+            "The one `sleep(` call must be the retry wait in persist_latched_detection."
+        );
+        let drain_at = code
+            .find("fn await_shutdown_and_drain_with_signal(")
+            .expect("The production body must define await_shutdown_and_drain_with_signal.");
+        let open = drain_at + code[drain_at..].find('{').expect("The drain must have a body.");
+        let close = closing_bracket(&code, open, ('{', '}'))
+            .expect("The drain body must have a closing brace.");
+        let drain = &code[open..close];
+        assert!(
+            matches!(
+                (drain.find("executor.shutdown("), drain.find("persist_latched_detection(")),
+                (Some(shutdown), Some(persist)) if shutdown < persist
+            ),
+            "In await_shutdown_and_drain_with_signal, executor.shutdown( must come before \
+             persist_latched_detection(. The body is: {drain}"
+        );
         assert!(
             body.contains("executor.shutdown"),
             "production shutdown must drain via TaskExecutor::shutdown"
@@ -3776,8 +3849,9 @@ mod tests {
             "DSR-2.1 must name the registered sync-monitor task bn.sync_monitor"
         );
         assert!(
-            body.contains("spawn_proposer_sync_monitor"),
-            "FU-A6 must start the proposer sync monitor from production run()"
+            body.contains("spawn_proposer_sync_monitor(proposer_bn_manager"),
+            "FU-A6: the production body must call spawn_proposer_sync_monitor( with \
+             proposer_bn_manager. The `use` line alone is not a call."
         );
     }
 
