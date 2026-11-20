@@ -563,9 +563,9 @@ pub(crate) struct DetectionShutdown {
 ///
 /// `signal` is the operator-signal arm. [`run`] installs it before the
 /// liveness loop starts, so its handlers already catch SIGINT and SIGTERM.
-pub(crate) async fn await_shutdown_and_drain(
+pub(crate) async fn await_shutdown_and_drain<S: SignalStream>(
     inputs: ShutdownInputs,
-    mut signal: ShutdownSignal,
+    mut signal: ShutdownSignal<S>,
 ) -> (ShutdownOutcome, Result<(), BootstrapError>) {
     await_shutdown_and_drain_with_signal(inputs, async move {
         let name = signal.recv().await;
@@ -1008,13 +1008,32 @@ fn ensure_fallback_dir_writable(dir: &std::path::Path) -> Result<(), BootstrapEr
 /// by the default action. [`run`] installs the handlers just before the
 /// liveness loop starts. Earlier boot steps keep the default action, so
 /// Ctrl+C still stops a boot that has latched nothing.
-pub(crate) struct ShutdownSignal {
+///
+/// `S` is the signal stream. Production uses [`OsSignal`]. A test stream
+/// lets a test drive each arm of [`Self::recv`] without a signal.
+pub(crate) struct ShutdownSignal<S = OsSignal> {
+    interrupt: S,
     #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-    #[cfg(not(unix))]
-    interrupt: tokio::signal::windows::CtrlC,
+    terminate: S,
+}
+
+/// One kind of operator signal that [`ShutdownSignal::recv`] waits for.
+pub(crate) trait SignalStream {
+    /// Wait for the next delivery of the signal.
+    fn recv(&mut self) -> impl Future<Output = Option<()>> + Send;
+}
+
+/// The signal stream of the platform.
+#[cfg(unix)]
+pub(crate) type OsSignal = tokio::signal::unix::Signal;
+/// The signal stream of the platform.
+#[cfg(not(unix))]
+pub(crate) type OsSignal = tokio::signal::windows::CtrlC;
+
+impl SignalStream for OsSignal {
+    fn recv(&mut self) -> impl Future<Output = Option<()>> + Send {
+        OsSignal::recv(self)
+    }
 }
 
 impl ShutdownSignal {
@@ -1043,7 +1062,9 @@ impl ShutdownSignal {
         let installed = Self { interrupt: tokio::signal::windows::ctrl_c().map_err(failed)? };
         Ok(installed)
     }
+}
 
+impl<S: SignalStream> ShutdownSignal<S> {
     /// Wait for the next SIGINT or SIGTERM and return its name.
     pub(crate) async fn recv(&mut self) -> &'static str {
         #[cfg(unix)]
@@ -1352,6 +1373,106 @@ mod tests {
                 "{name} must have a handler when install returns. SigCgt is {caught:#018x}."
             );
         }
+    }
+
+    /// A signal stream for a test. The stream gives a delivery at once, or
+    /// it never gives a delivery.
+    #[cfg(unix)]
+    struct TestSignal {
+        delivered: bool,
+    }
+
+    #[cfg(unix)]
+    impl SignalStream for TestSignal {
+        fn recv(&mut self) -> impl Future<Output = Option<()>> + Send {
+            let delivered = self.delivered;
+            async move {
+                if delivered {
+                    Some(())
+                } else {
+                    std::future::pending().await
+                }
+            }
+        }
+    }
+
+    /// Poll `future` one time with a waker that does nothing.
+    #[cfg(unix)]
+    fn poll_once<F: Future>(future: F) -> std::task::Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    /// W4-D2c fix1: give a delivery only to the `delivered` stream of a
+    /// `ShutdownSignal` with test streams. Then do these steps:
+    ///
+    /// 1. Poll `recv` one time. It must return the name of `delivered`.
+    /// 2. Give a new signal of the same kind to `await_shutdown_and_drain`.
+    ///    The drain must start and join `drain_probe`.
+    ///
+    /// A spawned task cancels the token after the first poll of the drain. If
+    /// the signal arm does not start the drain, the token arm starts it, and
+    /// the log assertions of the caller fail. Thus the test cannot hang.
+    #[cfg(unix)]
+    async fn drain_with_one_signal(delivered: &'static str) {
+        let signal = || ShutdownSignal {
+            interrupt: TestSignal { delivered: delivered == "SIGINT" },
+            terminate: TestSignal { delivered: delivered == "SIGTERM" },
+        };
+        assert_eq!(
+            poll_once(signal().recv()),
+            std::task::Poll::Ready(delivered),
+            "ShutdownSignal::recv must return {delivered} at the first poll when only \
+             {delivered} has a delivery."
+        );
+
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let probe_token = token.clone();
+        executor.spawn("drain_probe", ShutdownTier::Background, async move {
+            probe_token.cancelled().await;
+        });
+        let fallback = token.clone();
+        tokio::spawn(async move { fallback.cancel() });
+        let (outcome, res) =
+            await_shutdown_and_drain(probe_inputs(executor, shutdown_rx, token), signal()).await;
+        assert!(res.is_ok(), "The drain after {delivered} must return Ok. The result is {res:?}.");
+        assert!(
+            outcome.joined.contains(&"drain_probe"),
+            "The drain must join drain_probe. The drain joined {:?} and aborted {:?}.",
+            outcome.joined,
+            outcome.aborted
+        );
+    }
+
+    /// W4-D2c fix1: SIGINT alone must start the drain. See
+    /// [`drain_with_one_signal`].
+    #[cfg(unix)]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn sigint_alone_starts_the_drain() {
+        drain_with_one_signal("SIGINT").await;
+        assert!(logs_contain("Received SIGINT"), "The SIGINT arm must start the drain.");
+        assert!(!logs_contain("Received SIGTERM"), "The SIGTERM arm must not start the drain.");
+        assert!(
+            !logs_contain("Process cancellation token cancelled"),
+            "The token arm must not start the drain when SIGINT has a delivery."
+        );
+    }
+
+    /// W4-D2c fix1: SIGTERM alone must start the drain. See
+    /// [`drain_with_one_signal`].
+    #[cfg(unix)]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn sigterm_alone_starts_the_drain() {
+        drain_with_one_signal("SIGTERM").await;
+        assert!(logs_contain("Received SIGTERM"), "The SIGTERM arm must start the drain.");
+        assert!(!logs_contain("Received SIGINT"), "The SIGINT arm must not start the drain.");
+        assert!(
+            !logs_contain("Process cancellation token cancelled"),
+            "The token arm must not start the drain when SIGTERM has a delivery."
+        );
     }
 
     /// Shutdown while the runner's prepare POST is held: the drain joins
