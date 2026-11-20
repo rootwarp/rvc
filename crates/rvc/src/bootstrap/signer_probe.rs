@@ -6,7 +6,10 @@
 //!
 //! In-tree `rvc-signer` resolves `{identifier}` before decoding `type`, so a
 //! dummy-key 404 is not evidence the type is supported. On 404 the probe lists
-//! `/api/v1/eth2/publicKeys` and re-POSTs with a loaded key.
+//! `/api/v1/eth2/publicKeys` and re-POSTs with a loaded key, but only when
+//! doppelganger detection is off. With detection on, the probe runs before
+//! the forward-window gate exists, so it does not sign with a loaded key and
+//! reports the type as unknown.
 
 use std::time::Duration;
 
@@ -25,6 +28,10 @@ use crate::config::{redact_url, Config};
 use crate::metrics::{signer_sign_type, RVC_SIGNER_CAPABILITY};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe error when the probe does not sign with the loaded key it found.
+const LOADED_KEY_NOT_USED: &str =
+    "doppelganger detection is on, so the probe does not sign with a loaded key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
@@ -80,15 +87,19 @@ pub(super) async fn probe_configured_remote_signer(config: &Config) {
         config.fork_schedule.gloas_fork_epoch,
         genesis_fork_version,
         PROBE_TIMEOUT,
+        !config.doppelganger_detection,
     )
     .await;
 }
 
+/// Probe the signer at `url`. The probe signs with a key that the signer has
+/// loaded only when `sign_with_loaded_key` is `true`.
 async fn probe_signer_url(
     url: &str,
     gloas_fork_epoch: Option<u64>,
     genesis_fork_version: [u8; 4],
     timeout: Duration,
+    sign_with_loaded_key: bool,
 ) {
     let gloas_scheduled = gloas_epoch_is_scheduled(gloas_fork_epoch);
     let client = match reqwest::Client::builder().timeout(timeout).build() {
@@ -208,8 +219,14 @@ async fn probe_signer_url(
 
     let need_keys =
         raw_is_not_found(&ptc_raw) || raw_is_not_found(&prefs_raw) || raw_is_not_found(&auth_raw);
-    let loaded_key =
-        if need_keys { Some(fetch_first_public_key(&client, base).await) } else { None };
+    let loaded_key = if need_keys {
+        Some(match fetch_first_public_key(&client, base).await {
+            Ok(Some(_)) if !sign_with_loaded_key => Err(LOADED_KEY_NOT_USED.to_string()),
+            found => found,
+        })
+    } else {
+        None
+    };
 
     if let (Some(raw), Some(body)) = (ptc_raw, ptc_body.as_ref()) {
         let result = resolve_probe(&client, base, raw, body, loaded_key.as_ref()).await;
@@ -588,7 +605,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
             .mount(&server)
             .await;
-        probe_signer_url(&server.uri(), Some(600_000), [0; 4], Duration::from_millis(50)).await;
+        probe_signer_url(&server.uri(), Some(600_000), [0; 4], Duration::from_millis(50), false)
+            .await;
         assert_eq!(
             capability(signer_sign_type::PAYLOAD_ATTESTATION),
             0,

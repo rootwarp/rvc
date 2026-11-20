@@ -328,7 +328,8 @@ async fn run_with_clock<C: SlotClock + 'static>(
     );
 
     // Step 7c: optionally start Keymanager API (Ingress; ARCH-2g P1-6).
-    let _keymanager_started = spawn_keymanager_api(
+    // From the first task spawn on, each boot error stops the tasks first.
+    let keymanager_started = spawn_keymanager_api(
         &config,
         KeymanagerApiDeps {
             composite_signer: composite_signer.clone(),
@@ -352,7 +353,10 @@ async fn run_with_clock<C: SlotClock + 'static>(
         },
         listeners.keymanager,
         &executor,
-    )?;
+    );
+    if let Err(err) = keymanager_started {
+        return Err(stop_boot_tasks(executor, err.into()).await);
+    }
 
     // Step 8: duty orchestrator.
     let circuit_breaker = std::sync::Arc::new(signer::CircuitBreakerState::new(
@@ -415,14 +419,17 @@ async fn run_with_clock<C: SlotClock + 'static>(
     finalize_health_status(&health_status).await;
 
     // P1-2/P1-3/P1-4: metrics + monitoring + proposer-config on executor.
-    spawn_background_tasks(
+    let background_started = spawn_background_tasks(
         &config,
         listeners.metrics,
         health_status,
         &executor,
         pubkey_map.clone(),
         validator_store.clone(),
-    )?;
+    );
+    if let Err(err) = background_started {
+        return Err(stop_boot_tasks(executor, err).await);
+    }
 
     // Log broadcast topics if non-default (T3.4)
     {
@@ -452,14 +459,17 @@ async fn run_with_clock<C: SlotClock + 'static>(
     // Its own task, so the slot loop's post-duty window cannot drop a pass.
     // Shape B: `EpochBoundaryTask::run` roots each pass span.
     let Some(boundary) = orchestrator.take_epoch_boundary_runner() else {
-        return Err(BootstrapError::EpochBoundaryRunnerMissing);
+        return Err(stop_boot_tasks(executor, BootstrapError::EpochBoundaryRunnerMissing).await);
     };
     executor.spawn("epoch.boundary.runner", ShutdownTier::Orchestrator, boundary.run());
 
     // The last fallible boot step. From the loop start on, the only way out
     // of `run` is the drain, so a latch reaches `persist_latched_detection`.
     // SIGINT and SIGTERM have a handler before the loop can latch.
-    let signal = ShutdownSignal::install()?;
+    let signal = match ShutdownSignal::install() {
+        Ok(signal) => signal,
+        Err(err) => return Err(stop_boot_tasks(executor, err).await),
+    };
     if let Some(task) = liveness_task {
         spawn_liveness_loop(task, &executor);
     }
@@ -648,6 +658,21 @@ pub(crate) async fn await_shutdown_and_drain_with_signal(
         }
     };
     (outcome, res)
+}
+
+/// Cancel and join the tasks that boot has spawned, then return `err`.
+///
+/// Each boot error after the first task spawn returns through this function,
+/// so `run` does not return while a spawned task still runs. The liveness
+/// loop has not started at that point, so no detection latch can be set.
+async fn stop_boot_tasks(executor: TaskExecutor, err: BootstrapError) -> BootstrapError {
+    let outcome = executor.shutdown(TierBudget::default()).await;
+    warn!(
+        joined = ?outcome.joined,
+        aborted = ?outcome.aborted,
+        "a boot step failed after the first task spawn; the boot tasks are stopped"
+    );
+    err
 }
 
 /// How long the drain waits between attempts when nothing durable exists yet.
@@ -2766,7 +2791,7 @@ mod tests {
 
         let take = squash(
             "let Some(boundary) = orchestrator.take_epoch_boundary_runner() else {
-                return Err(BootstrapError::EpochBoundaryRunnerMissing);
+                return Err(stop_boot_tasks(executor, BootstrapError::EpochBoundaryRunnerMissing).await);
             };",
         );
         let spawn = format!(
