@@ -662,6 +662,8 @@ impl MarkerDir {
     /// A failed step stops the probe with an error. After an error in step 1
     /// or step 2, the probe removes nothing.
     fn probe(&self) -> io::Result<()> {
+        #[cfg(test)]
+        FALLBACK_PROBES.with(|count| count.set(count.get() + 1));
         let name = OsString::from(format!(
             ".{MARKER_FILENAME}.{}.{}.probe",
             std::process::id(),
@@ -1608,6 +1610,13 @@ thread_local! {
     static PROBE_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
     static PROBE_STEP_HOOK: RefCell<Option<(PathBuf, ProbeStep, RecordPathHook)>> =
         const { RefCell::new(None) };
+    static FALLBACK_PROBES: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+thread_local! {
+    static UNNAMED_PROBE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1923,7 +1932,8 @@ fn note_probe(dir: &Path) -> io::Result<()> {
 }
 
 /// A step of [`probe_fallback_dir_writable`]. The hook of [`arm_probe_step`]
-/// runs immediately before the step.
+/// runs immediately before the step. `Create`, `Open`, `Check` and `Remove`
+/// are steps of the probe in the private subdirectory.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeStep {
@@ -1936,6 +1946,36 @@ pub(crate) enum ProbeStep {
     /// The probe removes its entries. The identity check and the fsync of
     /// the probe file are complete at this step.
     Remove,
+    /// The probe with no name opens its file (`O_TMPFILE`). The file has no
+    /// name, so the hook gets the database directory.
+    #[cfg(target_os = "linux")]
+    Unnamed,
+    /// The probe with no name fsyncs the database directory. The write and
+    /// the fsync of its file are complete at this step. The hook gets the
+    /// database directory.
+    #[cfg(target_os = "linux")]
+    SyncDir,
+}
+
+/// Return the number of probes on this thread that use the private
+/// subdirectory. On Linux, each of these probes is a fallback from the probe
+/// with no name.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) fn fallback_probes() -> u32 {
+    FALLBACK_PROBES.with(Cell::get)
+}
+
+/// Make the next `O_TMPFILE` open of a probe on this thread fail with the
+/// error number `errno`. The open runs, and the probe gets the error in
+/// place of the file.
+///
+/// `UnnamedProbeErrorGuard::drop` removes the error if no probe used it.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) fn arm_unnamed_probe_error(errno: i32) -> UnnamedProbeErrorGuard {
+    UNNAMED_PROBE_ERROR.with(|slot| slot.set(Some(errno)));
+    UnnamedProbeErrorGuard
 }
 
 /// Run `hook` one time on this thread, at the step `step` of
@@ -2069,6 +2109,19 @@ pub(crate) struct ProbeStepHookGuard;
 impl Drop for ProbeStepHookGuard {
     fn drop(&mut self) {
         PROBE_STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// `UnnamedProbeErrorGuard::drop` removes the error if no probe used it.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) struct UnnamedProbeErrorGuard;
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+impl Drop for UnnamedProbeErrorGuard {
+    fn drop(&mut self) {
+        UNNAMED_PROBE_ERROR.with(|slot| slot.set(None));
     }
 }
 

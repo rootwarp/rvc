@@ -2132,7 +2132,9 @@ mod tests {
     /// in a temporary directory that is not the working directory of the
     /// process. Thus a probe that opens the database directory again by its
     /// path does not find it. The keystore path is absolute. The hook fails
-    /// the record step. The test requires these results:
+    /// the record step. On Linux, the test injects `EOPNOTSUPP` into the
+    /// `O_TMPFILE` open, so the probe uses the private subdirectory. The test
+    /// requires these results:
     ///
     /// - Boot passes the probe of the database directory and returns the
     ///   error of the record step.
@@ -2147,6 +2149,8 @@ mod tests {
         let name = slash.path().file_name().expect("The database directory must have a name.");
         let _start = crate::detection_marker::arm_walk_start(root.path());
         let _record = crate::detection_marker::arm_preallocate_failure();
+        #[cfg(target_os = "linux")]
+        let _unnamed = crate::detection_marker::arm_unnamed_probe_error(libc::EOPNOTSUPP);
         let config = Config {
             keystore_path: keys.path().to_path_buf(),
             slashing_db_path: std::path::Path::new(name).join("slashing.sqlite"),
@@ -2187,7 +2191,9 @@ mod tests {
     /// - After the identity check and before the removal, a directory with a
     ///   file gets the name.
     ///
-    /// For each row, the test requires these results:
+    /// On Linux, the test injects `EOPNOTSUPP` into the `O_TMPFILE` open, so
+    /// the probe uses the private subdirectory. For each row, the test
+    /// requires these results:
     ///
     /// - Boot returns exit code 1, and the error names the database
     ///   directory.
@@ -2234,6 +2240,8 @@ mod tests {
             let (_keys, slash, config) = fallback_probe_fixture(true);
             let made = std::rc::Rc::new(std::cell::RefCell::new(None));
             let record = std::rc::Rc::clone(&made);
+            #[cfg(target_os = "linux")]
+            let _unnamed = crate::detection_marker::arm_unnamed_probe_error(libc::EOPNOTSUPP);
             let _hook = arm_probe_step(slash.path(), step, move |entry| {
                 if step != ProbeStep::Create {
                     std::fs::rename(entry, entry.with_extension("moved"))
@@ -2275,8 +2283,9 @@ mod tests {
     }
 
     /// Detection is on. A hook reads the probe entry of the database directory
-    /// after the identity check and before the removal. The test requires these
-    /// results:
+    /// after the identity check and before the removal. On Linux, the test
+    /// injects `EISDIR` into the `O_TMPFILE` open, so the probe uses the
+    /// private subdirectory. The test requires these results:
     ///
     /// - The probe entry is a directory with mode 0700 that holds one file.
     /// - Boot passes the probe and stops when it checks the genesis validators
@@ -2287,6 +2296,8 @@ mod tests {
     async fn boot_probes_with_a_file_in_a_private_directory() {
         use std::os::unix::fs::PermissionsExt;
         let (_keys, slash, config) = fallback_probe_fixture(true);
+        #[cfg(target_os = "linux")]
+        let _unnamed = crate::detection_marker::arm_unnamed_probe_error(libc::EISDIR);
         let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
         let record = std::rc::Rc::clone(&seen);
         let step = crate::detection_marker::ProbeStep::Remove;
@@ -2324,6 +2335,135 @@ mod tests {
         assert!(
             probes.is_empty(),
             "The probe must remove its entry from the database directory: {probes:?}"
+        );
+    }
+
+    /// Detection is on, and the probe of the database directory opens a file
+    /// with no name (`O_TMPFILE`). The database path is relative, and each
+    /// walk starts in a temporary directory that is not the working
+    /// directory. The hook fails the record step after the probe. At one step
+    /// of the probe, a hook adds an empty directory with mode 0700 and a file
+    /// to the database directory. For each step, the test requires these
+    /// results:
+    ///
+    /// - At the step, the database directory holds no entry.
+    /// - Boot passes the probe with no fallback and returns the error of the
+    ///   record step.
+    /// - After boot, the database directory holds only the two entries of the
+    ///   hook, with the device and inode numbers from the hook.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_probes_the_fallback_dir_with_a_file_that_has_no_name() {
+        use crate::detection_marker::{arm_probe_step, fallback_probes, ProbeStep};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        fn ids(paths: &[std::path::PathBuf]) -> Vec<Option<(u64, u64)>> {
+            let id = |path: &std::path::PathBuf| std::fs::symlink_metadata(path).ok();
+            paths.iter().map(|path| id(path).map(|meta| (meta.dev(), meta.ino()))).collect()
+        }
+        let mut failed = Vec::new();
+        for step in [ProbeStep::Unnamed, ProbeStep::SyncDir] {
+            let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+            let root = tempfile::tempdir().expect("The test must create the start directory.");
+            let slash = tempfile::tempdir_in(root.path())
+                .expect("The test must create the database directory.");
+            let name = slash.path().file_name().expect("The database directory must have a name.");
+            let _start = crate::detection_marker::arm_walk_start(root.path());
+            let _record = crate::detection_marker::arm_preallocate_failure();
+            let added = vec![slash.path().join("added-dir"), slash.path().join("added-file")];
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (record, dir, paths) =
+                (std::rc::Rc::clone(&seen), slash.path().to_path_buf(), added.clone());
+            let _hook = arm_probe_step(std::path::Path::new(name), step, move |_| {
+                let names = sorted_names(&dir);
+                let made = std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&paths[0])
+                    .and_then(|()| std::fs::write(&paths[1], b"added"));
+                *record.borrow_mut() = Some((names, made.is_ok(), ids(&paths)));
+            });
+            let config = Config {
+                keystore_path: keys.path().to_path_buf(),
+                slashing_db_path: std::path::Path::new(name).join("slashing.sqlite"),
+                doppelganger_detection: true,
+                ..Default::default()
+            };
+            let fallbacks = fallback_probes();
+
+            let err = boot_error(config).await;
+
+            let fallbacks = fallback_probes() - fallbacks;
+            let after = sorted_names(slash.path());
+            let text = err.to_string();
+            let hook = seen.borrow().clone();
+            let kept = hook.as_ref().is_some_and(|(names, made, made_ids)| {
+                names.is_empty() && *made && *made_ids == ids(&added)
+            });
+            let stopped = err.exit_code() == 1 && text.contains("cannot preallocate");
+            if !kept || after != ["added-dir", "added-file"] || fallbacks != 0 || !stopped {
+                failed.push(format!(
+                    "{step:?}: hook {hook:?}, entries after boot {after:?}, fallback probes \
+                     {fallbacks}, exit code {}, error {text}",
+                    err.exit_code()
+                ));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "At each step, the probe must add no entry to the database directory and must remove \
+             no entry. Boot must pass the probe with no fallback and stop at the record step. \
+             These steps do not: {failed:#?}"
+        );
+    }
+
+    /// Detection is on, and one step of the probe with no name fails. The
+    /// rows are:
+    ///
+    /// - The `O_TMPFILE` open fails with `EACCES`.
+    /// - The `O_TMPFILE` open fails with `EIO`.
+    /// - The fsync of the file with no name fails with `EIO`.
+    /// - The fsync of the database directory fails with `EIO`.
+    ///
+    /// For each row, the test requires these results:
+    ///
+    /// - Boot returns exit code 1, and the error names the database directory.
+    /// - The probe does not use the private subdirectory.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_stops_at_each_error_of_the_unnamed_probe() {
+        use crate::detection_marker::{
+            arm_fsync_failures_after, arm_unnamed_probe_error, fallback_probes,
+        };
+        // The probe of the keystore directory does two fsyncs before this probe.
+        let rows = [
+            ("an EACCES open", Some(libc::EACCES), None),
+            ("an EIO open", Some(libc::EIO), None),
+            ("an EIO fsync of the file", None, Some(2)),
+            ("an EIO fsync of the directory", None, Some(3)),
+        ];
+        let mut failed = Vec::new();
+        for (row, errno, skip) in rows {
+            let (_keys, slash, config) = fallback_probe_fixture(true);
+            let _open = errno.map(arm_unnamed_probe_error);
+            let _sync = skip.map(|skip| arm_fsync_failures_after(skip, 1));
+            let fallbacks = fallback_probes();
+
+            let err = boot_error(config).await;
+
+            let fallbacks = fallback_probes() - fallbacks;
+            let text = err.to_string();
+            let dir = format!("slashing database directory {}", slash.path().display());
+            if err.exit_code() != 1 || !text.contains(&dir) || fallbacks != 0 {
+                failed.push(format!(
+                    "{row}: exit code {}, fallback probes {fallbacks}, error {text}",
+                    err.exit_code()
+                ));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "For each error of the probe with no name, boot must return exit code 1 with an error \
+             that names the database directory. The probe must not use the private \
+             subdirectory. These boots do not: {failed:#?}"
         );
     }
 
