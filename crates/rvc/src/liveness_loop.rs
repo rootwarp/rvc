@@ -4405,8 +4405,7 @@ mod tests {
     /// stop the drain in that hour. The test requires these results:
     ///
     /// - After one hour, the drain must still run.
-    /// - In that hour, the failure counter must increase by at least 1 for
-    ///   each 30 s. The maximum back-off delay is 30 s.
+    /// - The failure counter must increase by at least 120 during the hour.
     /// - After the test creates the fallback directory, the drain must return
     ///   exit 12, and the owned fallback marker must be present.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4438,8 +4437,8 @@ mod tests {
             .saturating_sub(before);
         assert!(
             failures >= FAILING_SECS / 30,
-            "The drain must try the writes again at least once in each 30 s while both writes \
-             fail. In {FAILING_SECS} s, the failure counter increased by {failures}."
+            "The failure counter must increase by at least 120 during the hour. In \
+             {FAILING_SECS} s, the failure counter increased by {failures}."
         );
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         tokio::time::advance(Duration::from_secs(30)).await;
