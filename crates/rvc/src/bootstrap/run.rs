@@ -3771,12 +3771,13 @@ mod tests {
     /// - In `await_shutdown_and_drain_with_signal`, `executor.shutdown(`
     ///   comes before `persist_latched_detection(`.
     /// - `run_with_clock` calls `spawn_proposer_sync_monitor(` with
-    ///   `proposer_bn_manager`. A `use` line or a call in a comment fails
-    ///   this check.
+    ///   `proposer_bn_manager`. A `use` line, a call in a comment or a call
+    ///   in a literal fails this check.
     ///
     /// The fixtures make sure that the brace scan finds the innermost `fn`.
-    /// They also make sure that the call check rejects a call in a comment
-    /// and a call outside `run_with_clock`.
+    /// They also make sure that the call check accepts a call after a raw
+    /// string or a character literal. The call check must reject a call in a
+    /// comment, a call in a literal and a call outside `run_with_clock`.
     #[test]
     fn test_run_rs_has_no_sleep_as_join_substitute() {
         let at_sleep = |fixture: &'static str| {
@@ -3798,21 +3799,28 @@ mod tests {
             assert_eq!(at_sleep(fixture), None, "The brace scan must reject {case}.");
         }
         let call = "spawn_proposer_sync_monitor(proposer_bn_manager, &executor, Some(s));";
-        assert!(
-            boot_calls_proposer_sync_monitor(&format!(
-                "async fn run_with_clock<C>() {{\n a();\n {call}\n}}"
-            )),
-            "The call check must accept a call in run_with_clock."
-        );
+        let boot = |line: String| format!("async fn run_with_clock<C>() {{\n a();\n {line}\n}}");
+        for (case, line) in [
+            ("a call in run_with_clock", call.to_string()),
+            ("a call after a raw string with `//`", format!(r##"let p = r#"a"//"#; {call}"##)),
+            ("a call after a character literal with a quote", format!("let q = '\"'; {call}")),
+        ] {
+            assert!(
+                boot_calls_proposer_sync_monitor(&boot(line)),
+                "The call check must accept {case}."
+            );
+        }
         for (case, fixture) in [
-            (
-                "a call only in a comment",
-                format!("async fn run_with_clock<C>() {{\n a();\n // {call}\n}}"),
-            ),
+            ("a call only in a comment", boot(format!("// {call}"))),
             (
                 "a call outside run_with_clock",
                 format!("fn other() {{ {call} }}\nasync fn run_with_clock<C>() {{ a(); }}"),
             ),
+            ("a call only in a string", boot(format!("let s = \"{call}\";"))),
+            ("a call only in a block comment", boot(format!("/* {call} */"))),
+            ("a call only in a nested block comment", boot(format!("/* /* */ {call} */"))),
+            ("a call only in a raw string with quotes", boot(format!(r##"r#"" {call} ""#;"##))),
+            ("a call only in a string with an escaped quote", boot(format!("\"\\\" {call}\";"))),
         ] {
             assert!(
                 !boot_calls_proposer_sync_monitor(&fixture),
