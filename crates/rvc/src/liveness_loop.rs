@@ -4400,14 +4400,13 @@ mod tests {
     }
 
     /// W4-D3a (747-8): the keystore directory and the fallback directory do
-    /// not exist, so each write of the drain fails. The test keeps both
-    /// writes failing for one hour of paused time. This time is longer than
-    /// a plausible limit on the failed rounds. The test requires these
-    /// results:
+    /// not exist, so each write of the drain fails. Both writes fail for one
+    /// hour of paused time. A limit on the number of failed rounds must not
+    /// stop the drain in that hour. The test requires these results:
     ///
     /// - After one hour, the drain must still run.
-    /// - In that hour, the failure counter must grow by at least 1 for each
-    ///   30 s. The maximum back-off delay is 30 s.
+    /// - In that hour, the failure counter must increase by at least 1 for
+    ///   each 30 s. The maximum back-off delay is 30 s.
     /// - After the test creates the fallback directory, the drain must return
     ///   exit 12, and the owned fallback marker must be present.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4440,7 +4439,7 @@ mod tests {
         assert!(
             failures >= FAILING_SECS / 30,
             "The drain must try the writes again at least once in each 30 s while both writes \
-             fail. In {FAILING_SECS} s, the failure counter grew by {failures}."
+             fail. In {FAILING_SECS} s, the failure counter increased by {failures}."
         );
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         tokio::time::advance(Duration::from_secs(30)).await;
