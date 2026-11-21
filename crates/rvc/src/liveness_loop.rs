@@ -396,12 +396,14 @@ impl LivenessObservationLoop {
     /// the keystore directory, and the owned fallback marker when one is set.
     ///
     /// [`crate::detection_marker::log_persist_report`] logs and counts each
-    /// failed path. The machine gets the durable flag only from a durable
+    /// failed path. A loop with no keystore directory logs one error and
+    /// counts one failure. The machine gets the durable flag only from a durable
     /// report: a write and its fsync returned `Ok` on at least one path.
     /// Otherwise the loop stays up and latched, and the next tick writes
     /// again. Exit 12 waits for the flag. A later read is not durability.
     fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
         let Some(keystore_dir) = &self.detection_marker_dir else {
+            crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
             error!(
                 "doppelganger detected but no data directory is configured for the marker; \
                  staying up and refusing signatures until a marker can be written"
