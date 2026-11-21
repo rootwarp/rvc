@@ -3308,10 +3308,12 @@ mod tests {
     #[test]
     fn liveness_loop_starts_after_the_last_fallible_boot_step() {
         assert_eq!(
-            boot_body("async fn run_with_clock<C>() -> R {\n a { b } \"}\" // }\n}\nfn next() {}")
-                .as_deref(),
-            Some("\n a { b } \"}\" \n"),
-            "The brace scan must skip a comment and a string, and stop at the outer brace."
+            boot_body(
+                "async fn run_with_clock<C>() -> R {\n a({ b }, \"}\"); // }\n}\nfn next() {}"
+            )
+            .map(|body| body.split_whitespace().collect::<Vec<_>>().join(" ")),
+            Some("a({ b }, \"}\");".to_string()),
+            "The body text must have no comments, and it must stop at the outer brace."
         );
         for (case, fixture) in [
             ("a source without run_with_clock", "fn run() {}"),
@@ -3853,53 +3855,73 @@ mod tests {
         })
     }
 
+    /// Check the ARCH-2h sleep rule in the Rust source `src`. Return an
+    /// error if `src` breaks one of these rules:
+    ///
+    /// 1. `src` has one `sleep` call. A `sleep` call in macro input counts.
+    /// 2. That call is a call expression in `persist_latched_detection`.
+    fn sleep_rule(src: &str) -> Result<(), String> {
+        let code = without_comments(src);
+        let sleeps: Vec<usize> = code.match_indices("sleep(").map(|(at, _)| at).collect();
+        match sleeps[..] {
+            [at] if enclosing_fn(&code, at) == Some("persist_latched_detection") => Ok(()),
+            _ => Err(format!("The scan found these `sleep` calls: {sleeps:?}")),
+        }
+    }
+
+    /// Check the drain order in the Rust source `src`. In
+    /// `await_shutdown_and_drain_with_signal`, the first
+    /// `persist_latched_detection` call must be a call expression after the
+    /// first `executor.shutdown` call expression.
+    fn drain_rule(src: &str) -> Result<(), String> {
+        let code = without_comments(src);
+        let at = code.find("fn await_shutdown_and_drain_with_signal(").ok_or("No drain.")?;
+        let open = at + code[at..].find('{').ok_or("No body.")?;
+        let drain = &code[open..closing_bracket(&code, open, ('{', '}')).ok_or("No end.")?];
+        match (drain.find("executor.shutdown("), drain.find("persist_latched_detection(")) {
+            (Some(shutdown), Some(persist)) if shutdown < persist => Ok(()),
+            _ => Err(format!("The calls in the drain are wrong: {drain}")),
+        }
+    }
+
+    /// Return `true` if `run_with_clock` in the Rust source `src` has a call
+    /// expression to `name`. If `first_arg` is `Some`, the first argument of
+    /// the call must be that identifier. A call in a comment, in a literal or
+    /// in macro input does not count.
+    fn boot_calls(src: &str, name: &str, first_arg: Option<&str>) -> bool {
+        match first_arg {
+            Some(arg) => {
+                boot_body(src).is_some_and(|body| find_tokens(&body, &[name, "(", arg]).is_some())
+            }
+            None => src.contains(name),
+        }
+    }
+
     /// Return `true` if the body of `run_with_clock` in `src` calls
-    /// `spawn_proposer_sync_monitor(` with `proposer_bn_manager`. The check
-    /// compares `Code` tokens, thus a call in a comment or in a literal does
-    /// not count.
+    /// `spawn_proposer_sync_monitor` with `proposer_bn_manager` as its first
+    /// argument.
     fn boot_calls_proposer_sync_monitor(src: &str) -> bool {
-        boot_body(src).is_some_and(|body| {
-            find_tokens(&body, &["spawn_proposer_sync_monitor", "(", "proposer_bn_manager"])
-                .is_some()
-        })
+        boot_calls(src, "spawn_proposer_sync_monitor", Some("proposer_bn_manager"))
     }
 
     /// ARCH-2h: the production body joins tasks. It does not sleep in place
-    /// of a join. The scan removes the comments first. The test requires
-    /// these results:
+    /// of a join. The checks read calls, not text. The test requires these
+    /// results:
     ///
     /// - The production body has one `sleep(` call. That call is the retry
     ///   wait in `persist_latched_detection`.
     /// - In `await_shutdown_and_drain_with_signal`, `executor.shutdown(`
     ///   comes before `persist_latched_detection(`.
     /// - `run_with_clock` calls `spawn_proposer_sync_monitor(` with
-    ///   `proposer_bn_manager`. A `use` line, a call in a comment or a call
-    ///   in a literal fails this check.
+    ///   `proposer_bn_manager` as its first argument. It also calls the
+    ///   broadcast drain waiter, the SSE subscriber and the sync monitor.
     ///
-    /// The fixtures make sure that the brace scan finds the innermost `fn`.
-    /// They also make sure that the call check accepts a call after a raw
-    /// string or a character literal. The call check must reject a call in a
-    /// comment, a call in a literal and a call outside `run_with_clock`.
+    /// The fixtures make sure that a comment or a literal does not give a
+    /// call. A literal is a character, byte, or string literal. String
+    /// literals include byte and C strings. A call in macro input counts only
+    /// for the sleep check.
     #[test]
     fn test_run_rs_has_no_sleep_as_join_substitute() {
-        let at_sleep = |fixture: &'static str| {
-            enclosing_fn(fixture, fixture.find("sleep(").expect("The fixture must call sleep."))
-        };
-        assert_eq!(
-            at_sleep(
-                "fn a() { b(); }\nasync fn retry(x: &X) -> bool {\n loop {\n if f(\"}\") { fn \
-                 inner() {} }\n sleep(T).await;\n }\n}\nfn c() {}"
-            ),
-            Some("retry"),
-            "The brace scan must skip a string and a nested fn, and find the fn of the call."
-        );
-        for (case, fixture) in [
-            ("a call outside a function", "sleep(T);"),
-            ("a call after the last fn", "fn a() { b(); } sleep(T);"),
-            ("a fn with no closing brace", "fn a() { sleep(T);"),
-        ] {
-            assert_eq!(at_sleep(fixture), None, "The brace scan must reject {case}.");
-        }
         let call = "spawn_proposer_sync_monitor(proposer_bn_manager, &executor, Some(s));";
         let boot = |line: String| format!("async fn run_with_clock<C>() {{\n a();\n {line}\n}}");
         for (case, line) in [
@@ -3930,71 +3952,114 @@ mod tests {
             );
         }
 
+        let mut wrong = Vec::new();
+        for (case, valid, body, rest) in [
+            ("a sleep after a nested fn", true, "if f(\"}\") { fn i() {} } sleep(T)", ""),
+            ("an extra `sleep(` literal", true, "sleep(T);", "fn b() { \"sleep(\"; }"),
+            ("a sleep only in a string", false, r#""sleep(T)";"#, ""),
+            ("a sleep only in a string with escaped quotes", false, r#""\" sleep(T) \"";"#, ""),
+            ("a sleep only in a raw string", false, r#"r"sleep(T)";"#, ""),
+            ("a sleep only in a raw string with `##`", false, r###"r##""# sleep(T) ""##;"###, ""),
+            ("a sleep in `stringify!`", false, "stringify!(sleep(T));", ""),
+            ("a sleep in another fn", false, "", "fn o() { sleep(T); }"),
+            ("a second sleep in macro input", false, "sleep(T);", "fn o() { m!(sleep(T)); }"),
+            ("a sleep outside a fn", false, "", "static S: () = sleep(T);"),
+        ] {
+            let src = format!("async fn persist_latched_detection() {{ {body} }}\n{rest}");
+            if sleep_rule(&src).is_ok() != valid {
+                wrong.push(case);
+            }
+        }
+        let (stop, save) = ("executor.shutdown(b);", "persist_latched_detection(d);");
+        for (case, valid, body) in [
+            ("the real call order", true, format!("h.shutdown(); {stop} {save}")),
+            ("a persist literal first", true, format!("{save:?}; {stop} {save}")),
+            ("a reversed call order", false, format!("{save} {stop}")),
+            ("a persist call only in a comment", false, format!("{stop} // {save}\n")),
+            ("a persist call only in a string", false, format!("{stop} {save:?};")),
+            ("a persist call in `stringify!`", false, format!("{stop} stringify!({save});")),
+            ("a persist call in macro input first", false, format!("m!({save}); {stop} {save}")),
+            ("a shutdown in a raw string", false, format!(r###"r##""# {stop} ""##; {save}"###)),
+            ("a shutdown call on another receiver", false, format!("h.shutdown(b); {save}")),
+            ("the calls in a nested fn", false, format!("fn o() {{ {stop} {save} }}")),
+        ] {
+            let src = format!("fn await_shutdown_and_drain_with_signal() {{ {body} }}");
+            if drain_rule(&src).is_ok() != valid {
+                wrong.push(case);
+            }
+        }
+        let bound = "async fn run_with_clock<C>() where [(); { 1 }]: Sized,";
+        let (name, arg) = ("spawn_proposer_sync_monitor", "proposer_bn_manager");
+        for (case, valid, src) in [
+            ("a call after a brace in the signature", true, format!("{bound} {{ {call} }}")),
+            ("a call in a method", true, format!("impl B {{ {} }}", boot(call.to_string()))),
+            ("a call only in a byte string", false, boot(format!("b{call:?};"))),
+            ("a call only in a C string", false, boot(format!("c{call:?};"))),
+            ("a call in `stringify!`", false, boot(format!("stringify!({call});"))),
+            ("a literal in `stringify!`", false, boot(format!("stringify!({name}(\"x\" {arg}));"))),
+            ("a literal after the name", false, boot(format!("stringify!({name} \"x\" ({arg}));"))),
+            ("a call to a longer identifier", false, boot(format!("x\u{301}{call}"))),
+            ("a call with another first argument", false, boot(format!("{name}(bn_manager);"))),
+        ] {
+            if boot_calls_proposer_sync_monitor(&src) != valid {
+                wrong.push(case);
+            }
+        }
+        let waiter =
+            "e.set_after_orchestrator_waiter(async { d.wait_for_broadcast_drains(b).await });";
+        for (case, valid, line) in [
+            ("the drain waiter in run_with_clock", true, waiter.to_string()),
+            ("the drain waiter only in a comment", false, format!("// {waiter}")),
+            ("the drain waiter only in a string", false, format!("{waiter:?};")),
+        ] {
+            let src = boot(line);
+            let found = boot_calls(&src, "set_after_orchestrator_waiter", None)
+                && boot_calls(&src, "wait_for_broadcast_drains", None);
+            if found != valid {
+                wrong.push(case);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "Each call check must accept each valid case and reject each other case. These \
+             cases give the wrong result: {wrong:?}"
+        );
+
         let src = include_str!("run.rs");
         let body = src.split("#[cfg(test)]").next().expect("production body before tests");
-        let code = without_comments(body);
-        let sleeps: Vec<usize> = code.match_indices("sleep(").map(|(at, _)| at).collect();
         assert_eq!(
-            sleeps.len(),
-            1,
-            "The production body of run.rs must have one `sleep(` call. The scan found {} \
-             calls.",
-            sleeps.len()
+            sleep_rule(body),
+            Ok(()),
+            "ARCH-2h: the production body must have one `sleep` call. That call must be the \
+             retry wait in persist_latched_detection."
         );
         assert_eq!(
-            enclosing_fn(&code, sleeps[0]),
-            Some("persist_latched_detection"),
-            "The one `sleep(` call must be the retry wait in persist_latched_detection."
+            drain_rule(body),
+            Ok(()),
+            "In await_shutdown_and_drain_with_signal, executor.shutdown must come before \
+             persist_latched_detection."
         );
-        let drain_at = code
-            .find("fn await_shutdown_and_drain_with_signal(")
-            .expect("The production body must define await_shutdown_and_drain_with_signal.");
-        let open = drain_at + code[drain_at..].find('{').expect("The drain must have a body.");
-        let close = closing_bracket(&code, open, ('{', '}'))
-            .expect("The drain body must have a closing brace.");
-        let drain = &code[open..close];
-        assert!(
-            matches!(
-                (drain.find("executor.shutdown("), drain.find("persist_latched_detection(")),
-                (Some(shutdown), Some(persist)) if shutdown < persist
-            ),
-            "In await_shutdown_and_drain_with_signal, executor.shutdown( must come before \
-             persist_latched_detection(. The body is: {drain}"
-        );
-        assert!(
-            body.contains("executor.shutdown"),
-            "production shutdown must drain via TaskExecutor::shutdown"
-        );
-        assert!(
-            body.contains("wait_for_broadcast_drains"),
-            "broadcast drains must be joined from production run()"
-        );
-        assert!(
-            body.contains("set_after_orchestrator_waiter"),
-            "the drain join must run after the orchestrator tier"
-        );
+        for name in [
+            "set_after_orchestrator_waiter",
+            "wait_for_broadcast_drains",
+            "spawn_sse_subscriber",
+            "spawn_sync_monitor",
+        ] {
+            assert!(boot_calls(body, name, None), "run_with_clock must call {name}.");
+        }
         assert!(
             body.contains("duty_orchestrator"),
             "orchestrator must be registered as duty_orchestrator"
         );
-        assert!(
-            body.contains("spawn_sse_subscriber"),
-            "ARCH-3l must start the SSE subscriber from production run()"
-        );
         assert!(body.contains("bn.sse"), "ARCH-3l must name the registered SSE task bn.sse");
-        assert!(
-            body.contains("spawn_sync_monitor"),
-            "DSR-2.1 must start the sync monitor from production run()"
-        );
         assert!(
             body.contains("bn.sync_monitor"),
             "DSR-2.1 must name the registered sync-monitor task bn.sync_monitor"
         );
         assert!(
             boot_calls_proposer_sync_monitor(body),
-            "FU-A6: run_with_clock must call spawn_proposer_sync_monitor( with \
-             proposer_bn_manager. The check does not count a `use` line, a comment or a \
-             literal."
+            "FU-A6. `run_with_clock` must call `spawn_proposer_sync_monitor` with \
+             `proposer_bn_manager` as its first argument."
         );
     }
 
