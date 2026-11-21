@@ -3754,6 +3754,13 @@ mod tests {
         })
     }
 
+    /// Return `true` if the body of `run_with_clock` in `src` calls
+    /// `spawn_proposer_sync_monitor(` with `proposer_bn_manager`. The scan
+    /// removes the `//` comments first.
+    fn boot_calls_proposer_sync_monitor(src: &str) -> bool {
+        src.contains("spawn_proposer_sync_monitor(proposer_bn_manager")
+    }
+
     /// ARCH-2h: the production body joins tasks. It does not sleep in place
     /// of a join. The scan removes the `//` comments first. The test requires
     /// these results:
@@ -3762,11 +3769,13 @@ mod tests {
     ///   wait in `persist_latched_detection`.
     /// - In `await_shutdown_and_drain_with_signal`, `executor.shutdown(`
     ///   comes before `persist_latched_detection(`.
-    /// - The production body calls `spawn_proposer_sync_monitor(` with
-    ///   `proposer_bn_manager`. A `use` line without the call fails this
-    ///   check.
+    /// - `run_with_clock` calls `spawn_proposer_sync_monitor(` with
+    ///   `proposer_bn_manager`. A `use` line or a call in a comment fails
+    ///   this check.
     ///
     /// The fixtures make sure that the brace scan finds the innermost `fn`.
+    /// They also make sure that the call check rejects a call in a comment
+    /// and a call outside `run_with_clock`.
     #[test]
     fn test_run_rs_has_no_sleep_as_join_substitute() {
         let at_sleep = |fixture: &'static str| {
@@ -3781,11 +3790,33 @@ mod tests {
             "The brace scan must skip a string and a nested fn, and find the fn of the call."
         );
         for (case, fixture) in [
-            ("a call in no fn", "sleep(T);"),
+            ("a call outside a function", "sleep(T);"),
             ("a call after the last fn", "fn a() { b(); } sleep(T);"),
             ("a fn with no closing brace", "fn a() { sleep(T);"),
         ] {
             assert_eq!(at_sleep(fixture), None, "The brace scan must reject {case}.");
+        }
+        let call = "spawn_proposer_sync_monitor(proposer_bn_manager, &executor, Some(s));";
+        assert!(
+            boot_calls_proposer_sync_monitor(&format!(
+                "async fn run_with_clock<C>() {{\n a();\n {call}\n}}"
+            )),
+            "The call check must accept a call in run_with_clock."
+        );
+        for (case, fixture) in [
+            (
+                "a call only in a comment",
+                format!("async fn run_with_clock<C>() {{\n a();\n // {call}\n}}"),
+            ),
+            (
+                "a call outside run_with_clock",
+                format!("fn other() {{ {call} }}\nasync fn run_with_clock<C>() {{ a(); }}"),
+            ),
+        ] {
+            assert!(
+                !boot_calls_proposer_sync_monitor(&fixture),
+                "The call check must reject {case}."
+            );
         }
 
         let src = include_str!("run.rs");
@@ -3849,9 +3880,9 @@ mod tests {
             "DSR-2.1 must name the registered sync-monitor task bn.sync_monitor"
         );
         assert!(
-            body.contains("spawn_proposer_sync_monitor(proposer_bn_manager"),
-            "FU-A6: the production body must call spawn_proposer_sync_monitor( with \
-             proposer_bn_manager. The `use` line alone is not a call."
+            boot_calls_proposer_sync_monitor(body),
+            "FU-A6: run_with_clock must call spawn_proposer_sync_monitor( with \
+             proposer_bn_manager. The check does not count a `use` line or a comment."
         );
     }
 

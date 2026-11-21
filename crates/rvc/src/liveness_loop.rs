@@ -4340,7 +4340,7 @@ mod tests {
     /// results:
     ///
     /// - The loop must not request exit 12.
-    /// - At 5 s, the drain must still run, and the durable flag must stay clear.
+    /// - At 5 s, the drain must still run. The durable flag must stay clear.
     /// - After the fsync failures stop, the drain must return exit 12.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_fsync_failure_then_shutdown_keeps_retrying() {
@@ -4386,7 +4386,7 @@ mod tests {
         );
         assert!(
             !machine.detection_persisted(),
-            "A detected record that the test reads back must not set the durable flag."
+            "The durable flag must stay clear while each fsync fails."
         );
         drop(guard);
         tokio::time::advance(Duration::from_secs(30)).await;
@@ -4400,14 +4400,20 @@ mod tests {
     }
 
     /// W4-D3a (747-8): the keystore directory and the fallback directory do
-    /// not exist, so each write of the drain fails. The test requires these
+    /// not exist, so each write of the drain fails. The test keeps both
+    /// writes failing for one hour of paused time. This time is longer than
+    /// a plausible limit on the failed rounds. The test requires these
     /// results:
     ///
-    /// - At 10 s, the drain must still run.
+    /// - After one hour, the drain must still run.
+    /// - In that hour, the failure counter must grow by at least 1 for each
+    ///   30 s. The maximum back-off delay is 30 s.
     /// - After the test creates the fallback directory, the drain must return
     ///   exit 12, and the owned fallback marker must be present.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn drain_waits_while_both_writes_fail_then_exits_12_once_the_fallback_exists() {
+        const FAILING_SECS: u64 = 3_600;
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let db_dir = root.path().join("db");
         let token = CancellationToken::new();
@@ -4425,9 +4431,17 @@ mod tests {
             )
             .await
         });
-        advance_in_steps(10).await;
+        advance_in_steps(FAILING_SECS).await;
 
         assert!(!drain.is_finished(), "The drain must not finish while both writes fail.");
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        assert!(
+            failures >= FAILING_SECS / 30,
+            "The drain must try the writes again at least once in each 30 s while both writes \
+             fail. In {FAILING_SECS} s, the failure counter grew by {failures}."
+        );
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         tokio::time::advance(Duration::from_secs(30)).await;
         let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
