@@ -4302,7 +4302,8 @@ mod tests {
     /// fallback is configured. The test requires these results:
     ///
     /// - The report is durable, because the record write returned `Ok`.
-    /// - The keystore marker result is `Err`, and the marker is absent.
+    /// - The keystore marker write returns the test error, and the marker is
+    ///   absent.
     /// - The record contains the epoch and the Unix time of the input.
     #[test]
     fn persist_all_keeps_the_record_when_the_marker_fails() {
@@ -4316,9 +4317,10 @@ mod tests {
             report.durable(),
             "The record write must make the report durable. The report is {report:?}."
         );
-        assert!(
-            report.keystore_marker.is_err(),
-            "The keystore marker write must fail. The report is {report:?}."
+        assert_eq!(
+            report.keystore_marker.as_ref().map_err(|err| (err.kind(), err.to_string())),
+            Err((io::ErrorKind::StorageFull, "injected marker write failure".to_string())),
+            "The keystore marker write must return the test error. The report is {report:?}."
         );
         assert!(
             matches!(inspect(dir.path()), MarkerInspect::Absent),
@@ -4434,10 +4436,11 @@ mod tests {
         let guard = arm_fsync_failures_after(1, 1);
         let report = persist_all(&paths, &marker);
         drop(guard);
-        assert!(
-            report.keystore_marker.is_err(),
-            "The keystore marker write must return Err when the directory fsync fails. The \
-             report is {report:?}."
+        assert_eq!(
+            report.keystore_marker.as_ref().map_err(io::Error::raw_os_error),
+            Err(Some(libc::EIO)),
+            "The keystore marker write must return the EIO of the directory fsync. The report is \
+             {report:?}."
         );
         assert!(
             !report.durable(),

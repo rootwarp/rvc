@@ -843,11 +843,18 @@ mod tests {
 
     /// W4-D3c: the database directory is not the keystore directory. The
     /// liveness loop that enablement builds must get the owned fallback
-    /// marker of that database, so the loop can write it before exit 12.
+    /// marker of that database. The record is pre-allocated, and the two
+    /// directories exist. The test latches the machine and runs the built
+    /// loop for one tick. Then the record, the keystore marker and the owned
+    /// fallback marker must contain the key, the epoch and the Unix time that
+    /// the loop got.
     #[tokio::test]
     async fn wire_signing_enablement_gives_the_loop_the_fallback_of_the_database() {
+        const EPOCH: Epoch = 9;
+        const UNIX_SECS: u64 = 1_700_000_000;
         let (_server, beacon) = mock_beacon(0).await;
-        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let pk = SecretKey::generate().public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db =
             Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open."));
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
@@ -857,19 +864,20 @@ mod tests {
         for dir in [&keystore, &db_dir] {
             std::fs::create_dir(dir).expect("The test must create the directory.");
         }
+        crate::detection_marker::preallocate_detection_record(&keystore)
+            .expect("The test must pre-allocate the record.");
         let config = Config {
             keystore_path: keystore,
             slashing_db_path: db_dir.join("slashing.sqlite"),
             ..base_config(true)
         };
-        let expected = crate::detection_marker::FallbackMarkerPath::for_config(
+        let fallback = crate::detection_marker::FallbackMarkerPath::for_config(
             &config.keystore_path,
             &config.slashing_db_path,
-        );
-        assert!(
-            expected.is_some(),
+        )
+        .expect(
             "The database directory must give a fallback marker, because it is not the keystore \
-             directory."
+             directory.",
         );
 
         let handles = wire_signing_enablement(&config, &keys, &beacon, slashing_db, &executor)
@@ -880,9 +888,34 @@ mod tests {
             .expect("With detection on, enablement must return the built liveness loop.");
         assert_eq!(
             prepared.detection_fallback(),
-            expected.as_ref(),
+            Some(&fallback),
             "The built liveness loop must have the owned fallback marker of the database."
         );
+        let _unix = crate::detection_marker::arm_unix_secs(UNIX_SECS);
+        prepared.run_first_detecting_tick(EPOCH).await;
+        let marker = crate::detection_marker::DetectionMarker {
+            epoch: EPOCH,
+            unix_secs: UNIX_SECS,
+            pubkeys: vec![format!("0x{}", hex::encode(pk.to_bytes()))],
+        };
+        assert_eq!(
+            crate::detection_marker::inspect_record(&config.keystore_path),
+            crate::detection_marker::RecordInspect::Detected { epoch: EPOCH, unix_secs: UNIX_SECS },
+            "The record must contain the epoch and the Unix time that the loop got."
+        );
+        for (name, inspected) in [
+            ("keystore", crate::detection_marker::inspect(&config.keystore_path)),
+            ("fallback", crate::detection_marker::inspect_fallback(&fallback).owned),
+        ] {
+            assert!(
+                matches!(
+                    &inspected,
+                    crate::detection_marker::MarkerInspect::Present(found) if *found == marker
+                ),
+                "The {name} marker must contain the key, the epoch and the Unix time that the \
+                 loop got. The marker is {inspected:?}."
+            );
+        }
         executor.token().cancel();
     }
 

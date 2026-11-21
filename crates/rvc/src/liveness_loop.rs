@@ -4929,34 +4929,33 @@ mod tests {
 
     /// W4-D3c: the keystore directory does not exist, and no fallback is
     /// configured. Thus the record write and the keystore marker write fail.
-    /// The loop must count each failed path one time and add no count of its
-    /// own. The durable flag must stay unset, and the loop must not request
-    /// exit 12.
+    /// The test requires these results:
+    ///
+    /// - The loop counts each failed path one time and adds no count of its
+    ///   own.
+    /// - The durable flag stays unset, and the loop does not request exit 12.
+    /// - The record and the keystore marker are absent on the disk.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
-        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(Some(&root.path().join("keys")), None, |_| {
-            RecordingExit::default()
-        });
-        poll_until_parked(&live.task).await;
-
-        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
-            .get()
-            .saturating_sub(before);
+        let keys = root.path().join("keys");
+        let failures = failures_of_a_tick_with_no_durable_path(Some(&keys)).await;
         assert_eq!(
             failures, 2,
             "The loop must increase the failure counter by exactly 2, one time for the record \
              and one time for the keystore marker. The counter increased by {failures}."
         );
-        assert!(!live.machine.detection_persisted(), "A failed write must not set the flag.");
-        assert!(
-            live.exits.codes.lock().expect("The test must read the exit codes.").is_empty(),
-            "The loop must not request exit 12 while each path fails."
+        assert_eq!(
+            crate::detection_marker::inspect_record(&keys),
+            crate::detection_marker::RecordInspect::Absent,
+            "The record must be absent, because the keystore directory does not exist."
         );
-        live.cancel.cancel();
-        tokio::time::advance(Duration::from_secs(12)).await;
-        live.task.await.expect("The loop task must not panic.");
+        let marker = crate::detection_marker::inspect(&keys);
+        assert!(
+            matches!(marker, crate::detection_marker::MarkerInspect::Absent),
+            "The keystore marker must be absent, because the keystore directory does not exist. \
+             The marker is {marker:?}."
+        );
     }
 
     /// Spawn a loop from [`spawn_detecting_loop`] with `keystore` and no
@@ -5004,6 +5003,18 @@ mod tests {
             &self,
         ) -> Option<&crate::detection_marker::FallbackMarkerPath> {
             self.loop_task.detection_fallback.as_ref()
+        }
+
+        /// Latch the machine of the built loop with a live answer for its one
+        /// pending key. Then run the loop with a clock seam at `epoch`, until
+        /// the loop waits after its first tick. The enablement tests use it.
+        pub(crate) async fn run_first_detecting_tick(self, epoch: Epoch) {
+            let key = self.loop_task.machine.pending_keys().pop().expect("A key must be pending.");
+            let live = ValidatorLivenessData { index: key.pubkey_hex, is_live: true };
+            let answer = EpochLiveness { epoch: key.next_check_epoch, samples: Some(vec![live]) };
+            let _ = self.loop_task.machine.apply_live_answers_only(&[answer]);
+            let task = tokio::spawn(self.loop_task.with_clock_seam(ClockSeam::new(epoch, 0)).run());
+            poll_until_parked(&task).await;
         }
     }
 
