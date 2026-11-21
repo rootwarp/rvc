@@ -4704,10 +4704,11 @@ mod tests {
 
     /// Spawn a liveness loop that gets a live answer for its one key. The
     /// loop reads epoch [`LOOP_EPOCH`] from a clock seam. It writes in
-    /// `keystore`, and also in `fallback` when `fallback` is set. A
-    /// recording exit request keeps each exit code that the loop requests.
+    /// `keystore` when `keystore` is set, and in `fallback` when `fallback`
+    /// is set. A recording exit request keeps each exit code that the loop
+    /// requests.
     fn spawn_detecting_loop(
-        keystore: &std::path::Path,
+        keystore: Option<&std::path::Path>,
         fallback: Option<crate::detection_marker::FallbackMarkerPath>,
     ) -> DetectingLoop {
         let machine = machine();
@@ -4729,8 +4730,10 @@ mod tests {
         )
         .with_clock_seam(ClockSeam::new(LOOP_EPOCH, 0))
         .with_slot_duration(Duration::from_secs(12))
-        .with_detection_marker_dir(keystore.to_path_buf())
         .with_exit_request(Arc::clone(&exits) as Arc<dyn ExitRequest>);
+        if let Some(keystore) = keystore {
+            loop_ = loop_.with_detection_marker_dir(keystore.to_path_buf());
+        }
         if let Some(fallback) = fallback {
             loop_ = loop_.with_detection_fallback(fallback);
         }
@@ -4767,7 +4770,7 @@ mod tests {
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         let fallback = fallback_in(&db_dir);
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
-        let live = spawn_detecting_loop(&keys, Some(fallback.clone()));
+        let live = spawn_detecting_loop(Some(&keys), Some(fallback.clone()));
         poll_until_parked(&live.task).await;
 
         assert_eq!(
@@ -4829,7 +4832,7 @@ mod tests {
         .to_string();
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(keys.path(), None);
+        let live = spawn_detecting_loop(Some(keys.path()), None);
         poll_until_parked(&live.task).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4914,7 +4917,7 @@ mod tests {
     async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(&root.path().join("keys"), None);
+        let live = spawn_detecting_loop(Some(&root.path().join("keys")), None);
         poll_until_parked(&live.task).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4933,6 +4936,44 @@ mod tests {
         live.cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
         live.task.await.expect("The loop task must not panic.");
+    }
+
+    /// Spawn a loop from [`spawn_detecting_loop`] with `keystore` and no
+    /// fallback, and let it run its first tick. No path can be durable. The
+    /// loop must not set the durable flag and must not request exit 12.
+    /// Return the increase of the failure counter.
+    async fn failures_of_a_tick_with_no_durable_path(keystore: Option<&std::path::Path>) -> u64 {
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let live = spawn_detecting_loop(keystore, None);
+        poll_until_parked(&live.task).await;
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        assert!(
+            !live.machine.detection_persisted(),
+            "The loop must not set the durable flag, because no path is durable."
+        );
+        assert!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").is_empty(),
+            "The loop must not request exit 12, because no path is durable."
+        );
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
+        failures
+    }
+
+    /// W4-D3c: no keystore directory and no fallback are configured. Thus
+    /// the loop has no path to write. The loop must increase the failure
+    /// counter by exactly 1.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_counts_one_failure_when_no_keystore_dir_is_configured() {
+        let failures = failures_of_a_tick_with_no_durable_path(None).await;
+        assert_eq!(
+            failures, 1,
+            "The loop must increase the failure counter by exactly 1, because no keystore \
+             directory is configured. The counter increased by {failures}."
+        );
     }
 
     impl LivenessLoopSpawn {
