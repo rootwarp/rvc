@@ -3179,6 +3179,7 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
     struct RecordingExit {
         codes: std::sync::Mutex<Vec<i32>>,
     }
@@ -4694,12 +4695,12 @@ mod tests {
     const LOOP_UNIX_SECS: u64 = 1_700_000_000;
 
     /// A liveness loop from [`spawn_detecting_loop`].
-    struct DetectingLoop {
+    struct DetectingLoop<E> {
         machine: Arc<ForwardWindowMachine>,
         /// The one key of the loop, as a marker stores it: `0x` and the
         /// lowercase hex.
         marker_key: String,
-        exits: Arc<RecordingExit>,
+        exits: Arc<E>,
         cancel: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -4707,18 +4708,19 @@ mod tests {
     /// Spawn a liveness loop that gets a live answer for its one key. The
     /// loop reads epoch [`LOOP_EPOCH`] from a clock seam. It writes in
     /// `keystore` when `keystore` is set, and in `fallback` when `fallback`
-    /// is set. A recording exit request keeps each exit code that the loop
-    /// requests.
-    fn spawn_detecting_loop(
+    /// is set. `exit` gets the machine and makes the exit request of the
+    /// loop. `RecordingExit` stores each exit code.
+    fn spawn_detecting_loop<E: ExitRequest + 'static>(
         keystore: Option<&std::path::Path>,
         fallback: Option<crate::detection_marker::FallbackMarkerPath>,
-    ) -> DetectingLoop {
+        exit: impl FnOnce(&Arc<ForwardWindowMachine>) -> E,
+    ) -> DetectingLoop<E> {
         let machine = machine();
         let pk = new_pk();
         machine.register(&pk, 0);
         let reg = PubkeyIndexRegistry::shared();
         reg.write().insert(pk.to_bytes(), "7".to_string());
-        let exits = Arc::new(RecordingExit { codes: std::sync::Mutex::new(Vec::new()) });
+        let exits = Arc::new(exit(&machine));
         let cancel = CancellationToken::new();
         // The constructor needs an epoch clock. `test_clock` reads
         // `std::time::Instant::now()` one time to make it. The loop reads its
@@ -4755,15 +4757,33 @@ mod tests {
         }
     }
 
+    /// An exit request that stores each exit code with two values that it
+    /// reads at the request: the owned fallback marker and the durable flag.
+    struct FallbackAtExit {
+        machine: Arc<ForwardWindowMachine>,
+        fallback: crate::detection_marker::FallbackMarkerPath,
+        requests:
+            std::sync::Mutex<Vec<(i32, Option<crate::detection_marker::DetectionMarker>, bool)>>,
+    }
+
+    impl ExitRequest for FallbackAtExit {
+        fn request(&self, exit_code: i32) {
+            let marker = crate::detection_marker::inspect_fallback(&self.fallback).owned;
+            let durable = self.machine.detection_persisted();
+            let mut requests = self.requests.lock().expect("The test must store the request.");
+            requests.push((exit_code, present_marker(marker), durable));
+        }
+    }
+
     /// W4-D3c (746-10): the keystore directory does not exist, so the record
     /// write and the keystore marker write fail. The directory of the owned
     /// fallback marker exists. The loop latches on its first tick. The test
-    /// sends no signal and starts no drain. The test requires these results:
+    /// sends no signal and starts no drain. The loop must request exit 12 one
+    /// time. At that request, these results must be true:
     ///
     /// - The owned fallback marker contains the key, the epoch and the Unix
     ///   time that the loop got.
     /// - The durable flag of the machine is set.
-    /// - The loop requests exit 12 one time.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn running_loop_writes_the_fallback_when_the_keystore_dir_fails() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
@@ -4772,28 +4792,25 @@ mod tests {
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         let fallback = fallback_in(&db_dir);
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
-        let live = spawn_detecting_loop(Some(&keys), Some(fallback.clone()));
+        let live =
+            spawn_detecting_loop(Some(&keys), Some(fallback.clone()), |machine| FallbackAtExit {
+                machine: Arc::clone(machine),
+                fallback: fallback.clone(),
+                requests: std::sync::Mutex::default(),
+            });
         poll_until_parked(&live.task).await;
 
+        let marker = crate::detection_marker::DetectionMarker {
+            epoch: LOOP_EPOCH,
+            unix_secs: LOOP_UNIX_SECS,
+            pubkeys: vec![live.marker_key.clone()],
+        };
         assert_eq!(
-            present_marker(crate::detection_marker::inspect_fallback(&fallback).owned),
-            Some(crate::detection_marker::DetectionMarker {
-                epoch: LOOP_EPOCH,
-                unix_secs: LOOP_UNIX_SECS,
-                pubkeys: vec![live.marker_key.clone()],
-            }),
-            "The loop must write the owned fallback marker while the keystore directory is \
-             missing. The marker must contain the key, the epoch and the Unix time that the \
-             loop got."
-        );
-        assert!(
-            live.machine.detection_persisted(),
-            "The fallback marker write must set the durable flag."
-        );
-        assert_eq!(
-            live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
-            &[EXIT_DOPPELGANGER_DETECTED],
-            "The loop must request exit 12 one time without a signal or a drain."
+            live.exits.requests.lock().expect("The test must read the requests.").as_slice(),
+            [(EXIT_DOPPELGANGER_DETECTED, Some(marker), true)],
+            "The loop must request exit 12 one time without a signal or a drain. At the request, \
+             the owned fallback marker must contain the key, the epoch and the Unix time that \
+             the loop got. The machine must have the durable flag at the request."
         );
         live.cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
@@ -4830,11 +4847,11 @@ mod tests {
                 pubkeys: Vec::new(),
             },
         )
-        .expect_err("The keystore marker write must fail while the failures are armed.")
+        .expect_err("The marker write must return the test error.")
         .to_string();
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(Some(keys.path()), None);
+        let live = spawn_detecting_loop(Some(keys.path()), None, |_| RecordingExit::default());
         poll_until_parked(&live.task).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4919,7 +4936,9 @@ mod tests {
     async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(Some(&root.path().join("keys")), None);
+        let live = spawn_detecting_loop(Some(&root.path().join("keys")), None, |_| {
+            RecordingExit::default()
+        });
         poll_until_parked(&live.task).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4946,7 +4965,7 @@ mod tests {
     /// Return the increase of the failure counter.
     async fn failures_of_a_tick_with_no_durable_path(keystore: Option<&std::path::Path>) -> u64 {
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(keystore, None);
+        let live = spawn_detecting_loop(keystore, None, |_| RecordingExit::default());
         poll_until_parked(&live.task).await;
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
             .get()
