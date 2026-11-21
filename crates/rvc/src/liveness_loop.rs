@@ -301,7 +301,6 @@ impl LivenessObservationLoop {
         );
 
         let mut shutdown_requested = false;
-        let mut marker_durable = false;
         crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.set(0);
 
         // detached: process-lifetime loop root; the tick is the exported span.
@@ -346,15 +345,14 @@ impl LivenessObservationLoop {
                     }
                     crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.set(1);
                 }
-                if latched && !marker_durable {
+                if latched && !self.machine.detection_persisted() {
                     let detected_pubkeys = self.machine.detected_hexes();
-                    if self.persist_detection_marker(current_epoch, &detected_pubkeys) {
-                        marker_durable = true;
-                    } else {
-                        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                    }
+                    self.persist_detection_marker(current_epoch, &detected_pubkeys);
                 }
-                if marker_durable && !shutdown_requested {
+                // The durable flag of the machine is the only durability flag.
+                // Only a durable report of this loop or of the drain sets it.
+                let durable = self.machine.detection_persisted();
+                if durable && !shutdown_requested {
                     shutdown_requested = true;
                     match &self.exit_request {
                         Some(request) => request.request(EXIT_DOPPELGANGER_DETECTED),
@@ -362,7 +360,7 @@ impl LivenessObservationLoop {
                             error!("doppelganger detected but no shutdown handle is installed")
                         }
                     }
-                } else if latched && marker_durable {
+                } else if durable {
                     debug!(
                         detected,
                         pending,
@@ -393,37 +391,36 @@ impl LivenessObservationLoop {
         }
     }
 
-    /// Durably record the detection. `true` when a write and its fsync returned `Ok`.
+    /// Write the detection to each configured path with
+    /// [`crate::detection_marker::persist_all`]: the record and the marker in
+    /// the keystore directory, and the owned fallback marker when one is set.
     ///
-    /// A write failure is logged and the caller stays up, latched, and retries
-    /// on the next tick. Exit 12 is requested only after this returns `true`.
-    /// That `Ok` is recorded on the machine. A later read is not durability.
-    fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) -> bool {
-        let Some(dir) = &self.detection_marker_dir else {
+    /// [`crate::detection_marker::log_persist_report`] logs and counts each
+    /// failed path. The machine gets the durable flag only from a durable
+    /// report: a write and its fsync returned `Ok` on at least one path.
+    /// Otherwise the loop stays up and latched, and the next tick writes
+    /// again. Exit 12 waits for the flag. A later read is not durability.
+    fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
+        let Some(keystore_dir) = &self.detection_marker_dir else {
             error!(
                 "doppelganger detected but no data directory is configured for the marker; \
                  staying up and refusing signatures until a marker can be written"
             );
-            return false;
+            return;
+        };
+        let paths = crate::detection_marker::DetectionPaths {
+            keystore_dir: keystore_dir.clone(),
+            fallback: self.detection_fallback.clone(),
         };
         let marker = crate::detection_marker::DetectionMarker {
             epoch,
             unix_secs: crate::detection_marker::unix_secs_now(),
             pubkeys: pubkeys.to_vec(),
         };
-        match crate::detection_marker::persist_detection(dir, &marker) {
-            Ok(()) => {
-                self.machine.mark_detection_persisted();
-                true
-            }
-            Err(err) => {
-                error!(
-                    error = %err,
-                    path = %crate::detection_marker::marker_path(dir).display(),
-                    "failed to persist doppelganger detection marker; staying up and retrying"
-                );
-                false
-            }
+        let report = crate::detection_marker::persist_all(&paths, &marker);
+        crate::detection_marker::log_persist_report(&report, "liveness loop");
+        if report.durable() {
+            self.machine.mark_detection_persisted();
         }
     }
 
@@ -846,6 +843,9 @@ impl ClockSeam {
 /// `LivenessObservationLoop::refresh_indices_for_test`.
 ///
 /// The loop takes its cancel token and its exit request from `executor`.
+/// `fallback` is the owned fallback marker beside the slashing database. The
+/// loop writes it with the keystore paths before it requests exit 12.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn LivenessApi>,
@@ -855,6 +855,7 @@ pub fn prepare_liveness_loop(
     executor: &TaskExecutor,
     // Keystore dir + shared DELETE/import lock for Safe sidecar cleanup.
     import_sidecar: Option<(std::path::PathBuf, Arc<TrackedKeys>)>,
+    fallback: Option<crate::detection_marker::FallbackMarkerPath>,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let pubkey_index_ret = Arc::clone(&pubkey_index);
@@ -869,6 +870,9 @@ pub fn prepare_liveness_loop(
     if let Some((dir, tracked)) = import_sidecar {
         loop_task = loop_task.with_detection_marker_dir(dir.clone());
         loop_task = loop_task.with_import_sidecar_dir(dir, tracked);
+    }
+    if let Some(fallback) = fallback {
+        loop_task = loop_task.with_detection_fallback(fallback);
     }
     Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret, loop_task })
 }
@@ -1447,6 +1451,7 @@ mod tests {
             )),
             &exec,
             None,
+            None,
         );
         spawn_liveness_loop(
             handle.expect("A machine and a registry with an index must give a built loop."),
@@ -1464,6 +1469,7 @@ mod tests {
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec2,
             None,
+            None,
         );
         spawn_liveness_loop(
             no_handle.expect("A machine with an empty registry must give a built loop."),
@@ -1478,6 +1484,7 @@ mod tests {
             None,
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec3,
+            None,
             None,
         );
         assert!(no_machine.is_none());
@@ -1597,6 +1604,7 @@ mod tests {
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec,
             None,
+            None,
         );
         spawn_liveness_loop(
             spawn.expect(
@@ -1648,6 +1656,7 @@ mod tests {
             clock,
             executor,
             Some((dir.to_path_buf(), Arc::new(TrackedKeys::new()))),
+            None,
         )
         .expect("`prepare_liveness_loop` must build the loop when a machine is available.");
         spawn_liveness_loop(prepared, executor);

@@ -243,6 +243,10 @@ async fn wire_signing_enablement_body(
             Arc::clone(&epoch_clock),
             executor,
             Some((config.keystore_path.clone(), Arc::clone(&tracked_keys))),
+            crate::detection_marker::FallbackMarkerPath::for_config(
+                &config.keystore_path,
+                &config.slashing_db_path,
+            ),
         )
     } else {
         None

@@ -1496,23 +1496,6 @@ pub fn reset_or_replace_detection_record(data_dir: &Path) -> io::Result<ClearOut
     }
 }
 
-/// Persist the in-place record when it exists, then the marker file.
-///
-/// `Ok` only after a `pwrite` and its file `fsync` both succeeded, or the
-/// marker write, file `fsync`, rename, and directory `fsync` all succeeded.
-/// Callers record durability from that `Ok`. A later read is not a substitute:
-/// the page cache can show `detected` when `fsync` failed. An in-place
-/// overwrite does not allocate a new directory entry. On copy-on-write or
-/// thin storage (btrfs, ZFS, thin LVM) it can still allocate a new block.
-pub fn persist_detection(data_dir: &Path, marker: &DetectionMarker) -> io::Result<()> {
-    let record_ok = commit_detection_record(data_dir, marker.epoch, marker.unix_secs).is_ok();
-    match write_marker(data_dir, marker) {
-        Ok(()) => Ok(()),
-        Err(_) if record_ok => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 /// The paths of one detection: the keystore directory, which holds the
 /// record and the keystore marker, and the owned fallback marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
