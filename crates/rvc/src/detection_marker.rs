@@ -1582,18 +1582,38 @@ impl PersistReport {
     }
 }
 
-/// Write the record, then the keystore marker, then the owned fallback
-/// marker when the keystore marker failed.
+/// Write the detection to each configured path: the record in place, the
+/// keystore marker, and the owned fallback marker when one is configured.
+///
+/// Each call attempts each configured path. The result of one path does not
+/// stop the write of a different path: a failed keystore volume does not
+/// stop the fallback marker, and a written record does not stop the two
+/// markers. The record is attempted also when it does not exist. With
+/// detection on, boot pre-allocates it, so a missing record is a failure.
 pub fn persist_all(paths: &DetectionPaths, marker: &DetectionMarker) -> PersistReport {
     let record = commit_detection_record(&paths.keystore_dir, marker.epoch, marker.unix_secs);
     let keystore_marker = write_marker(&paths.keystore_dir, marker);
-    let fallback_marker = match (&paths.fallback, &keystore_marker) {
-        (Some(fallback), Err(_)) => {
-            Some(write_fallback_marker(fallback, &paths.keystore_dir, marker))
-        }
-        _ => None,
-    };
+    let fallback_marker = paths
+        .fallback
+        .as_ref()
+        .map(|fallback| write_fallback_marker(fallback, &paths.keystore_dir, marker));
     PersistReport { record, keystore_marker, fallback_marker, paths: paths.clone() }
+}
+
+/// Log each failed path of `report` at the error level with its `path`, its
+/// `error` and `context`, and count each failed path in
+/// [`crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL`].
+pub fn log_persist_report(report: &PersistReport, context: &str) {
+    for (kind, path, error) in report.failures() {
+        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+        tracing::error!(
+            context,
+            kind = ?kind,
+            path = %path.display(),
+            error = %error,
+            "failed to persist the doppelganger detection on this path"
+        );
+    }
 }
 
 enum ParsedRecord {
