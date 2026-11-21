@@ -2932,171 +2932,65 @@ mod tests {
         assert!(spawn_at < orch_at, "spawn the runner before the duty_orchestrator task");
     }
 
-    /// The kind of a token from [`rust_tokens`].
-    #[derive(PartialEq, Eq)]
-    enum TokenKind {
-        /// A line comment or a block comment.
-        Comment,
-        /// A string literal or a character literal. This includes byte
-        /// strings, C strings and raw strings.
-        Literal,
-        /// A word or one punctuation character. A word is an identifier, a
-        /// keyword, a number or a lifetime.
-        Code,
-    }
-
-    /// Split the Rust source `src` into tokens. Return the kind and the byte
-    /// range of each token. Whitespace is not a token. A comment or a literal
-    /// with no end stops at the end of `src`.
-    fn rust_tokens(src: &str) -> Vec<(TokenKind, std::ops::Range<usize>)> {
-        let word = |c: char| c.is_alphanumeric() || c == '_';
-        let mut tokens = Vec::new();
-        let mut at = 0;
-        while let Some(c) = src[at..].chars().next() {
-            let rest = &src[at..];
-            let (kind, len) = if rest.starts_with("//") {
-                (TokenKind::Comment, rest.find('\n').unwrap_or(rest.len()))
-            } else if rest.starts_with("/*") {
-                (TokenKind::Comment, block_comment_len(rest))
-            } else if let Some(len) = literal_len(rest) {
-                (TokenKind::Literal, len)
-            } else if word(c) || c == '\'' {
-                (TokenKind::Code, rest.len() - rest[c.len_utf8()..].trim_start_matches(word).len())
+    /// Return the byte range of each token in `tokens`, in source order. A
+    /// group gives the range of its open bracket, the ranges of its tokens
+    /// and the range of its close bracket.
+    fn token_ranges(tokens: proc_macro2::TokenStream) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::new();
+        for tree in tokens {
+            if let proc_macro2::TokenTree::Group(group) = tree {
+                ranges.push(group.span_open().byte_range());
+                ranges.extend(token_ranges(group.stream()));
+                ranges.push(group.span_close().byte_range());
             } else {
-                (TokenKind::Code, c.len_utf8())
-            };
-            if !c.is_whitespace() {
-                tokens.push((kind, at..at + len));
+                ranges.push(tree.span().byte_range());
             }
-            at += len;
         }
-        tokens
+        ranges
     }
 
-    /// Return the byte length of the block comment at the start of `text`.
-    /// A block comment can contain block comments.
-    fn block_comment_len(text: &str) -> usize {
-        let mut depth = 0usize;
-        let mut at = 0;
-        while let Some(c) = text[at..].chars().next() {
-            if text[at..].starts_with("/*") {
-                depth += 1;
-                at += 2;
-            } else if text[at..].starts_with("*/") {
-                depth -= 1;
-                at += 2;
-                if depth == 0 {
-                    return at;
+    /// Return the index of the bracket that closes the bracket at the byte
+    /// index `open` in `code`. The `proc_macro2` lexer reads `code`, thus a
+    /// comment or a literal cannot give a bracket. Return `None` if `code`
+    /// does not lex or if no bracket opens at `open`.
+    fn closing_bracket(code: &str, open: usize) -> Option<usize> {
+        fn close(tokens: proc_macro2::TokenStream, open: usize) -> Option<usize> {
+            tokens.into_iter().find_map(|tree| match tree {
+                proc_macro2::TokenTree::Group(group)
+                    if group.span_open().byte_range().start == open =>
+                {
+                    Some(group.span_close().byte_range().start)
                 }
-            } else {
-                at += c.len_utf8();
-            }
+                proc_macro2::TokenTree::Group(group) => close(group.stream(), open),
+                _ => None,
+            })
         }
-        text.len()
+        close(code.parse().ok()?, open)
     }
 
-    /// Return the byte length of the string or character literal at the
-    /// start of `text`. Return `None` if no literal starts there. A raw
-    /// string can have `#` delimiters. A literal with no end stops at the end
-    /// of `text`.
-    fn literal_len(text: &str) -> Option<usize> {
-        let rest = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-        let prefix = &text[..text.len() - rest.len()];
-        if matches!(prefix, "r" | "br" | "cr") {
-            let quoted = rest.trim_start_matches('#');
-            let body = quoted.strip_prefix('"')?;
-            let end = format!("\"{}", &rest[..rest.len() - quoted.len()]);
-            let len = body.find(&end).map_or(body.len(), |at| at + end.len());
-            return Some(text.len() - body.len() + len);
-        }
-        let quote = rest.chars().next().filter(|&q| q == '"' || q == '\'')?;
-        if !matches!((prefix, quote), ("" | "b" | "c", '"') | ("" | "b", '\'')) {
-            return None;
-        }
-        if quote == '\'' {
-            let first = rest[1..].chars().next()?;
-            if first != '\\' && !rest[1 + first.len_utf8()..].starts_with('\'') {
-                return None;
-            }
-        }
-        let mut chars = rest.char_indices().skip(1);
-        while let Some((at, c)) = chars.next() {
-            if c == '\\' {
-                chars.next();
-            } else if c == quote {
-                return Some(prefix.len() + at + 1);
-            }
-        }
-        Some(text.len())
-    }
-
-    /// Return `src` without its comments. A block comment changes to one
-    /// space. The `\n` after a line comment stays.
-    fn without_comments(src: &str) -> String {
-        let mut code = String::with_capacity(src.len());
-        let mut at = 0;
-        for (kind, range) in rust_tokens(src) {
-            if kind == TokenKind::Comment {
-                code.push_str(&src[at..range.start]);
-                if src[range.clone()].starts_with("/*") {
-                    code.push(' ');
-                }
-                at = range.end;
-            }
-        }
-        code.push_str(&src[at..]);
-        code
-    }
-
-    /// Return the byte index and the text of each `Code` token in `code`.
-    fn code_tokens(code: &str) -> Vec<(usize, &str)> {
-        rust_tokens(code)
-            .into_iter()
-            .filter(|(kind, _)| *kind == TokenKind::Code)
-            .map(|(_, range)| (range.start, &code[range]))
-            .collect()
-    }
-
-    /// Return the byte index of the first run of `Code` tokens in `code`
-    /// that is equal to `pattern`.
-    fn find_tokens(code: &str, pattern: &[&str]) -> Option<usize> {
-        code_tokens(code)
-            .windows(pattern.len())
-            .find(|run| run.iter().map(|&(_, token)| token).eq(pattern.iter().copied()))
-            .map(|run| run[0].0)
-    }
-
-    /// Return the index of the bracket that closes the `open_char` at the
-    /// byte index `open` in `code`. The scan counts only `Code` tokens, thus
-    /// it skips comments and literals. Return `None` if the closing bracket
-    /// is missing.
-    fn closing_bracket(
-        code: &str,
-        open: usize,
-        (open_char, close_char): (char, char),
-    ) -> Option<usize> {
-        let mut depth = 0usize;
-        code_tokens(&code[open..]).into_iter().find_map(|(at, token)| {
-            if token.starts_with(open_char) {
-                depth += 1;
-            } else if token.starts_with(close_char) {
-                depth -= 1;
-                return (depth == 0).then_some(open + at);
-            }
-            None
-        })
-    }
-
-    /// Return the text between the outer braces of `async fn run_with_clock<`
-    /// in `src`, with no comments. The scans use `Code` tokens, thus a
-    /// comment or a literal cannot give the function or a brace. Return
-    /// `None` if the function or its closing brace is missing.
+    /// Return the text between the outer braces of `run_with_clock` in
+    /// `src`, with no comments. `syn` finds the function by its name, thus a
+    /// brace in the signature has no effect. The `proc_macro2` lexer reads
+    /// the body. A gap between two tokens changes to one space if it has a
+    /// comment. Return `None` if `src` does not parse or has no function
+    /// `run_with_clock`.
     fn boot_body(src: &str) -> Option<String> {
-        let code = without_comments(src);
-        let start = find_tokens(&code, &["async", "fn", "run_with_clock", "<"])?;
-        let open = start + find_tokens(&code[start..], &["{"])?;
-        let close = closing_bracket(&code, open, ('{', '}'))?;
-        Some(code[open + 1..close].to_string())
+        let file = syn::parse_file(src).ok()?;
+        let block = file.items.iter().find_map(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident == "run_with_clock" => Some(&item.block),
+            _ => None,
+        })?;
+        let range = block.brace_token.span.join().byte_range();
+        let body = &src[range.start + 1..range.end - 1];
+        let (mut text, mut at) = (String::new(), 0);
+        let end = std::iter::once(body.len()..body.len());
+        for token in token_ranges(body.parse().ok()?).into_iter().chain(end) {
+            let gap = &body[at..token.start];
+            text.push_str(if gap.trim().is_empty() { gap } else { " " });
+            text.push_str(&body[token.clone()]);
+            at = token.end;
+        }
+        Some(text)
     }
 
     /// Return the byte index of each `return` keyword in `text`.
@@ -3179,7 +3073,7 @@ mod tests {
             );
         }
         let open = drain_at + "await_shutdown_and_drain".len();
-        let Some(drain_end) = closing_bracket(body, open, ('(', ')')) else {
+        let Some(drain_end) = closing_bracket(body, open) else {
             return Err("The drain call must have a closing parenthesis.".to_string());
         };
         let window = &body[spawn_at..=drain_end];
@@ -3291,7 +3185,7 @@ mod tests {
 
         let src = include_str!("run.rs");
         let prod = src.split("#[cfg(test)]").next().expect("The production code must come first.");
-        let body = boot_body(prod).expect("The brace scan must find the body of run_with_clock.");
+        let body = boot_body(prod).expect("The parse must find the body of run_with_clock.");
         assert_eq!(
             boot_error_rule(&body),
             Ok(()),
@@ -3303,8 +3197,8 @@ mod tests {
     /// W4-D2c: the boot function starts the loop after the last step that can
     /// fail. It installs both signal handlers before it starts the loop.
     /// From the loop start to the end of the drain call, the boot function
-    /// does not return early or panic. The fixtures make sure that the brace
-    /// scan finds a body and that the rule check rejects each wrong order.
+    /// does not return early or panic. The fixtures make sure that the parse
+    /// finds a body and that the rule check rejects each wrong order.
     #[test]
     fn liveness_loop_starts_after_the_last_fallible_boot_step() {
         assert_eq!(
@@ -3319,7 +3213,7 @@ mod tests {
             ("a source without run_with_clock", "fn run() {}"),
             ("a body with no closing brace", "async fn run_with_clock<C>() { a {"),
         ] {
-            assert_eq!(boot_body(fixture), None, "The brace scan must reject {case}.");
+            assert_eq!(boot_body(fixture), None, "The parse must reject {case}.");
         }
 
         let pre = "spawn_background_tasks(); take_epoch_boundary_runner(); \
@@ -3446,10 +3340,10 @@ mod tests {
 
         let src = include_str!("run.rs");
         let prod = src.split("#[cfg(test)]").next().expect("The production code must come first.");
-        let body = boot_body(prod).expect("The brace scan must find the body of run_with_clock.");
+        let body = boot_body(prod).expect("The parse must find the body of run_with_clock.");
         assert!(
             body.contains("wire_signing_enablement(") && body.contains("build_services("),
-            "The brace scan must find the boot body. The body is: {body}"
+            "The parse must find the boot body. The body is: {body}"
         );
         assert_eq!(
             liveness_start_rule(&body),
@@ -3841,18 +3735,101 @@ mod tests {
         );
     }
 
-    /// Return the name of the innermost `fn` whose body holds the byte index
-    /// `at` in `code`. The brace scan skips string literals. Return `None`
-    /// if no `fn` body holds `at`.
-    fn enclosing_fn(code: &str, at: usize) -> Option<&str> {
-        code[..at].rmatch_indices("fn ").find_map(|(start, _)| {
-            let open = start + code[start..].find('{')?;
-            let close = closing_bracket(code, open, ('{', '}'))?;
-            let name = code[start + "fn ".len()..]
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .next()?;
-            (open < at && at < close).then_some(name)
-        })
+    /// A call in Rust source. See [`calls_in`].
+    #[derive(Debug)]
+    struct Call {
+        /// The name of the innermost `fn` that has the call.
+        func: Option<String>,
+        /// The last path segment of the called function, or the method name.
+        name: String,
+        /// The receiver of a method call, if it is one identifier.
+        receiver: Option<String>,
+        /// The first argument, if it is one identifier.
+        first_arg: Option<String>,
+        /// `true` for a name before parentheses in macro input. A macro such
+        /// as `stringify!` can change its input to text.
+        in_macro: bool,
+    }
+
+    /// The visitor of [`calls_in`]. `func` is the name of the `fn` that the
+    /// visitor reads.
+    #[derive(Default)]
+    struct CallVisitor {
+        func: Option<String>,
+        calls: Vec<Call>,
+    }
+
+    impl CallVisitor {
+        fn push(&mut self, name: String, args: [Option<&syn::Expr>; 2], in_macro: bool) {
+            let [receiver, first_arg] = args.map(|expr| match expr {
+                Some(syn::Expr::Path(path)) => path.path.get_ident().map(ToString::to_string),
+                _ => None,
+            });
+            let func = self.func.clone();
+            self.calls.push(Call { func, name, receiver, first_arg, in_macro });
+        }
+
+        fn in_fn(&mut self, ident: &syn::Ident, visit: impl FnOnce(&mut Self)) {
+            let outer = self.func.replace(ident.to_string());
+            visit(self);
+            self.func = outer;
+        }
+
+        /// Record each name before parentheses in the macro input `tokens`.
+        fn macro_input(&mut self, tokens: proc_macro2::TokenStream) {
+            let mut name = None;
+            for tree in tokens {
+                if let proc_macro2::TokenTree::Group(group) = &tree {
+                    if let (Some(name), proc_macro2::Delimiter::Parenthesis) =
+                        (name.take(), group.delimiter())
+                    {
+                        self.push(name, [None, None], true);
+                    }
+                    self.macro_input(group.stream());
+                }
+                name = match &tree {
+                    proc_macro2::TokenTree::Ident(ident) => Some(ident.to_string()),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CallVisitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            self.in_fn(&item.sig.ident, |visitor| syn::visit::visit_item_fn(visitor, item));
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.in_fn(&item.sig.ident, |visitor| syn::visit::visit_impl_item_fn(visitor, item));
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                let name = path.path.segments.last().map(|segment| segment.ident.to_string());
+                self.push(name.unwrap_or_default(), [None, call.args.first()], false);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.push(call.method.to_string(), [Some(&*call.receiver), call.args.first()], false);
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            self.macro_input(mac.tokens.clone());
+        }
+    }
+
+    /// Return the calls in the Rust source `src`, in the order of the visit.
+    /// A comment or a literal is not in the syntax tree, thus it gives no
+    /// call.
+    fn calls_in(src: &str) -> Vec<Call> {
+        let file = syn::parse_file(src).expect("The source must be valid Rust.");
+        let mut visitor = CallVisitor::default();
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+        visitor.calls
     }
 
     /// Check the ARCH-2h sleep rule in the Rust source `src`. Return an
@@ -3861,11 +3838,15 @@ mod tests {
     /// 1. `src` has one `sleep` call. A `sleep` call in macro input counts.
     /// 2. That call is a call expression in `persist_latched_detection`.
     fn sleep_rule(src: &str) -> Result<(), String> {
-        let code = without_comments(src);
-        let sleeps: Vec<usize> = code.match_indices("sleep(").map(|(at, _)| at).collect();
-        match sleeps[..] {
-            [at] if enclosing_fn(&code, at) == Some("persist_latched_detection") => Ok(()),
-            _ => Err(format!("The scan found these `sleep` calls: {sleeps:?}")),
+        let sleeps: Vec<Call> =
+            calls_in(src).into_iter().filter(|call| call.name == "sleep").collect();
+        match &sleeps[..] {
+            [call]
+                if !call.in_macro && call.func.as_deref() == Some("persist_latched_detection") =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("The visitor found these `sleep` calls: {sleeps:?}")),
         }
     }
 
@@ -3874,13 +3855,21 @@ mod tests {
     /// `persist_latched_detection` call must be a call expression after the
     /// first `executor.shutdown` call expression.
     fn drain_rule(src: &str) -> Result<(), String> {
-        let code = without_comments(src);
-        let at = code.find("fn await_shutdown_and_drain_with_signal(").ok_or("No drain.")?;
-        let open = at + code[at..].find('{').ok_or("No body.")?;
-        let drain = &code[open..closing_bracket(&code, open, ('{', '}')).ok_or("No end.")?];
-        match (drain.find("executor.shutdown("), drain.find("persist_latched_detection(")) {
-            (Some(shutdown), Some(persist)) if shutdown < persist => Ok(()),
-            _ => Err(format!("The calls in the drain are wrong: {drain}")),
+        let calls: Vec<Call> = calls_in(src)
+            .into_iter()
+            .filter(|call| call.func.as_deref() == Some("await_shutdown_and_drain_with_signal"))
+            .collect();
+        let shutdown = calls.iter().position(|call| {
+            !call.in_macro
+                && call.name == "shutdown"
+                && call.receiver.as_deref() == Some("executor")
+        });
+        let persist = calls.iter().position(|call| call.name == "persist_latched_detection");
+        match (shutdown, persist) {
+            (Some(shutdown), Some(persist)) if shutdown < persist && !calls[persist].in_macro => {
+                Ok(())
+            }
+            _ => Err(format!("The calls in the drain are wrong: {calls:?}")),
         }
     }
 
@@ -3889,12 +3878,12 @@ mod tests {
     /// the call must be that identifier. A call in a comment, in a literal or
     /// in macro input does not count.
     fn boot_calls(src: &str, name: &str, first_arg: Option<&str>) -> bool {
-        match first_arg {
-            Some(arg) => {
-                boot_body(src).is_some_and(|body| find_tokens(&body, &[name, "(", arg]).is_some())
-            }
-            None => src.contains(name),
-        }
+        calls_in(src).iter().any(|call| {
+            !call.in_macro
+                && call.func.as_deref() == Some("run_with_clock")
+                && call.name == name
+                && first_arg.is_none_or(|arg| call.first_arg.as_deref() == Some(arg))
+        })
     }
 
     /// Return `true` if the body of `run_with_clock` in `src` calls

@@ -97,6 +97,10 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 rvc-test-support.workspace = true
 rcgen.workspace = true
+# The run.rs tests parse the source with syn to find calls. `span-locations`
+# gives the byte range of a token. Cargo.lock already has these versions.
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+syn = { version = "=2.0.117", features = ["full", "visit"] }
 # ring only: rustls auto-resolution panics when aws-lc and ring are both
 # unified on, which `--workspace --all-features` does. The HTTPS redirect
 # test installs this provider before `ServerConfig::builder()`.
