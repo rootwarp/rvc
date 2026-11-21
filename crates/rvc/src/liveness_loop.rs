@@ -4280,6 +4280,8 @@ mod tests {
     /// The first marker write fails, the drain waits, and the retry exits 12.
     /// W4-D3a (747-9): the failure counter grows by at least 1 across the
     /// drain.
+    /// W4-D3b: the record is missing in each round. The drain counts each
+    /// failed path one time, so the counter increases by exactly 3.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn shutdown_retries_a_failed_marker_write_then_exits_12() {
         let _guard = crate::detection_marker::arm_marker_write_failures(1);
@@ -4332,6 +4334,13 @@ mod tests {
             "The failed marker write of the drain must increment \
              rvc_doppelganger_marker_write_failures_total. The value before the drain is \
              {before}, and the value after the drain is {after}."
+        );
+        assert_eq!(
+            after.saturating_sub(before),
+            3,
+            "The drain must count each failed path one time. The first round has two failed \
+             paths: the missing record and the keystore marker. The second round has one failed \
+             path: the missing record."
         );
     }
 
@@ -4466,6 +4475,191 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
+    }
+
+    /// Return the `error` value of each `ERROR` line in `logged` that has the
+    /// `path` value `path`. In a line, the `path` value is all the text
+    /// between ` path=` and ` error=`. The `error` value is all the text after
+    /// ` error=`. Thus a space in a path does not stop the match.
+    fn path_errors(logged: &[String], path: &std::path::Path) -> Vec<String> {
+        let path = path.display().to_string();
+        logged
+            .iter()
+            .filter(|line| line.contains(" ERROR "))
+            .filter_map(|line| {
+                let (_, fields) = line.split_once(" path=")?;
+                let (value, error) = fields.split_once(" error=")?;
+                (value == path).then(|| error.to_string())
+            })
+            .collect()
+    }
+
+    /// W4-D3b: a directory is at the record path, so the record write of the
+    /// drain fails. The keystore marker write succeeds. The test requires
+    /// these results:
+    ///
+    /// - The drain returns exit 12.
+    /// - The log has one error line with the record path. The `error` value
+    ///   of that line is the error that the record write gives. The test
+    ///   gets that error from `commit_detection_record` before the drain.
+    #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
+    async fn drain_logs_the_record_error_with_its_path() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let record = crate::detection_marker::record_path(keys.path());
+        std::fs::create_dir(&record).expect("The test must create a directory at the record path.");
+        let record_error = crate::detection_marker::commit_detection_record(keys.path(), 0, 0)
+            .expect_err("The record write must fail while a directory is at the record path.")
+            .to_string();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock, and the test does not wait on the wall clock.
+        let detection =
+            detection_shutdown(latched_machine(), keys.path().to_path_buf(), None, test_clock());
+
+        let (_outcome, res) = crate::bootstrap::await_shutdown_and_drain_with_signal(
+            drain_inputs(executor, shutdown_rx, token, Some(detection)),
+            std::future::ready(()),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the keystore marker write succeeds. The result \
+             is {res:?}."
+        );
+        let logged = RefCell::new(Vec::new());
+        logs_assert(|lines| {
+            logged.replace(lines.iter().map(ToString::to_string).collect());
+            Ok(())
+        });
+        let logged = logged.into_inner();
+        assert_eq!(
+            path_errors(&logged, &record),
+            [record_error],
+            "The log must have one error line with the record path and the error of the record \
+             write. The log is {logged:#?}."
+        );
+    }
+
+    /// W4-D3b: each path of the drain fails in the first round. Each path
+    /// has a different error:
+    ///
+    /// - The record is missing.
+    /// - A directory is at the keystore marker path.
+    /// - A regular file is at the path of the fallback directory.
+    ///
+    /// Before the drain, the test gets the error of each writer for these
+    /// paths. The test requires these results:
+    ///
+    /// - The first round logs one error line for each path. The `error`
+    ///   value of each line is the error of the writer of that path.
+    /// - The first round increases the failure counter by exactly 3, one
+    ///   for each failed path.
+    /// - The drain continues after the first round.
+    /// - The test replaces the file with a directory and moves paused time by
+    ///   1 s. Then the drain returns exit 12, and the owned fallback marker
+    ///   is present.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn drain_logs_each_failed_path_with_its_error() {
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        std::fs::create_dir(&keys).expect("The test must create the keystore directory.");
+        std::fs::create_dir(crate::detection_marker::marker_path(&keys))
+            .expect("The test must create a directory at the keystore marker path.");
+        let db_dir = root.path().join("db");
+        std::fs::write(&db_dir, b"")
+            .expect("The test must put a regular file at the fallback directory path.");
+        let fallback = fallback_in(&db_dir);
+        let paths = [
+            crate::detection_marker::record_path(&keys),
+            crate::detection_marker::marker_path(&keys),
+            fallback.owned_path(),
+        ];
+        let marker = crate::detection_marker::DetectionMarker {
+            epoch: 0,
+            unix_secs: 0,
+            pubkeys: Vec::new(),
+        };
+        let errors = [
+            crate::detection_marker::commit_detection_record(&keys, 0, 0).err(),
+            crate::detection_marker::write_marker(&keys, &marker).err(),
+            crate::detection_marker::write_fallback_marker(&fallback, &keys, &marker).err(),
+        ]
+        .map(|error| error.expect("Each write must fail before the drain starts.").to_string());
+        assert_eq!(
+            errors.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3,
+            "The test must give a different error to each path. The errors are {errors:?}."
+        );
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock. The test moves only paused Tokio time, and the counter
+        // check uses the increase from the value before the drain.
+        let detection =
+            detection_shutdown(latched_machine(), keys, Some(fallback.clone()), test_clock());
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        let last_path = paths[2].display().to_string();
+        for _ in 0..64 {
+            if logs_contain(&last_path) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        let logged = RefCell::new(Vec::new());
+        logs_assert(|lines| {
+            logged.replace(lines.iter().map(ToString::to_string).collect());
+            Ok(())
+        });
+        let logged = logged.into_inner();
+        assert_eq!(
+            paths.each_ref().map(|path| path_errors(&logged, path)),
+            errors.map(|error| vec![error]),
+            "The first round must log one error line for each path. The error value of each line \
+             must be the error of the writer of that path. The paths are {paths:?}. The log is \
+             {logged:#?}."
+        );
+        assert_eq!(
+            failures, 3,
+            "The first round must increase the failure counter by exactly 3, one for each failed \
+             path. The counter increased by {failures}."
+        );
+        assert!(
+            !drain.is_finished(),
+            "The drain must continue after the first round, because each path failed."
+        );
+        std::fs::remove_file(&db_dir).expect("The test must remove the regular file.");
+        std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the fallback write succeeds. The result is \
+             {res:?}."
+        );
+        assert!(
+            matches!(
+                crate::detection_marker::inspect_fallback(&fallback).owned,
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The owned fallback marker must be present after the drain."
+        );
     }
 
     /// A signal with the latch clear returns Ok and leaves the record clear.

@@ -722,93 +722,37 @@ fn shell_word(path: &std::path::Path) -> Option<String> {
 
 /// Write a durable detection record once the latch is set.
 ///
-/// The pre-allocated keystore record is overwritten in place first. The
-/// keystore marker and [`DetectionShutdown::fallback`] are additional
-/// paths. `true` only when this process has seen a write and its fsync return
-/// `Ok` (a rename also needs the directory fsync). A later rewrite failure
-/// does not retry. A read of the record or a marker is not durability, and
-/// neither is an unreadable file. Only a latch whose flag is still clear
-/// sleeps and retries. Exit 12 without a completed fsync is not safe: Compose
-/// `restart: unless-stopped` starts the process again, and the detected key
-/// would get a fresh window.
+/// Each round writes each path with [`crate::detection_marker::persist_all`]:
+/// the pre-allocated keystore record in place, the keystore marker, and
+/// [`DetectionShutdown::fallback`]. [`crate::detection_marker::log_persist_report`]
+/// logs and counts each failed path. `true` only when this process has seen a
+/// write and its fsync return `Ok` (a rename also needs the directory fsync).
+/// A later rewrite failure does not retry. A read of the record or a marker
+/// is not durability, and neither is an unreadable file. Only a latch whose
+/// flag is still clear sleeps and retries. Exit 12 without a completed fsync
+/// is not safe: Compose `restart: unless-stopped` starts the process again,
+/// and the detected key would get a fresh window.
 async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
     if !detection.machine.detected_latch() {
         return false;
     }
+    let paths = crate::detection_marker::DetectionPaths {
+        keystore_dir: detection.keystore_dir.clone(),
+        fallback: detection.fallback.clone(),
+    };
     loop {
         if detection.machine.detection_persisted() {
             return true;
         }
-        let epoch = detection.epoch_clock.current_epoch();
-        let unix_secs = crate::detection_marker::unix_secs_now();
         let marker = crate::detection_marker::DetectionMarker {
-            epoch,
-            unix_secs,
+            epoch: detection.epoch_clock.current_epoch(),
+            unix_secs: crate::detection_marker::unix_secs_now(),
             pubkeys: detection.machine.detected_hexes(),
         };
-        if crate::detection_marker::commit_detection_record(
-            &detection.keystore_dir,
-            epoch,
-            unix_secs,
-        )
-        .is_ok()
-        {
+        let report = crate::detection_marker::persist_all(&paths, &marker);
+        crate::detection_marker::log_persist_report(&report, "shutdown drain");
+        if report.durable() {
             detection.machine.mark_detection_persisted();
-            if let Err(err) =
-                crate::detection_marker::write_marker(&detection.keystore_dir, &marker)
-            {
-                crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                error!(
-                    error = %err,
-                    path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
-                    "in-place detection record is durable; the marker write failed"
-                );
-                if let Some(fallback) = &detection.fallback {
-                    if let Err(fallback_err) = crate::detection_marker::write_fallback_marker(
-                        fallback,
-                        &detection.keystore_dir,
-                        &marker,
-                    ) {
-                        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                        error!(
-                            error = %fallback_err,
-                            path = %fallback.owned_path().display(),
-                            "in-place detection record is durable; the fallback marker write failed"
-                        );
-                    }
-                }
-            }
-        } else if crate::detection_marker::write_marker(&detection.keystore_dir, &marker).is_ok() {
-            detection.machine.mark_detection_persisted();
-        } else {
-            crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-            error!(
-                path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
-                "failed to persist doppelganger detection marker during shutdown"
-            );
-            if let Some(fallback) = &detection.fallback {
-                if crate::detection_marker::write_fallback_marker(
-                    fallback,
-                    &detection.keystore_dir,
-                    &marker,
-                )
-                .is_ok()
-                {
-                    detection.machine.mark_detection_persisted();
-                    error!(
-                        path = %fallback.owned_path().display(),
-                        "persisted doppelganger detection marker beside the slashing database"
-                    );
-                } else {
-                    crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
-                    error!(
-                        path = %fallback.owned_path().display(),
-                        "failed to persist the fallback doppelganger detection marker"
-                    );
-                }
-            }
-        }
-        if detection.machine.detection_persisted() {
             return true;
         }
         tokio::time::sleep(MARKER_SHUTDOWN_RETRY).await;

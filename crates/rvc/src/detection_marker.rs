@@ -1509,6 +1509,113 @@ pub fn persist_detection(data_dir: &Path, marker: &DetectionMarker) -> io::Resul
     }
 }
 
+/// The paths of one detection: the keystore directory, which holds the
+/// record and the keystore marker, and the owned fallback marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectionPaths {
+    /// Keystore directory. The record and the keystore marker are in it.
+    pub keystore_dir: PathBuf,
+    /// Owned fallback marker beside the slashing database. `None` when that
+    /// directory is the keystore directory.
+    pub fallback: Option<FallbackMarkerPath>,
+}
+
+/// One path of [`persist_all`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistPath {
+    /// The pre-allocated record, overwritten in place.
+    Record,
+    /// The marker in the keystore directory.
+    KeystoreMarker,
+    /// The owned fallback marker beside the slashing database.
+    FallbackMarker,
+}
+
+/// The result of each path of one [`persist_all`] call.
+#[derive(Debug)]
+pub struct PersistReport {
+    /// The in-place write of the record.
+    pub record: io::Result<()>,
+    /// The write of the keystore marker.
+    pub keystore_marker: io::Result<()>,
+    /// The write of the owned fallback marker. `None` when no fallback is
+    /// configured.
+    pub fallback_marker: Option<io::Result<()>>,
+    /// The paths of the call. Each failure gives its file path from them.
+    paths: DetectionPaths,
+}
+
+impl PersistReport {
+    /// `true` when at least one path returned `Ok`. A path returns `Ok` only
+    /// after its write and its fsync returned `Ok` (a rename also needs the
+    /// directory fsync).
+    pub fn durable(&self) -> bool {
+        self.record.is_ok()
+            || self.keystore_marker.is_ok()
+            || self.fallback_marker.as_ref().is_some_and(Result::is_ok)
+    }
+
+    /// Each failed path, with its file path and its error, in the write
+    /// order.
+    pub fn failures(&self) -> impl Iterator<Item = (PersistPath, PathBuf, &io::Error)> + '_ {
+        let keystore_dir = &self.paths.keystore_dir;
+        let record = self
+            .record
+            .as_ref()
+            .err()
+            .map(|err| (PersistPath::Record, record_path(keystore_dir), err));
+        let keystore_marker = self
+            .keystore_marker
+            .as_ref()
+            .err()
+            .map(|err| (PersistPath::KeystoreMarker, marker_path(keystore_dir), err));
+        let fallback_marker =
+            self.paths.fallback.as_ref().zip(self.fallback_marker.as_ref()).and_then(
+                |(fallback, result)| {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|err| (PersistPath::FallbackMarker, fallback.owned_path(), err))
+                },
+            );
+        record.into_iter().chain(keystore_marker).chain(fallback_marker)
+    }
+}
+
+/// Write the detection to each configured path: the record in place, the
+/// keystore marker, and the owned fallback marker when one is configured.
+///
+/// Each call attempts each configured path. The result of one path does not
+/// stop the write of a different path: a failed keystore volume does not
+/// stop the fallback marker, and a written record does not stop the two
+/// markers. The record is attempted also when it does not exist. With
+/// detection on, boot pre-allocates it, so a missing record is a failure.
+pub fn persist_all(paths: &DetectionPaths, marker: &DetectionMarker) -> PersistReport {
+    let record = commit_detection_record(&paths.keystore_dir, marker.epoch, marker.unix_secs);
+    let keystore_marker = write_marker(&paths.keystore_dir, marker);
+    let fallback_marker = paths
+        .fallback
+        .as_ref()
+        .map(|fallback| write_fallback_marker(fallback, &paths.keystore_dir, marker));
+    PersistReport { record, keystore_marker, fallback_marker, paths: paths.clone() }
+}
+
+/// Log each failed path of `report` at the error level with its `path`, its
+/// `error` and `context`, and count each failed path in
+/// [`crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL`].
+pub fn log_persist_report(report: &PersistReport, context: &str) {
+    for (kind, path, error) in report.failures() {
+        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+        tracing::error!(
+            context,
+            kind = ?kind,
+            path = %path.display(),
+            error = %error,
+            "failed to persist the doppelganger detection on this path"
+        );
+    }
+}
+
 enum ParsedRecord {
     Clear,
     Detected { epoch: u64, unix_secs: u64 },
@@ -4307,6 +4414,176 @@ mod tests {
             matches!(inspect(dir.path()), MarkerInspect::Present(_)),
             "The marker must be at its final path before the directory fsync fails."
         );
+    }
+
+    /// The fallback directory of a row of the `persist_all` table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FallbackRow {
+        /// The directory exists, so the write succeeds.
+        Ok,
+        /// A regular file is at the directory path, so the write fails.
+        Fails,
+        /// No fallback is configured.
+        None,
+    }
+
+    /// `persist_all` writes each configured path on each call. The result of
+    /// one path does not stop the write of a different path. Each row sets
+    /// these conditions:
+    ///
+    /// - The record is pre-allocated (`Ok`) or absent (`Err`).
+    /// - The keystore marker write passes (`Ok`), or
+    ///   `arm_marker_write_failures(1)` stops it (`Err`).
+    /// - The fallback directory exists (`Ok`), is a regular file (`Err`), or
+    ///   is not configured.
+    ///
+    /// The test requires these results for each row:
+    ///
+    /// - The report has one result for each configured path. Each result
+    ///   agrees with the row.
+    /// - A successful path contains a detected record or a valid marker. The
+    ///   other paths contain neither in this test.
+    /// - Each `Ok` path contains the epoch and the Unix time of the input.
+    ///   Each `Ok` marker also contains the keys of the input.
+    /// - `failures` gives each `Err` path one time, with its file path and
+    ///   the error of the report.
+    /// - `durable` is `true` only when at least one path is `Ok`.
+    #[test]
+    fn persist_all_attempts_every_path_independently() {
+        let input = DetectionMarker {
+            epoch: 7,
+            unix_secs: 1_700_000_000,
+            pubkeys: vec![pubkey(), format!("0x{}", "cd".repeat(48))],
+        };
+        for record_ok in [true, false] {
+            for marker_ok in [true, false] {
+                for fallback_row in [FallbackRow::Ok, FallbackRow::Fails, FallbackRow::None] {
+                    let row = format!(
+                        "record {record_ok}, keystore marker {marker_ok}, fallback {fallback_row:?}"
+                    );
+                    let (root, [keys]) = temp_dirs(["keys"]);
+                    if record_ok {
+                        preallocate_detection_record(&keys)
+                            .expect("The test must pre-allocate the record.");
+                    }
+                    let slash = root.path().join("slash");
+                    match fallback_row {
+                        FallbackRow::Ok => fs::create_dir(&slash)
+                            .expect("The test must create the fallback directory."),
+                        FallbackRow::Fails => fs::write(&slash, b"")
+                            .expect("The test must put a regular file at the fallback path."),
+                        FallbackRow::None => {}
+                    }
+                    let fallback =
+                        (fallback_row != FallbackRow::None).then(|| FallbackMarkerPath {
+                            dir: slash.clone(),
+                            slashing_db_path: slash.join("a.sqlite"),
+                        });
+                    let fallback_ok = fallback_row == FallbackRow::Ok;
+                    let paths =
+                        DetectionPaths { keystore_dir: keys.clone(), fallback: fallback.clone() };
+
+                    let guard = (!marker_ok).then(|| arm_marker_write_failures(1));
+                    let report = persist_all(&paths, &input);
+                    drop(guard);
+
+                    let expected = (record_ok, marker_ok, fallback.as_ref().map(|_| fallback_ok));
+                    assert_eq!(
+                        (
+                            report.record.is_ok(),
+                            report.keystore_marker.is_ok(),
+                            report.fallback_marker.as_ref().map(Result::is_ok),
+                        ),
+                        expected,
+                        "The report must have one result for each configured path. Each result \
+                         must agree with the row. The row is: {row}. The report is {report:?}."
+                    );
+                    assert_eq!(
+                        (
+                            matches!(inspect_record(&keys), RecordInspect::Detected { .. }),
+                            matches!(inspect(&keys), MarkerInspect::Present(_)),
+                            fallback.as_ref().map(|fallback| {
+                                matches!(
+                                    inspect_fallback(fallback).owned,
+                                    MarkerInspect::Present(_)
+                                )
+                            }),
+                        ),
+                        expected,
+                        "A successful path must contain a detected record or a valid marker. The \
+                         other paths must contain neither in this test. The row is: {row}."
+                    );
+                    assert_eq!(
+                        (
+                            record_ok.then(|| inspect_record(&keys)),
+                            marker_ok.then(|| present_marker(inspect(&keys))),
+                            fallback.as_ref().filter(|_| fallback_ok).map(|fallback| {
+                                present_marker(inspect_fallback(fallback).owned)
+                            }),
+                        ),
+                        (
+                            record_ok.then_some(RecordInspect::Detected {
+                                epoch: input.epoch,
+                                unix_secs: input.unix_secs,
+                            }),
+                            marker_ok.then(|| Some(input.clone())),
+                            fallback_ok.then(|| Some(input.clone())),
+                        ),
+                        "Each Ok path must contain the epoch and the Unix time of the input. Each \
+                         Ok marker must also contain the keys of the input. The row is: {row}."
+                    );
+                    let failures: Vec<(PersistPath, PathBuf)> =
+                        report.failures().map(|(path, file, _)| (path, file)).collect();
+                    let failed: Vec<(PersistPath, PathBuf)> = [
+                        (!record_ok).then(|| (PersistPath::Record, record_path(&keys))),
+                        (!marker_ok).then(|| (PersistPath::KeystoreMarker, marker_path(&keys))),
+                        fallback
+                            .as_ref()
+                            .filter(|_| !fallback_ok)
+                            .map(|fallback| (PersistPath::FallbackMarker, fallback.owned_path())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    assert_eq!(
+                        failures, failed,
+                        "failures must give each Err path one time, with its file path. The row \
+                         is: {row}."
+                    );
+                    for (path, _, error) in report.failures() {
+                        let field = match path {
+                            PersistPath::Record => report.record.as_ref().err(),
+                            PersistPath::KeystoreMarker => report.keystore_marker.as_ref().err(),
+                            PersistPath::FallbackMarker => report
+                                .fallback_marker
+                                .as_ref()
+                                .and_then(|result| result.as_ref().err()),
+                        };
+                        assert!(
+                            field.is_some_and(|field| std::ptr::eq(field, error)),
+                            "failures must give the error of the report for {path:?}. The row \
+                             is: {row}."
+                        );
+                    }
+                    assert_eq!(
+                        report.durable(),
+                        record_ok || marker_ok || fallback_ok,
+                        "durable must be true only when at least one path is Ok. The row is: \
+                         {row}."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Return the marker of a `Present` result. Return `None` for each other
+    /// result.
+    fn present_marker(result: MarkerInspect) -> Option<DetectionMarker> {
+        if let MarkerInspect::Present(marker) = result {
+            Some(marker)
+        } else {
+            None
+        }
     }
 
     /// Return the sorted names in `dir`, without the record name.
