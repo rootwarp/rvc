@@ -4443,11 +4443,18 @@ mod tests {
     ///   agrees with the row.
     /// - The file of each `Ok` path is present. The file of each `Err` path
     ///   is not present.
+    /// - Each `Ok` path contains the epoch and the Unix time of the input.
+    ///   Each `Ok` marker also contains the keys of the input.
     /// - `failures` gives each `Err` path one time, with its file path and
     ///   the error of the report.
     /// - `durable` is `true` only when at least one path is `Ok`.
     #[test]
     fn persist_all_attempts_every_path_independently() {
+        let input = DetectionMarker {
+            epoch: 7,
+            unix_secs: 1_700_000_000,
+            pubkeys: vec![pubkey(), format!("0x{}", "cd".repeat(48))],
+        };
         for record_ok in [true, false] {
             for marker_ok in [true, false] {
                 for fallback_row in [FallbackRow::Ok, FallbackRow::Fails, FallbackRow::None] {
@@ -4477,7 +4484,7 @@ mod tests {
                         DetectionPaths { keystore_dir: keys.clone(), fallback: fallback.clone() };
 
                     let guard = (!marker_ok).then(|| arm_marker_write_failures(1));
-                    let report = persist_all(&paths, &sample_marker());
+                    let report = persist_all(&paths, &input);
                     drop(guard);
 
                     let expected = (record_ok, marker_ok, fallback.as_ref().map(|_| fallback_ok));
@@ -4505,6 +4512,25 @@ mod tests {
                         expected,
                         "The file of each Ok path must be present. The file of each Err path \
                          must not be present. The row is: {row}."
+                    );
+                    assert_eq!(
+                        (
+                            record_ok.then(|| inspect_record(&keys)),
+                            marker_ok.then(|| present_marker(inspect(&keys))),
+                            fallback.as_ref().filter(|_| fallback_ok).map(|fallback| {
+                                present_marker(inspect_fallback(fallback).owned)
+                            }),
+                        ),
+                        (
+                            record_ok.then_some(RecordInspect::Detected {
+                                epoch: input.epoch,
+                                unix_secs: input.unix_secs,
+                            }),
+                            marker_ok.then(|| Some(input.clone())),
+                            fallback_ok.then(|| Some(input.clone())),
+                        ),
+                        "Each Ok path must contain the epoch and the Unix time of the input. Each \
+                         Ok marker must also contain the keys of the input. The row is: {row}."
                     );
                     let failures: Vec<(PersistPath, PathBuf)> =
                         report.failures().map(|(path, file, _)| (path, file)).collect();
@@ -4547,6 +4573,16 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Return the marker of a `Present` result. Return `None` for each other
+    /// result.
+    fn present_marker(result: MarkerInspect) -> Option<DetectionMarker> {
+        if let MarkerInspect::Present(marker) = result {
+            Some(marker)
+        } else {
+            None
         }
     }
 
