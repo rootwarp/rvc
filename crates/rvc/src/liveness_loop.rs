@@ -4513,6 +4513,9 @@ mod tests {
             .to_string();
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock, and the test does not wait on the wall clock.
         let detection =
             detection_shutdown(latched_machine(), keys.path().to_path_buf(), None, test_clock());
 
@@ -4595,6 +4598,10 @@ mod tests {
         );
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock. The test moves only paused Tokio time, and the counter
+        // check uses the increase from the value before the drain.
         let detection =
             detection_shutdown(latched_machine(), keys, Some(fallback.clone()), test_clock());
         let drain = tokio::spawn(async move {

@@ -4441,8 +4441,8 @@ mod tests {
     ///
     /// - The report has one result for each configured path. Each result
     ///   agrees with the row.
-    /// - The file of each `Ok` path is present. The file of each `Err` path
-    ///   is not present.
+    /// - A successful path contains a detected record or a valid marker. The
+    ///   other paths contain neither in this test.
     /// - Each `Ok` path contains the epoch and the Unix time of the input.
     ///   Each `Ok` marker also contains the keys of the input.
     /// - `failures` gives each `Err` path one time, with its file path and
@@ -4510,8 +4510,8 @@ mod tests {
                             }),
                         ),
                         expected,
-                        "The file of each Ok path must be present. The file of each Err path \
-                         must not be present. The row is: {row}."
+                        "A successful path must contain a detected record or a valid marker. The \
+                         other paths must contain neither in this test. The row is: {row}."
                     );
                     assert_eq!(
                         (
