@@ -3922,7 +3922,7 @@ mod tests {
             ("a call only in a block comment", boot(format!("/* {call} */"))),
             ("a call only in a nested block comment", boot(format!("/* /* */ {call} */"))),
             ("a call only in a raw string with quotes", boot(format!(r##"r#"" {call} ""#;"##))),
-            ("a call only in a string with an escaped quote", boot(format!("\"\\\" {call}\";"))),
+            ("a call only in a string with escaped quotes", boot(format!(r#""\" {call} \"";"#))),
         ] {
             assert!(
                 !boot_calls_proposer_sync_monitor(&fixture),
