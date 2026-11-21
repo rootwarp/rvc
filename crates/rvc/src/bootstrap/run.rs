@@ -3758,7 +3758,8 @@ mod tests {
     /// `spawn_proposer_sync_monitor(` with `proposer_bn_manager`. The scan
     /// removes the `//` comments first.
     fn boot_calls_proposer_sync_monitor(src: &str) -> bool {
-        src.contains("spawn_proposer_sync_monitor(proposer_bn_manager")
+        boot_body(src)
+            .is_some_and(|body| body.contains("spawn_proposer_sync_monitor(proposer_bn_manager"))
     }
 
     /// ARCH-2h: the production body joins tasks. It does not sleep in place
