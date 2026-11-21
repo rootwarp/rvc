@@ -2932,70 +2932,169 @@ mod tests {
         assert!(spawn_at < orch_at, "spawn the runner before the duty_orchestrator task");
     }
 
-    /// Return `src` without its `//` comments. A string literal stays as it is.
-    fn without_line_comments(src: &str) -> String {
-        let mut code = String::with_capacity(src.len());
-        let mut chars = src.chars().peekable();
-        let mut in_string = false;
-        while let Some(c) = chars.next() {
-            if in_string {
-                code.push(c);
-                if c == '\\' {
-                    code.extend(chars.next());
-                } else if c == '"' {
-                    in_string = false;
-                }
-            } else if c == '/' && chars.peek() == Some(&'/') {
-                if chars.by_ref().any(|skipped| skipped == '\n') {
-                    code.push('\n');
+    /// The kind of a token from [`rust_tokens`].
+    #[derive(PartialEq, Eq)]
+    enum TokenKind {
+        /// A line comment or a block comment.
+        Comment,
+        /// A string literal or a character literal. This includes byte
+        /// strings, C strings and raw strings.
+        Literal,
+        /// A word or one punctuation character. A word is an identifier, a
+        /// keyword, a number or a lifetime.
+        Code,
+    }
+
+    /// Split the Rust source `src` into tokens. Return the kind and the byte
+    /// range of each token. Whitespace is not a token. A comment or a literal
+    /// with no end stops at the end of `src`.
+    fn rust_tokens(src: &str) -> Vec<(TokenKind, std::ops::Range<usize>)> {
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut tokens = Vec::new();
+        let mut at = 0;
+        while let Some(c) = src[at..].chars().next() {
+            let rest = &src[at..];
+            let (kind, len) = if rest.starts_with("//") {
+                (TokenKind::Comment, rest.find('\n').unwrap_or(rest.len()))
+            } else if rest.starts_with("/*") {
+                (TokenKind::Comment, block_comment_len(rest))
+            } else if let Some(len) = literal_len(rest) {
+                (TokenKind::Literal, len)
+            } else if word(c) || c == '\'' {
+                (TokenKind::Code, rest.len() - rest[c.len_utf8()..].trim_start_matches(word).len())
+            } else {
+                (TokenKind::Code, c.len_utf8())
+            };
+            if !c.is_whitespace() {
+                tokens.push((kind, at..at + len));
+            }
+            at += len;
+        }
+        tokens
+    }
+
+    /// Return the byte length of the block comment at the start of `text`.
+    /// A block comment can contain block comments.
+    fn block_comment_len(text: &str) -> usize {
+        let mut depth = 0usize;
+        let mut at = 0;
+        while let Some(c) = text[at..].chars().next() {
+            if text[at..].starts_with("/*") {
+                depth += 1;
+                at += 2;
+            } else if text[at..].starts_with("*/") {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return at;
                 }
             } else {
-                in_string = c == '"';
-                code.push(c);
+                at += c.len_utf8();
             }
         }
+        text.len()
+    }
+
+    /// Return the byte length of the string or character literal at the
+    /// start of `text`. Return `None` if no literal starts there. A raw
+    /// string can have `#` delimiters. A literal with no end stops at the end
+    /// of `text`.
+    fn literal_len(text: &str) -> Option<usize> {
+        let rest = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        let prefix = &text[..text.len() - rest.len()];
+        if matches!(prefix, "r" | "br" | "cr") {
+            let quoted = rest.trim_start_matches('#');
+            let body = quoted.strip_prefix('"')?;
+            let end = format!("\"{}", &rest[..rest.len() - quoted.len()]);
+            let len = body.find(&end).map_or(body.len(), |at| at + end.len());
+            return Some(text.len() - body.len() + len);
+        }
+        let quote = rest.chars().next().filter(|&q| q == '"' || q == '\'')?;
+        if !matches!((prefix, quote), ("" | "b" | "c", '"') | ("" | "b", '\'')) {
+            return None;
+        }
+        if quote == '\'' {
+            let first = rest[1..].chars().next()?;
+            if first != '\\' && !rest[1 + first.len_utf8()..].starts_with('\'') {
+                return None;
+            }
+        }
+        let mut chars = rest.char_indices().skip(1);
+        while let Some((at, c)) = chars.next() {
+            if c == '\\' {
+                chars.next();
+            } else if c == quote {
+                return Some(prefix.len() + at + 1);
+            }
+        }
+        Some(text.len())
+    }
+
+    /// Return `src` without its comments. A block comment changes to one
+    /// space. The `\n` after a line comment stays.
+    fn without_comments(src: &str) -> String {
+        let mut code = String::with_capacity(src.len());
+        let mut at = 0;
+        for (kind, range) in rust_tokens(src) {
+            if kind == TokenKind::Comment {
+                code.push_str(&src[at..range.start]);
+                if src[range.clone()].starts_with("/*") {
+                    code.push(' ');
+                }
+                at = range.end;
+            }
+        }
+        code.push_str(&src[at..]);
         code
     }
 
+    /// Return the byte index and the text of each `Code` token in `code`.
+    fn code_tokens(code: &str) -> Vec<(usize, &str)> {
+        rust_tokens(code)
+            .into_iter()
+            .filter(|(kind, _)| *kind == TokenKind::Code)
+            .map(|(_, range)| (range.start, &code[range]))
+            .collect()
+    }
+
+    /// Return the byte index of the first run of `Code` tokens in `code`
+    /// that is equal to `pattern`.
+    fn find_tokens(code: &str, pattern: &[&str]) -> Option<usize> {
+        code_tokens(code)
+            .windows(pattern.len())
+            .find(|run| run.iter().map(|&(_, token)| token).eq(pattern.iter().copied()))
+            .map(|run| run[0].0)
+    }
+
     /// Return the index of the bracket that closes the `open_char` at the
-    /// byte index `open` in `code`. The scan skips string literals. Return
-    /// `None` if the closing bracket is missing.
+    /// byte index `open` in `code`. The scan counts only `Code` tokens, thus
+    /// it skips comments and literals. Return `None` if the closing bracket
+    /// is missing.
     fn closing_bracket(
         code: &str,
         open: usize,
         (open_char, close_char): (char, char),
     ) -> Option<usize> {
-        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
-        for (at, c) in code[open..].char_indices() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_string = false;
-                }
-            } else if c == '"' {
-                in_string = true;
-            } else if c == open_char {
+        let mut depth = 0usize;
+        code_tokens(&code[open..]).into_iter().find_map(|(at, token)| {
+            if token.starts_with(open_char) {
                 depth += 1;
-            } else if c == close_char {
+            } else if token.starts_with(close_char) {
                 depth -= 1;
-                if depth == 0 {
-                    return Some(open + at);
-                }
+                return (depth == 0).then_some(open + at);
             }
-        }
-        None
+            None
+        })
     }
 
     /// Return the text between the outer braces of `async fn run_with_clock<`
-    /// in `src`, with no `//` comments. The brace scan skips string literals.
-    /// Return `None` if the function or its closing brace is missing.
+    /// in `src`, with no comments. The scans use `Code` tokens, thus a
+    /// comment or a literal cannot give the function or a brace. Return
+    /// `None` if the function or its closing brace is missing.
     fn boot_body(src: &str) -> Option<String> {
-        let code = without_line_comments(src);
-        let start = code.find("async fn run_with_clock<")?;
-        let open = start + code[start..].find('{')?;
+        let code = without_comments(src);
+        let start = find_tokens(&code, &["async", "fn", "run_with_clock", "<"])?;
+        let open = start + find_tokens(&code[start..], &["{"])?;
         let close = closing_bracket(&code, open, ('{', '}'))?;
         Some(code[open + 1..close].to_string())
     }
@@ -3755,15 +3854,18 @@ mod tests {
     }
 
     /// Return `true` if the body of `run_with_clock` in `src` calls
-    /// `spawn_proposer_sync_monitor(` with `proposer_bn_manager`. The scan
-    /// removes the `//` comments first.
+    /// `spawn_proposer_sync_monitor(` with `proposer_bn_manager`. The check
+    /// compares `Code` tokens, thus a call in a comment or in a literal does
+    /// not count.
     fn boot_calls_proposer_sync_monitor(src: &str) -> bool {
-        boot_body(src)
-            .is_some_and(|body| body.contains("spawn_proposer_sync_monitor(proposer_bn_manager"))
+        boot_body(src).is_some_and(|body| {
+            find_tokens(&body, &["spawn_proposer_sync_monitor", "(", "proposer_bn_manager"])
+                .is_some()
+        })
     }
 
     /// ARCH-2h: the production body joins tasks. It does not sleep in place
-    /// of a join. The scan removes the `//` comments first. The test requires
+    /// of a join. The scan removes the comments first. The test requires
     /// these results:
     ///
     /// - The production body has one `sleep(` call. That call is the retry
@@ -3830,7 +3932,7 @@ mod tests {
 
         let src = include_str!("run.rs");
         let body = src.split("#[cfg(test)]").next().expect("production body before tests");
-        let code = without_line_comments(body);
+        let code = without_comments(body);
         let sleeps: Vec<usize> = code.match_indices("sleep(").map(|(at, _)| at).collect();
         assert_eq!(
             sleeps.len(),
@@ -3891,7 +3993,8 @@ mod tests {
         assert!(
             boot_calls_proposer_sync_monitor(body),
             "FU-A6: run_with_clock must call spawn_proposer_sync_monitor( with \
-             proposer_bn_manager. The check does not count a `use` line or a comment."
+             proposer_bn_manager. The check does not count a `use` line, a comment or a \
+             literal."
         );
     }
 
