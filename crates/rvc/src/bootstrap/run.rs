@@ -4000,6 +4000,7 @@ mod tests {
             ("the drain waiter in run_with_clock", true, waiter.to_string()),
             ("the drain waiter only in a comment", false, format!("// {waiter}")),
             ("the drain waiter only in a string", false, format!("{waiter:?};")),
+            ("the drain waiter in `stringify!`", false, format!("stringify!({waiter});")),
         ] {
             let src = boot(line);
             let found = boot_calls(&src, "set_after_orchestrator_waiter", None)
