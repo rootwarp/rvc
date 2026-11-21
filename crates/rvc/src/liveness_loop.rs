@@ -4468,6 +4468,144 @@ mod tests {
         }
     }
 
+    /// Count the lines in `logged` that have these three tokens:
+    ///
+    /// - the `ERROR` level,
+    /// - the field `path=<path>`,
+    /// - an `error` field.
+    fn failed_path_lines(logged: &[String], path: &std::path::Path) -> usize {
+        let path = format!("path={}", path.display());
+        logged
+            .iter()
+            .filter(|line| {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                tokens.contains(&"ERROR")
+                    && tokens.contains(&path.as_str())
+                    && tokens.iter().any(|token| token.starts_with("error="))
+            })
+            .count()
+    }
+
+    /// W4-D3b: a directory is at the record path, so the record write of the
+    /// drain fails. The keystore marker write succeeds. The test requires
+    /// these results:
+    ///
+    /// - The drain returns exit 12.
+    /// - The log has one error line with the record path and an `error`
+    ///   field.
+    #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
+    async fn drain_logs_the_record_error_with_its_path() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let record = crate::detection_marker::record_path(keys.path());
+        std::fs::create_dir(&record).expect("The test must create a directory at the record path.");
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection =
+            detection_shutdown(latched_machine(), keys.path().to_path_buf(), None, test_clock());
+
+        let (_outcome, res) = crate::bootstrap::await_shutdown_and_drain_with_signal(
+            drain_inputs(executor, shutdown_rx, token, Some(detection)),
+            std::future::ready(()),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the keystore marker write succeeds. The result \
+             is {res:?}."
+        );
+        let logged = RefCell::new(Vec::new());
+        logs_assert(|lines| {
+            logged.replace(lines.iter().map(ToString::to_string).collect());
+            Ok(())
+        });
+        let logged = logged.into_inner();
+        assert_eq!(
+            failed_path_lines(&logged, &record),
+            1,
+            "The log must have one error line with the record path and an error field. The log \
+             is {logged:#?}."
+        );
+    }
+
+    /// W4-D3b: each path of the drain fails in the first round:
+    ///
+    /// - The record is missing.
+    /// - The keystore directory is missing.
+    /// - A regular file is at the path of the fallback directory.
+    ///
+    /// The test requires these results:
+    ///
+    /// - The first round logs one error line for each path. Each line has
+    ///   the path and an `error` field.
+    /// - In the first round, the failure counter increases by at least 3.
+    /// - The test replaces the file with a directory and moves paused time by
+    ///   1 s. Then the drain returns exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn drain_logs_each_failed_path_with_its_error() {
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        let db_dir = root.path().join("db");
+        std::fs::write(&db_dir, b"")
+            .expect("The test must put a regular file at the fallback directory path.");
+        let fallback = fallback_in(&db_dir);
+        let paths = [
+            crate::detection_marker::record_path(&keys),
+            crate::detection_marker::marker_path(&keys),
+            fallback.owned_path(),
+        ];
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection = detection_shutdown(latched_machine(), keys, Some(fallback), test_clock());
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        let last_path = paths[2].display().to_string();
+        for _ in 0..64 {
+            if logs_contain(&last_path) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        let logged = RefCell::new(Vec::new());
+        logs_assert(|lines| {
+            logged.replace(lines.iter().map(ToString::to_string).collect());
+            Ok(())
+        });
+        let logged = logged.into_inner();
+        assert_eq!(
+            paths.each_ref().map(|path| failed_path_lines(&logged, path)),
+            [1, 1, 1],
+            "The first round must log one error line for each path. Each line must have the path \
+             and an error field. The paths are {paths:?}. The log is {logged:#?}."
+        );
+        assert!(
+            failures >= 3,
+            "The first round must increase the failure counter by at least 3. The counter \
+             increased by {failures}."
+        );
+        std::fs::remove_file(&db_dir).expect("The test must remove the regular file.");
+        std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the fallback write succeeds. The result is \
+             {res:?}."
+        );
+    }
+
     /// A signal with the latch clear returns Ok and leaves the record clear.
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_without_detection_returns_ok_and_leaves_the_record_clear() {
