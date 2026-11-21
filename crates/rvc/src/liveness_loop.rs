@@ -114,6 +114,9 @@ pub struct LivenessObservationLoop {
     /// Validator data directory for the detection marker. Production sets this
     /// to the keystore directory.
     detection_marker_dir: Option<std::path::PathBuf>,
+    /// Owned fallback marker beside the slashing database. Production sets
+    /// this when that directory is not the keystore directory.
+    detection_fallback: Option<crate::detection_marker::FallbackMarkerPath>,
     /// Replaces the monotonic clock in tests. Production leaves this unset.
     #[cfg(any(test, feature = "test-utils"))]
     clock_seam: Option<Arc<ClockSeam>>,
@@ -199,6 +202,7 @@ impl LivenessObservationLoop {
             last_query_failure_warned: parking_lot::Mutex::new(None),
             exit_request: None,
             detection_marker_dir: None,
+            detection_fallback: None,
             #[cfg(any(test, feature = "test-utils"))]
             clock_seam: None,
         }
@@ -236,6 +240,15 @@ impl LivenessObservationLoop {
     /// Directory that receives `.rvc.doppelganger_detected` before exit 12.
     pub fn with_detection_marker_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.detection_marker_dir = Some(dir);
+        self
+    }
+
+    /// Owned fallback marker that the loop also writes before exit 12.
+    pub fn with_detection_fallback(
+        mut self,
+        fallback: crate::detection_marker::FallbackMarkerPath,
+    ) -> Self {
+        self.detection_fallback = Some(fallback);
         self
     }
 
@@ -4660,6 +4673,237 @@ mod tests {
             ),
             "The owned fallback marker must be present after the drain."
         );
+    }
+
+    /// The epoch that the W4-D3c loop tests give to the loop through a clock
+    /// seam.
+    const LOOP_EPOCH: Epoch = 9;
+
+    /// The Unix time that the W4-D3c loop tests give to the writers.
+    const LOOP_UNIX_SECS: u64 = 1_700_000_000;
+
+    /// A liveness loop from [`spawn_detecting_loop`].
+    struct DetectingLoop {
+        machine: Arc<ForwardWindowMachine>,
+        /// The one key of the loop, as a marker stores it: `0x` and the
+        /// lowercase hex.
+        marker_key: String,
+        exits: Arc<RecordingExit>,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spawn a liveness loop that gets a live answer for its one key. The
+    /// loop reads epoch [`LOOP_EPOCH`] from a clock seam. It writes in
+    /// `keystore`, and also in `fallback` when `fallback` is set. A
+    /// recording exit request keeps each exit code that the loop requests.
+    fn spawn_detecting_loop(
+        keystore: &std::path::Path,
+        fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+    ) -> DetectingLoop {
+        let machine = machine();
+        let pk = new_pk();
+        machine.register(&pk, 0);
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "7".to_string());
+        let exits = Arc::new(RecordingExit { codes: std::sync::Mutex::new(Vec::new()) });
+        let cancel = CancellationToken::new();
+        // The constructor needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. The loop reads its
+        // epoch from the seam, so no assertion uses that clock.
+        let mut loop_ = LivenessObservationLoop::new(
+            Arc::clone(&machine),
+            Arc::new(with_live(&[("7", true)]).0),
+            reg,
+            test_clock(),
+            cancel.clone(),
+        )
+        .with_clock_seam(ClockSeam::new(LOOP_EPOCH, 0))
+        .with_slot_duration(Duration::from_secs(12))
+        .with_detection_marker_dir(keystore.to_path_buf())
+        .with_exit_request(Arc::clone(&exits) as Arc<dyn ExitRequest>);
+        if let Some(fallback) = fallback {
+            loop_ = loop_.with_detection_fallback(fallback);
+        }
+        let task = tokio::spawn(loop_.run());
+        let marker_key = format!("0x{}", hex::encode(pk.to_bytes()));
+        DetectingLoop { machine, marker_key, exits, cancel, task }
+    }
+
+    /// Return the marker in `inspected`. Return `None` when `inspected` is
+    /// not a valid marker.
+    fn present_marker(
+        inspected: crate::detection_marker::MarkerInspect,
+    ) -> Option<crate::detection_marker::DetectionMarker> {
+        match inspected {
+            crate::detection_marker::MarkerInspect::Present(marker) => Some(marker),
+            _ => None,
+        }
+    }
+
+    /// W4-D3c (746-10): the keystore directory does not exist, so the record
+    /// write and the keystore marker write fail. The directory of the owned
+    /// fallback marker exists. The loop latches on its first tick. The test
+    /// sends no signal and starts no drain. The test requires these results:
+    ///
+    /// - The owned fallback marker contains the key, the epoch and the Unix
+    ///   time that the loop got.
+    /// - The durable flag of the machine is set.
+    /// - The loop requests exit 12 one time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn running_loop_writes_the_fallback_when_the_keystore_dir_fails() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        let db_dir = root.path().join("db");
+        std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
+        let fallback = fallback_in(&db_dir);
+        let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
+        let live = spawn_detecting_loop(&keys, Some(fallback.clone()));
+        poll_until_parked(&live.task).await;
+
+        assert_eq!(
+            present_marker(crate::detection_marker::inspect_fallback(&fallback).owned),
+            Some(crate::detection_marker::DetectionMarker {
+                epoch: LOOP_EPOCH,
+                unix_secs: LOOP_UNIX_SECS,
+                pubkeys: vec![live.marker_key.clone()],
+            }),
+            "The loop must write the owned fallback marker while the keystore directory is \
+             missing. The marker must contain the key, the epoch and the Unix time that the \
+             loop got."
+        );
+        assert!(
+            live.machine.detection_persisted(),
+            "The fallback marker write must set the durable flag."
+        );
+        assert_eq!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
+            &[EXIT_DOPPELGANGER_DETECTED],
+            "The loop must request exit 12 one time without a signal or a drain."
+        );
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
+    }
+
+    /// W4-D3c (746-5): the record is pre-allocated and each marker write
+    /// fails. No fallback is configured. The loop latches on its first tick.
+    /// Before the loop starts, the test gets the error of the keystore marker
+    /// writer. The test requires these results:
+    ///
+    /// - The log has one error line with the keystore marker path. The
+    ///   `error` value of that line is the error of the writer, and the
+    ///   `context` value is `liveness loop`.
+    /// - The failure counter increases by exactly 1.
+    /// - The record contains the epoch and the Unix time that the loop got.
+    /// - The loop requests exit 12 one time, because the record is durable.
+    ///
+    /// Then the test moves paused time by one slot. The next tick must not
+    /// write again, and it must not request exit 12 again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn loop_logs_and_counts_a_marker_failure_when_the_record_is_durable() {
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        crate::detection_marker::preallocate_detection_record(keys.path())
+            .expect("The test must pre-allocate the record.");
+        let _failures = crate::detection_marker::arm_marker_write_failures(u32::MAX);
+        let marker_path = crate::detection_marker::marker_path(keys.path());
+        let marker_error = crate::detection_marker::write_marker(
+            keys.path(),
+            &crate::detection_marker::DetectionMarker {
+                epoch: 0,
+                unix_secs: 0,
+                pubkeys: Vec::new(),
+            },
+        )
+        .expect_err("The keystore marker write must fail while the failures are armed.")
+        .to_string();
+        let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let live = spawn_detecting_loop(keys.path(), None);
+        poll_until_parked(&live.task).await;
+
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        // `logs_assert` keeps only the lines with the scope of this test. The
+        // loop logs in its detached `liveness_loop.tick` span, so the test
+        // reads all of the captured log. The marker path is in a new
+        // temporary directory, thus a line of a different test cannot match.
+        let captured = tracing_test::internal::global_buf()
+            .lock()
+            .expect("The test must lock the captured log.")
+            .clone();
+        let logged: Vec<String> = String::from_utf8(captured)
+            .expect("The captured log must be UTF-8.")
+            .lines()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            path_errors(&logged, &marker_path),
+            [marker_error],
+            "The log must have one error line with the keystore marker path and the error of the \
+             marker write. The log is {logged:#?}."
+        );
+        let marker_field = format!(" path={} error=", marker_path.display());
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|line| line.contains(" ERROR ") && line.contains(&marker_field))
+                .map(|line| line.contains("context=\"liveness loop\""))
+                .collect::<Vec<_>>(),
+            [true],
+            "The error line of the keystore marker path must have the context of the liveness \
+             loop. The log is {logged:#?}."
+        );
+        assert_eq!(
+            failures, 1,
+            "The loop must increase the failure counter by exactly 1, for the failed keystore \
+             marker. The counter increased by {failures}."
+        );
+        assert_eq!(
+            crate::detection_marker::inspect_record(keys.path()),
+            crate::detection_marker::RecordInspect::Detected {
+                epoch: LOOP_EPOCH,
+                unix_secs: LOOP_UNIX_SECS,
+            },
+            "The record must contain the epoch and the Unix time that the loop got."
+        );
+        assert!(live.machine.detection_persisted(), "The record write must set the durable flag.");
+        assert_eq!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
+            &[EXIT_DOPPELGANGER_DETECTED],
+            "The loop must request exit 12 one time, because the record is durable."
+        );
+
+        tokio::time::advance(Duration::from_secs(12)).await;
+        poll_until_parked(&live.task).await;
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        assert_eq!(
+            failures, 1,
+            "After a durable report, the next tick must not write again. The counter increased \
+             by {failures}."
+        );
+        assert_eq!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
+            &[EXIT_DOPPELGANGER_DETECTED],
+            "The next tick must not request exit 12 again."
+        );
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
+    }
+
+    impl LivenessLoopSpawn {
+        /// Return the owned fallback marker of the built loop. The
+        /// enablement tests read it.
+        pub(crate) fn detection_fallback(
+            &self,
+        ) -> Option<&crate::detection_marker::FallbackMarkerPath> {
+            self.loop_task.detection_fallback.as_ref()
+        }
     }
 
     /// A signal with the latch clear returns Ok and leaves the record clear.

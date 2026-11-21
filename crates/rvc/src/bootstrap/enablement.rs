@@ -837,6 +837,51 @@ mod tests {
         executor.token().cancel();
     }
 
+    /// W4-D3c: the database directory is not the keystore directory. The
+    /// liveness loop that enablement builds must get the owned fallback
+    /// marker of that database, so the loop can write it before exit 12.
+    #[tokio::test]
+    async fn wire_signing_enablement_gives_the_loop_the_fallback_of_the_database() {
+        let (_server, beacon) = mock_beacon(0).await;
+        let keys = loaded_keys_with_pubkey(SecretKey::generate().public_key());
+        let slashing_db =
+            Arc::new(SlashingDb::open_in_memory().expect("The in-memory slashing DB must open."));
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keystore = root.path().join("keys");
+        let db_dir = root.path().join("db");
+        for dir in [&keystore, &db_dir] {
+            std::fs::create_dir(dir).expect("The test must create the directory.");
+        }
+        let config = Config {
+            keystore_path: keystore,
+            slashing_db_path: db_dir.join("slashing.sqlite"),
+            ..base_config(true)
+        };
+        let expected = crate::detection_marker::FallbackMarkerPath::for_config(
+            &config.keystore_path,
+            &config.slashing_db_path,
+        );
+        assert!(
+            expected.is_some(),
+            "The database directory must give a fallback marker, because it is not the keystore \
+             directory."
+        );
+
+        let handles = wire_signing_enablement(&config, &keys, &beacon, slashing_db, &executor)
+            .await
+            .expect("Enablement must succeed with detection on and one key.");
+        let prepared = handles
+            .liveness_task
+            .expect("With detection on, enablement must return the built liveness loop.");
+        assert_eq!(
+            prepared.detection_fallback(),
+            expected.as_ref(),
+            "The built liveness loop must have the owned fallback marker of the database."
+        );
+        executor.token().cancel();
+    }
+
     #[tokio::test]
     async fn test_liveness_task_cancels_on_shutdown_token() {
         use crate::bootstrap::executor::ShutdownTier;

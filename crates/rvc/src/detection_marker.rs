@@ -971,6 +971,10 @@ pub fn clear_marker(data_dir: &Path) -> io::Result<ClearOutcome> {
 
 /// Unix seconds for a marker timestamp. A clock before the epoch records 0.
 pub fn unix_secs_now() -> u64 {
+    #[cfg(test)]
+    if let Some(secs) = UNIX_SECS_OVERRIDE.with(Cell::get) {
+        return secs;
+    }
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
@@ -1778,6 +1782,7 @@ thread_local! {
     static PROBE_STEP_HOOK: RefCell<Option<(PathBuf, ProbeStep, RecordPathHook)>> =
         const { RefCell::new(None) };
     static FALLBACK_PROBES: Cell<u32> = const { Cell::new(0) };
+    static UNIX_SECS_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2024,6 +2029,16 @@ fn run_before_record_link() {
 pub(crate) fn arm_marker_write_failures(count: u32) -> MarkerWriteFailGuard {
     MARKER_WRITE_FAILS_LEFT.with(|left| left.set(count));
     MarkerWriteFailGuard
+}
+
+/// Make [`unix_secs_now`] return `secs` on this thread. A test then knows the
+/// Unix time that a writer records, and the test does not read the clock.
+///
+/// The guard removes the override when it drops.
+#[cfg(test)]
+pub(crate) fn arm_unix_secs(secs: u64) -> UnixSecsGuard {
+    UNIX_SECS_OVERRIDE.with(|slot| slot.set(Some(secs)));
+    UnixSecsGuard
 }
 
 /// Fail the next `count` fsyncs on this thread with `EIO`.
@@ -2288,6 +2303,17 @@ pub(crate) struct MarkerWriteFailGuard;
 impl Drop for MarkerWriteFailGuard {
     fn drop(&mut self) {
         MARKER_WRITE_FAILS_LEFT.with(|left| left.set(0));
+    }
+}
+
+/// The guard removes the Unix time override when it drops.
+#[cfg(test)]
+pub(crate) struct UnixSecsGuard;
+
+#[cfg(test)]
+impl Drop for UnixSecsGuard {
+    fn drop(&mut self) {
+        UNIX_SECS_OVERRIDE.with(|slot| slot.set(None));
     }
 }
 
@@ -4289,15 +4315,37 @@ mod tests {
         );
     }
 
+    /// W4-D3c: the record write passes and each marker write fails. No
+    /// fallback is configured. The test requires these results:
+    ///
+    /// - The report is durable, because the record write returned `Ok`.
+    /// - The keystore marker result is `Err`, and the marker is absent.
+    /// - The record contains the epoch and the Unix time of the input.
     #[test]
-    fn injected_marker_failure_does_not_block_the_in_place_record() {
-        let dir = tempfile::tempdir().expect("temp");
-        preallocate_detection_record(dir.path()).expect("preallocate");
+    fn persist_all_keeps_the_record_when_the_marker_fails() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        preallocate_detection_record(dir.path()).expect("The test must pre-allocate the record.");
         let _guard = arm_marker_write_failures(u32::MAX);
         let marker = DetectionMarker { epoch: 3, unix_secs: 4, pubkeys: vec![pubkey()] };
-        persist_detection(dir.path(), &marker).expect("record is enough");
-        assert!(matches!(inspect(dir.path()), MarkerInspect::Absent));
-        assert!(matches!(inspect_record(dir.path()), RecordInspect::Detected { .. }));
+        let paths = DetectionPaths { keystore_dir: dir.path().to_path_buf(), fallback: None };
+        let report = persist_all(&paths, &marker);
+        assert!(
+            report.durable(),
+            "The record write must make the report durable. The report is {report:?}."
+        );
+        assert!(
+            report.keystore_marker.is_err(),
+            "The keystore marker write must fail. The report is {report:?}."
+        );
+        assert!(
+            matches!(inspect(dir.path()), MarkerInspect::Absent),
+            "The keystore marker must be absent."
+        );
+        assert_eq!(
+            inspect_record(dir.path()),
+            RecordInspect::Detected { epoch: 3, unix_secs: 4 },
+            "The record must contain the epoch and the Unix time of the input."
+        );
     }
 
     /// Return `header` followed by zero bytes, to a total of `len` bytes.
@@ -4386,8 +4434,9 @@ mod tests {
         );
     }
 
-    /// No record exists, so `persist_detection` writes only the marker. The
-    /// temp-file fsync passes and the directory fsync after the rename fails.
+    /// No record exists and no fallback is configured, so `persist_all`
+    /// writes only the keystore marker. The temp-file fsync passes and the
+    /// directory fsync after the rename fails.
     #[test]
     fn dir_fsync_failure_after_rename_is_not_durable() {
         let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
@@ -4397,22 +4446,31 @@ mod tests {
             "The directory must not contain a record."
         );
         let marker = DetectionMarker { epoch: 5, unix_secs: 6, pubkeys: vec![pubkey()] };
+        let paths = DetectionPaths { keystore_dir: dir.path().to_path_buf(), fallback: None };
         let before = fsync_calls();
         let guard = arm_fsync_failures_after(1, 1);
-        let result = persist_detection(dir.path(), &marker);
+        let report = persist_all(&paths, &marker);
         drop(guard);
         assert!(
-            result.is_err(),
-            "persist_detection must return Err when the directory fsync fails."
+            report.keystore_marker.is_err(),
+            "The keystore marker write must return Err when the directory fsync fails. The \
+             report is {report:?}."
+        );
+        assert!(
+            !report.durable(),
+            "The report must not be durable when the directory fsync fails. The report is \
+             {report:?}."
         );
         assert_eq!(
             fsync_calls() - before,
             2,
             "The marker write must fsync the temp file and then the directory."
         );
-        assert!(
-            matches!(inspect(dir.path()), MarkerInspect::Present(_)),
-            "The marker must be at its final path before the directory fsync fails."
+        assert_eq!(
+            present_marker(inspect(dir.path())),
+            Some(marker),
+            "The marker must be at its final path before the directory fsync fails. The marker \
+             must contain the keys, the epoch and the Unix time of the input."
         );
     }
 
