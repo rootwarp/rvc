@@ -4905,6 +4905,36 @@ mod tests {
         live.task.await.expect("The loop task must not panic.");
     }
 
+    /// W4-D3c: the keystore directory does not exist, and no fallback is
+    /// configured. Thus the record write and the keystore marker write fail.
+    /// The loop must count each failed path one time and add no count of its
+    /// own. The durable flag must stay unset, and the loop must not request
+    /// exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let live = spawn_detecting_loop(&root.path().join("keys"), None);
+        poll_until_parked(&live.task).await;
+
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        assert_eq!(
+            failures, 2,
+            "The loop must increase the failure counter by exactly 2, one time for the record \
+             and one time for the keystore marker. The counter increased by {failures}."
+        );
+        assert!(!live.machine.detection_persisted(), "A failed write must not set the flag.");
+        assert!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").is_empty(),
+            "The loop must not request exit 12 while each path fails."
+        );
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
+    }
+
     impl LivenessLoopSpawn {
         /// Return the owned fallback marker of the built loop. The
         /// enablement tests read it.
