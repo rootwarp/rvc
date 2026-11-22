@@ -242,11 +242,16 @@ async fn wire_signing_enablement_body(
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),
             executor,
-            Some((config.keystore_path.clone(), Arc::clone(&tracked_keys))),
-            crate::detection_marker::FallbackMarkerPath::for_config(
-                &config.keystore_path,
-                &config.slashing_db_path,
-            ),
+            Some((
+                crate::detection_marker::DetectionPaths {
+                    keystore_dir: config.keystore_path.clone(),
+                    fallback: crate::detection_marker::FallbackMarkerPath::for_config(
+                        &config.keystore_path,
+                        &config.slashing_db_path,
+                    ),
+                },
+                Arc::clone(&tracked_keys),
+            )),
         )
     } else {
         None
@@ -886,11 +891,6 @@ mod tests {
         let prepared = handles
             .liveness_task
             .expect("With detection on, enablement must return the built liveness loop.");
-        assert_eq!(
-            prepared.detection_fallback(),
-            Some(&fallback),
-            "The built liveness loop must have the owned fallback marker of the database."
-        );
         let _unix = crate::detection_marker::arm_unix_secs(UNIX_SECS);
         prepared.run_first_detecting_tick(EPOCH).await;
         let marker = crate::detection_marker::DetectionMarker {

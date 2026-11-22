@@ -111,12 +111,12 @@ pub struct LivenessObservationLoop {
     last_query_failure_warned: parking_lot::Mutex<Option<Epoch>>,
     /// Drain request. Production [`prepare_liveness_loop`] always sets this.
     exit_request: Option<Arc<dyn ExitRequest>>,
-    /// Validator data directory for the detection marker. Production sets this
-    /// to the keystore directory.
-    detection_marker_dir: Option<std::path::PathBuf>,
-    /// Owned fallback marker beside the slashing database. Production sets
-    /// this when that directory is not the keystore directory.
-    detection_fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+    /// The paths of the detection: the keystore directory for the record and
+    /// the marker, and the owned fallback marker beside the slashing database.
+    /// The fallback comes only with the keystore directory that owns it.
+    /// Production sets the keystore directory, and the fallback when that
+    /// database directory is not the keystore directory.
+    detection_paths: Option<crate::detection_marker::DetectionPaths>,
     /// Replaces the monotonic clock in tests. Production leaves this unset.
     #[cfg(any(test, feature = "test-utils"))]
     clock_seam: Option<Arc<ClockSeam>>,
@@ -201,8 +201,7 @@ impl LivenessObservationLoop {
             no_index_noted: parking_lot::Mutex::new(HashSet::new()),
             last_query_failure_warned: parking_lot::Mutex::new(None),
             exit_request: None,
-            detection_marker_dir: None,
-            detection_fallback: None,
+            detection_paths: None,
             #[cfg(any(test, feature = "test-utils"))]
             clock_seam: None,
         }
@@ -237,18 +236,21 @@ impl LivenessObservationLoop {
         self
     }
 
-    /// Directory that receives `.rvc.doppelganger_detected` before exit 12.
-    pub fn with_detection_marker_dir(mut self, dir: std::path::PathBuf) -> Self {
-        self.detection_marker_dir = Some(dir);
-        self
+    /// Directory that receives `.rvc.doppelganger_detected` before exit 12,
+    /// with no fallback marker. It replaces the paths of an earlier call.
+    pub fn with_detection_marker_dir(self, dir: std::path::PathBuf) -> Self {
+        self.with_detection_paths(crate::detection_marker::DetectionPaths {
+            keystore_dir: dir,
+            fallback: None,
+        })
     }
 
-    /// Owned fallback marker that the loop also writes before exit 12.
-    pub fn with_detection_fallback(
-        mut self,
-        fallback: crate::detection_marker::FallbackMarkerPath,
-    ) -> Self {
-        self.detection_fallback = Some(fallback);
+    /// The paths that the loop writes before exit 12: the record and the
+    /// marker in the keystore directory, and the owned fallback marker when
+    /// `paths` has one. A caller can give the fallback only with the keystore
+    /// directory that owns it. It replaces the paths of an earlier call.
+    pub fn with_detection_paths(mut self, paths: crate::detection_marker::DetectionPaths) -> Self {
+        self.detection_paths = Some(paths);
         self
     }
 
@@ -396,13 +398,14 @@ impl LivenessObservationLoop {
     /// the keystore directory, and the owned fallback marker when one is set.
     ///
     /// [`crate::detection_marker::log_persist_report`] logs and counts each
-    /// failed path. A loop with no keystore directory logs one error and
-    /// counts one failure. The machine gets the durable flag only from a durable
-    /// report: a write and its fsync returned `Ok` on at least one path.
-    /// Otherwise the loop stays up and latched, and the next tick writes
-    /// again. Exit 12 waits for the flag. A later read is not durability.
+    /// failed path. A loop with no detection paths has no keystore directory
+    /// and no fallback. It logs one error and counts one failure. The machine
+    /// gets the durable flag only from a durable report: a write and its fsync
+    /// returned `Ok` on at least one path. Otherwise the loop stays up and
+    /// latched, and the next tick writes again. Exit 12 waits for the flag. A
+    /// later read is not durability.
     fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
-        let Some(keystore_dir) = &self.detection_marker_dir else {
+        let Some(paths) = &self.detection_paths else {
             crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
             error!(
                 "doppelganger detected but no data directory is configured for the marker; \
@@ -410,16 +413,12 @@ impl LivenessObservationLoop {
             );
             return;
         };
-        let paths = crate::detection_marker::DetectionPaths {
-            keystore_dir: keystore_dir.clone(),
-            fallback: self.detection_fallback.clone(),
-        };
         let marker = crate::detection_marker::DetectionMarker {
             epoch,
             unix_secs: crate::detection_marker::unix_secs_now(),
             pubkeys: pubkeys.to_vec(),
         };
-        let report = crate::detection_marker::persist_all(&paths, &marker);
+        let report = crate::detection_marker::persist_all(paths, &marker);
         crate::detection_marker::log_persist_report(&report, "liveness loop");
         if report.durable() {
             self.machine.mark_detection_persisted();
@@ -845,9 +844,11 @@ impl ClockSeam {
 /// `LivenessObservationLoop::refresh_indices_for_test`.
 ///
 /// The loop takes its cancel token and its exit request from `executor`.
-/// `fallback` is the owned fallback marker beside the slashing database. The
-/// loop writes it with the keystore paths before it requests exit 12.
-#[allow(clippy::too_many_arguments)]
+/// `keystore` gives the detection paths and the lock that the keymanager
+/// DELETE and import hold. The loop writes these paths before it requests
+/// exit 12. It removes the Safe import sidecars from their keystore
+/// directory. The owned fallback marker comes only in these paths, with the
+/// keystore directory that owns it.
 pub fn prepare_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn LivenessApi>,
@@ -855,9 +856,8 @@ pub fn prepare_liveness_loop(
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
     executor: &TaskExecutor,
-    // Keystore dir + shared DELETE/import lock for Safe sidecar cleanup.
-    import_sidecar: Option<(std::path::PathBuf, Arc<TrackedKeys>)>,
-    fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+    // Detection paths + shared DELETE/import lock for Safe sidecar cleanup.
+    keystore: Option<(crate::detection_marker::DetectionPaths, Arc<TrackedKeys>)>,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let pubkey_index_ret = Arc::clone(&pubkey_index);
@@ -869,12 +869,9 @@ pub fn prepare_liveness_loop(
     if let Some(pm) = pubkey_map {
         loop_task = loop_task.with_pubkey_map(pm);
     }
-    if let Some((dir, tracked)) = import_sidecar {
-        loop_task = loop_task.with_detection_marker_dir(dir.clone());
-        loop_task = loop_task.with_import_sidecar_dir(dir, tracked);
-    }
-    if let Some(fallback) = fallback {
-        loop_task = loop_task.with_detection_fallback(fallback);
+    if let Some((paths, tracked)) = keystore {
+        loop_task = loop_task.with_import_sidecar_dir(paths.keystore_dir.clone(), tracked);
+        loop_task = loop_task.with_detection_paths(paths);
     }
     Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret, loop_task })
 }
@@ -1453,7 +1450,6 @@ mod tests {
             )),
             &exec,
             None,
-            None,
         );
         spawn_liveness_loop(
             handle.expect("A machine and a registry with an index must give a built loop."),
@@ -1471,7 +1467,6 @@ mod tests {
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec2,
             None,
-            None,
         );
         spawn_liveness_loop(
             no_handle.expect("A machine with an empty registry must give a built loop."),
@@ -1486,7 +1481,6 @@ mod tests {
             None,
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec3,
-            None,
             None,
         );
         assert!(no_machine.is_none());
@@ -1606,7 +1600,6 @@ mod tests {
             Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec,
             None,
-            None,
         );
         spawn_liveness_loop(
             spawn.expect(
@@ -1657,8 +1650,13 @@ mod tests {
             None,
             clock,
             executor,
-            Some((dir.to_path_buf(), Arc::new(TrackedKeys::new()))),
-            None,
+            Some((
+                crate::detection_marker::DetectionPaths {
+                    keystore_dir: dir.to_path_buf(),
+                    fallback: None,
+                },
+                Arc::new(TrackedKeys::new()),
+            )),
         )
         .expect("`prepare_liveness_loop` must build the loop when a machine is available.");
         spawn_liveness_loop(prepared, executor);
@@ -4706,13 +4704,12 @@ mod tests {
     }
 
     /// Spawn a liveness loop that gets a live answer for its one key. The
-    /// loop reads epoch [`LOOP_EPOCH`] from a clock seam. It writes in
-    /// `keystore` when `keystore` is set, and in `fallback` when `fallback`
-    /// is set. `exit` gets the machine and makes the exit request of the
-    /// loop. `RecordingExit` stores each exit code.
+    /// loop reads epoch [`LOOP_EPOCH`] from a clock seam. It writes the
+    /// detection to `paths` when `paths` is set. `exit` gets the machine and
+    /// makes the exit request of the loop. `RecordingExit` stores each exit
+    /// code.
     fn spawn_detecting_loop<E: ExitRequest + 'static>(
-        keystore: Option<&std::path::Path>,
-        fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+        paths: Option<crate::detection_marker::DetectionPaths>,
         exit: impl FnOnce(&Arc<ForwardWindowMachine>) -> E,
     ) -> DetectingLoop<E> {
         let machine = machine();
@@ -4735,11 +4732,8 @@ mod tests {
         .with_clock_seam(ClockSeam::new(LOOP_EPOCH, 0))
         .with_slot_duration(Duration::from_secs(12))
         .with_exit_request(Arc::clone(&exits) as Arc<dyn ExitRequest>);
-        if let Some(keystore) = keystore {
-            loop_ = loop_.with_detection_marker_dir(keystore.to_path_buf());
-        }
-        if let Some(fallback) = fallback {
-            loop_ = loop_.with_detection_fallback(fallback);
+        if let Some(paths) = paths {
+            loop_ = loop_.with_detection_paths(paths);
         }
         let task = tokio::spawn(loop_.run());
         let marker_key = format!("0x{}", hex::encode(pk.to_bytes()));
@@ -4792,12 +4786,15 @@ mod tests {
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
         let fallback = fallback_in(&db_dir);
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
-        let live =
-            spawn_detecting_loop(Some(&keys), Some(fallback.clone()), |machine| FallbackAtExit {
-                machine: Arc::clone(machine),
-                fallback: fallback.clone(),
-                requests: std::sync::Mutex::default(),
-            });
+        let paths = crate::detection_marker::DetectionPaths {
+            keystore_dir: keys,
+            fallback: Some(fallback.clone()),
+        };
+        let live = spawn_detecting_loop(Some(paths), |machine| FallbackAtExit {
+            machine: Arc::clone(machine),
+            fallback: fallback.clone(),
+            requests: std::sync::Mutex::default(),
+        });
         poll_until_parked(&live.task).await;
 
         let marker = crate::detection_marker::DetectionMarker {
@@ -4851,7 +4848,11 @@ mod tests {
         .to_string();
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(Some(keys.path()), None, |_| RecordingExit::default());
+        let paths = crate::detection_marker::DetectionPaths {
+            keystore_dir: keys.path().to_path_buf(),
+            fallback: None,
+        };
+        let live = spawn_detecting_loop(Some(paths), |_| RecordingExit::default());
         poll_until_parked(&live.task).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4939,7 +4940,9 @@ mod tests {
     async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let keys = root.path().join("keys");
-        let failures = failures_of_a_tick_with_no_durable_path(Some(&keys)).await;
+        let paths =
+            crate::detection_marker::DetectionPaths { keystore_dir: keys.clone(), fallback: None };
+        let failures = failures_of_a_tick_with_no_durable_path(Some(paths)).await;
         assert_eq!(
             failures, 2,
             "The loop must increase the failure counter by exactly 2, one time for the record \
@@ -4958,13 +4961,15 @@ mod tests {
         );
     }
 
-    /// Spawn a loop from [`spawn_detecting_loop`] with `keystore` and no
-    /// fallback, and let it run its first tick. No path can be durable. The
-    /// loop must not set the durable flag and must not request exit 12.
-    /// Return the increase of the failure counter.
-    async fn failures_of_a_tick_with_no_durable_path(keystore: Option<&std::path::Path>) -> u64 {
+    /// Spawn a loop from [`spawn_detecting_loop`] with `paths`, and let it
+    /// run its first tick. No path can be durable. The loop must not set the
+    /// durable flag and must not request exit 12. Return the increase of the
+    /// failure counter.
+    async fn failures_of_a_tick_with_no_durable_path(
+        paths: Option<crate::detection_marker::DetectionPaths>,
+    ) -> u64 {
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
-        let live = spawn_detecting_loop(keystore, None, |_| RecordingExit::default());
+        let live = spawn_detecting_loop(paths, |_| RecordingExit::default());
         poll_until_parked(&live.task).await;
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
             .get()
@@ -5079,14 +5084,6 @@ mod tests {
     }
 
     impl LivenessLoopSpawn {
-        /// Return the owned fallback marker of the built loop. The
-        /// enablement tests read it.
-        pub(crate) fn detection_fallback(
-            &self,
-        ) -> Option<&crate::detection_marker::FallbackMarkerPath> {
-            self.loop_task.detection_fallback.as_ref()
-        }
-
         /// Latch the machine of the built loop with a live answer for its one
         /// pending key. Then run the loop with a clock seam at `epoch`, until
         /// the loop waits after its first tick. The enablement tests use it.
