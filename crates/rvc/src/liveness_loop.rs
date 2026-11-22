@@ -4932,6 +4932,7 @@ mod tests {
     ///   "failed to persist the doppelganger detection on this path".
     /// - The failure counter increases by exactly 1.
     /// - The record contains the epoch and the Unix time that the loop got.
+    /// - The keystore marker is absent on the disk.
     /// - The loop requests exit 12 one time, because the record is durable.
     ///
     /// Then the test moves paused time by one slot. The next tick must not
@@ -5018,6 +5019,12 @@ mod tests {
                 unix_secs: LOOP_UNIX_SECS,
             },
             "The record must contain the epoch and the Unix time that the loop got."
+        );
+        let marker = crate::detection_marker::inspect(keys.path());
+        assert!(
+            matches!(marker, crate::detection_marker::MarkerInspect::Absent),
+            "The keystore marker must be absent, because each marker write failed. The marker is \
+             {marker:?}."
         );
         assert!(live.machine.detection_persisted(), "The record write must set the durable flag.");
         assert_eq!(
@@ -5165,10 +5172,13 @@ mod tests {
     ///   the path, and the error that the writer of that path gives.
     /// - The failure counter increases by exactly 3.
     /// - The durable flag stays clear, and the loop does not request exit 12.
+    /// - Each path on the disk stays as the test made it. The record stays
+    ///   absent. See [`assert_failed_paths_stay`].
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_logs_and_counts_each_failed_path_when_the_fallback_fails() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let failing = failing_markers(root.path(), false);
+        let paths = failing.paths.clone();
         let log = ThreadLog::default();
         let _log = log.capture();
         let failures = failures_of_a_tick_with_no_durable_path(Some(failing.paths)).await;
@@ -5184,6 +5194,77 @@ mod tests {
             failures, 3,
             "The loop must increase the failure counter by exactly 3, one time for each failed \
              path. The counter increased by {failures}."
+        );
+        assert_failed_paths_stay(&paths, false);
+    }
+
+    /// Check the disk after a tick with the paths of [`failing_markers`].
+    /// Each failed write must keep its path as the test made it:
+    ///
+    /// - The keystore directory holds only the marker directory, and the
+    ///   record when `record` is `true`. It holds no temporary file.
+    /// - The directory at the keystore marker path is empty. The marker read
+    ///   gives `Unreadable` with `InvalidData` for that path.
+    /// - When `record` is `false`, the record read gives `Absent`.
+    /// - The regular file at the path of the fallback directory is empty. The
+    ///   read of the owned fallback marker gives `Unreadable` with
+    ///   `NotADirectory`.
+    fn assert_failed_paths_stay(paths: &crate::detection_marker::DetectionPaths, record: bool) {
+        use crate::detection_marker::MarkerInspect;
+        let keys = &paths.keystore_dir;
+        let marker_path = crate::detection_marker::marker_path(keys);
+        let mut made = vec![marker_path.clone()];
+        if record {
+            made.push(crate::detection_marker::record_path(keys));
+        }
+        made.sort();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(keys)
+            .expect("The test must read the keystore directory.")
+            .map(|entry| entry.expect("The test must read each entry.").path())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries, made,
+            "The keystore directory must hold only the entries that the test made. It must hold \
+             no temporary file of a failed write."
+        );
+        let in_marker_dir = std::fs::read_dir(&marker_path)
+            .expect("The test must read the directory at the keystore marker path.")
+            .count();
+        assert_eq!(in_marker_dir, 0, "The directory at the keystore marker path must stay empty.");
+        let marker = crate::detection_marker::inspect(keys);
+        assert!(
+            matches!(
+                &marker,
+                MarkerInspect::Unreadable { path, source }
+                    if *path == marker_path && source.kind() == std::io::ErrorKind::InvalidData
+            ),
+            "The keystore marker read must give Unreadable with InvalidData, because a directory \
+             is at the marker path. The result is {marker:?}."
+        );
+        if !record {
+            assert_eq!(
+                crate::detection_marker::inspect_record(keys),
+                crate::detection_marker::RecordInspect::Absent,
+                "The record must stay absent, because its write failed."
+            );
+        }
+        let fallback = paths.fallback.as_ref().expect("The paths must have a fallback.");
+        assert_eq!(
+            std::fs::read(&fallback.dir).map_err(|err| err.kind()),
+            Ok(Vec::new()),
+            "The regular file at the path of the fallback directory must stay empty."
+        );
+        let owned = crate::detection_marker::inspect_fallback(fallback).owned;
+        assert!(
+            matches!(
+                &owned,
+                MarkerInspect::Unreadable { path, source }
+                    if *path == fallback.owned_path()
+                        && source.kind() == std::io::ErrorKind::NotADirectory
+            ),
+            "The owned fallback marker read must give Unreadable with NotADirectory, because a \
+             regular file is at the path of its directory. The result is {owned:?}."
         );
     }
 
@@ -5203,11 +5284,14 @@ mod tests {
     /// - The record contains the epoch and the Unix time that the loop got.
     /// - The machine has the durable flag, and the loop requests exit 12 one
     ///   time.
+    /// - Each marker path on the disk stays as the test made it. See
+    ///   [`assert_failed_paths_stay`].
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_logs_and_counts_both_marker_failures_when_the_record_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let failing = failing_markers(root.path(), true);
-        let keys = failing.paths.keystore_dir.clone();
+        let paths = failing.paths.clone();
+        let keys = paths.keystore_dir.clone();
         let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
         let log = ThreadLog::default();
         let _log = log.capture();
@@ -5239,6 +5323,7 @@ mod tests {
             },
             "The record must contain the epoch and the Unix time that the loop got."
         );
+        assert_failed_paths_stay(&paths, true);
         assert!(live.machine.detection_persisted(), "The record write must set the durable flag.");
         assert_eq!(
             live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
