@@ -4470,6 +4470,8 @@ mod tests {
     /// - The fallback marker write returns the `EIO` of the directory fsync
     ///   after the rename.
     /// - The report is not durable.
+    /// - The call does two fsyncs: the temporary fallback file, then the
+    ///   database directory.
     /// - The owned fallback marker is at its final path. It contains the
     ///   keys, the epoch and the Unix time of the input.
     #[cfg(unix)]
@@ -4485,6 +4487,7 @@ mod tests {
             fallback: Some(fallback.clone()),
         };
         let marker = DetectionMarker { epoch: 5, unix_secs: 6, pubkeys: vec![pubkey()] };
+        let targets_before = fsync_targets().len();
         let guard = arm_fsync_failure_for(&db_dir, 0);
         let report = persist_all(&paths, &marker);
         drop(guard);
@@ -4509,6 +4512,12 @@ mod tests {
         assert!(
             !report.durable(),
             "The report must not be durable, because each path failed. The report is {report:?}."
+        );
+        assert_eq!(
+            fsync_targets()[targets_before..].to_vec(),
+            [file_id(&fallback.owned_path()), file_id(&db_dir)],
+            "The call must fsync the temporary fallback file and then the database directory. \
+             After the rename, the temporary file is the owned fallback marker."
         );
         assert_eq!(
             present_marker(inspect_fallback(&fallback).owned),
