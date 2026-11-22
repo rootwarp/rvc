@@ -4996,6 +4996,88 @@ mod tests {
         );
     }
 
+    /// Return each `fn` parameter and each struct field of the Rust source
+    /// `src` whose type names `FallbackMarkerPath`. The scan reads the items
+    /// at the top level of the file. It skips each item with `#[cfg(test)]`,
+    /// thus it skips the test module.
+    fn fallback_holders(src: &str) -> Vec<String> {
+        struct NamesFallback(bool);
+        impl<'ast> syn::visit::Visit<'ast> for NamesFallback {
+            fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+                if ident == "FallbackMarkerPath" {
+                    self.0 = true;
+                }
+            }
+        }
+        let names_fallback = |ty: &syn::Type| {
+            let mut visitor = NamesFallback(false);
+            syn::visit::Visit::visit_type(&mut visitor, ty);
+            visitor.0
+        };
+        let in_tests = |attrs: &[syn::Attribute]| {
+            attrs.iter().any(|attr| {
+                attr.path().is_ident("cfg")
+                    && attr.parse_args::<syn::Ident>().is_ok_and(|arg| arg == "test")
+            })
+        };
+        let params = |sig: &syn::Signature| -> Vec<String> {
+            sig.inputs
+                .iter()
+                .filter_map(|input| match input {
+                    syn::FnArg::Typed(arg) if names_fallback(&arg.ty) => {
+                        let name = match &*arg.pat {
+                            syn::Pat::Ident(pat) => pat.ident.to_string(),
+                            _ => String::from("_"),
+                        };
+                        Some(format!("fn {} parameter {name}", sig.ident))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let file = syn::parse_file(src).expect("The source must be valid Rust.");
+        let mut holders = Vec::new();
+        for item in &file.items {
+            match item {
+                syn::Item::Fn(item) if !in_tests(&item.attrs) => holders.extend(params(&item.sig)),
+                syn::Item::Impl(item) if !in_tests(&item.attrs) => {
+                    for method in item.items.iter().filter_map(|item| match item {
+                        syn::ImplItem::Fn(method) if !in_tests(&method.attrs) => Some(method),
+                        _ => None,
+                    }) {
+                        holders.extend(params(&method.sig));
+                    }
+                }
+                syn::Item::Struct(item) if !in_tests(&item.attrs) => {
+                    for field in item.fields.iter().filter(|field| names_fallback(&field.ty)) {
+                        let name =
+                            field.ident.as_ref().map_or_else(String::new, ToString::to_string);
+                        holders.push(format!("struct {} field {name}", item.ident));
+                    }
+                }
+                _ => {}
+            }
+        }
+        holders
+    }
+
+    /// W4-D3c fix1: the owned fallback marker records its keystore directory
+    /// as its owner. Thus the loop must get the fallback only in
+    /// `DetectionPaths`, with that keystore directory. The test reads the
+    /// source of this file. Outside the tests, no `fn` parameter and no
+    /// struct field can name `FallbackMarkerPath`. Thus no caller can make a
+    /// loop with a fallback and with no keystore directory.
+    #[test]
+    fn the_loop_gets_the_fallback_only_with_its_keystore_dir() {
+        let holders = fallback_holders(include_str!("liveness_loop.rs"));
+        assert_eq!(
+            holders,
+            Vec::<String>::new(),
+            "The loop must get the fallback only in `DetectionPaths`, with the keystore directory \
+             that owns it. These parameters and fields hold a fallback alone: {holders:?}."
+        );
+    }
+
     impl LivenessLoopSpawn {
         /// Return the owned fallback marker of the built loop. The
         /// enablement tests read it.
