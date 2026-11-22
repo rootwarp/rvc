@@ -4877,15 +4877,14 @@ mod tests {
         }
     }
 
-    /// W4-D3c (746-10): the keystore directory does not exist, so the record
-    /// write and the keystore marker write fail. The directory of the owned
-    /// fallback marker exists. The loop latches on its first tick. The test
+    /// W4-D3c (746-10): the keystore directory is missing. The fallback
+    /// directory exists. The loop detects the key on its first tick. The test
     /// sends no signal and starts no drain. The loop must request exit 12 one
-    /// time. At that request, these results must be true:
+    /// time. At that request, these conditions must be true:
     ///
     /// - The owned fallback marker contains the key, the epoch and the Unix
     ///   time that the loop got.
-    /// - The durable flag of the machine is set.
+    /// - The machine has the durable flag.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn running_loop_writes_the_fallback_when_the_keystore_dir_fails() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
@@ -5047,14 +5046,14 @@ mod tests {
         live.task.await.expect("The loop task must not panic.");
     }
 
-    /// W4-D3c: the keystore directory does not exist, and no fallback is
-    /// configured. Thus the record write and the keystore marker write fail.
-    /// The test requires these results:
+    /// W4-D3c: the keystore directory is missing. The test sets no fallback
+    /// path. Thus the record write and the keystore marker write fail. The
+    /// test requires these results:
     ///
-    /// - The loop counts each failed path one time and adds no count of its
-    ///   own.
-    /// - The durable flag stays unset, and the loop does not request exit 12.
-    /// - The record and the keystore marker are absent on the disk.
+    /// - The failure counter increases by exactly 2, one time for each
+    ///   failed path. The loop adds no count of its own.
+    /// - The durable flag stays clear, and the loop does not request exit 12.
+    /// - The record and the keystore marker are missing on the disk.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_counts_each_failed_path_once_when_no_path_is_durable() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");

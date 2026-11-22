@@ -846,13 +846,14 @@ mod tests {
         executor.token().cancel();
     }
 
-    /// W4-D3c: the database directory is not the keystore directory. The
-    /// liveness loop that enablement builds must get the owned fallback
-    /// marker of that database. The record is pre-allocated, and the two
-    /// directories exist. The test latches the machine and runs the built
-    /// loop for one tick. Then the record, the keystore marker and the owned
-    /// fallback marker must contain the key, the epoch and the Unix time that
-    /// the loop got.
+    /// W4-D3c: the test uses different directories for the keystore and the
+    /// database. It pre-allocates the record in the keystore directory. It
+    /// sets the detection latch and runs one tick of the loop that
+    /// enablement builds. These conditions must be true:
+    ///
+    /// - The record contains the test epoch and Unix time.
+    /// - The keystore marker and the owned fallback marker of the database
+    ///   contain the test key, epoch and Unix time.
     #[tokio::test]
     async fn wire_signing_enablement_gives_the_loop_the_fallback_of_the_database() {
         const EPOCH: Epoch = 9;
