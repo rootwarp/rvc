@@ -4760,7 +4760,10 @@ mod tests {
     /// directory. Thus the two marker writes fail. If `record` is `true`,
     /// pre-allocate the record, thus the record write succeeds. If not, the
     /// record is missing, and its write fails too. Before the loop starts,
-    /// get the error of the writer of each failed path for its line.
+    /// get the error of the writer of each failed path for its line. Each
+    /// write must fail with the error kind of its cause: `NotFound` for the
+    /// record, `IsADirectory` for the keystore marker and `NotADirectory` for
+    /// the fallback marker.
     fn failing_markers(root: &std::path::Path, record: bool) -> FailingMarkers {
         use crate::detection_marker::PersistPath;
         let keys = root.join("keys");
@@ -4782,22 +4785,42 @@ mod tests {
             crate::detection_marker::preallocate_detection_record(&keys)
                 .expect("The test must pre-allocate the record.");
         } else {
-            let error = crate::detection_marker::commit_detection_record(&keys, 0, 0)
-                .expect_err("The record write must fail, because the record is missing.");
             let path = crate::detection_marker::record_path(&keys);
-            lines.push(loop_report_line(PersistPath::Record, &path, &error));
+            let result = crate::detection_marker::commit_detection_record(&keys, 0, 0);
+            let cause = (std::io::ErrorKind::NotFound, "the record is missing");
+            lines.push(failed_line(PersistPath::Record, &path, result, cause));
         }
-        let error = crate::detection_marker::write_marker(&keys, &marker)
-            .expect_err("The keystore marker write must fail, because a directory is at its path.");
-        lines.push(loop_report_line(PersistPath::KeystoreMarker, &marker_path, &error));
-        let error = crate::detection_marker::write_fallback_marker(&fallback, &keys, &marker)
-            .expect_err("The fallback marker write must fail, because its directory is a file.");
-        lines.push(loop_report_line(PersistPath::FallbackMarker, &fallback.owned_path(), &error));
+        let result = crate::detection_marker::write_marker(&keys, &marker);
+        let cause = (std::io::ErrorKind::IsADirectory, "a directory is at its path");
+        lines.push(failed_line(PersistPath::KeystoreMarker, &marker_path, result, cause));
+        let result = crate::detection_marker::write_fallback_marker(&fallback, &keys, &marker);
+        let cause =
+            (std::io::ErrorKind::NotADirectory, "a regular file is at the path of its directory");
+        lines.push(failed_line(PersistPath::FallbackMarker, &fallback.owned_path(), result, cause));
         let paths = crate::detection_marker::DetectionPaths {
             keystore_dir: keys,
             fallback: Some(fallback),
         };
         FailingMarkers { paths, lines }
+    }
+
+    /// Return the line of [`loop_report_line`] for the failed write `result`
+    /// of the path `kind`. The write must fail with the error kind of
+    /// `cause`. The text of `cause` gives the reason.
+    fn failed_line(
+        kind: crate::detection_marker::PersistPath,
+        path: &std::path::Path,
+        result: std::io::Result<()>,
+        (cause, reason): (std::io::ErrorKind, &str),
+    ) -> String {
+        let error = result.err();
+        assert_eq!(
+            error.as_ref().map(std::io::Error::kind),
+            Some(cause),
+            "The {kind:?} write must fail with {cause:?}, because {reason}. The error is \
+             {error:?}."
+        );
+        error.map(|error| loop_report_line(kind, path, &error)).unwrap_or_default()
     }
 
     /// A liveness loop from [`spawn_detecting_loop`].

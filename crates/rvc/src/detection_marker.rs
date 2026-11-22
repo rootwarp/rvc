@@ -4466,6 +4466,7 @@ mod tests {
     /// fsync of the temporary fallback file returns `Ok`. Each fsync of the
     /// database directory returns `EIO`. The test requires these results:
     ///
+    /// - The record write and the keystore marker write return `NotFound`.
     /// - The fallback marker write returns the `EIO` of the directory fsync
     ///   after the rename.
     /// - The report is not durable.
@@ -4487,6 +4488,15 @@ mod tests {
         let guard = arm_fsync_failure_for(&db_dir, 0);
         let report = persist_all(&paths, &marker);
         drop(guard);
+        assert_eq!(
+            (
+                report.record.as_ref().map_err(io::Error::kind),
+                report.keystore_marker.as_ref().map_err(io::Error::kind),
+            ),
+            (Err(io::ErrorKind::NotFound), Err(io::ErrorKind::NotFound)),
+            "The record write and the keystore marker write must return NotFound, because the \
+             keystore directory is missing. The report is {report:?}."
+        );
         assert_eq!(
             report
                 .fallback_marker
