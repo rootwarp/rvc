@@ -4299,8 +4299,8 @@ mod tests {
     }
 
     /// W4-D3c: the record write returns `Ok`. The test sets no fallback path.
-    /// The keystore marker write returns the injected error. The test
-    /// requires these results:
+    /// The keystore marker write returns the injected error. The test checks
+    /// these conditions:
     ///
     /// - The report is durable, because the record write returned `Ok`.
     /// - The keystore marker write returns the injected error, and the
@@ -4420,9 +4420,9 @@ mod tests {
         );
     }
 
-    /// The test supplies no record and no fallback path. Thus `persist_all`
-    /// writes only the keystore marker. The temporary file fsync returns
-    /// `Ok`. The directory fsync returns `EIO` after the rename.
+    /// The test gives no record and no fallback path. As a result,
+    /// `persist_all` writes only the keystore marker. The temporary file fsync
+    /// returns `Ok`. The directory fsync returns `EIO` after the rename.
     #[test]
     fn dir_fsync_failure_after_rename_is_not_durable() {
         let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
@@ -4461,10 +4461,11 @@ mod tests {
         );
     }
 
-    /// W4-D3c fix1: the keystore directory is missing, thus the record write
-    /// and the keystore marker write fail. The fallback directory exists. The
-    /// fsync of the temporary fallback file returns `Ok`. Each fsync of the
-    /// database directory returns `EIO`. The test requires these results:
+    /// W4-D3c fix1: the keystore directory is missing. Because of this, the
+    /// record write and the keystore marker write fail. The fallback
+    /// directory exists. The fsync of the temporary fallback file returns
+    /// `Ok`. Each fsync of the database directory returns `EIO`. The test
+    /// checks these conditions:
     ///
     /// - The record write and the keystore marker write return `NotFound`.
     /// - The fallback marker write returns the `EIO` of the directory fsync

@@ -221,13 +221,13 @@ pub static RVC_DOPPELGANGER_DETECTION_LATCH: LazyLock<IntGauge> = LazyLock::new(
 });
 
 /// Failed writes of a doppelganger detection. The running liveness loop and
-/// the shutdown drain add 1 for each failed path of an attempt (record,
-/// keystore marker, fallback marker), so one attempt can add up to 3. A
-/// liveness loop with no keystore directory adds 1 for each attempt. A
-/// rising value means a write is still failing. Do not stop the process
-/// then: `SIGKILL` before the first durable record loses the latch. Exit 12
-/// still follows after a write of the in-place record or a marker and its
-/// fsync returned `Ok` in this process.
+/// the shutdown drain add 1 for each failed path of an attempt. The paths
+/// are the record, the keystore marker and the fallback marker. One attempt
+/// can add up to 3. A liveness loop with no keystore directory adds 1 for
+/// each attempt. If the value increases, a write failed again. Do not stop
+/// the process then: `SIGKILL` before the first durable record loses the
+/// latch. Exit 12 still follows after a write of the in-place record or a
+/// marker and its fsync returned `Ok` in this process.
 pub static RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> =
     LazyLock::new(|| {
         define_int_counter(

@@ -113,9 +113,10 @@ pub struct LivenessObservationLoop {
     exit_request: Option<Arc<dyn ExitRequest>>,
     /// The paths of the detection: the keystore directory for the record and
     /// the marker, and the owned fallback marker beside the slashing database.
-    /// The fallback comes only with the keystore directory that owns it.
-    /// Production sets the keystore directory, and the fallback when that
-    /// database directory is not the keystore directory.
+    /// The fallback marker records the keystore directory as its owner. The
+    /// loop gets the fallback only in these paths, with that keystore
+    /// directory. Production always sets the keystore directory. It sets the
+    /// fallback when the slashing database is in a different directory.
     detection_paths: Option<crate::detection_marker::DetectionPaths>,
     /// Replaces the monotonic clock in tests. Production leaves this unset.
     #[cfg(any(test, feature = "test-utils"))]
@@ -237,7 +238,8 @@ impl LivenessObservationLoop {
     }
 
     /// Directory that receives `.rvc.doppelganger_detected` before exit 12,
-    /// with no fallback marker. It replaces the paths of an earlier call.
+    /// with no fallback marker. This call replaces the paths of a previous
+    /// call, and it removes their fallback.
     pub fn with_detection_marker_dir(self, dir: std::path::PathBuf) -> Self {
         self.with_detection_paths(crate::detection_marker::DetectionPaths {
             keystore_dir: dir,
@@ -245,10 +247,11 @@ impl LivenessObservationLoop {
         })
     }
 
-    /// The paths that the loop writes before exit 12: the record and the
-    /// marker in the keystore directory, and the owned fallback marker when
-    /// `paths` has one. A caller can give the fallback only with the keystore
-    /// directory that owns it. It replaces the paths of an earlier call.
+    /// Set the paths that the loop writes before exit 12. The loop writes the
+    /// record and the marker in the keystore directory. It also writes the
+    /// owned fallback marker when `paths` has a fallback. A caller can give
+    /// the fallback only with its keystore directory. This call replaces the
+    /// paths of a previous call.
     pub fn with_detection_paths(mut self, paths: crate::detection_marker::DetectionPaths) -> Self {
         self.detection_paths = Some(paths);
         self
@@ -847,8 +850,8 @@ impl ClockSeam {
 /// `keystore` gives the detection paths and the lock that the keymanager
 /// DELETE and import hold. The loop writes these paths before it requests
 /// exit 12. It removes the Safe import sidecars from their keystore
-/// directory. The owned fallback marker comes only in these paths, with the
-/// keystore directory that owns it.
+/// directory. The loop gets the owned fallback marker only in these paths,
+/// with its keystore directory.
 pub fn prepare_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn LivenessApi>,
@@ -4697,8 +4700,9 @@ mod tests {
 
     /// The level, the target and the fields of each event on the test
     /// thread, one line for each event. The current-thread runtime runs the
-    /// loop on the test thread. Thus the log gets the lines of the loop, also
-    /// in its detached tick span, and no line of a different test.
+    /// loop on the test thread. As a result, the log gets the lines of the
+    /// loop and the lines in its detached tick span. It gets no line of a
+    /// different test.
     #[derive(Clone, Default)]
     struct ThreadLog(Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -4748,8 +4752,9 @@ mod tests {
         )
     }
 
-    /// The paths of a loop test in which the two marker writes fail, and the
-    /// line that the loop must log for each failed path, in the write order.
+    /// The paths of a loop test in which the two marker writes fail.
+    /// `lines` has the line that the loop must log for each failed path, in
+    /// the write order.
     struct FailingMarkers {
         paths: crate::detection_marker::DetectionPaths,
         lines: Vec<String>,
@@ -4757,13 +4762,14 @@ mod tests {
 
     /// Make a keystore directory in `root` with a directory at the keystore
     /// marker path. Put a regular file at the path of the fallback
-    /// directory. Thus the two marker writes fail. If `record` is `true`,
-    /// pre-allocate the record, thus the record write succeeds. If not, the
-    /// record is missing, and its write fails too. Before the loop starts,
-    /// get the error of the writer of each failed path for its line. Each
-    /// write must fail with the error kind of its cause: `NotFound` for the
-    /// record, `IsADirectory` for the keystore marker and `NotADirectory` for
-    /// the fallback marker.
+    /// directory. Because of these entries, the two marker writes fail. If
+    /// `record` is `true`, pre-allocate the record. Then the record write
+    /// succeeds. If `record` is `false`, the record is missing, and its write
+    /// also fails. Before the loop starts, get the error of the writer of
+    /// each failed path for its line. Each write must fail with the error
+    /// kind of its cause. The record write must give `NotFound`, the keystore
+    /// marker write `IsADirectory`, and the fallback marker write
+    /// `NotADirectory`.
     fn failing_markers(root: &std::path::Path, record: bool) -> FailingMarkers {
         use crate::detection_marker::PersistPath;
         let keys = root.join("keys");
@@ -4959,7 +4965,7 @@ mod tests {
     /// W4-D3c (746-5): the test pre-allocates the record and sets no
     /// fallback path. Each keystore marker write returns an error. The test
     /// reads the error from the marker writer before the first tick. The
-    /// test requires these results:
+    /// test checks these conditions:
     ///
     /// - The log has one error line with the keystore marker path. The
     ///   `error` value of that line is the error of the writer, and the
@@ -5088,12 +5094,12 @@ mod tests {
         live.task.await.expect("The loop task must not panic.");
     }
 
-    /// W4-D3c: the keystore directory is missing. The test sets no fallback
-    /// path. Thus the record write and the keystore marker write fail. The
-    /// test requires these results:
+    /// W4-D3c: the keystore directory is missing, and the test sets no
+    /// fallback path. Because of this, the record write and the keystore
+    /// marker write fail. The test checks these conditions:
     ///
     /// - The failure counter increases by exactly 2, one time for each
-    ///   failed path. The loop adds no count of its own.
+    ///   failed path. The loop adds no other count.
     /// - The durable flag stays clear, and the loop does not request exit 12.
     /// - The record and the keystore marker are missing on the disk.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -5148,9 +5154,9 @@ mod tests {
         failures
     }
 
-    /// W4-D3c: the test supplies no detection paths. Thus the loop has no
-    /// keystore directory and no fallback path. The test requires these
-    /// results:
+    /// W4-D3c: the test gives no detection paths. As a result, the loop has
+    /// no keystore directory and no fallback path. The test checks these
+    /// conditions:
     ///
     /// - One tick increases the failure counter by exactly 1.
     /// - The log has one error line with the configuration reason.
@@ -5200,7 +5206,7 @@ mod tests {
     /// - A directory is at the keystore marker path.
     /// - A regular file is at the path of the fallback directory.
     ///
-    /// The test requires these results:
+    /// The test checks these conditions:
     ///
     /// - The log has one error line for each path, in the write order. Each
     ///   line has the message of the report, the context `liveness loop`,
@@ -5303,13 +5309,13 @@ mod tests {
         );
     }
 
-    /// W4-D3c fix1: the record is pre-allocated, and the loop has a fallback.
-    /// The two marker writes fail:
+    /// W4-D3c fix1: the test pre-allocates the record and gives the loop a
+    /// fallback. The two marker writes fail:
     ///
     /// - A directory is at the keystore marker path.
     /// - A regular file is at the path of the fallback directory.
     ///
-    /// The test requires these results:
+    /// The test checks these conditions:
     ///
     /// - The log has one error line for each marker path, in the write
     ///   order. Each line has the message of the report, the context
