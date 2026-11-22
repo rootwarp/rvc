@@ -4460,6 +4460,53 @@ mod tests {
         );
     }
 
+    /// W4-D3c fix1: the keystore directory is missing, thus the record write
+    /// and the keystore marker write fail. The fallback directory exists. The
+    /// fsync of the temporary fallback file returns `Ok`. Each fsync of the
+    /// database directory returns `EIO`. The test requires these results:
+    ///
+    /// - The fallback marker write returns the `EIO` of the directory fsync
+    ///   after the rename.
+    /// - The report is not durable.
+    /// - The owned fallback marker is at its final path. It contains the
+    ///   keys, the epoch and the Unix time of the input.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_dir_fsync_failure_after_rename_is_not_durable() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let db_dir = root.path().join("db");
+        fs::create_dir(&db_dir).expect("The test must create the database directory.");
+        let fallback =
+            FallbackMarkerPath { dir: db_dir.clone(), slashing_db_path: db_dir.join("a.sqlite") };
+        let paths = DetectionPaths {
+            keystore_dir: root.path().join("keys"),
+            fallback: Some(fallback.clone()),
+        };
+        let marker = DetectionMarker { epoch: 5, unix_secs: 6, pubkeys: vec![pubkey()] };
+        let guard = arm_fsync_failure_for(&db_dir, 0);
+        let report = persist_all(&paths, &marker);
+        drop(guard);
+        assert_eq!(
+            report
+                .fallback_marker
+                .as_ref()
+                .map(|result| result.as_ref().map_err(io::Error::raw_os_error)),
+            Some(Err(Some(libc::EIO))),
+            "The fallback marker write must return the EIO of the database directory fsync. The \
+             report is {report:?}."
+        );
+        assert!(
+            !report.durable(),
+            "The report must not be durable, because each path failed. The report is {report:?}."
+        );
+        assert_eq!(
+            present_marker(inspect_fallback(&fallback).owned),
+            Some(marker),
+            "The owned fallback marker must be at its final path before the directory fsync \
+             fails. It must contain the keys, the epoch and the Unix time of the input."
+        );
+    }
+
     /// The fallback directory of a row of the `persist_all` table.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FallbackRow {

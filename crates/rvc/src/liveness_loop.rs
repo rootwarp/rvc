@@ -4692,6 +4692,114 @@ mod tests {
     /// The Unix time that the W4-D3c loop tests give to the writers.
     const LOOP_UNIX_SECS: u64 = 1_700_000_000;
 
+    /// The message of each error line of `log_persist_report`.
+    const REPORT_MESSAGE: &str = "failed to persist the doppelganger detection on this path";
+
+    /// The level, the target and the fields of each event on the test
+    /// thread, one line for each event. The current-thread runtime runs the
+    /// loop on the test thread. Thus the log gets the lines of the loop, also
+    /// in its detached tick span, and no line of a different test.
+    #[derive(Clone, Default)]
+    struct ThreadLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            let mut line = format!("{} {}", metadata.level(), metadata.target());
+            event.record(&mut LoopLogVisitor(&mut line));
+            self.0.lock().expect("The test must store the log line.").push(line);
+        }
+    }
+
+    impl ThreadLog {
+        /// Send each event of the test thread to this log until the guard
+        /// drops.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        /// Return each line, in the log order.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("The test must read the log.").clone()
+        }
+
+        /// Return each `ERROR` line with a `path` field, in the log order.
+        fn path_lines(&self) -> Vec<String> {
+            let lines = self.lines().into_iter();
+            lines.filter(|line| line.starts_with("ERROR ") && line.contains(" path=")).collect()
+        }
+    }
+
+    /// Return the line of [`ThreadLog`] that `log_persist_report` must give
+    /// for a failed path of the liveness loop.
+    fn loop_report_line(
+        kind: crate::detection_marker::PersistPath,
+        path: &std::path::Path,
+        error: &std::io::Error,
+    ) -> String {
+        format!(
+            "ERROR rvc::detection_marker message={REPORT_MESSAGE} context=liveness loop \
+             kind={kind:?} path={} error={error}",
+            path.display()
+        )
+    }
+
+    /// The paths of a loop test in which the two marker writes fail, and the
+    /// line that the loop must log for each failed path, in the write order.
+    struct FailingMarkers {
+        paths: crate::detection_marker::DetectionPaths,
+        lines: Vec<String>,
+    }
+
+    /// Make a keystore directory in `root` with a directory at the keystore
+    /// marker path. Put a regular file at the path of the fallback
+    /// directory. Thus the two marker writes fail. If `record` is `true`,
+    /// pre-allocate the record, thus the record write succeeds. If not, the
+    /// record is missing, and its write fails too. Before the loop starts,
+    /// get the error of the writer of each failed path for its line.
+    fn failing_markers(root: &std::path::Path, record: bool) -> FailingMarkers {
+        use crate::detection_marker::PersistPath;
+        let keys = root.join("keys");
+        std::fs::create_dir(&keys).expect("The test must create the keystore directory.");
+        let marker_path = crate::detection_marker::marker_path(&keys);
+        std::fs::create_dir(&marker_path)
+            .expect("The test must create a directory at the keystore marker path.");
+        let db_dir = root.join("db");
+        std::fs::write(&db_dir, b"")
+            .expect("The test must put a regular file at the fallback directory path.");
+        let fallback = fallback_in(&db_dir);
+        let marker = crate::detection_marker::DetectionMarker {
+            epoch: 0,
+            unix_secs: 0,
+            pubkeys: Vec::new(),
+        };
+        let mut lines = Vec::new();
+        if record {
+            crate::detection_marker::preallocate_detection_record(&keys)
+                .expect("The test must pre-allocate the record.");
+        } else {
+            let error = crate::detection_marker::commit_detection_record(&keys, 0, 0)
+                .expect_err("The record write must fail, because the record is missing.");
+            let path = crate::detection_marker::record_path(&keys);
+            lines.push(loop_report_line(PersistPath::Record, &path, &error));
+        }
+        let error = crate::detection_marker::write_marker(&keys, &marker)
+            .expect_err("The keystore marker write must fail, because a directory is at its path.");
+        lines.push(loop_report_line(PersistPath::KeystoreMarker, &marker_path, &error));
+        let error = crate::detection_marker::write_fallback_marker(&fallback, &keys, &marker)
+            .expect_err("The fallback marker write must fail, because its directory is a file.");
+        lines.push(loop_report_line(PersistPath::FallbackMarker, &fallback.owned_path(), &error));
+        let paths = crate::detection_marker::DetectionPaths {
+            keystore_dir: keys,
+            fallback: Some(fallback),
+        };
+        FailingMarkers { paths, lines }
+    }
+
     /// A liveness loop from [`spawn_detecting_loop`].
     struct DetectingLoop<E> {
         machine: Arc<ForwardWindowMachine>,
@@ -4814,14 +4922,15 @@ mod tests {
         live.task.await.expect("The loop task must not panic.");
     }
 
-    /// W4-D3c (746-5): the record is pre-allocated and each marker write
-    /// fails. No fallback is configured. The loop latches on its first tick.
-    /// Before the loop starts, the test gets the error of the keystore marker
-    /// writer. The test requires these results:
+    /// W4-D3c (746-5): the test pre-allocates the record and sets no
+    /// fallback path. Each keystore marker write returns an error. The test
+    /// reads the error from the marker writer before the first tick. The
+    /// test requires these results:
     ///
     /// - The log has one error line with the keystore marker path. The
     ///   `error` value of that line is the error of the writer, and the
-    ///   `context` value is `liveness loop`.
+    ///   `context` value is `liveness loop`. The line has the message
+    ///   "failed to persist the doppelganger detection on this path".
     /// - The failure counter increases by exactly 1.
     /// - The record contains the epoch and the Unix time that the loop got.
     /// - The loop requests exit 12 one time, because the record is durable.
@@ -4887,6 +4996,16 @@ mod tests {
             [true],
             "The error line of the keystore marker path must have the context of the liveness \
              loop. The log is {logged:#?}."
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|line| line.contains(" ERROR ") && line.contains(&marker_field))
+                .map(|line| line.contains(&format!(": {REPORT_MESSAGE} ")))
+                .collect::<Vec<_>>(),
+            [true],
+            "The error line of the keystore marker path must have the message \
+             \"{REPORT_MESSAGE}\". The log is {logged:#?}."
         );
         assert_eq!(
             failures, 1,
@@ -4988,17 +5107,148 @@ mod tests {
         failures
     }
 
-    /// W4-D3c: no keystore directory and no fallback are configured. Thus
-    /// the loop has no path to write. The loop must increase the failure
-    /// counter by exactly 1.
+    /// W4-D3c: the test supplies no detection paths. Thus the loop has no
+    /// keystore directory and no fallback path. The test requires these
+    /// results:
+    ///
+    /// - One tick increases the failure counter by exactly 1.
+    /// - The log has one error line with the configuration reason.
+    /// - The log has no line of `log_persist_report`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_counts_one_failure_when_no_keystore_dir_is_configured() {
+        let log = ThreadLog::default();
+        let _log = log.capture();
         let failures = failures_of_a_tick_with_no_durable_path(None).await;
         assert_eq!(
             failures, 1,
             "The loop must increase the failure counter by exactly 1, because no keystore \
              directory is configured. The counter increased by {failures}."
         );
+        let logged = log.lines();
+        let errors: Vec<&String> = logged
+            .iter()
+            .filter(|line| {
+                ["ERROR rvc::liveness_loop ", "ERROR rvc::detection_marker "]
+                    .iter()
+                    .any(|start| line.starts_with(start))
+                    && !line.contains(DETECTED_MESSAGE)
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [&format!("ERROR rvc::liveness_loop message={NO_PATHS_MESSAGE}")],
+            "The loop must log one error line with the configuration reason. The log must have \
+             no line of the report. The log is {logged:#?}."
+        );
+    }
+
+    /// The message of the error line that the loop logs for each key when it
+    /// sets the latch.
+    const DETECTED_MESSAGE: &str =
+        "message=doppelganger detected; refusing new signatures and requesting shutdown";
+
+    /// The message of the error line of a loop with no detection paths.
+    const NO_PATHS_MESSAGE: &str = "doppelganger detected but no data directory is configured \
+                                    for the marker; staying up and refusing signatures until a \
+                                    marker can be written";
+
+    /// W4-D3c fix1: the loop has a fallback, and each of its three writes
+    /// fails:
+    ///
+    /// - The record is missing.
+    /// - A directory is at the keystore marker path.
+    /// - A regular file is at the path of the fallback directory.
+    ///
+    /// The test requires these results:
+    ///
+    /// - The log has one error line for each path, in the write order. Each
+    ///   line has the message of the report, the context `liveness loop`,
+    ///   the path, and the error that the writer of that path gives.
+    /// - The failure counter increases by exactly 3.
+    /// - The durable flag stays clear, and the loop does not request exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_logs_and_counts_each_failed_path_when_the_fallback_fails() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let failing = failing_markers(root.path(), false);
+        let log = ThreadLog::default();
+        let _log = log.capture();
+        let failures = failures_of_a_tick_with_no_durable_path(Some(failing.paths)).await;
+        assert_eq!(
+            log.path_lines(),
+            failing.lines,
+            "The loop must log one error line for each failed path. Each line must have the \
+             message of the report, the context of the liveness loop, the path and the error of \
+             the writer. The log is {:#?}.",
+            log.lines()
+        );
+        assert_eq!(
+            failures, 3,
+            "The loop must increase the failure counter by exactly 3, one time for each failed \
+             path. The counter increased by {failures}."
+        );
+    }
+
+    /// W4-D3c fix1: the record is pre-allocated, and the loop has a fallback.
+    /// The two marker writes fail:
+    ///
+    /// - A directory is at the keystore marker path.
+    /// - A regular file is at the path of the fallback directory.
+    ///
+    /// The test requires these results:
+    ///
+    /// - The log has one error line for each marker path, in the write
+    ///   order. Each line has the message of the report, the context
+    ///   `liveness loop`, the path, and the error that the writer of that
+    ///   path gives.
+    /// - The failure counter increases by exactly 2.
+    /// - The record contains the epoch and the Unix time that the loop got.
+    /// - The machine has the durable flag, and the loop requests exit 12 one
+    ///   time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_logs_and_counts_both_marker_failures_when_the_record_is_durable() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let failing = failing_markers(root.path(), true);
+        let keys = failing.paths.keystore_dir.clone();
+        let _unix = crate::detection_marker::arm_unix_secs(LOOP_UNIX_SECS);
+        let log = ThreadLog::default();
+        let _log = log.capture();
+        let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
+        let live = spawn_detecting_loop(Some(failing.paths), |_| RecordingExit::default());
+        poll_until_parked(&live.task).await;
+
+        let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
+            .get()
+            .saturating_sub(before);
+        assert_eq!(
+            log.path_lines(),
+            failing.lines,
+            "The loop must log one error line for each failed marker path. Each line must have \
+             the message of the report, the context of the liveness loop, the path and the error \
+             of the writer. The log is {:#?}.",
+            log.lines()
+        );
+        assert_eq!(
+            failures, 2,
+            "The loop must increase the failure counter by exactly 2, one time for each failed \
+             marker. The counter increased by {failures}."
+        );
+        assert_eq!(
+            crate::detection_marker::inspect_record(&keys),
+            crate::detection_marker::RecordInspect::Detected {
+                epoch: LOOP_EPOCH,
+                unix_secs: LOOP_UNIX_SECS,
+            },
+            "The record must contain the epoch and the Unix time that the loop got."
+        );
+        assert!(live.machine.detection_persisted(), "The record write must set the durable flag.");
+        assert_eq!(
+            live.exits.codes.lock().expect("The test must read the exit codes.").as_slice(),
+            &[EXIT_DOPPELGANGER_DETECTED],
+            "The loop must request exit 12 one time, because the record is durable."
+        );
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
     }
 
     /// Return each `fn` parameter and each struct field of the Rust source
