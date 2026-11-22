@@ -15,6 +15,16 @@ pub enum ImportKeystoreError {
     DecryptionFailed(String),
     #[error("invalid keystore: {0}")]
     InvalidKeystore(String),
+    /// The keystore `pubkey` field is missing or is not lowercase bare hex.
+    ///
+    /// The message is a fixed phrase. It names the field and contains no secret.
+    #[error("{0}")]
+    PubkeyField(&'static str),
+    /// The password is longer than the 4096-byte body boot will read.
+    ///
+    /// The message is a fixed phrase and contains no secret.
+    #[error("import password exceeds 4096 bytes")]
+    PasswordTooLarge,
     #[error("I/O error: {0}")]
     Io(String),
     /// A DELETE has snapshotted this pubkey and has not finished yet.
@@ -107,6 +117,17 @@ pub enum SlashingProtectionError {
     ImportQueueFull { retry_after_secs: u64 },
 }
 
+/// Interchange blob returned by [`SlashingProtection::export_interchange`].
+///
+/// `json` is the EIP-3076 document for the requested keys. `with_history` is
+/// the subset that had any slashing row or watermark, in request order after
+/// canonical dedup. W4-K2 uses it for `not_active`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedInterchange {
+    pub json: String,
+    pub with_history: Vec<Pubkey>,
+}
+
 /// Manages EIP-3076 slashing protection interchange data.
 #[async_trait]
 pub trait SlashingProtection: Send + Sync {
@@ -114,7 +135,15 @@ pub trait SlashingProtection: Send + Sync {
         &self,
         interchange_json: &str,
     ) -> Result<(), SlashingProtectionError>;
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
+
+    /// Export slashing protection for `pubkeys`.
+    ///
+    /// All-or-nothing over the requested keys. An empty record stands for a
+    /// requested key with neither rows nor watermarks.
+    async fn export_interchange(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError>;
 }
 
 /// Manages validator configurations (enable/disable).
@@ -186,8 +215,8 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// `ForwardWindowMachine` adapters treat this as a no-op for machine state;
     /// only [`Self::cancel_monitoring`] (DELETE) removes machine registration.
     fn stop_monitoring(&self, pubkey: &Pubkey);
-    /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
-    /// a fresh window (`ForwardWindowMachine::cancel`).
+    /// DELETE / hard-remove path: drop monitoring state so a re-import starts
+    /// a fresh window (`ForwardWindowMachine::cancel`). A `Detected` entry stays.
     ///
     /// Default: same as [`Self::stop_monitoring`] (log-only / pending-set
     /// implementors where both mean "prune pending").
@@ -199,6 +228,27 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// Keys that are not under active monitoring (e.g. existing keys loaded at
     /// startup) are considered safe and return `true` by default.
     fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool;
+
+    /// `true` when this key is `Detected` or the process detection latch is set.
+    ///
+    /// This is not `!is_doppelganger_safe`. A key that is still `Pending` is
+    /// unsafe to sign and must not roll back a wall-clock enable. The default
+    /// is `false` so monitors that do not model detection leave the enable write
+    /// in place.
+    fn signing_closed_by_detection(&self, pubkey: &Pubkey) -> bool {
+        let _ = pubkey;
+        false
+    }
+
+    /// `true` only when this pubkey itself is `Detected`.
+    ///
+    /// The process latch makes [`Self::signing_closed_by_detection`] true for
+    /// every key. This method does not. The enable-task rollback persists
+    /// `enabled = false` only for keys this returns true for.
+    fn is_detected_key(&self, pubkey: &Pubkey) -> bool {
+        let _ = pubkey;
+        false
+    }
 }
 
 /// Errors from remote-key import.

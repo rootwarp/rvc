@@ -8,12 +8,45 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
-use super::error::KeyManagerError;
+use super::error::{KeyManagerError, KeystoreError};
 use super::keystore::Keystore;
 use observability::logging::TruncatedPubkey;
 
 /// Reserved password-map key for the wildcard (global default) password.
 pub const WILDCARD_KEY: &str = "*";
+
+/// Password-map key for a pubkey hex field.
+///
+/// Lowercases only. A `0x` prefix stays in the key, so `hex::decode` rejects
+/// it and a prefixed keystore field does not select a bare-hex secret.
+pub fn password_map_key(pubkey_hex: &str) -> String {
+    pubkey_hex.to_ascii_lowercase()
+}
+
+/// Pubkey bytes for a password-map key.
+///
+/// The field is lowercased first, so uppercase hex matches the secret written
+/// from the decrypted key. A `0x` prefix does not decode.
+pub fn decode_password_map_key(pubkey_hex: &str) -> Option<[u8; PUBLIC_KEY_BYTES_LEN]> {
+    let bytes = hex::decode(password_map_key(pubkey_hex)).ok()?;
+    if bytes.len() != PUBLIC_KEY_BYTES_LEN {
+        return None;
+    }
+    let mut pubkey = [0u8; PUBLIC_KEY_BYTES_LEN];
+    pubkey.copy_from_slice(&bytes);
+    Some(pubkey)
+}
+
+/// Why keystores in one directory load were not decrypted.
+///
+/// Filled while results are aggregated. Parallel decryption does not touch it.
+#[derive(Debug, Default)]
+pub struct KeystoreLoadReport {
+    /// Declared pubkeys whose password failed the keystore checksum.
+    pub password_rejected: HashSet<[u8; PUBLIC_KEY_BYTES_LEN]>,
+    /// Declared pubkeys that failed to load for some other reason.
+    pub load_failed: HashSet<[u8; PUBLIC_KEY_BYTES_LEN]>,
+}
 
 /// A prepared decryption work item. Produced by Phase 1, consumed by Phase 2.
 struct DecryptionTask<'a> {
@@ -35,6 +68,8 @@ enum DecryptionOutcome {
         pubkey_hex: String,
         file_path: PathBuf,
         error: String,
+        /// `true` only for [`KeystoreError::ChecksumMismatch`].
+        password_rejected: bool,
     },
 }
 
@@ -111,6 +146,28 @@ impl KeyManager {
         passwords: &HashMap<String, SecretString>,
         num_threads: Option<usize>,
         denylist: Option<&HashSet<[u8; PUBLIC_KEY_BYTES_LEN]>>,
+    ) -> Result<Self, KeyManagerError> {
+        Self::load_from_directory_with_threads_filtered_reporting(
+            path,
+            passwords,
+            num_threads,
+            denylist,
+            &mut KeystoreLoadReport::default(),
+        )
+    }
+
+    /// Like [`Self::load_from_directory_with_threads_filtered`], and records
+    /// why a declared pubkey was not loaded.
+    ///
+    /// A checksum failure is `report.password_rejected`. Every other decrypt
+    /// failure is `report.load_failed`. A keystore that does not parse is not
+    /// recorded; the caller reads that file itself.
+    pub fn load_from_directory_with_threads_filtered_reporting<P: AsRef<Path>>(
+        path: P,
+        passwords: &HashMap<String, SecretString>,
+        num_threads: Option<usize>,
+        denylist: Option<&HashSet<[u8; PUBLIC_KEY_BYTES_LEN]>>,
+        report: &mut KeystoreLoadReport,
     ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
 
@@ -200,7 +257,9 @@ impl KeyManager {
                 }
             }
 
-            let password = match passwords.get(&pubkey_hex).or_else(|| passwords.get(WILDCARD_KEY))
+            let password = match passwords
+                .get(&password_map_key(&pubkey_hex))
+                .or_else(|| passwords.get(WILDCARD_KEY))
             {
                 Some(p) => p,
                 None => {
@@ -268,6 +327,7 @@ impl KeyManager {
                                 pubkey_hex: task.declared_pubkey_hex,
                                 file_path: task.file_path,
                                 error: e.to_string(),
+                                password_rejected: matches!(e, KeystoreError::ChecksumMismatch),
                             };
                         }
                     };
@@ -281,6 +341,7 @@ impl KeyManager {
                                 pubkey_hex: task.declared_pubkey_hex,
                                 file_path: task.file_path,
                                 error: "invalid pubkey hex".to_string(),
+                                password_rejected: false,
                             };
                         }
                     };
@@ -292,6 +353,7 @@ impl KeyManager {
                                 pubkey_hex: task.declared_pubkey_hex,
                                 file_path: task.file_path,
                                 error: "invalid pubkey format".to_string(),
+                                password_rejected: false,
                             };
                         }
                     };
@@ -306,6 +368,7 @@ impl KeyManager {
                             pubkey_hex: task.declared_pubkey_hex,
                             file_path: task.file_path,
                             error,
+                            password_rejected: false,
                         };
                     }
 
@@ -337,7 +400,14 @@ impl KeyManager {
                     keys.insert(pubkey_bytes, secret_key);
                     success_count += 1;
                 }
-                DecryptionOutcome::Failure { pubkey_hex, file_path, error } => {
+                DecryptionOutcome::Failure { pubkey_hex, file_path, error, password_rejected } => {
+                    if let Some(pubkey) = decode_password_map_key(&pubkey_hex) {
+                        if password_rejected {
+                            report.password_rejected.insert(pubkey);
+                        } else {
+                            report.load_failed.insert(pubkey);
+                        }
+                    }
                     warn!(
                         pubkey = %TruncatedPubkey::new(&pubkey_hex),
                         file = ?file_path,

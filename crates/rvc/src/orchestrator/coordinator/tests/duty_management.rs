@@ -1,6 +1,9 @@
 //! Coordinator tests: proposer preparation, committee subscriptions, epoch reorg.
 
 use super::*;
+use crate::orchestrator::duty_management::{
+    arm_prepare_hook, DutyManagementService, PrepareOutcome, PreparePoint,
+};
 
 // --- B-05: Proposer preparation tests ---
 
@@ -88,7 +91,8 @@ async fn test_prepare_proposers_sends_preparations() {
     deps.pubkey_index.write().insert(pubkey.to_bytes(), "42".to_string());
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
-    orchestrator.duty_management.prepare_proposers(3).await;
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+    assert!(matches!(outcome, Ok(PrepareOutcome::Complete)), "every key has an index: {outcome:?}");
     // wiremock will verify expect(1) on drop
 }
 
@@ -138,7 +142,8 @@ async fn test_prepare_proposers_no_validators_no_call() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.prepare_proposers(0).await;
+    let outcome = orchestrator.duty_management.prepare_proposers(0).await;
+    assert!(matches!(outcome, Ok(PrepareOutcome::Complete)), "no local key: {outcome:?}");
 }
 
 #[tokio::test]
@@ -219,7 +224,27 @@ async fn test_prepare_proposers_failure_is_non_fatal() {
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
     // Should not panic - failure is non-fatal
-    orchestrator.duty_management.prepare_proposers(3).await;
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+    assert!(matches!(outcome, Err(OrchestratorError::Beacon(_))), "the POST failed: {outcome:?}");
+    drop(orchestrator);
+
+    // Timeout arm, on paused time: the POST is held an hour, past its own 3 s bound.
+    tokio::time::pause();
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let held = retirement_beacon().with_method_delay(prep, Duration::from_secs(3_600));
+    let local = (SecretKey::generate(), true);
+    let (orchestrator, _handle, held) =
+        retirement_orchestrator(3, near_gloas_schedule(100), held, local, vec![], vec![]).await;
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(OrchestratorError::OperationTimedOut { operation: "proposer_preparation" })
+        ),
+        "the POST's own bound cut it: {outcome:?}"
+    );
+    let posts = held.call_stamps().iter().filter(|stamp| stamp.method == prep).count();
+    assert_eq!(posts, 1, "the POST went out, and was dropped at the bound");
 }
 
 // --- B-05: Committee subscription tests ---
@@ -310,7 +335,8 @@ async fn test_submit_committee_subscriptions_sends_subscriptions() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.submit_committee_subscriptions(3).await;
+    let sent = orchestrator.duty_management.submit_committee_subscriptions(3).await;
+    assert!(matches!(sent, Ok(())), "the POST went out: {sent:?}");
     // wiremock will verify expect(1) on drop
 }
 
@@ -360,9 +386,16 @@ async fn test_submit_committee_subscriptions_no_duties_no_call() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.submit_committee_subscriptions(0).await;
+    let sent = orchestrator.duty_management.submit_committee_subscriptions(0).await;
+    assert!(matches!(sent, Ok(())), "nothing to send: {sent:?}");
 }
 
+/// The duty pubkey of validator 55, `0xdd` repeated.
+const SUBSCRIPTION_DUTY_PUBKEY: &str = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+/// A subscription POST that answers 500 is an error, through the facade, and
+/// one held past its own 3 s `preparation` bound is `OperationTimedOut`;
+/// neither panics.
 #[tokio::test]
 async fn test_submit_committee_subscriptions_failure_is_non_fatal() {
     use wiremock::matchers::{method, path};
@@ -376,7 +409,7 @@ async fn test_submit_committee_subscriptions_failure_is_non_fatal() {
             "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "execution_optimistic": false,
             "data": [{
-                "pubkey": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "pubkey": SUBSCRIPTION_DUTY_PUBKEY,
                 "validator_index": "55",
                 "committee_index": "0",
                 "committee_length": "64",
@@ -392,19 +425,73 @@ async fn test_submit_committee_subscriptions_failure_is_non_fatal() {
     Mock::given(method("POST"))
         .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
+    let beacon_config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let orchestrator = subscription_orchestrator(beacon).await;
+
+    // Should not panic
+    let sent = orchestrator.submit_committee_subscriptions(3).await;
+    assert!(sent.is_err(), "the POST answered 500: {sent:?}");
+    assert!(matches!(sent, Err(OrchestratorError::Beacon(_))), "{sent:?}");
+    drop(orchestrator);
+
+    // Timeout arm, on paused time: the POST is held an hour.
+    tokio::time::pause();
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let held = Arc::new(
+        bn_manager::MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, _indices| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                    execution_optimistic: false,
+                    data: vec![AttesterDuty {
+                        pubkey: SUBSCRIPTION_DUTY_PUBKEY.to_string(),
+                        validator_index: "55".to_string(),
+                        committee_index: "0".to_string(),
+                        committee_length: "64".to_string(),
+                        committees_at_slot: "2".to_string(),
+                        validator_committee_index: "3".to_string(),
+                        slot: "97".to_string(),
+                    }],
+                })
+            })
+            .with_submit_beacon_committee_subscriptions(|_subscriptions| Ok(()))
+            .with_method_delay(subs, Duration::from_secs(3_600)),
+    );
+    let orchestrator = subscription_orchestrator(held.clone()).await;
+
+    let sent = orchestrator.duty_management.submit_committee_subscriptions(3).await;
+    assert!(
+        matches!(
+            sent,
+            Err(OrchestratorError::OperationTimedOut { operation: "committee_subscription" })
+        ),
+        "the POST's own bound cut it: {sent:?}"
+    );
+    let posts = held.call_stamps().iter().filter(|stamp| stamp.method == subs).count();
+    assert_eq!(posts, 1, "the POST went out, and was dropped at the bound");
+}
+
+/// Validator 55 (duty pubkey `0xdd…`) with an attester duty at slot 97 of
+/// epoch 3, its key in the signer and the store, over `beacon`.
+async fn subscription_orchestrator(
+    beacon: Arc<dyn BeaconNodeClient>,
+) -> DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon> {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 96));
     clock.set_slot(96);
-
-    let beacon_config = BeaconClientConfig::new(mock_server.uri());
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["55".to_string()]));
     duty_tracker.fetch_duties_for_epoch(3).await.unwrap();
 
     let secret_key = SecretKey::generate();
     let pubkey = secret_key.public_key();
+    let validator_store = create_mock_validator_store();
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
 
     let mut key_manager = KeyManager::new();
     key_manager.insert(secret_key);
@@ -430,13 +517,11 @@ async fn test_submit_committee_subscriptions_failure_is_non_fatal() {
         beacon,
         create_mock_block_beacon(),
         None,
-        create_mock_validator_store(),
+        validator_store,
         config,
         pubkey_map,
     ));
-
-    // Should not panic
-    orchestrator.duty_management.submit_committee_subscriptions(3).await;
+    orchestrator
 }
 
 // NOTE: Tests for builder registration behavior (called_at_epoch_boundary,
@@ -514,7 +599,7 @@ async fn test_check_reorg_at_epoch_boundary_no_change() {
     ));
 
     // Should not panic, should complete successfully
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 }
 
 #[tokio::test]
@@ -586,7 +671,7 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
     ));
 
     // No caches populated — should fetch and not panic
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 
     // Attester/proposer caches populated; PTC skipped (epochs 10/11 are pre-Gloas).
     assert!(duty_tracker.is_epoch_cached(10).await);
@@ -668,7 +753,10 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches_ptc_when_gloas_acti
         pubkey_map,
     ));
 
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+    orchestrator
+        .duty_management
+        .check_reorg_at_epoch_boundary(gloas_epoch, &AtomicBool::default())
+        .await;
 
     assert!(duty_tracker.is_epoch_cached(gloas_epoch).await);
     assert!(duty_tracker.is_epoch_cached(gloas_epoch + 1).await);
@@ -678,179 +766,86 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches_ptc_when_gloas_acti
     assert!(duty_tracker.is_ptc_epoch_cached(gloas_epoch + 1).await);
 }
 
-#[tokio::test]
-async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-
-    let slow_response = serde_json::json!({
-        "data": [],
-        "dependent_root": "0xslow_root",
-        "execution_optimistic": false
-    });
+/// Runs `check_reorg_at_epoch_boundary(epoch)` on paused time against a
+/// beacon node that holds every duty call for `duty_fetch + 500 ms`, and
+/// asserts each call in `expected` is cut at `duty_fetch`: call `k` arrives
+/// at `k × duty_fetch` and the check ends at `expected.len() × duty_fetch`.
+async fn assert_reorg_check_cuts_each_call_at_duty_fetch(
+    epoch: u64,
+    expected: &[bn_manager::MockMethod],
+) {
+    use bn_manager::MockMethod;
 
     let timeouts = fast_timeouts();
-
-    // Respond slower than duty_fetch timeout (200ms)
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    // HTTP timeout must exceed duty_fetch timeout so the tokio timeout fires first
-    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
-        .with_timeout(Duration::from_secs(30))
-        .with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let held = timeouts.duty_fetch + Duration::from_millis(500);
+    let beacon = Arc::new(
+        bn_manager::MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetAttesterDuties, held)
+            .with_method_delay(MockMethod::GetProposerDuties, held)
+            .with_method_delay(MockMethod::PostPtcDuties, held),
+    );
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-    clock.set_slot(320);
+    clock.set_slot(epoch * ::timing::SLOTS_PER_EPOCH);
 
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-    let submitter = Arc::new(MockSubmitter::new());
-    let propagator = Arc::new(Propagator::new(submitter));
-    let config = create_test_config().with_timeouts(timeouts.clone());
-    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
         duty_tracker,
         signer,
         propagator,
-        beacon,
+        beacon.clone(),
         create_mock_block_beacon(),
         None,
         create_mock_validator_store(),
-        config,
-        pubkey_map,
+        create_test_config().with_timeouts(timeouts.clone()),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    let start = std::time::Instant::now();
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    let start = tokio::time::Instant::now();
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(epoch, &AtomicBool::default()).await;
     let elapsed = start.elapsed();
 
-    // Pre-Gloas: 4 calls (attester+proposer × current/next), each bounded by
-    // duty_fetch (200ms). PTC is gated out. Without timeout wrapping this would
-    // take 4 * 700ms ≈ 2.8s. With timeouts: 4 * 200ms = 800ms + margin.
-    assert!(
-        elapsed < timeouts.duty_fetch * 5,
-        "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
-        elapsed,
-        timeouts.duty_fetch * 5
-    );
+    let calls: Vec<_> =
+        beacon.call_stamps().into_iter().map(|stamp| (stamp.method, stamp.at - start)).collect();
+    let want: Vec<_> =
+        expected.iter().zip(0u32..).map(|(&method, k)| (method, timeouts.duty_fetch * k)).collect();
+    assert_eq!(calls, want, "each duty call starts when the one before it is cut at duty_fetch");
+    let count = u32::try_from(expected.len()).expect("a handful of calls");
+    assert_eq!(elapsed, timeouts.duty_fetch * count, "the check ends when the last call is cut");
 }
 
-#[tokio::test]
+/// Pre-Gloas: attester and proposer for the epoch and the next (PTC is gated
+/// out). Without the timeout each call would take `duty_fetch + 500 ms`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
+    use bn_manager::MockMethod::{GetAttesterDuties, GetProposerDuties};
+
+    let expected = [GetAttesterDuties, GetProposerDuties, GetAttesterDuties, GetProposerDuties];
+    assert_reorg_check_cuts_each_call_at_duty_fetch(10, &expected).await;
+}
+
+/// Gloas+: attester, proposer and PTC for the epoch and the next.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon_when_gloas_active() {
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use bn_manager::MockMethod::{GetAttesterDuties, GetProposerDuties, PostPtcDuties};
 
-    let mock_server = MockServer::start().await;
-
-    let slow_response = serde_json::json!({
-        "data": [],
-        "dependent_root": "0xslow_root",
-        "execution_optimistic": false
-    });
-
-    let timeouts = fast_timeouts();
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/ptc/.*"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&slow_response)
-                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
-        .with_timeout(Duration::from_secs(30))
-        .with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
-
-    let gloas_epoch = 70u64;
-    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
-    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-    clock.set_slot(slot);
-
-    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let signer =
-        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-    let submitter = Arc::new(MockSubmitter::new());
-    let propagator = Arc::new(Propagator::new(submitter));
-    let config = create_test_config().with_timeouts(timeouts.clone());
-    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-
-    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
-        clock,
-        duty_tracker,
-        signer,
-        propagator,
-        beacon,
-        create_mock_block_beacon(),
-        None,
-        create_mock_validator_store(),
-        config,
-        pubkey_map,
-    ));
-
-    let start = std::time::Instant::now();
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
-    let elapsed = start.elapsed();
-
-    // Gloas+: 6 calls (attester+proposer+ptc × current/next), each bounded by
-    // duty_fetch (200ms). With timeouts: 6 * 200ms = 1.2s + margin.
-    assert!(
-        elapsed < timeouts.duty_fetch * 7,
-        "Gloas reorg check took {:?}, expected < {:?} (6 timeouts + margin)",
-        elapsed,
-        timeouts.duty_fetch * 7
-    );
+    // create_test_config schedules Gloas at epoch 70.
+    let expected = [
+        GetAttesterDuties,
+        GetProposerDuties,
+        PostPtcDuties,
+        GetAttesterDuties,
+        GetProposerDuties,
+        PostPtcDuties,
+    ];
+    assert_reorg_check_cuts_each_call_at_duty_fetch(70, &expected).await;
 }
 
 #[tokio::test]
@@ -888,7 +883,7 @@ async fn test_check_reorg_at_epoch_boundary_survives_error() {
     ));
 
     // Should not panic even with broken beacon (pre-Gloas: PTC path not entered)
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
 }
 
 #[tokio::test]
@@ -927,7 +922,10 @@ async fn test_check_reorg_at_epoch_boundary_survives_error_when_gloas_active() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+    orchestrator
+        .duty_management
+        .check_reorg_at_epoch_boundary(gloas_epoch, &AtomicBool::default())
+        .await;
 }
 
 // --- RF6-31: prepare_proposers complexity (count-based, not wall-clock) ---
@@ -1029,9 +1027,10 @@ async fn test_prepare_proposers_index_lookups_are_linear_in_validators() {
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
     let before = duty_tracker.slot_duty_lookup_count();
-    orchestrator.duty_management.prepare_proposers(3).await;
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
     let after = duty_tracker.slot_duty_lookup_count();
     let lookups = after - before;
+    assert!(matches!(outcome, Ok(PrepareOutcome::Complete)), "every key has an index: {outcome:?}");
 
     // Registry path: no duty-cache scans. Old path was ~N×64×2 epoch slots.
     assert_eq!(
@@ -1135,10 +1134,47 @@ async fn drive_prepare_and_register(
     extra_locals: Vec<(SecretKey, bool)>,
     foreign_keys: Vec<SecretKey>,
 ) -> RetirementDrive {
+    let (orchestrator, _handle, mock) =
+        retirement_orchestrator(epoch, schedule, mock, local, extra_locals, foreign_keys).await;
+    orchestrator.epoch_boundary.run_pending(epoch * ::timing::SLOTS_PER_EPOCH).await;
+    RetirementDrive { mock }
+}
+
+/// Builder-attached orchestrator at slot 0 of `epoch`; `local` has index 42.
+async fn retirement_orchestrator(
+    epoch: u64,
+    schedule: Arc<ForkSchedule>,
+    mock: bn_manager::MockBeaconNodeClient,
+    local: (SecretKey, bool),
+    extra_locals: Vec<(SecretKey, bool)>,
+    foreign_keys: Vec<SecretKey>,
+) -> (
+    DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    Arc<bn_manager::MockBeaconNodeClient>,
+) {
+    let (deps, mock) = retirement_deps(epoch, schedule, mock, local, extra_locals, foreign_keys);
+    let (orchestrator, handle) = DutyOrchestrator::new(deps);
+    (orchestrator, handle, mock)
+}
+
+/// Deps of [`retirement_orchestrator`].
+fn retirement_deps(
+    epoch: u64,
+    schedule: Arc<ForkSchedule>,
+    mock: bn_manager::MockBeaconNodeClient,
+    local: (SecretKey, bool),
+    extra_locals: Vec<(SecretKey, bool)>,
+    foreign_keys: Vec<SecretKey>,
+) -> (
+    OrchestratorDeps<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    Arc<bn_manager::MockBeaconNodeClient>,
+) {
     use signer::ValidatorSigner;
     use validator_store::ValidatorConfig;
 
     let mock = Arc::new(mock);
+    mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = epoch * ::timing::SLOTS_PER_EPOCH;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));
@@ -1206,11 +1242,7 @@ async fn drive_prepare_and_register(
         pubkey_map,
     );
     deps.pubkey_index.write().insert(local_pk, "42".to_string());
-    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
-
-    orchestrator.duty_management.on_epoch_boundary(epoch, slot).await;
-    orchestrator.run_builder_epoch_boundary(epoch).await;
-    RetirementDrive { mock }
+    (deps, mock)
 }
 
 #[tokio::test]
@@ -1249,6 +1281,24 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
             assert!(
                 prepare.is_empty(),
                 "Gloas epoch {epoch}: prepare_beacon_proposer must not be called"
+            );
+            let (gloas, _handle, gloas_mock) = retirement_orchestrator(
+                epoch,
+                schedule.clone(),
+                retirement_beacon(),
+                (SecretKey::generate(), true),
+                vec![],
+                vec![],
+            )
+            .await;
+            let outcome = gloas.duty_management.prepare_proposers(epoch).await;
+            assert!(
+                matches!(outcome, Ok(PrepareOutcome::Complete)),
+                "Gloas epoch {epoch}: nothing more to send: {outcome:?}"
+            );
+            assert!(
+                gloas_mock.call_stamps().is_empty(),
+                "Gloas epoch {epoch}: no beacon-node call"
             );
             assert!(
                 register.is_empty(),
@@ -1337,7 +1387,7 @@ async fn test_legacy_404_or_501_does_not_retire_prepare_or_register() {
     assert_eq!(
         driven.mock.register_validators_calls().len(),
         1,
-        "BN 501 must not skip register_validators"
+        "A BN 501 must not stop the runner's registration step from sending register_validators."
     );
 }
 
@@ -1352,8 +1402,18 @@ fn test_retirement_gate_reads_only_fork_name_from_epoch() {
     assert!(::builder::legacy_proposer_ops_retired(ForkName::from_epoch(gloas_epoch, &schedule)));
 }
 
-#[tokio::test]
+/// 654-AC6: a proposer root change re-opens the preferences step through
+/// `run_pending`. The epoch is Gloas, and root A is in the cache for it. The
+/// first attester request takes 1 s. The mock holds the first PTC request.
+/// Thus the 10 s step bound stops the first ReorgCheck, and the next pass
+/// runs ReorgCheck again. These results must occur:
+///
+/// 1. The first pass must send the preferences, signed with root A.
+/// 2. The beacon node then answers root B. The next pass must send the
+///    preferences again, signed with root B.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_proposer_root_change_rebroadcasts_preferences() {
+    use bn_manager::MockMethod;
     use signer::ValidatorSigner;
     use validator_store::ValidatorConfig;
 
@@ -1365,7 +1425,23 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     let local = SecretKey::generate();
     let local_pk = local.public_key().to_bytes();
     let local_hex = pubkey_hex(&local_pk);
-    let mock = Arc::new(retirement_beacon());
+    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
+    let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
+    let answer = duties.clone();
+    let root = Arc::new(parking_lot::Mutex::new(ROOT_A));
+    let answered = Arc::clone(&root);
+    let mock = retirement_beacon_base()
+        .with_get_proposer_duties(move |epoch| {
+            Ok(beacon::DependentRootResponse {
+                dependent_root: answered.lock().to_string(),
+                execution_optimistic: false,
+                data: if epoch == gloas_epoch { answer.clone() } else { Vec::new() },
+            })
+        })
+        .with_call_delays(MockMethod::GetAttesterDuties, [Duration::from_secs(1)])
+        .with_call_delays(MockMethod::PostPtcDuties, [Duration::from_secs(3_600)]);
+    let mock = Arc::new(mock);
+    mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));
@@ -1417,30 +1493,2729 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     deps.pubkey_index.write().insert(local_pk, "42".to_string());
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
-    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
-    let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
-
     assert!(!duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_A.into(), &duties).await);
-    orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
+    let parse = |hex: &str| {
+        eth_types::canonical::gvr_hex::parse_gvr_hex(hex).expect("The test root must be valid.")
+    };
+    orchestrator.epoch_boundary.run_pending(slot).await;
     {
         let calls = mock.submit_proposer_preferences_calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 1, "The first pass must send one preferences POST.");
         assert_eq!(calls[0].len(), 1);
-        assert_eq!(
-            calls[0][0].message.dependent_root,
-            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_A).unwrap()
-        );
+        assert_eq!(calls[0][0].message.proposal_slot, proposal_slot);
+        assert_eq!(calls[0][0].message.dependent_root, parse(ROOT_A));
+    }
+    assert!(
+        orchestrator.epoch_boundary.has_pending(slot + 1),
+        "The step bound stopped ReorgCheck, so the next pass must run it again."
+    );
+
+    *root.lock() = ROOT_B;
+    orchestrator.epoch_boundary.run_pending(slot + 1).await;
+    {
+        let calls = mock.submit_proposer_preferences_calls();
+        assert_eq!(calls.len(), 2, "The root change must cause one more preferences POST.");
+        assert_eq!(calls[1].len(), 1);
+        assert_eq!(calls[1][0].message.proposal_slot, proposal_slot);
+        assert_eq!(calls[1][0].message.dependent_root, parse(ROOT_B));
+    }
+    let root_b = duty_tracker.get_cached_proposer_dependent_root(gloas_epoch).await;
+    assert_eq!(root_b.as_deref(), Some(ROOT_B), "ReorgCheck must put root B in the cache.");
+}
+
+/// Span names from each new span up through its ancestors, read at creation.
+#[derive(Clone, Default)]
+struct SpanChains(Arc<parking_lot::Mutex<Vec<Vec<&'static str>>>>);
+
+impl<S> tracing_subscriber::Layer<S> for SpanChains
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        _attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = ctx.span(id) {
+            self.0.lock().push(span.scope().map(|s| s.name()).collect());
+        }
+    }
+}
+
+impl SpanChains {
+    fn ancestors_of(&self, name: &str) -> Vec<Vec<&'static str>> {
+        self.0.lock().iter().filter(|chain| chain[0] == name).map(|c| c[1..].to_vec()).collect()
+    }
+}
+
+/// The runner task's pass at slot 0 runs the boundary steps under a root
+/// `epoch.boundary` span, and a proposer `dependent_root` change seen by the
+/// reorg check re-broadcasts preferences from that pass.
+///
+/// The pass sends one preferences POST. That POST must carry root B, the
+/// root that the reorg check puts in the cache.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_slot_zero_boundary_runs_under_epoch_span_and_rebroadcasts_on_root_change() {
+    let _metrics = m2_metric_lock().await;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let gloas_epoch = 100u64;
+    let epoch = gloas_epoch - 1;
+    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon_base().with_get_proposer_duties(move |e| {
+        let data = if e == gloas_epoch {
+            vec![proposer_duty(&local_hex, "42", proposal_slot)]
+        } else {
+            Vec::new()
+        };
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ROOT_B.to_string(),
+            execution_optimistic: false,
+            data,
+        })
+    });
+    let (mut orchestrator, handle, mock) = retirement_orchestrator(
+        epoch,
+        near_gloas_schedule(gloas_epoch),
+        mock,
+        (local, true),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert!(!orchestrator.duty_tracker.cache_proposer_duties(epoch, ROOT_A.into(), &[]).await);
+    orchestrator.clock.advance_time(9);
+
+    let chains = SpanChains::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(chains.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let mut waited_ms = 0u64;
+    while mock.submit_proposer_preferences_calls().is_empty() && waited_ms < 2_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+
+    let prefs = mock.submit_proposer_preferences_calls();
+    assert_eq!(prefs.len(), 1, "the root change must re-broadcast once; virtual ms {waited_ms}");
+    assert_eq!(prefs[0].len(), 1);
+    assert_eq!(prefs[0][0].message.proposal_slot, proposal_slot);
+    assert_eq!(
+        prefs[0][0].message.dependent_root,
+        eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
+    );
+
+    for step in ["orchestrator.check_reorg", "orchestrator.submit_committee_subscriptions"] {
+        let ancestors = chains.ancestors_of(step);
+        assert!(!ancestors.is_empty(), "{step} span must be created");
+        for chain in ancestors {
+            assert!(
+                chain.ends_with(&["epoch.boundary"]),
+                "{step} must run under the root epoch.boundary span: {chain:?}"
+            );
+        }
+    }
+}
+
+/// The runner task's slot-0 pass resets the circuit breaker passed in
+/// `OrchestratorDeps`, the same `Arc` the proposal path records misses on.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_slot_zero_boundary_resets_the_deps_circuit_breaker() {
+    use crate::orchestrator::block_proposal::publish_circuit_breaker_metrics;
+    use ::metrics::definitions::{RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES};
+
+    let _metrics = m2_metric_lock().await;
+    let gloas_epoch = 100u64;
+    let (deps, _mock) = retirement_deps(
+        gloas_epoch - 1,
+        near_gloas_schedule(gloas_epoch),
+        retirement_beacon(),
+        (SecretKey::generate(), true),
+        vec![],
+        vec![],
+    );
+    let breaker = Arc::new(CircuitBreakerState::new(3, 5));
+    for _ in 0..5 {
+        breaker.record_miss();
+    }
+    publish_circuit_breaker_metrics(&breaker);
+    assert!(breaker.is_tripped());
+    assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 5);
+    assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 5);
+
+    let (mut orchestrator, handle) =
+        DutyOrchestrator::new(OrchestratorDeps { circuit_breaker: Arc::clone(&breaker), ..deps });
+    orchestrator.clock.advance_time(9);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let mut waited_ms = 0u64;
+    while breaker.epoch_misses() != 0 && waited_ms < 2_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+
+    assert!(
+        !breaker.is_tripped(),
+        "the boundary must reset the deps breaker; virtual ms {waited_ms}"
+    );
+    assert_eq!(breaker.epoch_misses(), 0);
+    assert_eq!(breaker.consecutive_misses(), 0);
+    assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 0);
+    assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 0);
+}
+
+/// Records `produce` so a startup test can see the first proposer duty.
+///
+/// Slot 2 is not an epoch boundary, so the post-duty epoch-boundary path does
+/// not send `prepare_beacon_proposer` before that proposal. Startup
+/// preparation runs on its own task and can overlap the proposal.
+struct StartupOrderBlockBeacon {
+    log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl BeaconBlockClient for StartupOrderBlockBeacon {
+    async fn produce_block_v3(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        self.log.lock().expect("order log").push("produce");
+        Ok(ProduceBlockResponse {
+            data: serde_json::json!({
+                "slot": "2",
+                "proposer_index": "7",
+                "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "body": {}
+            }),
+            is_blinded: false,
+            consensus_version: "phase0".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
+        })
     }
 
-    assert!(duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_B.into(), &duties).await);
-    orchestrator.on_proposer_dependent_root_changed(gloas_epoch).await;
-    {
-        let calls = mock.submit_proposer_preferences_calls();
-        assert_eq!(calls.len(), 2, "root change must invoke one more preferences POST");
-        assert_eq!(calls[1].len(), 1);
-        assert_eq!(
-            calls[1][0].message.dependent_root,
-            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
-        );
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("produce_block_v4 not configured".into()))
     }
+
+    async fn publish_block(
+        &self,
+        _signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &WireBody,
+        _blobs: &WireBody,
+        _kzg_proofs: &WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<block_service::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
+}
+
+/// The beacon node's fee recipient before the startup `prepare_beacon_proposer`
+/// lands: a readable mismatch with the local `0xff` fee.
+const BN_DEFAULT_FEE: [u8; 20] = [0x22; 20];
+
+type SignedBlocks = Arc<std::sync::Mutex<Vec<eth_types::SignedBeaconBlock>>>;
+
+/// Answers `produce_block_v3` with a Deneb block for validator 7 whose
+/// execution payload pays `default_fee`, and records each signed block
+/// `publish_block` receives. It stands for a beacon node behind the default
+/// `FeeRecipientPolicy::Sign`, which hands a readable mismatch to the signer.
+struct DefaultFeeBlockBeacon {
+    default_fee: [u8; 20],
+    published: SignedBlocks,
+}
+
+#[async_trait]
+impl BeaconBlockClient for DefaultFeeBlockBeacon {
+    async fn produce_block_v3(
+        &self,
+        slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        use ssz08::Encode;
+
+        let mut body = eth_types::external_vector_deneb_body();
+        body.execution_payload.fee_recipient = self.default_fee;
+        let mut block = eth_types::external_vector_deneb_block();
+        block.slot = slot;
+        block.proposer_index = 7;
+        block.body = body.as_ssz_bytes();
+        Ok(ProduceBlockResponse {
+            data: serde_json::to_value(&block)
+                .map_err(|e| block_service::BlockServiceError::Parse(e.to_string()))?,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
+        })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("produce_block_v4 not configured".into()))
+    }
+
+    async fn publish_block(
+        &self,
+        signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.published.lock().expect("published blocks").push(signed_block.clone());
+        Ok(())
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("blinded publish not expected".into()))
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("SSZ publish not expected".into()))
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &WireBody,
+        _blobs: &WireBody,
+        _kzg_proofs: &WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("envelope publish not expected".into()))
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<block_service::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
+}
+
+struct StartupFeeRun {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+    clock: Arc<MockSlotClock>,
+    log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Validator 7's public key.
+    local_pk: [u8; 48],
+    /// The slashing DB the signer records each header sign in.
+    slashing_db: Arc<SlashingDb>,
+    handle: OrchestratorHandle,
+    run: tokio::task::JoinHandle<Result<(), super::super::OrchestratorError>>,
+    /// The task from `take_epoch_boundary_runner()`, spawned after `run`.
+    runner: tokio::task::JoinHandle<()>,
+    /// The epoch-boundary runner `run` sends processed slots to.
+    boundary: Arc<EpochBoundaryRunner>,
+    /// The last slot that `run` processed.
+    processed: watch::Receiver<Option<Slot>>,
+}
+
+/// This helper requests shutdown. Then it waits until `run` and the runner
+/// task both end, and checks how each one ended.
+async fn shut_down_both(started: StartupFeeRun) {
+    started.handle.shutdown();
+    let ended =
+        advance_until(None, || started.run.is_finished() && started.runner.is_finished()).await;
+    assert!(ended, "Shutdown must end `run` and the runner task within 2,000 virtual ms.");
+    let result = started.run.await.expect("The run task must not panic.");
+    assert!(result.is_ok(), "Shutdown must end the slot loop with Ok: {result:?}");
+    started.runner.await.expect("The runner task must not panic.");
+}
+
+fn fee_hex(fee: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(fee))
+}
+
+/// Local validator index 7, default fee `0xff`, slot 2 (not an epoch boundary).
+/// This helper spawns `run()`, and then the task from
+/// `take_epoch_boundary_runner()`.
+async fn spawn_startup_runner(
+    mock: bn_manager::MockBeaconNodeClient,
+    clock: Arc<MockSlotClock>,
+    timeouts: OperationTimeouts,
+    seed_duty: bool,
+) -> StartupFeeRun {
+    spawn_startup_runner_with(mock, clock, timeouts, seed_duty, Some("7"), |log| {
+        StartupOrderBlockBeacon { log }
+    })
+    .await
+}
+
+/// [`spawn_startup_runner`] with the block beacon that `blocks` builds from
+/// the order log. `index` is the index of validator 7 in the index registry.
+/// With `None`, the index registry is empty at boot.
+async fn spawn_startup_runner_with<B: BeaconBlockClient + 'static>(
+    mock: bn_manager::MockBeaconNodeClient,
+    clock: Arc<MockSlotClock>,
+    timeouts: OperationTimeouts,
+    seed_duty: bool,
+    index: Option<&'static str>,
+    blocks: impl FnOnce(Arc<std::sync::Mutex<Vec<&'static str>>>) -> B,
+) -> StartupFeeRun {
+    use signer::ValidatorSigner;
+    use validator_store::{BlockSelectionMode, ValidatorConfig};
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let local_hex = pubkey_hex(&local_pk);
+    let slot: Slot = 2;
+    let epoch = slot / ::timing::SLOTS_PER_EPOCH;
+
+    let mock = mock.with_get_proposer_duties(move |e| {
+        if e == epoch && seed_duty {
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                execution_optimistic: false,
+                data: vec![proposer_duty(&local_hex, "7", slot)],
+            })
+        } else {
+            Ok(empty_dependent())
+        }
+    });
+    let mock = Arc::new(mock);
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(local);
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer = Arc::new(
+        SignerService::new(composite, Arc::clone(&slashing_db)).with_enablement(always_enabled()),
+    );
+
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+    let mut cfg = ValidatorConfig::new(local_pk);
+    cfg.builder_proposals = true;
+    validator_store.add_validator(cfg).unwrap();
+    validator_store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+    let schedule = create_test_fork_schedule();
+    let vs: Arc<dyn ValidatorSigner> = signer.clone();
+    let builder_service = Some(Arc::new(BuilderService::new(
+        Arc::new(vs),
+        Arc::new(beacon.clone()),
+        validator_store.clone(),
+        schedule.genesis_fork_version,
+        schedule.clone(),
+    )));
+
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec!["7".to_string()]));
+    if seed_duty {
+        duty_tracker.fetch_proposer_duties(epoch).await.expect("seed proposer duty");
+    }
+
+    let mut pubkey_map_inner = HashMap::new();
+    pubkey_map_inner.insert(local_pk, local_pk_public(&local_pk));
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+    let config = OrchestratorConfig::new([0xaau8; 32], schedule).with_timeouts(timeouts);
+    let deps = OrchestratorDeps::for_test(
+        Arc::clone(&clock),
+        duty_tracker,
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon,
+        Arc::new(blocks(Arc::clone(&log))),
+        builder_service,
+        validator_store,
+        config,
+        pubkey_map,
+    );
+    if let Some(index) = index {
+        deps.pubkey_index.write().insert(local_pk, index.to_string());
+    }
+    let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let boundary = Arc::clone(&orchestrator.epoch_boundary);
+    let processed = orchestrator.processed_slot_tx.subscribe();
+    let task = orchestrator.take_epoch_boundary_runner().expect("The runner task is taken once.");
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    let runner = tokio::spawn(task.run());
+    StartupFeeRun {
+        mock,
+        clock,
+        log,
+        local_pk,
+        slashing_db,
+        handle,
+        run,
+        runner,
+        boundary,
+        processed,
+    }
+}
+
+/// The `timeout` is a hang guard on paused time, never an assertion.
+async fn shutdown_startup_fee_run(started: StartupFeeRun) {
+    started.handle.shutdown();
+    let _ = tokio::time::timeout(Duration::from_millis(500), started.run).await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), started.runner).await;
+}
+
+/// Most 1 ms steps a startup wait takes: 2,000 ms of paused time.
+const STARTUP_WAIT_STEPS: u64 = 2_000;
+
+/// Advances paused time in 1 ms steps until `done` holds, at most
+/// [`STARTUP_WAIT_STEPS`] steps, and returns whether it held. `follow`, when
+/// given, moves 1 ms with each step. The test task never parks, so
+/// auto-advance cannot jump past a mock hold.
+async fn advance_until(follow: Option<&MockSlotClock>, mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..STARTUP_WAIT_STEPS {
+        if done() {
+            return true;
+        }
+        if let Some(clock) = follow {
+            clock.advance_ms(1);
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    done()
+}
+
+/// [`advance_until`] that parks on a 1 ms paused sleep instead. A slashable
+/// sign runs on the blocking pool: `advance` does not wait for it, but
+/// auto-advance does. Each wake is at most 1 ms away, so paused time still
+/// cannot jump past a mock hold.
+async fn park_until(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..STARTUP_WAIT_STEPS {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    done()
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_prepares_and_registers_in_the_boot_epoch() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let _metrics = m2_metric_lock().await;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    clock.advance_time(9);
+    let started =
+        spawn_startup_runner(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), true)
+            .await;
+
+    let ready = advance_until(None, || {
+        let produced = started.log.lock().expect("order log").contains(&"produce");
+        let prepared = !started.mock.prepare_beacon_proposer_calls().is_empty();
+        let registered = !started.mock.register_validators_calls().is_empty();
+        produced && prepared && registered && !started.boundary.has_pending(2)
+    })
+    .await;
+    let boundary_done = !started.boundary.has_pending(2);
+    let prepares = started.mock.prepare_beacon_proposer_calls();
+    let registers = started.mock.register_validators_calls();
+    shutdown_startup_fee_run(started).await;
+    let mut register_calls: Vec<Option<Slot>> = capture
+        .spans
+        .lock()
+        .iter()
+        .filter(|(name, _)| *name == "builder.register")
+        .map(|(_, pass)| *pass)
+        .collect();
+    register_calls.sort();
+    let signatures = capture
+        .spans
+        .lock()
+        .iter()
+        .filter(|(name, _)| *name == "sign.builder_registration")
+        .count();
+
+    assert!(ready, "startup prepare, register, and the proposer duty must run");
+    assert!(boundary_done, "the runner's boot-epoch pass must finish every step");
+    assert_eq!(
+        register_calls,
+        [Some(2)],
+        "The runner's slot-2 pass must make the only register_validators call."
+    );
+    let fee = fee_hex(&[0xff; 20]);
+    assert_eq!(prepares[0].len(), 1);
+    assert_eq!(prepares[0][0].validator_index, "7");
+    assert_eq!(prepares[0][0].fee_recipient, fee);
+    assert_eq!(registers.len(), 1, "The runner's boot-epoch step must send one registration POST.");
+    assert_eq!(
+        signatures, 1,
+        "The boot-epoch register_validators call must sign one registration."
+    );
+    assert_eq!(registers[0][0].message.fee_recipient, [0xff; 20]);
+}
+
+/// The epoch-boundary runner runs beside `run`. Boot is in slot 2, with
+/// 100 ms left in the slot. The mock fails the first prepare POST of the
+/// runner task and accepts each other POST. The mock tags each POST with the
+/// task that sends it and the slot of the clock. The runner retries at the
+/// next processed slot, and the slot loop processes slot 3 when the phases of
+/// slot 3 end. Thus the wait follows the clock to the end of slot 3. These
+/// results must occur:
+///
+/// - The runner sends its failed prepare in slot 2 and its retry in slot 3.
+/// - The runner's boot-epoch pass finishes each step.
+/// - No other task sends a prepare.
+/// - Shutdown ends both tasks.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_retries_a_failed_boot_prepare_at_the_next_slot() {
+    let _metrics = m2_metric_lock().await;
+    use beacon::BeaconError;
+
+    // 100 ms left in slot 2, so the per-slot retry is short.
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot_with_offset_ms(2, 11_900);
+    let runner_task = Arc::new(std::sync::OnceLock::<tokio::task::Id>::new());
+    let posts: Captured<(Option<tokio::task::Id>, Option<Slot>)> = Captured::default();
+    let mock = retirement_beacon_base().with_prepare_beacon_proposer({
+        let (runner_task, posts, clock) =
+            (Arc::clone(&runner_task), Arc::clone(&posts), Arc::clone(&clock));
+        move |_preparations| {
+            let writer = tokio::task::try_id();
+            let mut posts = posts.lock();
+            let first_from_runner = writer.is_some()
+                && writer == runner_task.get().copied()
+                && !posts.iter().any(|(earlier, _)| *earlier == writer);
+            posts.push((writer, clock.current_slot().ok()));
+            if first_from_runner {
+                Err(BeaconError::ApiError { status: 500, message: "unavailable".into() })
+            } else {
+                Ok(())
+            }
+        }
+    });
+    let started = spawn_startup_runner(mock, Arc::clone(&clock), fast_timeouts(), false).await;
+    let runner = started.runner.id();
+    runner_task.set(runner).expect("The runner task must be set one time.");
+    let slots_of = |task: tokio::task::Id| -> Vec<Option<Slot>> {
+        let posts = posts.lock();
+        posts.iter().filter(|(writer, _)| *writer == Some(task)).map(|(_, slot)| *slot).collect()
+    };
+    let ready = || slots_of(runner).len() >= 2 && !started.boundary.has_pending(2);
+
+    // The clock follows paused time. Step 1 ms at a time to the end of slot 2.
+    while clock.current_slot().ok() == Some(2) {
+        clock.advance_ms(1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    // Slot 3, where the retry is due.
+    while !ready() && clock.current_slot().ok() == Some(3) {
+        clock.advance_ms(1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    let ready = ready();
+    let runner_posts = slots_of(runner);
+    let all_posts = posts.lock().len();
+    let boundary_done = !started.boundary.has_pending(2);
+    shut_down_both(started).await;
+
+    assert!(
+        ready,
+        "The runner's prepare and its retry must occur before slot 3 ends. \
+         Runner POST slots: {runner_posts:?}."
+    );
+    assert_eq!(
+        runner_posts,
+        [Some(2), Some(3)],
+        "The runner must send its failed prepare in slot 2, and its retry in slot 3."
+    );
+    assert_eq!(all_posts, runner_posts.len(), "Each prepare POST must come from the runner task.");
+    assert!(boundary_done, "The runner's boot-epoch pass must finish each step.");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_prepares_epoch_zero_before_genesis_from_run() {
+    let _metrics = m2_metric_lock().await;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let genesis_ms = TEST_GENESIS_TIME.saturating_mul(1000);
+    clock.set_current_time_ms(genesis_ms - 50);
+    assert!(
+        matches!(clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. })),
+        "fixture must still be before genesis"
+    );
+    let started =
+        spawn_startup_runner(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), false)
+            .await;
+
+    let ready =
+        advance_until(None, || !started.mock.prepare_beacon_proposer_calls().is_empty()).await;
+    let prepares = started.mock.prepare_beacon_proposer_calls();
+    let still_before =
+        matches!(started.clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. }));
+    shutdown_startup_fee_run(started).await;
+
+    assert!(ready, "prepare_beacon_proposer must run before genesis");
+    assert!(still_before, "the clock must still be before genesis when prepare is sent");
+    assert_eq!(prepares[0][0].validator_index, "7");
+    assert_eq!(prepares[0][0].fee_recipient, fee_hex(&[0xff; 20]));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_prepare_does_not_block_the_proposer_duty() {
+    let _metrics = m2_metric_lock().await;
+    use bn_manager::MockMethod;
+
+    let mock = retirement_beacon_base()
+        .with_method_delay(MockMethod::PrepareBeaconProposer, Duration::from_secs(5));
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    clock.advance_time(9);
+    let mut timeouts = fast_timeouts();
+    // Longer than the wait below, so the timed wrapper does not cancel the
+    // in-flight prepare and hide a blocked slot loop.
+    timeouts.preparation = Duration::from_secs(5);
+    let started = spawn_startup_runner(mock, clock, timeouts, true).await;
+
+    let ready = advance_until(None, || {
+        let produced = started.log.lock().expect("order log").contains(&"produce");
+        let arrived = started
+            .mock
+            .call_stamps()
+            .iter()
+            .any(|stamp| stamp.method == MockMethod::PrepareBeaconProposer);
+        produced && arrived
+    })
+    .await;
+    let prepare_finished = !started.mock.prepare_beacon_proposer_calls().is_empty();
+    shutdown_startup_fee_run(started).await;
+
+    assert!(ready, "the proposer duty must run while prepare_beacon_proposer is still in flight");
+    assert!(
+        !prepare_finished,
+        "prepare must still be sleeping when the proposer duty has already run"
+    );
+}
+
+/// In-flight startup preparation is dropped when `run` returns.
+///
+/// The prepare call is held inside the beacon-node mock for one hour. Virtual
+/// time stays below that hold until `run` has returned, then moves past the
+/// hold and stays inside the two-hour preparation timeout. A jump past both
+/// would drop the call without recording it. A detached task records the call
+/// on this move.
+///
+/// The epoch-boundary runner runs beside `run`. The clock is 9 s into slot 2,
+/// so the runner's slot-2 pass starts at once and sends the prepare. The
+/// test tags each prepare call with the pass slot of its writer. Shutdown
+/// must end both tasks. The held prepare must not finish, and the runner
+/// must not send a prepare again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_drops_an_in_flight_step_when_run_returns() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let _metrics = m2_metric_lock().await;
+    use bn_manager::MockMethod;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+
+    let mock = retirement_beacon_base()
+        .with_method_delay(MockMethod::PrepareBeaconProposer, Duration::from_secs(3600));
+    let mut timeouts = fast_timeouts();
+    timeouts.preparation = Duration::from_secs(7200);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    clock.advance_time(9);
+    let started = spawn_startup_runner(mock, clock, timeouts, false).await;
+    let mock = Arc::clone(&started.mock);
+    let boundary = Arc::clone(&started.boundary);
+    let arrivals = || {
+        let stamps = mock.call_stamps();
+        stamps.iter().filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer).count()
+    };
+    let writers = || {
+        let spans = capture.spans.lock();
+        let mut writers: Vec<Option<Slot>> = spans
+            .iter()
+            .filter(|(name, _)| *name == "orchestrator.prepare_proposers")
+            .map(|(_, pass)| *pass)
+            .collect();
+        writers.sort();
+        writers
+    };
+
+    let mut waited_ms = 0u64;
+    loop {
+        if arrivals() >= 1 {
+            break;
+        }
+        assert!(!started.run.is_finished(), "run returned before prepare_beacon_proposer");
+        waited_ms += 1;
+        assert!(
+            waited_ms <= 5_000,
+            "The runner must start a prepare within 5,000 virtual ms. Prepare arrivals: {}.",
+            arrivals()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert_eq!(writers(), [Some(2)], "The prepare call must come from the runner's slot-2 pass.");
+    assert!(
+        mock.prepare_beacon_proposer_calls().is_empty(),
+        "the hold must still be inside the mock when run is stopped"
+    );
+    assert!(!started.runner.is_finished(), "The runner task must be active before shutdown.");
+
+    shut_down_both(started).await;
+    assert!(
+        mock.prepare_beacon_proposer_calls().is_empty(),
+        "prepare must still be in flight when run returns"
+    );
+
+    // One-second steps so a still-running task is polled as the hold expires.
+    // The preparation timeout is two hours, so this move does not cancel the call.
+    let mut moved_s = 0u64;
+    while mock.prepare_beacon_proposer_calls().is_empty() && moved_s < 4_000 {
+        moved_s += 1;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    assert!(
+        mock.prepare_beacon_proposer_calls().is_empty(),
+        "startup preparation must not finish after run returns; virtual seconds moved: {moved_s}"
+    );
+    assert_eq!(arrivals(), 1, "The runner must not send a prepare again after shutdown.");
+    assert_eq!(writers(), [Some(2)], "A prepare call must not start after shutdown.");
+    assert!(
+        boundary.has_pending(2),
+        "Shutdown dropped the runner's prepare, so PrepareProposers must stay pending in epoch 0."
+    );
+}
+
+/// The runner's boot-epoch pass sends its prepare and finishes. After that,
+/// `run` must keep the slot loop active.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn runner_keeps_serving_slots_after_the_boot_epoch_completes() {
+    let _metrics = m2_metric_lock().await;
+    let mut timeouts = fast_timeouts();
+    timeouts.preparation = Duration::from_secs(7200);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    // The clock is 9 s into slot 2, so the runner's slot-2 pass starts at once.
+    clock.advance_time(9);
+    let started = spawn_startup_runner(retirement_beacon_base(), clock, timeouts, false).await;
+
+    let mut waited_ms = 0u64;
+    while started.mock.prepare_beacon_proposer_calls().is_empty() && waited_ms < 5_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        !started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "startup preparation did not finish; virtual ms {waited_ms}"
+    );
+    for _ in 0..8 {
+        assert!(
+            !started.run.is_finished(),
+            "a finished startup future must leave the slot loop running"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
+/// 653-AC8, the registration half. At boot, the index registry is empty and
+/// the local key is builder-enabled. Each registration POST answers 200.
+/// `run` and the runner task run from the start of slot 2 to the last
+/// millisecond of slot 20. The mock slot clock moves 1 ms with each 1 ms
+/// paused sleep. These results must occur:
+///
+/// - The runner's slot-2 pass sends the only registration POST, with one
+///   signature. The registration step needs no validator index.
+/// - No `prepare_beacon_proposer` POST reaches the beacon node.
+/// - The slot loop processes each slot from 2 to 20.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_zero_indices_at_boot_do_not_re_register_every_slot() {
+    use bn_manager::MockMethod;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let _metrics = m2_metric_lock().await;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    let posts: Captured<Option<Slot>> = Captured::default();
+    let mock = retirement_beacon_base().with_register_validators({
+        let (posts, clock) = (Arc::clone(&posts), Arc::clone(&clock));
+        move |_registrations| {
+            posts.lock().push(clock.current_slot().ok());
+            Ok(())
+        }
+    });
+    let started =
+        spawn_startup_runner_with(mock, Arc::clone(&clock), fast_timeouts(), false, None, |log| {
+            StartupOrderBlockBeacon { log }
+        })
+        .await;
+
+    // Slot 21 starts 19 slots after boot. The drive stops 1 ms before it.
+    for _ in 0..(19 * 12_000 - 1) {
+        clock.advance_ms(1);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let slot_at_end = clock.current_slot().ok();
+    let last_processed = *started.processed.borrow();
+    let register_slots = posts.lock().clone();
+    let prepares = started
+        .mock
+        .call_stamps()
+        .iter()
+        .filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer)
+        .count();
+    shut_down_both(started).await;
+    let signatures = capture
+        .spans
+        .lock()
+        .iter()
+        .filter(|(name, _)| *name == "sign.builder_registration")
+        .count();
+
+    assert_eq!(slot_at_end, Some(20), "The drive must stop in slot 20.");
+    assert_eq!(last_processed, Some(20), "The slot loop must process each slot from 2 to 20.");
+    assert_eq!(
+        register_slots,
+        [Some(2)],
+        "The runner's slot-2 pass must send the only registration POST in slots 2 to 20. \
+         Slot of each registration POST: {register_slots:?}."
+    );
+    assert_eq!(
+        signatures, 1,
+        "Slots 2 to 20 must sign one registration. Signatures: {signatures}."
+    );
+    assert_eq!(
+        prepares, 0,
+        "With no validator index, no prepare_beacon_proposer POST must reach the beacon node."
+    );
+}
+
+/// W4-E4c: startup preparation is the boot epoch of the epoch-boundary
+/// runner. The scan reads the production part of `coordinator/mod.rs`, up to
+/// the declaration of the test module. That part must not contain a helper
+/// of the old startup future.
+#[test]
+fn startup_prep_lives_only_in_the_runner() {
+    const TEST_MODULE: &str = "#[cfg(test)]\npub(crate) mod tests;";
+    const STARTUP_FUTURE_HELPERS: [&str; 4] = [
+        "run_startup_proposer_preparation",
+        "startup_retry_delay",
+        "startup_register_validators",
+        "sleep_or_shutdown",
+    ];
+
+    let (production, _tests) = include_str!("../mod.rs")
+        .split_once(TEST_MODULE)
+        .expect("coordinator/mod.rs must declare its test module.");
+    assert!(
+        production.contains("pub async fn run(&mut self)"),
+        "The scan must include `DutyOrchestrator::run`."
+    );
+    let found: Vec<&str> =
+        STARTUP_FUTURE_HELPERS.into_iter().filter(|helper| production.contains(helper)).collect();
+    assert!(
+        found.is_empty(),
+        "The production part of coordinator/mod.rs must not contain a startup-future helper. \
+         Found: {found:?}."
+    );
+}
+
+const PENALTY_WARN: &str = "signing block with fee-recipient mismatch";
+
+/// What [`boot_with_held_startup_prepare`] saw.
+struct HeldPrepareBoot {
+    /// Execution-payload fee recipient of each signed block published.
+    published_fees: Vec<[u8; 20]>,
+    /// The blocks published while the prepare was still held.
+    published_before_prepare: Vec<eth_types::SignedBeaconBlock>,
+    /// Validator 7's block records in the slashing DB at that moment: what a
+    /// successful header sign leaves behind.
+    header_signs: Vec<::slashing::SignedBlock>,
+    /// Validator 7's public key.
+    local_key: PublicKey,
+    /// Each fee-recipient penalty WARN, as `message key=value ...`.
+    penalty_warns: Vec<String>,
+    /// `RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL` before boot and after shutdown.
+    penalty_total: (u64, u64),
+    /// The `prepare_beacon_proposer` POSTs that landed once the hold expired.
+    prepares: Vec<Vec<beacon::ProposerPreparation>>,
+}
+
+/// Boots at proposal slot 2 with the startup `prepare_beacon_proposer` held
+/// for an hour in the mock and a beacon node that builds on `default_fee`.
+/// The block must be published while the hold is in place; then the hold is
+/// released. The slot clock is not moved, so the prepare lands in the boot
+/// epoch.
+async fn boot_with_held_startup_prepare(default_fee: [u8; 20]) -> HeldPrepareBoot {
+    use block_service::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL as PENALTY_TOTAL;
+    use bn_manager::MockMethod;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const HOLD: Duration = Duration::from_secs(3600);
+
+    let _metrics = m2_metric_lock().await;
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let penalty_before = PENALTY_TOTAL.get();
+
+    let mock = retirement_beacon_base().with_method_delay(MockMethod::PrepareBeaconProposer, HOLD);
+    let mut timeouts = fast_timeouts();
+    // Longer than the hold, so the timed wrapper does not cancel the held call.
+    timeouts.preparation = 2 * HOLD;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    // The clock is 9 s into slot 2, so the runner's slot-2 pass starts at once.
+    clock.advance_time(9);
+    let published = SignedBlocks::default();
+    let blocks = DefaultFeeBlockBeacon { default_fee, published: Arc::clone(&published) };
+    let started =
+        spawn_startup_runner_with(mock, clock, timeouts, true, Some("7"), |_log| blocks).await;
+
+    let proposed = park_until(|| {
+        let signed = !published.lock().expect("published blocks").is_empty();
+        let arrived = started
+            .mock
+            .call_stamps()
+            .iter()
+            .any(|stamp| stamp.method == MockMethod::PrepareBeaconProposer);
+        signed && arrived
+    })
+    .await;
+    assert!(proposed, "the block must be signed and published while prepare is held");
+    assert!(
+        started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "the hold must still be inside the mock when the block is published"
+    );
+    let published_before_prepare = published.lock().expect("published blocks").clone();
+    let header_signs =
+        started.slashing_db.get_blocks(&hex::encode(started.local_pk)).expect("slashing DB blocks");
+    let local_key = local_pk_public(&started.local_pk);
+
+    // One-second steps so the held call is polled as the hold expires.
+    let mut moved_s = 0u64;
+    while started.mock.prepare_beacon_proposer_calls().is_empty() && moved_s < 4_000 {
+        moved_s += 1;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let prepares = started.mock.prepare_beacon_proposer_calls();
+    assert!(
+        !prepares.is_empty(),
+        "the held prepare must land once the hold expires; virtual seconds moved: {moved_s}"
+    );
+    assert_eq!(started.clock.current_slot().ok(), Some(2), "fixture: the boot epoch is kept");
+    shutdown_startup_fee_run(started).await;
+
+    let published_fees = published
+        .lock()
+        .expect("published blocks")
+        .iter()
+        .map(|signed| {
+            eth_types::decode_beacon_block_body_deneb(&signed.message.body)
+                .expect("published Deneb body")
+                .execution_payload
+                .fee_recipient
+        })
+        .collect();
+    let penalty_warns = capture
+        .warns
+        .lock()
+        .iter()
+        .filter(|(_, warn)| warn.starts_with(PENALTY_WARN))
+        .map(|(_, warn)| warn.clone())
+        .collect();
+    HeldPrepareBoot {
+        published_fees,
+        published_before_prepare,
+        header_signs,
+        local_key,
+        penalty_warns,
+        penalty_total: (penalty_before, PENALTY_TOTAL.get()),
+        prepares,
+    }
+}
+
+/// The block published while prepare was held carries the slot-2 header
+/// signature: the header sign recorded a slot-2 signing root in the slashing
+/// DB, and the published signature verifies over it under validator 7's key.
+fn assert_published_header_signature(boot: &HeldPrepareBoot) {
+    let signed_slots: Vec<Slot> = boot.header_signs.iter().map(|block| block.slot).collect();
+    assert_eq!(signed_slots, [2], "the slot-2 block header must be signed before prepare lands");
+    let root = boot.header_signs[0].signing_root.as_ref().expect("recorded signing root");
+    let root = hex::decode(root.trim_start_matches("0x")).expect("signing root hex");
+    assert_eq!(boot.published_before_prepare.len(), 1, "one block published while prepare is held");
+    let verified = ::crypto::Signature::from_bytes(&boot.published_before_prepare[0].signature)
+        .and_then(|signature| signature.verify(&boot.local_key, &root));
+    assert!(
+        verified.is_ok(),
+        "the published signature must be the slot-2 header signature: {verified:?}"
+    );
+}
+
+/// 652-AC8, a baseline pin: a proposal that runs before the startup
+/// `prepare_beacon_proposer` lands is built with the beacon node's default fee
+/// recipient. Under the default `FeeRecipientPolicy::Sign` it is signed and
+/// published with one penalty WARN and a penalty count, and the prepare lands
+/// later in the same epoch.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_proposal_before_startup_prepare_is_signed_with_penalty_warn() {
+    assert_eq!(
+        bn_manager::FeeRecipientPolicy::default(),
+        bn_manager::FeeRecipientPolicy::Sign,
+        "the default policy hands a readable mismatch to the signer"
+    );
+    let boot = boot_with_held_startup_prepare(BN_DEFAULT_FEE).await;
+
+    assert_eq!(
+        boot.published_fees,
+        [BN_DEFAULT_FEE],
+        "the block built on the beacon node's default fee must be signed and published"
+    );
+    assert_published_header_signature(&boot);
+    assert_eq!(boot.penalty_warns.len(), 1, "one penalty WARN: {:?}", boot.penalty_warns);
+    let local = fee_hex(&[0xff; 20]);
+    let warn = &boot.penalty_warns[0];
+    assert!(warn.contains(&format!("fee_expected={local}")), "{warn}");
+    assert!(warn.contains(&format!("fee_got={}", fee_hex(&BN_DEFAULT_FEE))), "{warn}");
+    let (before, after) = boot.penalty_total;
+    assert!(after > before, "the signed mismatch must be counted: {before} -> {after}");
+    assert_eq!(boot.prepares.len(), 1, "the held startup prepare lands once");
+    assert_eq!(boot.prepares[0][0].validator_index, "7");
+    assert_eq!(boot.prepares[0][0].fee_recipient, local);
+}
+
+/// Healthy control for the pin above: the same boot, with a beacon node whose
+/// default fee recipient already is the local `0xff`, signs and publishes the
+/// block with no penalty WARN.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_proposal_before_startup_prepare_with_a_matching_fee_has_no_penalty_warn() {
+    let boot = boot_with_held_startup_prepare([0xff; 20]).await;
+
+    assert_eq!(boot.published_fees, [[0xff; 20]], "the block must be signed and published");
+    assert_published_header_signature(&boot);
+    assert!(
+        boot.penalty_warns.is_empty(),
+        "a matching fee must not warn: {:?}",
+        boot.penalty_warns
+    );
+    assert_eq!(boot.prepares.len(), 1, "the held startup prepare lands once");
+}
+
+fn local_pk_public(bytes: &[u8; 48]) -> PublicKey {
+    PublicKey::from_bytes(bytes).expect("pubkey bytes")
+}
+
+// --- W4-E3a: a failed boundary step retries at the next processed slot ---
+
+const BOUNDARY_INDEX: &str = "42";
+const BOUNDARY_SLOT: Duration = Duration::from_secs(12);
+
+/// Slot of an `epoch.boundary` pass, kept in that span's extensions.
+struct PassSlot(Slot);
+
+/// Reads the `slot` field of an `epoch.boundary` span.
+struct SlotField(Option<Slot>);
+
+impl tracing::field::Visit for SlotField {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "slot" {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// One WARN event as `message key=value ...`.
+#[derive(Default)]
+struct WarnText {
+    message: String,
+    fields: String,
+}
+
+impl tracing::field::Visit for WarnText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+/// Each span opened and each WARN event, with the slot of the
+/// `epoch.boundary` pass it runs in (`None` outside a pass).
+#[derive(Clone, Default)]
+struct BoundaryCapture {
+    spans: Captured<(&'static str, Option<Slot>)>,
+    warns: Captured<(Option<Slot>, String)>,
+}
+
+type Captured<T> = Arc<parking_lot::Mutex<Vec<T>>>;
+
+/// The slot of the innermost `epoch.boundary` pass in `scope`.
+fn pass_slot<'a, R: tracing_subscriber::registry::LookupSpan<'a>>(
+    mut scope: tracing_subscriber::registry::Scope<'a, R>,
+) -> Option<Slot> {
+    scope.find_map(|span| span.extensions().get::<PassSlot>().map(|pass| pass.0))
+}
+
+impl<S> tracing_subscriber::Layer<S> for BoundaryCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        if span.name() == "epoch.boundary" {
+            let mut slot = SlotField(None);
+            attrs.record(&mut slot);
+            if let Some(slot) = slot.0 {
+                span.extensions_mut().insert(PassSlot(slot));
+            }
+        }
+        self.spans.lock().push((span.name(), pass_slot(span.scope())));
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut text = WarnText::default();
+            event.record(&mut text);
+            let pass = ctx.event_scope(event).and_then(pass_slot);
+            self.warns.lock().push((pass, format!("{}{}", text.message, text.fields)));
+        }
+    }
+}
+
+/// What [`drive_boundary`] saw.
+struct BoundaryRun {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+    /// Each span opened, with its pass slot, in opening order.
+    spans: Vec<(&'static str, Option<Slot>)>,
+    /// Each WARN event, with its pass slot, in order. The slot loop's own
+    /// warns (no block header or root in the mock; every phase due at slot
+    /// start) are outside any pass.
+    warns: Vec<(Option<Slot>, String)>,
+    /// Epochs of the `get_proposer_duties` requests made after the seed.
+    proposer_requests: Vec<u64>,
+    /// The builder service's signer, when the drive has a builder service.
+    registrations: Option<Arc<CountingRegistrationSigner>>,
+}
+
+impl BoundaryRun {
+    /// The pass slot of each `name` span, in opening order.
+    fn pass_slots(&self, name: &str) -> Vec<Option<Slot>> {
+        self.spans.iter().filter(|(opened, _)| *opened == name).map(|(_, slot)| *slot).collect()
+    }
+}
+
+/// Runs `run()` and the runner task from `from_slot` to the end of
+/// `to_slot`, with local validator 42 and no builder. The attester and
+/// proposer duties of E and E+1 (E is `from_slot`'s epoch) are fetched
+/// before boot, so the slot loop requests none of them.
+///
+/// Each slot lasts 12 s of paused time. Every phase is due at slot start, so
+/// the slot loop processes the slot then, and its post-duty window ends at
+/// the next slot start. The clock moves to the next slot 1 ms before that.
+async fn drive_boundary(
+    mock: bn_manager::MockBeaconNodeClient,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
+    let timeouts = create_test_config().timeouts;
+    drive_boundary_with(mock, SecretKey::generate(), timeouts, from_slot, to_slot).await
+}
+
+/// [`drive_boundary`] with `local` as validator 42, under `timeouts`.
+async fn drive_boundary_with(
+    mock: bn_manager::MockBeaconNodeClient,
+    local: SecretKey,
+    timeouts: OperationTimeouts,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
+    let keys = vec![(local, Some(BOUNDARY_INDEX))];
+    drive_boundary_keys(mock, keys, timeouts, from_slot, to_slot, no_hook).await
+}
+
+/// A [`drive_boundary_keys`] hook that does nothing.
+fn no_hook(_: Slot, _: &crate::pubkey_index::SharedPubkeyIndexRegistry) {}
+
+/// [`drive_boundary_with`] over `keys`, each signing-enabled and in the
+/// index registry at boot with its index when it has one. The tracker asks
+/// for validator 42's duties. The hook `before_slot(slot, registry)` runs
+/// one time for `from_slot` before boot. Then it runs after the pass of the
+/// previous slot, before the clock moves to `slot`.
+async fn drive_boundary_keys(
+    mock: bn_manager::MockBeaconNodeClient,
+    keys: Vec<(SecretKey, Option<&'static str>)>,
+    timeouts: OperationTimeouts,
+    from_slot: Slot,
+    to_slot: Slot,
+    before_slot: impl FnMut(Slot, &crate::pubkey_index::SharedPubkeyIndexRegistry),
+) -> BoundaryRun {
+    drive_boundary_opts(mock, keys, timeouts, from_slot, to_slot, before_slot, false).await
+}
+
+/// [`drive_boundary`] with `local` as validator 42 and a builder service
+/// over the same mock. The key is builder-enabled. The builder service
+/// signs through a [`CountingRegistrationSigner`].
+async fn drive_boundary_builder(
+    mock: bn_manager::MockBeaconNodeClient,
+    local: SecretKey,
+    from_slot: Slot,
+    to_slot: Slot,
+) -> BoundaryRun {
+    let keys = vec![(local, Some(BOUNDARY_INDEX))];
+    let timeouts = create_test_config().timeouts;
+    drive_boundary_opts(mock, keys, timeouts, from_slot, to_slot, no_hook, true).await
+}
+
+/// [`drive_boundary_keys`], with a builder service when `builder` is true.
+async fn drive_boundary_opts(
+    mock: bn_manager::MockBeaconNodeClient,
+    keys: Vec<(SecretKey, Option<&'static str>)>,
+    timeouts: OperationTimeouts,
+    from_slot: Slot,
+    to_slot: Slot,
+    mut before_slot: impl FnMut(Slot, &crate::pubkey_index::SharedPubkeyIndexRegistry),
+    builder: bool,
+) -> BoundaryRun {
+    use ::timing::{DeadlineBps, DeadlineSchedule};
+    use tracing_subscriber::layer::SubscriberExt;
+    use validator_store::ValidatorConfig;
+
+    let mock = Arc::new(mock);
+    mock.track_admission();
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+    let clock =
+        Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, BOUNDARY_SLOT, ::timing::SLOTS_PER_EPOCH));
+    clock.set_slot(from_slot);
+
+    let validator_store = create_mock_validator_store();
+    let mut key_manager = KeyManager::new();
+    let mut pubkey_map = HashMap::new();
+    let mut indices = Vec::new();
+    for (secret, index) in keys {
+        let pubkey = secret.public_key();
+        let pk_bytes = pubkey.to_bytes();
+        let mut validator = ValidatorConfig::new(pk_bytes);
+        validator.builder_proposals = builder;
+        validator_store.add_validator(validator).expect("add validator");
+        key_manager.insert(secret);
+        pubkey_map.insert(pk_bytes, pubkey);
+        indices.extend(index.map(|index| (pk_bytes, index.to_string())));
+    }
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+            Arc::new(SlashingDb::open_in_memory().expect("slashing db")),
+        )
+        .with_enablement(always_enabled()),
+    );
+
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec![BOUNDARY_INDEX.to_string()]));
+    let epoch = from_slot / ::timing::SLOTS_PER_EPOCH;
+    for epoch in [epoch, epoch + 1] {
+        duty_tracker.fetch_duties_for_epoch(epoch).await.expect("seed attester duties");
+        duty_tracker.fetch_proposer_duties(epoch).await.expect("seed proposer duties");
+    }
+    let seeded = mock.get_proposer_duties_calls().len();
+
+    let at_slot_start = DeadlineBps {
+        attestation: 0,
+        aggregate: 0,
+        sync_message: 0,
+        contribution: 0,
+        payload: 0,
+        payload_attestation: 0,
+    };
+    let config = create_test_config()
+        .with_deadline_schedule(DeadlineSchedule::uniform(at_slot_start))
+        .with_timeouts(timeouts);
+    let validator_signer: Arc<dyn ValidatorSigner> = signer.clone();
+    let registrations = builder.then(|| CountingRegistrationSigner::new(validator_signer));
+    let builder_service = registrations.as_ref().map(|registrations| {
+        let schedule = Arc::clone(&config.fork_schedule);
+        Arc::new(BuilderService::new(
+            registrations.clone(),
+            Arc::new(beacon.clone()),
+            Arc::clone(&validator_store),
+            schedule.genesis_fork_version,
+            schedule,
+        ))
+    });
+    let deps = OrchestratorDeps::for_test(
+        Arc::clone(&clock),
+        duty_tracker,
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon,
+        create_mock_block_beacon(),
+        builder_service,
+        validator_store,
+        config,
+        Arc::new(parking_lot::RwLock::new(pubkey_map)),
+    );
+    for (pk_bytes, index) in indices {
+        deps.pubkey_index.write().insert(pk_bytes, index);
+    }
+    let registry = Arc::clone(&deps.pubkey_index);
+    before_slot(from_slot, &registry);
+    let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let mut processed = orchestrator.processed_slot_tx.subscribe();
+
+    let capture = BoundaryCapture::default();
+    let subscriber = tracing_subscriber::registry::Registry::default().with(capture.clone());
+    let _default = tracing::subscriber::set_default(subscriber);
+    let runner = tokio::spawn(orchestrator.take_epoch_boundary_runner().expect("runner").run());
+    let run = tokio::spawn(async move { orchestrator.run().await });
+
+    let boot = tokio::time::Instant::now();
+    for slot in from_slot..=to_slot {
+        let slot_end = boot + BOUNDARY_SLOT * u32::try_from(slot - from_slot + 1).expect("slots");
+        let seen = tokio::time::timeout_at(slot_end, processed.wait_for(|p| *p == Some(slot)))
+            .await
+            .map(|seen| seen.map(|_| ()));
+        assert!(matches!(seen, Ok(Ok(()))), "slot {slot} must be processed in its slot");
+        tokio::time::sleep_until(slot_end - Duration::from_millis(1)).await;
+        if slot < to_slot {
+            before_slot(slot + 1, &registry);
+            clock.set_slot(slot + 1);
+        }
+    }
+    handle.shutdown();
+    let result = run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    runner.await.expect("runner task");
+
+    let proposer_requests = mock.get_proposer_duties_calls()[seeded..].to_vec();
+    let spans = capture.spans.lock().clone();
+    let warns = capture.warns.lock().clone();
+    BoundaryRun { mock, spans, warns, proposer_requests, registrations }
+}
+
+/// 653-AC1: the slot-32 pass's prepare POST answers 503, so PrepareProposers
+/// runs again in the slot-33 pass, and the steps already done in epoch 1 do
+/// not: ReorgCheck's proposer requests for E and E+1 are made once, and
+/// slot 34 has nothing pending.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_failed_step_retries_next_slot_without_rerunning_done_steps() {
+    let _metrics = m2_metric_lock().await;
+    let attempts = AtomicUsize::new(0);
+    let mock = retirement_beacon().with_prepare_beacon_proposer(move |_preparations| {
+        // Attempt 0 is the slot-32 pass's.
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+        } else {
+            Ok(())
+        }
+    });
+
+    let run = drive_boundary(mock, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers"),
+        [Some(32), Some(33)],
+        "The slot-32 pass must send the prepare, and the slot-33 pass must send its retry."
+    );
+    assert_eq!(run.mock.prepare_beacon_proposer_calls().len(), 2, "one POST per attempt");
+    let in_passes: Vec<&(Option<Slot>, String)> =
+        run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
+    assert!(
+        matches!(in_passes.as_slice(), [(Some(32), warn)]
+            if warn.starts_with("Failed to send proposer preparations")),
+        "the 503 is the only warn in any pass: {in_passes:?}"
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.check_reorg"),
+        [Some(32)],
+        "ReorgCheck is not repeated in the slot-33 pass"
+    );
+    assert_eq!(
+        run.proposer_requests,
+        [1, 2],
+        "one proposer-duties request each for E and E+1, ReorgCheck's in the slot-32 pass"
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33)],
+        "nothing is pending at slot 34"
+    );
+}
+
+/// W4-E6a: through `run()`, the runner retries registration at the next
+/// processed slot. The retry reuses the cached signature. The drive has a
+/// builder service over the mock. The registration POSTs of slots 32, 33 and 34
+/// answer 503, and the slot-35 POST answers 200. These results must occur:
+///
+/// - The beacon node accepts one registration POST in epoch 1.
+/// - The passes of slots 32 to 35 each call the registration one time, and
+///   no other registration call occurs.
+/// - The counting signer records one registration signature for the key.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn boundary_registration_failure_is_retried_next_slot_without_resigning() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let attempts = AtomicUsize::new(0);
+    let accepted: Captured<Vec<bn_manager::SignedValidatorRegistration>> = Captured::default();
+    let mock = retirement_beacon().with_register_validators({
+        let accepted = Arc::clone(&accepted);
+        move |registrations| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                return Err(beacon::BeaconError::ApiError {
+                    status: 503,
+                    message: "unavailable".into(),
+                });
+            }
+            accepted.lock().push(registrations);
+            Ok(())
+        }
+    });
+
+    let run = drive_boundary_builder(mock, local, 32, 36).await;
+
+    let accepted = accepted.lock().clone();
+    assert_eq!(accepted.len(), 1, "The beacon node must accept one registration POST in epoch 1.");
+    assert_eq!(
+        run.pass_slots("builder.register"),
+        [Some(32), Some(33), Some(34), Some(35)],
+        "The passes of slots 32 to 35 must each call the registration one time."
+    );
+    let posts = run.mock.register_validators_calls();
+    assert_eq!(posts[3], posts[0], "The accepted POST must carry the first signed registration.");
+    let registrations = run.registrations.expect("The drive must have a builder service.");
+    assert_eq!(
+        registrations.signatures(&local_pk),
+        1,
+        "The counting signer must record one registration signature for the key."
+    );
+}
+
+/// 654-AC6: through `run()`, the preferences step retries at the next
+/// processed slot from Gloas-1. The drive has a builder service, and it
+/// starts at the first slot of epoch 69. The test schedule has Gloas at
+/// epoch 70: it is `near_gloas_schedule(70)`. The local key proposes at slot
+/// 5 of each epoch from Gloas. The first preferences POST answers 503, and
+/// the later POSTs answer 200. These results must occur:
+///
+/// - The first two passes each call the proposer broadcast one time.
+/// - Each of the two POSTs carries the Gloas proposal of epoch 70.
+/// - No pass runs at the third slot, because no step is pending.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_preferences_retry_each_slot_from_gloas_minus_one() {
+    let _metrics = m2_metric_lock().await;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let gloas = create_test_fork_schedule().gloas_fork_epoch;
+    assert_eq!(
+        near_gloas_schedule(gloas),
+        create_test_fork_schedule(),
+        "The drive schedule must have Gloas at epoch {gloas}."
+    );
+    let first = (gloas - 1) * slots;
+    let proposal = gloas * slots + 5;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let attempts = AtomicUsize::new(0);
+    let mock = retirement_beacon_base()
+        .with_get_proposer_duties(move |epoch| {
+            let duty = proposer_duty(&local_hex, BOUNDARY_INDEX, epoch * slots + 5);
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                execution_optimistic: false,
+                data: if epoch < gloas { Vec::new() } else { vec![duty] },
+            })
+        })
+        .with_submit_proposer_preferences(move |_preferences| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(beacon::BeaconError::ApiError {
+                    status: 503,
+                    message: "unavailable".into(),
+                });
+            }
+            Ok(())
+        });
+
+    let run = drive_boundary_builder(mock, local, first, first + 2).await;
+
+    assert_eq!(
+        run.pass_slots("builder.broadcast_proposer_preferences"),
+        [Some(first), Some(first + 1)],
+        "The first pass must make the failed attempt, and the second pass must make the retry."
+    );
+    let posted: Vec<Vec<Slot>> = run
+        .mock
+        .submit_proposer_preferences_calls()
+        .iter()
+        .map(|post| post.iter().map(|signed| signed.message.proposal_slot).collect())
+        .collect();
+    assert_eq!(
+        posted,
+        [vec![proposal], vec![proposal]],
+        "Each of the two POSTs must carry the Gloas proposal at slot {proposal}."
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(first), Some(first + 1)],
+        "No step must be pending at slot {}.",
+        first + 2
+    );
+}
+
+// --- W4-E3b: per-step timeouts, and one warn for the steps an epoch did not finish ---
+
+const ABANDONED: &str = "epoch-boundary steps did not finish before the epoch ended";
+
+/// Outlasts every drive, so only a step bound ends a held request.
+const DRIVE_HOLD: Duration = Duration::from_secs(3_600);
+
+/// The attester duty of validator 42 at the last slot of `epoch`, outside
+/// the drives' slot ranges, so the slot loop never attests.
+fn last_slot_attester_duty(
+    pubkey: &str,
+    epoch: u64,
+) -> beacon::DependentRootResponse<Vec<AttesterDuty>> {
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    beacon::DependentRootResponse {
+        dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+        execution_optimistic: false,
+        data: vec![AttesterDuty {
+            pubkey: pubkey.to_string(),
+            validator_index: BOUNDARY_INDEX.to_string(),
+            committee_index: "1".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "4".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: (epoch * slots + slots - 1).to_string(),
+        }],
+    }
+}
+
+/// The fields of each abandoned-steps WARN, with its pass slot.
+fn abandoned_warns(run: &BoundaryRun) -> Vec<(Option<Slot>, &str)> {
+    run.warns
+        .iter()
+        .filter_map(|(pass, warn)| Some((*pass, warn.strip_prefix(ABANDONED)?.trim_start())))
+        .collect()
+}
+
+/// 653-AC2: each step has its own bound. With `duty_fetch` at 2 s and
+/// `preparation` at 60 s, every subscription POST is held past the
+/// subscription step's 2 s bound. The step ends `Failed` there, its POST is
+/// dropped before E+1's, and the next slot's pass sends it again. The
+/// prepare POST takes 3 s, past `duty_fetch` but inside `preparation`: its
+/// step is done in one attempt.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_step_timeout_leaves_step_pending() {
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(last_slot_attester_duty(&local_hex, epoch))
+        })
+        .with_method_delay(subs, DRIVE_HOLD)
+        .with_method_delay(bn_manager::MockMethod::PrepareBeaconProposer, Duration::from_secs(3));
+    let timeouts = OperationTimeouts {
+        duty_fetch: Duration::from_secs(2),
+        preparation: Duration::from_secs(60),
+        ..OperationTimeouts::default()
+    };
+
+    let run = drive_boundary_with(mock, local, timeouts, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(32), Some(33), Some(34)],
+        "E's POST, cut at the step bound, is sent again in each next slot's pass"
+    );
+    let posts = run.mock.call_stamps().iter().filter(|stamp| stamp.method == subs).count();
+    assert_eq!(posts, 3, "one subscription POST per pass");
+    let in_passes: Vec<&(Option<Slot>, String)> =
+        run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
+    let cut = |slot: Slot| {
+        (Some(slot), "Epoch boundary step timed out epoch=1 step=CommitteeSubscriptions timeout=2s")
+    };
+    assert_eq!(
+        in_passes.iter().map(|(pass, warn)| (*pass, warn.as_str())).collect::<Vec<_>>(),
+        [cut(32), cut(33), cut(34)],
+        "the step bound fires in each pass, not the 60 s POST bound"
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers"),
+        [Some(32)],
+        "The slot-32 pass must send the only prepare. The 3 s POST is inside its bound."
+    );
+}
+
+/// 653-AC2, recovery: only the first subscription POST is held past the
+/// 2 s step bound; later POSTs answer at once. The slot-32 pass is cut in
+/// E's POST. The slot-33 pass sends E and E+1 and finishes the step, so no
+/// pass runs at slot 34.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_step_timeout_retry_succeeds_then_stops() {
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&sent);
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(last_slot_attester_duty(&local_hex, epoch))
+        })
+        .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+            recorded.lock().extend(subscriptions.into_iter().map(|s| s.slot));
+            Ok(())
+        })
+        .with_call_delays(subs, [DRIVE_HOLD]);
+    let timeouts = OperationTimeouts {
+        duty_fetch: Duration::from_secs(2),
+        preparation: Duration::from_secs(60),
+        ..OperationTimeouts::default()
+    };
+
+    let run = drive_boundary_with(mock, local, timeouts, 32, 34).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(32), Some(33), Some(33)],
+        "E cut at slot 32, then E and E+1 at slot 33"
+    );
+    assert_eq!(*sent.lock(), ["63", "95"], "E and E+1 answered at slot 33");
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33)],
+        "the step is done at slot 33: no pass at slot 34"
+    );
+}
+
+/// 653-AC3: an epoch whose prepare never succeeds warns once, in the first
+/// pass of the next epoch, naming the step and its last outcome. Every
+/// prepare answers 503. A control run in which every step of epoch 1 is
+/// done warns nothing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_abandoned_steps_warn_at_epoch_end() {
+    let _metrics = m2_metric_lock().await;
+    let mock = retirement_beacon().with_prepare_beacon_proposer(|_preparations| {
+        Err(beacon::BeaconError::ApiError { status: 503, message: "unavailable".into() })
+    });
+
+    let run = drive_boundary(mock, 32, 64).await;
+
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers").len(),
+        33,
+        "Each of the 32 passes of epoch 1 must make one attempt, and the first pass of epoch 2 \
+         must make one."
+    );
+    assert_eq!(
+        abandoned_warns(&run),
+        [(
+            Some(64),
+            "epoch=1 abandoned_steps=[PrepareProposers] last_outcomes={PrepareProposers: Failed}"
+        )],
+        "one warn for epoch 1, in the slot-64 pass"
+    );
+
+    let control = drive_boundary(retirement_beacon(), 32, 64).await;
+    assert_eq!(
+        control.pass_slots("epoch.boundary"),
+        [Some(32), Some(64)],
+        "control: epoch 1 is done in one pass, and slot 64 starts epoch 2"
+    );
+    assert_eq!(abandoned_warns(&control), [], "control: every step of epoch 1 is done");
+}
+
+// --- W4-E3c: typed prepare and subscription results ---
+
+/// The validator indices of each prepare POST, sorted.
+fn prepared_indices(mock: &bn_manager::MockBeaconNodeClient) -> Vec<Vec<String>> {
+    mock.prepare_beacon_proposer_calls()
+        .into_iter()
+        .map(|preparations| {
+            let mut indices: Vec<String> =
+                preparations.into_iter().map(|p| p.validator_index).collect();
+            indices.sort();
+            indices
+        })
+        .collect()
+}
+
+/// 653-AC7, through `run`: a key whose index resolves a few slots into the
+/// epoch gets its fee recipient to the beacon node in that epoch. Three
+/// signing-enabled local keys; validators 42 and 43 have an index at boot,
+/// and 44's is inserted before slot 34. The slot-32 pass POSTs the two, the
+/// slot-33 pass sends nothing, and the slot-34 pass POSTs all three. That
+/// finishes the step: no pass at 35.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_late_index_gets_its_fee_recipient_within_the_epoch() {
+    let _metrics = m2_metric_lock().await;
+    let late = SecretKey::generate();
+    let late_pk = late.public_key().to_bytes();
+    let keys = vec![
+        (SecretKey::generate(), Some("42")),
+        (SecretKey::generate(), Some("43")),
+        (late, None),
+    ];
+    let timeouts = create_test_config().timeouts;
+    let resolve_late = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        if slot == 34 {
+            registry.write().insert(late_pk, "44".to_string());
+        }
+    };
+
+    let run = drive_boundary_keys(retirement_beacon(), keys, timeouts, 32, 35, resolve_late).await;
+
+    assert_eq!(
+        prepared_indices(&run.mock),
+        [vec!["42", "43"], vec!["42", "43", "44"]],
+        "The slot-32 pass must send the two resolved keys, and the slot-34 pass must send all three."
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.prepare_proposers"),
+        [Some(32), Some(34)],
+        "The slot-32 and slot-34 passes must send a prepare. The slot-33 pass only reads the registry."
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33), Some(34)],
+        "the step is done at slot 34: no pass at slot 35"
+    );
+}
+
+/// 653-AC4, through `run`: a subscription POST that answers 500 is sent
+/// again at the next slot. Only epoch 1 has an attester duty for validator
+/// 42, at its last slot (so the slot loop never attests), so each pass makes
+/// at most one subscription POST. The first answers 500, the slot-33 pass
+/// sends it again, answered `Ok`, and no pass runs at slot 34.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_subscription_post_500_is_retried_at_the_next_slot() {
+    let subs = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let posts = AtomicUsize::new(0);
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(if epoch == 1 {
+                last_slot_attester_duty(&local_hex, epoch)
+            } else {
+                empty_dependent()
+            })
+        })
+        .with_submit_beacon_committee_subscriptions(move |_subscriptions| {
+            if posts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(beacon::BeaconError::ApiError { status: 500, message: "internal".into() })
+            } else {
+                Ok(())
+            }
+        });
+
+    let run = drive_boundary_with(mock, local, create_test_config().timeouts, 32, 34).await;
+
+    let posts = run.mock.call_stamps().iter().filter(|stamp| stamp.method == subs).count();
+    assert_eq!(posts, 2, "the 500, then its retry");
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(32), Some(32), Some(33)],
+        "E (the 500) and E+1 (no duty) at slot 32, then E again at slot 33"
+    );
+    let in_passes: Vec<&(Option<Slot>, String)> =
+        run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
+    assert_eq!(
+        in_passes,
+        [&(
+            Some(32),
+            "Failed to send committee subscriptions epoch=1 \
+             error=Beacon node returned error: 500 - internal"
+                .to_string()
+        )],
+        "the 500 is the only warn in any pass"
+    );
+    assert_eq!(
+        run.pass_slots("epoch.boundary"),
+        [Some(32), Some(33)],
+        "the retry at slot 33 finishes the step: no pass at slot 34"
+    );
+}
+
+// --- W4-E7e: no prepare POST from an index registry that is stale after a revocation ---
+
+/// The helper sets each index from `indices`. It stamps `registry` with the
+/// current value of `generation`. The index resolver does the same under
+/// its write lock.
+fn revalidate(
+    registry: &crate::pubkey_index::SharedPubkeyIndexRegistry,
+    generation: &Arc<std::sync::atomic::AtomicU64>,
+    indices: &[([u8; 48], &str)],
+) {
+    let mut registry = registry.write();
+    for (pubkey, index) in indices {
+        registry.insert(*pubkey, (*index).to_string());
+    }
+    registry.attach_revocation(Arc::clone(generation), generation.load(Ordering::Acquire));
+}
+
+/// The helper increments `generation`, as a beacon node revocation does.
+fn revoke(generation: &std::sync::atomic::AtomicU64) {
+    generation.fetch_add(1, Ordering::AcqRel);
+}
+
+/// W4-E7e: proposer preparation must use validated indices.
+///
+/// 1. The local key has index 4 under generation 0.
+/// 2. A revocation makes the registry stale. The call must send no POST and
+///    must report `Stale`.
+/// 3. Revalidation gives the key index 9. The next call must send index 9
+///    and report `Complete`.
+#[tokio::test]
+async fn test_prepare_proposers_sends_no_index_from_a_registry_revoked_since_validation() {
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_prepare_beacon_proposer(|_| Ok(()));
+    let generation = mock.track_admission();
+    let (deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    revoke(&generation);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        mock.prepare_beacon_proposer_calls().len(),
+        0,
+        "The stale registry must not give index 4 to a prepare POST."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Stale)),
+        "A call on a stale registry must report Stale: {outcome:?}"
+    );
+
+    revalidate(&registry, &generation, &[(local_pk, "9")]);
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Complete)),
+        "The POST covers the one local key, so the call must report Complete: {outcome:?}"
+    );
+}
+
+/// W4-E7e R1: the token check before the POST must stop a POST of indices
+/// that a revocation made stale after the index snapshot.
+///
+/// 1. The local key has index 4 under generation 0.
+/// 2. The prepare hook runs after the read lock of the index snapshot ends.
+///    It revokes the registry and revalidates the key to index 9.
+/// 3. The call must send no POST and must report `Stale`.
+/// 4. The next call must send index 9 and report `Complete`.
+#[tokio::test]
+async fn test_prepare_proposers_sends_no_post_after_a_revocation_after_the_index_snapshot() {
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_prepare_beacon_proposer(|_| Ok(()));
+    let generation = mock.track_admission();
+    let (deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+    let mut change = Some((Arc::clone(&registry), Arc::clone(&generation)));
+    let _armed = arm_prepare_hook(move |point| {
+        if point != PreparePoint::AfterSnapshot {
+            return;
+        }
+        if let Some((registry, generation)) = change.take() {
+            revoke(&generation);
+            revalidate(&registry, &generation, &[(local_pk, "9")]);
+        }
+    });
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        mock.prepare_beacon_proposer_calls().len(),
+        0,
+        "A revocation after the index snapshot must stop the POST of index 4."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Stale)),
+        "A revocation after the index snapshot must make the call report Stale: {outcome:?}"
+    );
+
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Complete)),
+        "The POST covers the one local key, so the call must report Complete: {outcome:?}"
+    );
+}
+
+/// The mock holds the prepare POST for 3,600 seconds.
+const PREPARE_HOLD: Duration = Duration::from_secs(3_600);
+
+/// The preparation timeout is 7,200 seconds. The held POST ends before it.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(7_200);
+
+/// The helper calls `prepare_proposers(3)` on a new task while the mock
+/// holds the POST. When the POST arrives, the helper increments
+/// `generation`. Then the hold ends. The result is `None` if the task
+/// panics or the hang guard stops the wait.
+async fn prepare_with_a_revocation_during_the_post(
+    duty_management: &Arc<DutyManagementService>,
+    mock: &bn_manager::MockBeaconNodeClient,
+    generation: &std::sync::atomic::AtomicU64,
+) -> Option<Result<PrepareOutcome, OrchestratorError>> {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let arrivals = || mock.call_stamps().iter().filter(|stamp| stamp.method == prep).count();
+    let before = arrivals();
+    let duty_management = Arc::clone(duty_management);
+    let prepare = tokio::spawn(async move { duty_management.prepare_proposers(3).await });
+
+    let mut rounds = 0;
+    while arrivals() == before {
+        assert!(rounds < 1_000, "The mock must record the prepare POST.");
+        rounds += 1;
+        tokio::task::yield_now().await;
+    }
+    revoke(generation);
+    tokio::time::advance(PREPARE_HOLD).await;
+    tokio::time::timeout(PREPARE_HOLD, prepare).await.ok()?.ok()
+}
+
+/// W4-E7e: a revocation during the prepare POST makes the call report
+/// `Stale`, because the POST can carry an index from before the
+/// revocation. The mock holds the POST, and the test increments the
+/// generation before the mock answers.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revocation_during_the_prepare_post_reports_stale() {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new()
+        .with_prepare_beacon_proposer(|_| Ok(()))
+        .with_method_delay(prep, PREPARE_HOLD);
+    let generation = mock.track_admission();
+    let (mut deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), vec![], vec![]);
+    let preparation = PREPARE_TIMEOUT;
+    deps.config = deps
+        .config
+        .with_timeouts(OperationTimeouts { preparation, ..OperationTimeouts::default() });
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = prepare_with_a_revocation_during_the_post(
+        &orchestrator.duty_management,
+        &mock,
+        &generation,
+    )
+    .await;
+
+    assert_eq!(prepared_indices(&mock), [["4"]], "The mock must answer the held POST of index 4.");
+    assert!(
+        matches!(outcome, Some(Ok(PrepareOutcome::Stale))),
+        "A revocation during the POST must make the call report Stale: {outcome:?}"
+    );
+}
+
+/// W4-E7e R1: a revocation during the prepare POST of a partial set also
+/// makes the call report `Stale`.
+///
+/// 1. The first local key has index 4. The second local key has no index.
+/// 2. The mock holds the POST of index 4. A revocation occurs before the
+///    mock answers. The call must report `Stale`.
+/// 3. Revalidation gives the first key index 9. The next call must send
+///    index 9 and report `Partial` with one unresolved key.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revocation_during_a_partial_prepare_post_reports_stale() {
+    let prep = bn_manager::MockMethod::PrepareBeaconProposer;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new()
+        .with_prepare_beacon_proposer(|_| Ok(()))
+        .with_call_delays(prep, [PREPARE_HOLD]);
+    let generation = mock.track_admission();
+    let no_index = vec![(SecretKey::generate(), true)];
+    let (mut deps, mock) =
+        retirement_deps(3, near_gloas_schedule(100), mock, (local, true), no_index, vec![]);
+    let preparation = PREPARE_TIMEOUT;
+    deps.config = deps
+        .config
+        .with_timeouts(OperationTimeouts { preparation, ..OperationTimeouts::default() });
+    revalidate(&deps.pubkey_index, &generation, &[(local_pk, "4")]);
+    let registry = Arc::clone(&deps.pubkey_index);
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let outcome = prepare_with_a_revocation_during_the_post(
+        &orchestrator.duty_management,
+        &mock,
+        &generation,
+    )
+    .await;
+
+    assert_eq!(prepared_indices(&mock), [["4"]], "The mock must answer the held POST of index 4.");
+    assert!(
+        matches!(outcome, Some(Ok(PrepareOutcome::Stale))),
+        "A revocation during the POST of a partial set must make the call report Stale: \
+         {outcome:?}"
+    );
+
+    revalidate(&registry, &generation, &[(local_pk, "9")]);
+    let outcome = orchestrator.duty_management.prepare_proposers(3).await;
+
+    assert_eq!(
+        prepared_indices(&mock),
+        [["4"], ["9"]],
+        "The next call must send one POST with the revalidated index 9."
+    );
+    assert!(
+        matches!(outcome, Ok(PrepareOutcome::Partial { unresolved: 1 })),
+        "The second local key has no index, so the call must report Partial: {outcome:?}"
+    );
+}
+
+/// The recorder stores each prepare POST with the slot of its pass.
+#[derive(Clone, Default)]
+struct PassPosts {
+    /// The `before_slot` hook sets the slot for the next pass.
+    slot: Arc<std::sync::atomic::AtomicU64>,
+    /// Each line contains the slot and sorted indices for one POST.
+    lines: Captured<String>,
+}
+
+impl PassPosts {
+    /// This method returns a [`retirement_beacon`] that records each prepare
+    /// POST.
+    fn beacon(&self) -> bn_manager::MockBeaconNodeClient {
+        let posts = self.clone();
+        retirement_beacon().with_prepare_beacon_proposer(move |preparations| {
+            let mut indices: Vec<String> =
+                preparations.into_iter().map(|p| p.validator_index).collect();
+            indices.sort();
+            let slot = posts.slot.load(Ordering::Acquire);
+            posts.lines.lock().push(format!("{slot}: {}", indices.join(",")));
+            Ok(())
+        })
+    }
+
+    /// This method sets the slot for the next pass.
+    fn enter(&self, slot: Slot) {
+        self.slot.store(slot, Ordering::Release);
+    }
+
+    /// This method returns the recorded lines in POST order.
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().clone()
+    }
+}
+
+/// W4-E7e, through `run`: the runner sends no prepare POST while the
+/// registry is stale. It sends each revalidated index in the same epoch.
+/// The one local key has index 4 under generation 0.
+/// 1. Before slot 32, a revocation makes the registry stale. Slot 32 sends
+///    no POST.
+/// 2. Before slot 33, a revalidation gives index 9. Slot 33 sends 9, and
+///    the step is done.
+/// 3. Before slot 34, a revocation and a revalidation give index 11. The
+///    step opens again, and slot 34 sends 11.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_prepare_waits_for_revalidated_indices_and_resends_after_each_revalidation() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(local_pk, "4")]);
+            revoke(&generation);
+        } else if slot == 33 {
+            revalidate(registry, &generation, &[(local_pk, "9")]);
+        } else if slot == 34 {
+            revoke(&generation);
+            revalidate(registry, &generation, &[(local_pk, "11")]);
+        }
+    };
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, vec![(local, None)], timeouts, 32, 35, edit).await;
+
+    assert_eq!(
+        posts.lines(),
+        ["33: 9", "34: 11"],
+        "Slot 32 must send no POST. Slots 33 and 34 must each send the index of the last \
+         revalidation."
+    );
+}
+
+/// W4-E7e (NM-7), through `run`: a revocation and a revalidation between
+/// passes clear the partial suppression. The rule also applies when the
+/// resolved count does not change. There are three local keys, and the
+/// third key has no index.
+/// 1. Before slot 32, the first two keys get indices 4 and 5. Slot 32 sends
+///    4 and 5.
+/// 2. Before slot 33, a revocation and a revalidation give indices 14 and
+///    15. No pass sees the stale registry. Slot 33 sends 14 and 15.
+/// 3. Slots 34 and 35 send no POST, because the count and the registry
+///    token do not change.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_partial_prepare_resends_corrected_indices_after_a_revalidation_between_passes() {
+    let _metrics = m2_metric_lock().await;
+    let (first, second) = (SecretKey::generate(), SecretKey::generate());
+    let (first_pk, second_pk) = (first.public_key().to_bytes(), second.public_key().to_bytes());
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(first_pk, "4"), (second_pk, "5")]);
+        } else if slot == 33 {
+            revoke(&generation);
+            revalidate(registry, &generation, &[(first_pk, "14"), (second_pk, "15")]);
+        }
+    };
+    let keys = vec![(first, None), (second, None), (SecretKey::generate(), None)];
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, keys, timeouts, 32, 35, edit).await;
+
+    assert_eq!(
+        posts.lines(),
+        ["32: 4,5", "33: 14,15"],
+        "Slot 33 must send the corrected indices 14 and 15. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// The helper runs [`drive_boundary_keys`] over `keys` from slot 32 to slot
+/// 35, and returns the [`PassPosts`] lines.
+///
+/// 1. Before boot, the keys in `first` get their indices under generation 0.
+/// 2. The prepare hook runs after the token check that follows the first
+///    successful POST. It revokes the registry and gives the keys in
+///    `second` their indices. No pass runs between the two changes.
+async fn drive_with_a_revalidation_after_the_post_check(
+    keys: Vec<(SecretKey, Option<&'static str>)>,
+    first: &[([u8; 48], &'static str)],
+    second: Vec<([u8; 48], &'static str)>,
+) -> Vec<String> {
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let mut second = Some(second);
+    let mut armed = None;
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot != 32 {
+            return;
+        }
+        revalidate(registry, &generation, first);
+        let (registry, generation) = (Arc::clone(registry), Arc::clone(&generation));
+        let mut second = second.take();
+        armed = Some(arm_prepare_hook(move |point| {
+            if point != PreparePoint::AfterPostCheck {
+                return;
+            }
+            if let Some(second) = second.take() {
+                revoke(&generation);
+                revalidate(&registry, &generation, &second);
+            }
+        }));
+    };
+    let timeouts = create_test_config().timeouts;
+
+    drive_boundary_keys(mock, keys, timeouts, 32, 35, edit).await;
+    drop(armed);
+    posts.lines()
+}
+
+/// W4-E7e R1, through `run`: the runner must keep the registry token that
+/// it reads before the prepare POST. There is one local key.
+///
+/// 1. Before boot, the key gets index 4 under generation 0. Slot 32 sends 4.
+/// 2. After the token check that follows that POST, a revocation and a
+///    revalidation give index 9. The resolved count does not change.
+/// 3. Slot 33 must send 9. Slots 34 and 35 must send no POST.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revalidation_after_a_complete_prepare_post_resends_at_the_next_pass() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+
+    let lines = drive_with_a_revalidation_after_the_post_check(
+        vec![(local, None)],
+        &[(local_pk, "4")],
+        vec![(local_pk, "9")],
+    )
+    .await;
+
+    assert_eq!(
+        lines,
+        ["32: 4", "33: 9"],
+        "Slot 33 must send the revalidated index 9. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// W4-E7e R1, through `run`: the runner must keep the registry token that
+/// it reads before a partial prepare POST. There are three local keys, and
+/// the third key has no index.
+///
+/// 1. Before boot, the first two keys get indices 4 and 5 under generation
+///    0. Slot 32 sends 4 and 5.
+/// 2. After the token check that follows that POST, a revocation and a
+///    revalidation give indices 14 and 15. The resolved count does not
+///    change.
+/// 3. Slot 33 must send 14 and 15. Slots 34 and 35 must send no POST.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_revalidation_after_a_partial_prepare_post_resends_at_the_next_pass() {
+    let _metrics = m2_metric_lock().await;
+    let (first, second) = (SecretKey::generate(), SecretKey::generate());
+    let (first_pk, second_pk) = (first.public_key().to_bytes(), second.public_key().to_bytes());
+    let keys = vec![(first, None), (second, None), (SecretKey::generate(), None)];
+
+    let lines = drive_with_a_revalidation_after_the_post_check(
+        keys,
+        &[(first_pk, "4"), (second_pk, "5")],
+        vec![(first_pk, "14"), (second_pk, "15")],
+    )
+    .await;
+
+    assert_eq!(
+        lines,
+        ["32: 4,5", "33: 14,15"],
+        "Slot 33 must send the corrected indices 14 and 15. Slots 34 and 35 must send no POST."
+    );
+}
+
+/// W4-E7e R1 (Harper B1), through `run`: a POST after a `Stale` sample must
+/// not hide a registry that stays stale until the epoch ends. There is one
+/// local key.
+///
+/// 1. Before boot, the key gets index 4 under generation 0. Slot 32 sends 4.
+/// 2. Before slot 33, a revocation makes the registry stale. The slot-33
+///    pass reads the stale token.
+/// 3. The prepare hook runs before the index snapshot of that pass. It
+///    gives the key index 9. Slot 33 sends 9.
+/// 4. Before slot 34, a revocation makes the registry stale until the end
+///    of epoch 1. Slots 34 to 64 must send no POST.
+/// 5. The slot-64 pass must warn that PrepareProposers did not finish in
+///    epoch 1.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_stale_registry_after_a_stale_sample_post_names_prepare_at_the_epoch_end() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let posts = PassPosts::default();
+    let mock = posts.beacon();
+    let generation = mock.track_admission();
+    let mut armed = None;
+    let edit = |slot: Slot, registry: &crate::pubkey_index::SharedPubkeyIndexRegistry| {
+        posts.enter(slot);
+        if slot == 32 {
+            revalidate(registry, &generation, &[(local_pk, "4")]);
+        } else if slot == 33 {
+            revoke(&generation);
+            let mut change = Some((Arc::clone(registry), Arc::clone(&generation)));
+            armed = Some(arm_prepare_hook(move |point| {
+                if point != PreparePoint::BeforeSnapshot {
+                    return;
+                }
+                if let Some((registry, generation)) = change.take() {
+                    revalidate(&registry, &generation, &[(local_pk, "9")]);
+                }
+            }));
+        } else if slot == 34 {
+            revoke(&generation);
+        }
+    };
+    let timeouts = create_test_config().timeouts;
+
+    let run = drive_boundary_keys(mock, vec![(local, None)], timeouts, 32, 64, edit).await;
+    drop(armed);
+
+    assert_eq!(
+        posts.lines(),
+        ["32: 4", "33: 9"],
+        "Slots 32 and 33 must send indices 4 and 9. Slots 34 to 64 must send no POST."
+    );
+    assert_eq!(
+        abandoned_warns(&run),
+        [(
+            Some(64),
+            "epoch=1 abandoned_steps=[PrepareProposers] \
+             last_outcomes={PrepareProposers: NotReady}"
+        )],
+        "The slot-64 pass must warn one time that PrepareProposers did not finish in epoch 1."
+    );
+}
+
+// --- W4-E6b2: one admission for each preferences attempt ---
+
+/// This `RegistrationSigner` sends each call to the real signer. After the
+/// first `sign_proposer_preferences` call returns, it increments
+/// `generation`, as a beacon node revocation does.
+struct RevokeAfterFirstPreference {
+    inner: Arc<dyn ValidatorSigner>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    revoked: AtomicBool,
+}
+
+#[async_trait]
+impl ::builder::RegistrationSigner for RevokeAfterFirstPreference {
+    async fn sign_builder_registration(
+        &self,
+        registration: &::eth_types::ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_builder_registration(&*self.inner, registration, pubkey, fork_version)
+            .await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &::eth_types::ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        let signed = ValidatorSigner::sign_proposer_preferences(
+            &*self.inner,
+            prefs,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await;
+        if !self.revoked.swap(true, Ordering::AcqRel) {
+            revoke(&self.generation);
+        }
+        signed
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &::eth_types::BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<::crypto::Signature, ::signer::SignerError> {
+        ValidatorSigner::sign_builder_request_auth(&*self.inner, auth, pubkey, genesis_fork_version)
+            .await
+    }
+}
+
+/// W4-E6b2: a revocation during a proposer broadcast must stop each later
+/// sign of that broadcast. The test has this setup:
+///
+/// - The schedule has Gloas at epoch 100. The local key proposes at slot 5
+///   of epochs 100 and 101.
+/// - The builder service uses the production admission bridge over a
+///   `MockBeaconNodeClient`, and the real `SignerService`.
+/// - The signer wrapper increments the generation after the first
+///   preferences signature.
+///
+/// The broadcast must send only the preference that it signed before the
+/// revocation, and it must report the refused signature.
+#[tokio::test]
+async fn test_preferences_revoked_mid_broadcast_sign_nothing_after_the_revoke() {
+    let gloas_epoch = 100u64;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let mock = bn_manager::MockBeaconNodeClient::new().with_submit_proposer_preferences(|_| Ok(()));
+    let generation = mock.track_admission();
+    let mock = Arc::new(mock);
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(local);
+    let signer = SignerService::new(
+        Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+        Arc::new(SlashingDb::open_in_memory().expect("The slashing database must open.")),
+    )
+    .with_enablement(always_enabled());
+    let inner: Arc<dyn ValidatorSigner> = Arc::new(signer);
+    let wrapper = RevokeAfterFirstPreference { inner, generation, revoked: AtomicBool::new(false) };
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(local_pk))
+        .expect("The store must add the local validator.");
+    let builder = BuilderService::new(
+        Arc::new(wrapper),
+        Arc::new(beacon),
+        validator_store,
+        schedule.genesis_fork_version,
+        Arc::clone(&schedule),
+    );
+    let proposal = |epoch: u64| ::builder::UpcomingProposal {
+        pubkey: local_pk,
+        validator_index: 42,
+        proposal_slot: epoch * slots + 5,
+        dependent_root: [0x33; 32],
+    };
+    let proposals = [proposal(gloas_epoch), proposal(gloas_epoch + 1)];
+
+    let result = builder.broadcast_proposer_preferences(gloas_epoch, &proposals, &[0xaa; 32]).await;
+
+    let sent: Vec<Vec<Slot>> = mock
+        .submit_proposer_preferences_calls()
+        .iter()
+        .map(|post| post.iter().map(|signed| signed.message.proposal_slot).collect())
+        .collect();
+    assert_eq!(
+        sent,
+        [vec![gloas_epoch * slots + 5]],
+        "The broadcast must send only the preference that it signed before the revocation."
+    );
+    assert_eq!(
+        result.map_err(|e| e.to_string()),
+        Err("1 of 2 proposer preferences signatures failed".to_string()),
+        "The broadcast must report the signature that it did not get after the revocation."
+    );
+}
+
+/// W4-E6b2, a joint pin with W4-E7c1: the preferences step must not sign
+/// proposer duties that the tracker cached before a revocation. The epoch E
+/// is Gloas, and the local key proposes at slot 5 of E and E+1.
+///
+/// 1. The tracker fetches the proposer duties of E and E+1 under
+///    generation 0.
+/// 2. A revocation moves the generation to 1. After it, each proposer
+///    duties request answers 503.
+/// 3. The pass at the first slot of E must send no proposer preference and
+///    no builder preference.
+#[tokio::test]
+async fn preferences_from_duties_cached_before_revocation_are_not_signed() {
+    let gloas_epoch = 100u64;
+    let slots = ::timing::SLOTS_PER_EPOCH;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let mock = retirement_beacon_base();
+    let generation = mock.track_admission();
+    let answered = Arc::clone(&generation);
+    let mock = mock.with_get_proposer_duties(move |epoch| {
+        if answered.load(Ordering::Acquire) > 0 {
+            let message = "unavailable".to_string();
+            return Err(beacon::BeaconError::ApiError { status: 503, message });
+        }
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+            execution_optimistic: false,
+            data: vec![proposer_duty(&local_hex, "42", epoch * slots + 5)],
+        })
+    });
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let (orchestrator, _handle, mock) =
+        retirement_orchestrator(gloas_epoch, schedule, mock, (local, true), vec![], vec![]).await;
+    for epoch in [gloas_epoch, gloas_epoch + 1] {
+        orchestrator
+            .duty_tracker
+            .fetch_proposer_duties(epoch)
+            .await
+            .expect("The tracker must fetch the proposer duties before the revocation.");
+    }
+
+    revoke(&generation);
+    orchestrator.epoch_boundary.run_pending(gloas_epoch * slots).await;
+
+    assert_eq!(
+        mock.submit_proposer_preferences_calls().len(),
+        0,
+        "The pass must not send a proposer preference from duties cached before the revocation."
+    );
+    assert_eq!(
+        mock.submit_builder_preferences_calls().len(),
+        0,
+        "The pass must not send a builder preference from duties cached before the revocation."
+    );
 }

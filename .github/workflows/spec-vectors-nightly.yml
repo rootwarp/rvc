@@ -6,6 +6,9 @@ on:
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # Nightly mainnet spec-vectors (#240 / 3.10b).
   #
@@ -30,13 +33,17 @@ jobs:
       RVC_SPEC_VECTORS_REQUIRED: "1"
       PRESET: mainnet
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -46,13 +53,15 @@ jobs:
             ${{ runner.os }}-cargo-spec-vectors-deps-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       # Archives only: the pin is the tarball digest, not a restored tests/ tree.
       # No restore-keys: a lock change must miss, not restore a stale archive.
       - name: Cache spec-vector archives
         id: spec-vector-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
           key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
@@ -66,7 +75,7 @@ jobs:
       # Pyspec branch: pin CPython ≥ 3.12 (lock records 3.13.7) and re-run
       # 3.4b's recipe. PR jobs only sha256-verify; this is the reproduction.
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13.7"
 

@@ -657,3 +657,91 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
         );
     }
 }
+
+fn assert_out_of_range(err: SlashingError, field: &str, value: u64) {
+    match err {
+        SlashingError::OutOfRange { field: got, value: got_value } => {
+            assert_eq!(got, field);
+            assert_eq!(got_value, value);
+        }
+        other => panic!("expected OutOfRange {{ field: {field}, value: {value} }}, got {other:?}"),
+    }
+}
+
+/// The refusal is the `stage_attestation` result. `StagedAttestation::commit` is not called.
+#[test]
+fn stage_attestation_rejects_a_target_at_2_pow_63() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let err = db
+        .stage_attestation(PUBKEY, 1, 1 << 63, Some("0xstage".into()), GVR)
+        .expect_err("stage_attestation");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    assert!(db.get_attestations(PUBKEY).expect("rows").is_empty());
+
+    let err = db
+        .stage_attestation(PUBKEY, 1 << 63, (1 << 63) + 1, Some("0xsrc".into()), GVR)
+        .expect_err("source before target");
+    assert_out_of_range(err, "source_epoch", 1 << 63);
+    assert!(db.get_attestations(PUBKEY).expect("rows").is_empty());
+}
+
+/// The refusal is the `stage_block` result. `StagedBlock::commit` is not called.
+#[test]
+fn stage_block_rejects_a_slot_at_2_pow_63() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    for slot in [1_u64 << 63, u64::MAX] {
+        let err =
+            db.stage_block(PUBKEY, slot, Some("0xstage".into()), GVR).expect_err("stage_block");
+        assert_out_of_range(err, "slot", slot);
+    }
+    assert!(db.get_blocks(PUBKEY).expect("rows").is_empty());
+}
+
+/// Moving the range check into `Staged*::commit` or to after `pinned_gvr` /
+/// `check_gvr_before_lock` fails this scan. The behavioral tests above still
+/// pass in that case, because the history binds also refuse.
+#[test]
+fn stage_and_grouped_reserve_check_bounds_before_any_lock() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let stage = std::fs::read_to_string(root.join("stage.rs")).expect("stage.rs");
+    assert_call_before(
+        slice_until(&stage, "pub fn stage_block", "pub fn stage_attestation"),
+        "to_sql_i64(",
+        "pinned_gvr()?",
+        "stage_block",
+    );
+    assert_call_before(
+        slice_until(&stage, "pub fn stage_attestation", "pub fn reserve_block"),
+        "to_sql_i64(",
+        "pinned_gvr()?",
+        "stage_attestation",
+    );
+    let grouped = std::fs::read_to_string(root.join("group_commit.rs")).expect("group_commit.rs");
+    for (start, end) in [
+        ("fn reserve_block_grouped", "fn reserve_attestation_grouped"),
+        ("fn reserve_attestation_grouped", "pub fn enqueue_and_abandon_block"),
+        ("pub fn enqueue_and_abandon_block", "pub fn enqueue_block_cancellable"),
+        ("pub fn enqueue_block_cancellable", "pub fn block_next_eval"),
+    ] {
+        assert_call_before(
+            slice_until(&grouped, start, end),
+            "check_bounds()?",
+            "check_gvr_before_lock(",
+            start,
+        );
+    }
+}
+
+fn slice_until<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+    let at = src.find(start).unwrap_or_else(|| panic!("missing {start}"));
+    let rest = &src[at..];
+    let end_at =
+        rest[start.len()..].find(end).unwrap_or_else(|| panic!("missing {end} after {start}"));
+    &rest[..start.len() + end_at]
+}
+
+fn assert_call_before(body: &str, earlier: &str, later: &str, what: &str) {
+    let earlier_at = body.find(earlier).unwrap_or_else(|| panic!("{what} missing `{earlier}`"));
+    let later_at = body.find(later).unwrap_or_else(|| panic!("{what} missing `{later}`"));
+    assert!(earlier_at < later_at, "{what}: `{earlier}` must appear before `{later}`");
+}

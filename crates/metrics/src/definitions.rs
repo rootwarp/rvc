@@ -76,12 +76,22 @@ lazy_static! {
     };
 
     /// Gauge for per-BN health tier (1=Synced, 2=SmallLag, 3=LargeLag, 4=Unsynced).
-    /// Labels: endpoint
+    /// Labels: endpoint, pool (`main` or `proposer`)
     pub static ref RVC_BN_HEALTH_TIER: prometheus::IntGaugeVec = {
         define_int_gauge_vec(
             "rvc_bn_health_tier",
             "Health tier of each beacon node (1=synced, 2=small-lag, 3=large-lag, 4=unsynced)",
-            &["endpoint"],
+            &["endpoint", "pool"],
+        )
+    };
+
+    /// 1 when the beacon node is admitted for duties, 0 when it is not.
+    /// Labels: endpoint, pool (`main` or `proposer`)
+    pub static ref RVC_BN_ADMITTED: prometheus::IntGaugeVec = {
+        define_int_gauge_vec(
+            "rvc_bn_admitted",
+            "1 when the beacon node is admitted for duties, 0 when admission is revoked or not yet granted",
+            &["endpoint", "pool"],
         )
     };
 
@@ -170,11 +180,11 @@ lazy_static! {
         )
     };
 
-    /// Parent-root walk-back fallbacks at t=0 (ARCH-3d).
+    /// Parent-root walk-back fallbacks and unchecked parent lookups at t=0 (ARCH-3d).
     pub static ref RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL: IntCounterVec = {
         define_int_counter_vec(
             "rvc_slot_context_parent_fallback_total",
-            "Total number of SlotContext parent_root fallbacks after walk-back",
+            "Total number of SlotContext parent_root fallbacks and unchecked parent lookups; one slot can count two reasons",
             &["reason"],
         )
     };
@@ -201,6 +211,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_MONITORING_PUSH_SUCCESS_TOTAL);
     lazy_static::initialize(&RVC_MONITORING_PUSH_FAILURES_TOTAL);
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
+    lazy_static::initialize(&RVC_BN_ADMITTED);
     lazy_static::initialize(&RVC_TX_HOLD_DURATION_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_OFFSET_MS);
@@ -210,8 +221,10 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
     lazy_static::initialize(&RVC_SLOT_REPLAY_SKIPPED_TOTAL);
-    // DSR-2.4: force-register S5A zero children so scrapes see numeric samples.
-    let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT]);
+    // DSR-2.4: the health-tier gauge keeps one placeholder child so a scrape
+    // before the first beacon node still has a numeric sample. `rvc_bn_admitted`
+    // does not: an `endpoint="unknown"` child would look like a real node.
+    let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT, "main"]);
     for task in task_exit_tasks::ALL {
         for outcome in task_exit_outcome::ALL {
             let _ = RVC_TASK_EXITS_TOTAL.with_label_values(&[task, outcome]);
@@ -320,8 +333,22 @@ pub mod bn_health_tier {
 }
 
 /// `reason` label values for `rvc_slot_context_parent_fallback_total`.
+///
+/// Each reason other than `walk_back_exhausted` turns the parent filter off
+/// for that slot. One slot can count two reasons: `walk_back_exhausted`, and
+/// then a reason for the `head` fallback (for example `unconfirmed`).
 pub mod slot_context_parent_fallback {
     pub const WALK_BACK_EXHAUSTED: &str = "walk_back_exhausted";
+    /// No beacon node gave a header or a 404, and the error of the lowest
+    /// node index is a parse error (for example an optimistic header).
+    pub const UNCHECKED_PARSE: &str = "unchecked_parse";
+    /// No beacon node gave a header or a 404, and that error is not a parse
+    /// error (for example a timeout). Also a confirmed 404 for `head`.
+    pub const UNCHECKED_ERROR: &str = "unchecked_error";
+    /// One or more beacon nodes gave a header or a 404, but not enough agreed.
+    pub const UNCONFIRMED: &str = "unconfirmed";
+    /// The whole t=0 capture passed the pre-proposal deadline.
+    pub const CAPTURE_TIMEOUT: &str = "capture_timeout";
 }
 
 /// `phase` label values for `rvc_sync_committee_skipped_total`.
@@ -333,6 +360,7 @@ pub mod sync_committee_skip_phase {
 /// `reason` label values for `rvc_sync_committee_skipped_total`.
 pub mod sync_committee_skip_reason {
     pub const NO_HEAD_ROOT: &str = "no_head_root";
+    pub const BN_REVOKED: &str = "bn_revoked";
 }
 
 /// `reason` label values for `rvc_payload_attestation_skipped_total`.
@@ -451,6 +479,20 @@ mod tests {
         assert!(
             endpoints.contains(bn_health_tier::UNCONFIGURED_ENDPOINT),
             "bn_health_tier unknown endpoint must be force-registered, got {endpoints:?}"
+        );
+
+        let admitted = gathered.iter().find(|metric| metric.name() == "rvc_bn_admitted");
+        let unknown_admitted = admitted.is_some_and(|metric| {
+            metric.get_metric().iter().any(|sample| {
+                sample.get_label().iter().any(|label| {
+                    label.name() == "endpoint"
+                        && label.value() == bn_health_tier::UNCONFIGURED_ENDPOINT
+                })
+            })
+        });
+        assert!(
+            !unknown_admitted,
+            "rvc_bn_admitted must not publish an endpoint=unknown placeholder"
         );
     }
 

@@ -507,10 +507,8 @@ fn binding_for_stage_let(cleaned: &str, depths: &[i32], stage_at: usize) -> Opti
                 }
             }
             b']' => bracket += 1,
-            b'[' => {
-                if bracket > 0 {
-                    bracket -= 1;
-                }
+            b'[' if bracket > 0 => {
+                bracket -= 1;
             }
             b';' | b'}' if paren == 0 && bracket == 0 => break,
             b';' if paren == 0 && bracket == 0 => break,

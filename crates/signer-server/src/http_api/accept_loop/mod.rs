@@ -80,8 +80,7 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 ///   then the connection closes (bounded by [`DRAIN_TIMEOUT`]).
 ///
 /// `router` is taken as an opaque [`axum::Router`]; this module stays ignorant
-/// of `/sign` and the gate (extraction-readiness). Unlike `serve_metrics` (which
-/// handles connections serially, inline), this fans connections out across tasks.
+/// of `/sign` and the gate (extraction-readiness).
 pub async fn serve_https(
     listener: TcpListener,
     tls: Arc<ServerConfig>,

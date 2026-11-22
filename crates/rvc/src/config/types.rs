@@ -1,13 +1,13 @@
 //! Configuration types for the validator client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use bn_manager::BnRole;
+use bn_manager::{BnRole, FeeRecipientPolicy};
 use observability::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -17,12 +17,22 @@ use url::Url;
 
 use beacon::ResponseCaps;
 
-use super::error::ConfigError;
+use super::error::{parse_data_error, parse_error, ConfigError};
 use super::network::Network;
 use super::start::StartArgs;
 use crate::orchestrator::dispatch::DispatchLimits;
 use rvc_config::ConfigSource;
 use slashing::GroupCommitConfig;
+
+/// Upper bound for the four beacon operation timeouts, in seconds.
+///
+/// One maximum slot. [`Config::operation_timeouts`] clamps too, so a skipped
+/// [`Config::validate`] cannot install `u64::MAX`.
+pub(crate) const MAX_OPERATION_TIMEOUT_SECS: u64 = 60;
+
+fn bounded_operation_timeout(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(secs.min(MAX_OPERATION_TIMEOUT_SECS))
+}
 
 pub use rvc_config::{
     BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings, DutiesArgs,
@@ -247,6 +257,15 @@ pub struct Config {
     pub aggregate_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duty_fetch_timeout: Option<u64>,
+
+    /// Readable fee-recipient mismatch on `produceBlockV3`.
+    ///
+    /// `sign` (default) still signs the best remaining block. `reject` drops
+    /// it. A missing or unreadable fee on a full Bellatrix+ block is rejected
+    /// either way. Omitted from snapshots at the default so the operator-knob
+    /// inventory stays unchanged.
+    #[serde(default, skip_serializing_if = "FeeRecipientPolicy::is_default")]
+    pub fee_recipient_policy: FeeRecipientPolicy,
 }
 
 fn default_beacon_max_body_bytes() -> usize {
@@ -255,6 +274,7 @@ fn default_beacon_max_body_bytes() -> usize {
 
 /// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeaconNodeEntry {
     pub url: String,
     #[serde(default = "default_bn_roles")]
@@ -322,36 +342,89 @@ impl Default for Config {
             attestation_timeout: None,
             aggregate_timeout: None,
             duty_fetch_timeout: None,
+            fee_recipient_policy: FeeRecipientPolicy::Sign,
         }
     }
 }
 
 /// `[beacon]` table plus the TOML-only `beacon_nodes_config` array (names
 /// [`BnRole`], so it cannot live on `rvc-config::BeaconConfig`).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+///
+/// Serde cannot `deny_unknown_fields` across `flatten`. This removes only
+/// `beacon_nodes_config` and deserializes the rest as the strict `BeaconConfig`.
+#[derive(Debug, Default)]
 struct BeaconSection {
-    #[serde(flatten)]
     inner: BeaconConfig,
-    #[serde(default)]
     beacon_nodes_config: Vec<BeaconNodeEntry>,
+}
+
+impl<'de> Deserialize<'de> for BeaconSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        let toml::Value::Table(mut table) = value else {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: {}, expected a table",
+                value.type_str()
+            )));
+        };
+        let beacon_nodes_config = match table.remove("beacon_nodes_config") {
+            Some(entry) => Vec::<BeaconNodeEntry>::deserialize(entry)
+                .map_err(|err| serde::de::Error::custom(err.message()))?,
+            None => Vec::new(),
+        };
+        let inner = BeaconConfig::deserialize(toml::Value::Table(table))
+            .map_err(|err| serde::de::Error::custom(err.message()))?;
+        Ok(Self { inner, beacon_nodes_config })
+    }
 }
 
 /// `[server]` table plus leftover-key sentinels.
 ///
-/// Without these fields a leftover `[server] grpc_port` would parse silently
-/// (`#[serde(default)]`, no `deny_unknown_fields`).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+/// Serde cannot `deny_unknown_fields` across `flatten`. This removes only
+/// `grpc_port` and `grpc_address`, then deserializes the strict `ServerConfig`.
+#[derive(Debug, Default)]
 struct ServerSection {
-    #[serde(flatten)]
     inner: ServerConfig,
     grpc_port: Option<toml::Value>,
     grpc_address: Option<toml::Value>,
 }
 
+impl<'de> Deserialize<'de> for ServerSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        let toml::Value::Table(mut table) = value else {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: {}, expected a table",
+                value.type_str()
+            )));
+        };
+        let grpc_port = table.remove("grpc_port");
+        let grpc_address = table.remove("grpc_address");
+        let inner = ServerConfig::deserialize(toml::Value::Table(table))
+            .map_err(|err| serde::de::Error::custom(err.message()))?;
+        Ok(Self { inner, grpc_port, grpc_address })
+    }
+}
+
 /// Replacement probes named in `ConfigError::RemovedKey`.
-const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics HTTP server";
+///
+/// The gRPC reason lives here so the generic removed-key text still names
+/// `/health` and `/readyz`.
+const GRPC_KEY_REPLACEMENT: &str =
+    "GET /health and GET /readyz on the metrics HTTP server (gRPC healthz listener is gone)";
+
+/// Legacy `[secret_provider]` names and the spelling that replaces each one.
+const REMOVED_SECRET_PROVIDER_KEYS: &[(&str, &str)] = &[
+    ("provider", "providers = [\"gcp\"]"),
+    ("gcp_project_id", "[secret_provider.gcp] project_id"),
+    ("gcp_secret_prefix", "[secret_provider.gcp] secret_prefix"),
+];
 
 /// Intermediate wire format that accepts **both** nested tables and legacy flat
 /// keys. Flat keys fill fields that the corresponding nested table left at
@@ -362,7 +435,7 @@ const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics H
 /// plus the 31 4f/4g legacy keys (VD-4.1). Not deleted — serde `alias` cannot
 /// lift a top-level key into a nested table.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ConfigWire {
     beacon_url: String,
     beacon_nodes: Vec<String>,
@@ -403,6 +476,8 @@ struct ConfigWire {
     attestation_timeout: Option<u64>,
     aggregate_timeout: Option<u64>,
     duty_fetch_timeout: Option<u64>,
+    #[serde(default)]
+    fee_recipient_policy: FeeRecipientPolicy,
 
     // Nested tables (4f/4g + invented 4h sections). Flat keys above win.
     #[serde(default)]
@@ -489,7 +564,11 @@ fn removed_grpc_key(w: &ConfigWire) -> Option<&'static str> {
 impl Config {
     fn from_wire(w: ConfigWire) -> Result<Self, ConfigError> {
         if let Some(key) = removed_grpc_key(&w) {
-            return Err(ConfigError::RemovedKey { key, replacement: GRPC_KEY_REPLACEMENT });
+            return Err(ConfigError::RemovedKey {
+                key,
+                replacement: GRPC_KEY_REPLACEMENT,
+                file: None,
+            });
         }
         let mut logfile = w.logfile;
         if let Some(v) = w.logfile_max_size {
@@ -708,6 +787,7 @@ impl Config {
             attestation_timeout: w.attestation_timeout.or(w.beacon.inner.attestation_timeout),
             aggregate_timeout: w.aggregate_timeout.or(w.beacon.inner.aggregate_timeout),
             duty_fetch_timeout: w.duty_fetch_timeout.or(w.beacon.inner.duty_fetch_timeout),
+            fee_recipient_policy: w.fee_recipient_policy,
         })
     }
 
@@ -717,7 +797,7 @@ impl Config {
             other => {
                 return Err(ConfigError::Invalid {
                     field: "config",
-                    message: format!("config must be a TOML table, got {other:?}"),
+                    message: format!("config must be a TOML table, got {}", other.type_str()),
                     source_layer: ConfigSource::Default,
                 });
             }
@@ -732,7 +812,10 @@ impl Config {
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     field: "logfile",
-                    message: format!("logfile must be a string path or a table, got {other:?}"),
+                    message: format!(
+                        "logfile must be a string path or a table, got {}",
+                        other.type_str()
+                    ),
                     source_layer: ConfigSource::Default,
                 });
             }
@@ -740,9 +823,17 @@ impl Config {
         };
 
         let flat_network = match map.remove("network") {
-            Some(toml::Value::String(s)) => Some(
-                Network::deserialize(toml::Value::String(s)).map_err(ConfigError::ParseError)?,
-            ),
+            Some(toml::Value::String(s)) => {
+                match serde_path_to_error::deserialize(toml::Value::String(s)) {
+                    Ok(network) => Some(network),
+                    Err(err) => {
+                        return Err(parse_data_error(
+                            &err.into_inner(),
+                            Some("network".to_string()),
+                        ))
+                    }
+                }
+            }
             Some(toml::Value::Table(t)) => {
                 map.insert("network".into(), toml::Value::Table(t));
                 None
@@ -750,15 +841,28 @@ impl Config {
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     field: "network",
-                    message: format!("network must be a string preset or a table, got {other:?}"),
+                    message: format!(
+                        "network must be a string preset or a table, got {}",
+                        other.type_str()
+                    ),
                     source_layer: ConfigSource::Default,
                 });
             }
             None => None,
         };
 
-        let wire: ConfigWire =
-            ConfigWire::deserialize(toml::Value::Table(map)).map_err(ConfigError::ParseError)?;
+        if let Some((key, replacement)) = removed_secret_provider_key(&map) {
+            return Err(ConfigError::RemovedKey { key, replacement, file: None });
+        }
+
+        let wire: ConfigWire = match serde_path_to_error::deserialize(toml::Value::Table(map)) {
+            Ok(wire) => wire,
+            Err(err) => {
+                let rendered = err.path().to_string();
+                let path = if rendered.is_empty() { None } else { Some(rendered) };
+                return Err(parse_data_error(&err.into_inner(), path));
+            }
+        };
         let mut cfg = Self::from_wire(wire)?;
         if let Some(path) = flat_logfile_path {
             cfg.logfile.path = Some(path);
@@ -767,6 +871,33 @@ impl Config {
             cfg.network = net;
         }
         Ok(cfg)
+    }
+}
+
+fn removed_secret_provider_key(map: &toml::Table) -> Option<(&'static str, &'static str)> {
+    let section = match map.get("secret_provider") {
+        Some(toml::Value::Table(section)) => section,
+        _ => return None,
+    };
+    for (key, replacement) in REMOVED_SECRET_PROVIDER_KEYS {
+        if section.contains_key(*key) {
+            return Some((*key, *replacement));
+        }
+    }
+    None
+}
+
+fn attach_config_file(err: ConfigError, path: &Path) -> ConfigError {
+    let file = Some(path.to_path_buf());
+    match err {
+        ConfigError::UnknownKey { key, .. } => ConfigError::UnknownKey { key, file },
+        ConfigError::RemovedKey { key, replacement, .. } => {
+            ConfigError::RemovedKey { key, replacement, file }
+        }
+        ConfigError::Parse { line, column, kind, path, .. } => {
+            ConfigError::Parse { file, line, column, path, kind }
+        }
+        other => other,
     }
 }
 
@@ -792,18 +923,42 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)?;
-        let value: toml::Value = toml::from_str(&content)?;
-        Self::from_toml_value(value)
+        let value: toml::Value = match toml::from_str(&content) {
+            Ok(value) => value,
+            Err(err) => return Err(parse_error(&err, Some(&content), Some(path))),
+        };
+        let mut cfg = match Self::from_toml_value(value) {
+            Ok(cfg) => cfg,
+            Err(err) => return Err(attach_config_file(err, path)),
+        };
+        if cfg.proposer_config.refresh_interval != ProposerConfigSource::default().refresh_interval
+        {
+            cfg.proposer_config.refresh_interval_source = ConfigSource::File(path.to_path_buf());
+        }
+        Ok(cfg)
     }
 
+    /// Genesis unix time.
+    ///
+    /// Named networks use the preset. An explicit `genesis_time` that differs
+    /// from that preset is an error. Custom has no preset and requires the field.
     pub fn effective_genesis_time(&self) -> Result<u64, ConfigError> {
-        if let Some(genesis_time) = self.genesis_time {
-            return Ok(genesis_time);
+        match self.network.genesis_time() {
+            Some(preset) => {
+                if let Some(configured) = self.genesis_time {
+                    if configured != preset {
+                        return Err(ConfigError::InvalidNetwork(format!(
+                            "genesis_time {configured} does not match {} preset {preset}",
+                            self.network
+                        )));
+                    }
+                }
+                Ok(preset)
+            }
+            None => self
+                .genesis_time
+                .ok_or_else(|| ConfigError::MissingField("genesis_time".to_string())),
         }
-
-        self.network
-            .genesis_time()
-            .ok_or_else(|| ConfigError::MissingField("genesis_time".to_string()))
     }
 
     pub fn effective_genesis_validators_root(&self) -> Result<String, ConfigError> {
@@ -824,7 +979,7 @@ impl Config {
         if !self.beacon_url.starts_with("http://") && !self.beacon_url.starts_with("https://") {
             return Err(ConfigError::InvalidBeaconUrl(format!(
                 "beacon URL must start with http:// or https://: {}",
-                self.beacon_url
+                redact_url(&self.beacon_url)
             )));
         }
 
@@ -837,7 +992,7 @@ impl Config {
             if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
                 return Err(ConfigError::InvalidBeaconUrl(format!(
                     "beacon_nodes entry must start with http:// or https://: {}",
-                    node_url
+                    redact_url(node_url)
                 )));
             }
         }
@@ -884,6 +1039,29 @@ impl Config {
                 "--proposer-config-url and --proposer-config-file are mutually exclusive; use only one".to_string(),
             ));
         }
+        // Only a URL uses the interval. Without a URL, any value stays valid
+        // (older configs). With a URL, 0 would panic inside `tokio::time::interval`.
+        let url_uses_interval = self.proposer_config.url.is_some();
+        if url_uses_interval && self.proposer_config.refresh_interval == 0 {
+            return Err(ConfigError::Invalid {
+                field: "proposer_config.refresh_interval",
+                message: "must be greater than 0 when proposer_config.url is set".to_string(),
+                source_layer: self.proposer_config.refresh_interval_source.clone(),
+            });
+        }
+        if url_uses_interval
+            && self.proposer_config.refresh_interval
+                > rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+        {
+            return Err(ConfigError::Invalid {
+                field: "proposer_config.refresh_interval",
+                message: format!(
+                    "must be at most {} seconds",
+                    rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+                ),
+                source_layer: self.proposer_config.refresh_interval_source.clone(),
+            });
+        }
 
         // Broadcast topic values are typed (serde / FromStr). Cross-field rule only:
         // `none` cannot be combined with other topics.
@@ -893,26 +1071,26 @@ impl Config {
             ));
         }
 
-        if self.block_production_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--block-production-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.attestation_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--attestation-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.aggregate_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--aggregate-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.duty_fetch_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--duty-fetch-timeout must be greater than 0".to_string(),
-            ));
-        }
+        self.reject_operation_timeout(
+            "block_production_timeout",
+            "--block-production-timeout must be greater than 0",
+            self.block_production_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "attestation_timeout",
+            "--attestation-timeout must be greater than 0",
+            self.attestation_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "aggregate_timeout",
+            "--aggregate-timeout must be greater than 0",
+            self.aggregate_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "duty_fetch_timeout",
+            "--duty-fetch-timeout must be greater than 0",
+            self.duty_fetch_timeout,
+        )?;
         if let Err(e) = GroupCommitConfig::try_from_knobs(
             self.group_commit_batch_size,
             self.group_commit_wait_to_fill_ms,
@@ -1035,7 +1213,7 @@ impl Config {
             if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
                 return Err(ConfigError::InvalidBeaconUrl(format!(
                     "proposer_nodes entry must start with http:// or https://: {}",
-                    node_url
+                    redact_url(node_url)
                 )));
             }
         }
@@ -1050,7 +1228,34 @@ impl Config {
         }
     }
 
+    /// Directory under `keystore_path` for API-import passwords.
+    ///
+    /// Each file is named `0x` plus the bare pubkey hex.
+    pub const IMPORT_SECRETS_DIR: &str = ".rvc.keymanager-secrets";
+
+    /// Load keystore passwords from `--password-file` and persisted import secrets.
+    ///
+    /// Secrets under [`Self::IMPORT_SECRETS_DIR`] are applied even when no
+    /// password file is set. A secret replaces that pubkey's password-file
+    /// entry, so it also wins over `*` when the key manager looks up the
+    /// specific key first.
+    ///
+    /// A secrets directory that is not mode `0700`, a secret that is not mode
+    /// `0600`, or a secret that cannot be read is an error naming the path.
+    /// The password is not included.
     pub fn load_passwords(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
+        // Secrets are checked before the password file so a bad secret is
+        // reported even when `--password-file` is missing or unreadable.
+        let mut secrets = HashMap::new();
+        self.overlay_import_secrets(&mut secrets)?;
+        let mut passwords = self.read_password_file()?;
+        for (pubkey, password) in secrets {
+            passwords.insert(pubkey, password);
+        }
+        Ok(passwords)
+    }
+
+    fn read_password_file(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
         let password_file = match &self.password_file {
             Some(path) => path,
             None => return Ok(HashMap::new()),
@@ -1082,7 +1287,7 @@ impl Config {
                     continue;
                 }
                 let pubkey = match strip_prefix_strict(pubkey_trimmed) {
-                    Ok(s) => s,
+                    Ok(s) => crypto::password_map_key(s),
                     Err(HexError::DoubleZeroXPrefix) => {
                         warn!(
                             pubkey = pubkey_trimmed,
@@ -1097,6 +1302,140 @@ impl Config {
         }
 
         Ok(passwords)
+    }
+
+    fn import_secrets_dir(&self) -> PathBuf {
+        self.keystore_path.join(Self::IMPORT_SECRETS_DIR)
+    }
+
+    fn overlay_import_secrets(
+        &self,
+        passwords: &mut HashMap<String, SecretString>,
+    ) -> Result<(), ConfigError> {
+        // Boot sweeps staged partials once, here. Reject does not sweep again.
+        // The keystore directory holds R1-era partials; the secrets directory
+        // holds the current staging names.
+        sweep_import_secret_partials(&self.keystore_path)?;
+        let dir = self.import_secrets_dir();
+        if import_secrets_absent(&dir)? {
+            return Ok(());
+        }
+        let base = self.keystore_path.canonicalize().map_err(|_| ConfigError::ImportSecret {
+            path: self.keystore_path.clone(),
+            reason: "unreadable",
+        })?;
+        let canonical_dir = validated_import_secrets_dir(&base, &dir)?;
+        sweep_import_secret_partials(&canonical_dir)?;
+        let entries = fs::read_dir(&canonical_dir)
+            .map_err(|_| ConfigError::ImportSecret { path: dir.clone(), reason: "unreadable" })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ConfigError::ImportSecret {
+                path: dir.clone(),
+                reason: "unreadable",
+            })?;
+            load_one_import_secret(&canonical_dir, &entry, passwords)?;
+        }
+        Ok(())
+    }
+
+    /// Keystore declarations indexed before the boot loader runs.
+    ///
+    /// `None` when the import secrets directory is absent, so a boot without
+    /// import secrets does not scan the keystore directory again.
+    pub(crate) fn index_keystores_before_load(
+        &self,
+    ) -> Result<Option<DeclaredKeystores>, ConfigError> {
+        if import_secrets_absent(&self.import_secrets_dir())? {
+            return Ok(None);
+        }
+        index_declared_keystores(&self.keystore_path).map(Some)
+    }
+
+    /// Fail startup when a non-denylisted secret did not load its keystore.
+    ///
+    /// A checksum failure says the password did not decrypt the keystore. A
+    /// canonical `0x<pk>.json` that is empty, truncated, unreadable, or not a
+    /// valid keystore for that pubkey is corrupt. A non-canonical file counts
+    /// only when it validates or its `crypto` field is present. A secret with
+    /// no matching keystore is a warning. Denylisted keystores are skipped.
+    /// The error names the secret file and does not include the password.
+    ///
+    /// `before` is [`Self::index_keystores_before_load`]. When a secret's
+    /// keystore declaration differs between that view and the one taken here,
+    /// or `before` is `None`, the loader and this check did not see the same
+    /// directory, so startup fails with `keystore directory changed during
+    /// boot`.
+    pub(crate) fn reject_undecrypted_import_secrets(
+        &self,
+        loaded: &crypto::KeyManager,
+        denylist: Option<&HashSet<[u8; crypto::PUBLIC_KEY_BYTES_LEN]>>,
+        report: &crypto::KeystoreLoadReport,
+        before: Option<&DeclaredKeystores>,
+    ) -> Result<(), ConfigError> {
+        let dir = self.import_secrets_dir();
+        if import_secrets_absent(&dir)? {
+            return Ok(());
+        }
+        let base = self.keystore_path.canonicalize().map_err(|_| ConfigError::ImportSecret {
+            path: self.keystore_path.clone(),
+            reason: "unreadable",
+        })?;
+        let canonical_dir = validated_import_secrets_dir(&base, &dir)?;
+        let declared = index_declared_keystores(&self.keystore_path)?;
+        let entries = fs::read_dir(&canonical_dir).map_err(|_| ConfigError::ImportSecret {
+            path: canonical_dir.clone(),
+            reason: "unreadable",
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ConfigError::ImportSecret {
+                path: canonical_dir.clone(),
+                reason: "unreadable",
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(ConfigError::ImportSecret {
+                    path: canonical_dir.clone(),
+                    reason: "filename is not 0x plus bare pubkey hex",
+                });
+            };
+            let path = entry_error_path(&canonical_dir, name);
+            let pubkey = parse_import_secret_name(name).ok_or(ConfigError::ImportSecret {
+                path: path.clone(),
+                reason: "filename is not 0x plus bare pubkey hex",
+            })?;
+            if denylist.is_some_and(|deny| deny.contains(&pubkey)) {
+                continue;
+            }
+            if loaded.contains(&pubkey) {
+                continue;
+            }
+            if before.map(|index| index.get(&pubkey)) != Some(declared.get(&pubkey)) {
+                return Err(ConfigError::ImportSecret {
+                    path,
+                    reason: "keystore directory changed during boot",
+                });
+            }
+            let reason = if let Some(keystore) = declared.get(&pubkey) {
+                if !keystore.valid {
+                    "keystore is corrupt"
+                } else if report.password_rejected.contains(&pubkey) {
+                    "password did not decrypt the keystore"
+                } else if report.load_failed.contains(&pubkey) {
+                    "keystore could not be decrypted"
+                } else {
+                    "keystore was not loaded"
+                }
+            } else if report.password_rejected.contains(&pubkey) {
+                "password did not decrypt the keystore"
+            } else if report.load_failed.contains(&pubkey) {
+                "keystore could not be decrypted"
+            } else {
+                warn!(path = %path.display(), "import password secret has no keystore");
+                continue;
+            };
+            return Err(ConfigError::ImportSecret { path, reason });
+        }
+        Ok(())
     }
 
     /// Parses the `broadcast` config field into `BroadcastTopics`.
@@ -1141,19 +1480,37 @@ impl Config {
     pub fn operation_timeouts(&self) -> bn_manager::OperationTimeouts {
         let mut timeouts = bn_manager::OperationTimeouts::default();
         if let Some(secs) = self.block_production_timeout {
-            timeouts.block_production = std::time::Duration::from_secs(secs);
+            timeouts.block_production = bounded_operation_timeout(secs);
         }
         if let Some(secs) = self.attestation_timeout {
-            timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
+            timeouts.attestation_fetch = bounded_operation_timeout(secs);
         }
         if let Some(secs) = self.aggregate_timeout {
-            timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
-            timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
+            let bounded = bounded_operation_timeout(secs);
+            timeouts.aggregate_fetch = bounded;
+            timeouts.aggregate_submit = bounded;
         }
         if let Some(secs) = self.duty_fetch_timeout {
-            timeouts.duty_fetch = std::time::Duration::from_secs(secs);
+            timeouts.duty_fetch = bounded_operation_timeout(secs);
         }
         timeouts
+    }
+
+    fn reject_operation_timeout(
+        &self,
+        field: &'static str,
+        zero_message: &str,
+        value: Option<u64>,
+    ) -> Result<(), ConfigError> {
+        match value {
+            Some(0) => Err(ConfigError::MissingField(zero_message.to_string())),
+            Some(secs) if secs > MAX_OPERATION_TIMEOUT_SECS => Err(ConfigError::Invalid {
+                field,
+                message: format!("must be 1..={MAX_OPERATION_TIMEOUT_SECS} seconds, got {secs}"),
+                source_layer: ConfigSource::Default,
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Load with explicit precedence: defaults < file < CLI.
@@ -1165,7 +1522,9 @@ impl Config {
     pub fn load(file: Option<&Path>, cli: StartArgs) -> Result<Self, ConfigError> {
         let mut config = match file {
             Some(path) => Self::from_file(path).map_err(|err| match err {
-                removed @ ConfigError::RemovedKey { .. } => removed,
+                passed @ (ConfigError::RemovedKey { .. }
+                | ConfigError::UnknownKey { .. }
+                | ConfigError::Parse { .. }) => passed,
                 err => ConfigError::Invalid {
                     field: "config",
                     message: err.to_string(),
@@ -1394,6 +1753,7 @@ impl Config {
         }
         if let Some(v) = proposer.proposer_config.refresh_interval {
             self.proposer_config.refresh_interval = v;
+            self.proposer_config.refresh_interval_source = ConfigSource::Cli;
         }
         if let Some(v) = &proposer.proposer_config.url_token {
             self.proposer_config.url_token = Some(v.clone());
@@ -1447,20 +1807,639 @@ impl Config {
     }
 }
 
-/// Redacts credentials from a URL for safe logging.
-///
-/// If the URL contains a username, both the username and password are replaced
-/// with `***`. Unparseable URLs are returned as-is.
-pub fn redact_url(raw: &str) -> String {
-    match Url::parse(raw) {
-        Ok(mut parsed) => {
-            if !parsed.username().is_empty() {
-                let _ = parsed.set_username("***");
-                let _ = parsed.set_password(Some("***"));
-            }
-            parsed.to_string()
+/// Largest import-secret body boot will read. A password is a short string.
+pub(crate) const IMPORT_SECRET_MAX_BYTES: u64 = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// When set, the next import-secret read on this thread fails as unreadable.
+    static IMPORT_SECRET_READ_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// When set, the next owner check compares the file uid with this value.
+    static IMPORT_SECRET_EXPECT_UID: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    /// When set, the next directory fsync after a boot sweep fails.
+    static IMPORT_SECRET_SWEEP_SYNC_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// When set, the next sweep entry after a successful unlink is unreadable.
+    static IMPORT_SECRET_SWEEP_ENTRY_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn read_import_secret_bytes(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    #[cfg(test)]
+    {
+        let fail = IMPORT_SECRET_READ_FAILS.with(|flag| flag.replace(false));
+        if fail {
+            return Err("unreadable");
         }
-        Err(_) => raw.to_string(),
+    }
+    read_private_import_secret(path)
+}
+
+/// Open the secret without following a symlink, then check the fd.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_private_import_secret(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|err| {
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            "path escapes the keystore directory"
+        } else {
+            "unreadable"
+        }
+    })?;
+    let meta = file.metadata().map_err(|_| "unreadable")?;
+    if !meta.file_type().is_file() {
+        return Err("not a regular file");
+    }
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        return Err("file permissions must be 0600");
+    }
+    // SAFETY: geteuid only reads this process's effective user id.
+    let euid = unsafe { libc::geteuid() };
+    #[cfg(test)]
+    let euid = IMPORT_SECRET_EXPECT_UID.with(|slot| slot.replace(None)).unwrap_or(euid);
+    if meta.uid() != euid {
+        return Err("file owner must be the current user");
+    }
+    read_capped_secret(&mut file, meta.len())
+}
+
+#[cfg(not(unix))]
+fn read_private_import_secret(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    let mut file = fs::File::open(path).map_err(|_| "unreadable")?;
+    let len = file.metadata().map_err(|_| "unreadable")?.len();
+    read_capped_secret(&mut file, len)
+}
+
+/// Read `len` bytes into a buffer that is wiped if the read stops early.
+fn read_capped_secret(
+    file: &mut impl std::io::Read,
+    len: u64,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if len > IMPORT_SECRET_MAX_BYTES {
+        return Err("secret is too large");
+    }
+    let mut buf = zeroize::Zeroizing::new(vec![
+        0u8;
+        usize::try_from(len)
+            .map_err(|_| "secret is too large")?
+    ]);
+    // A short read drops `buf`, which zeroes the partial secret.
+    file.read_exact(&mut buf).map_err(|_| "unreadable")?;
+    Ok(buf)
+}
+
+fn unix_permission_bits(meta: &fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+fn entry_error_path(dir: &Path, name: &str) -> PathBuf {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "."
+        || name == ".."
+    {
+        return dir.to_path_buf();
+    }
+    let mut path = dir.to_path_buf();
+    path.push(name);
+    path
+}
+
+fn parse_import_secret_name(name: &str) -> Option<[u8; crypto::PUBLIC_KEY_BYTES_LEN]> {
+    let rest = name.strip_prefix("0x")?;
+    if rest.len() != crypto::PUBLIC_KEY_BYTES_LEN * 2 {
+        return None;
+    }
+    if !rest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return None;
+    }
+    let bytes = hex::decode(rest).ok()?;
+    if bytes.len() != crypto::PUBLIC_KEY_BYTES_LEN {
+        return None;
+    }
+    let mut pubkey = [0u8; crypto::PUBLIC_KEY_BYTES_LEN];
+    pubkey.copy_from_slice(&bytes);
+    Some(pubkey)
+}
+
+fn import_secrets_absent(dir: &Path) -> Result<bool, ConfigError> {
+    match fs::symlink_metadata(dir) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" }),
+    }
+}
+
+fn validated_import_secrets_dir(keystore_base: &Path, dir: &Path) -> Result<PathBuf, ConfigError> {
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|_| ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })?;
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "path escapes the keystore directory",
+        });
+    }
+    if !meta.is_dir() {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "not a directory",
+        });
+    }
+    if let Some(mode) = unix_permission_bits(&meta) {
+        if mode != 0o700 {
+            return Err(ConfigError::ImportSecret {
+                path: dir.to_path_buf(),
+                reason: "directory permissions must be 0700",
+            });
+        }
+    }
+    let canonical = dir
+        .canonicalize()
+        .map_err(|_| ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })?;
+    if !canonical.starts_with(keystore_base) {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "path escapes the keystore directory",
+        });
+    }
+    Ok(canonical)
+}
+
+fn load_one_import_secret(
+    secrets_dir: &Path,
+    entry: &fs::DirEntry,
+    passwords: &mut HashMap<String, SecretString>,
+) -> Result<(), ConfigError> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Err(ConfigError::ImportSecret {
+            path: secrets_dir.to_path_buf(),
+            reason: "filename is not 0x plus bare pubkey hex",
+        });
+    };
+    let path = entry_error_path(secrets_dir, name);
+    let pubkey = parse_import_secret_name(name).ok_or(ConfigError::ImportSecret {
+        path: path.clone(),
+        reason: "filename is not 0x plus bare pubkey hex",
+    })?;
+    let path = entry.path();
+    let meta = fs::symlink_metadata(&path)
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "unreadable" })?;
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::ImportSecret {
+            path,
+            reason: "path escapes the keystore directory",
+        });
+    }
+    if !meta.is_file() {
+        return Err(ConfigError::ImportSecret { path, reason: "not a regular file" });
+    }
+    if let Some(mode) = unix_permission_bits(&meta) {
+        if mode != 0o600 {
+            return Err(ConfigError::ImportSecret {
+                path,
+                reason: "file permissions must be 0600",
+            });
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "unreadable" })?;
+    if !canonical.starts_with(secrets_dir) {
+        return Err(ConfigError::ImportSecret {
+            path,
+            reason: "path escapes the keystore directory",
+        });
+    }
+    let bytes = read_import_secret_bytes(&path)
+        .map_err(|reason| ConfigError::ImportSecret { path: path.clone(), reason })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "not valid utf-8" })?;
+    let bare = crypto::password_map_key(&hex::encode(pubkey));
+    passwords.insert(bare, SecretString::from(text.to_owned()));
+    Ok(())
+}
+
+/// `.0x<96 lowercase hex>.<pid>.<nanos>.keymanager-secret.partial`
+pub(crate) fn is_staged_import_secret_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".keymanager-secret.partial") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pubkey), Some(pid), Some(nanos), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some(hex_body) = pubkey.strip_prefix("0x") else {
+        return false;
+    };
+    hex_body.len() == crypto::PUBLIC_KEY_BYTES_LEN * 2
+        && hex_body.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && !nanos.is_empty()
+        && nanos.bytes().all(|b| b.is_ascii_digit())
+}
+
+const SWEEP_UNLINK_FAILED: &str = "staged import secret could not be removed";
+const SWEEP_SYNC_FAILED: &str = "sync import secret directory failed";
+const SWEEP_UNLINK_AND_SYNC_FAILED: &str =
+    "staged import secret could not be removed; sync import secret directory failed";
+const SWEEP_UNREADABLE_AND_SYNC_FAILED: &str = "unreadable; sync import secret directory failed";
+
+fn sync_import_secret_dir(dir: &Path) -> Result<(), ConfigError> {
+    #[cfg(test)]
+    if IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.replace(false)) {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: SWEEP_SYNC_FAILED,
+        });
+    }
+    let file = fs::File::open(dir).map_err(|_| ConfigError::ImportSecret {
+        path: dir.to_path_buf(),
+        reason: SWEEP_SYNC_FAILED,
+    })?;
+    file.sync_all().map_err(|_| ConfigError::ImportSecret {
+        path: dir.to_path_buf(),
+        reason: SWEEP_SYNC_FAILED,
+    })
+}
+
+fn sweep_dir_unreadable(dir: &Path) -> ConfigError {
+    ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" }
+}
+
+fn sweep_entry(
+    entry: Result<fs::DirEntry, std::io::Error>,
+    removed: bool,
+) -> Result<fs::DirEntry, std::io::Error> {
+    let entry = entry?;
+    #[cfg(test)]
+    if removed && IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.get()) {
+        let staged = entry.file_name().to_str().is_some_and(is_staged_import_secret_name);
+        if staged {
+            IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(false));
+            return Err(std::io::Error::other("unreadable"));
+        }
+    }
+    let _ = removed;
+    Ok(entry)
+}
+
+fn remember_sweep(first_err: &mut Option<ConfigError>, err: ConfigError) {
+    if first_err.is_none() {
+        *first_err = Some(err);
+    }
+}
+
+/// Keep the first sweep error and name the directory fsync when that also fails.
+fn attach_sweep_sync(first_err: Option<ConfigError>, sync_err: ConfigError) -> ConfigError {
+    let ConfigError::ImportSecret { path, reason } = sync_err else {
+        return sync_err;
+    };
+    if reason != SWEEP_SYNC_FAILED {
+        return ConfigError::ImportSecret { path, reason };
+    }
+    let Some(ConfigError::ImportSecret { path, reason }) = first_err else {
+        return ConfigError::ImportSecret { path, reason: SWEEP_SYNC_FAILED };
+    };
+    let reason = match reason {
+        SWEEP_UNLINK_FAILED => SWEEP_UNLINK_AND_SYNC_FAILED,
+        "unreadable" => SWEEP_UNREADABLE_AND_SYNC_FAILED,
+        other => other,
+    };
+    ConfigError::ImportSecret { path, reason }
+}
+
+fn sweep_import_secret_partials(dir: &Path) -> Result<(), ConfigError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(sweep_dir_unreadable(dir)),
+    };
+    let mut removed = false;
+    let mut first_err = None;
+    for entry in entries {
+        let entry = match sweep_entry(entry, removed) {
+            Ok(entry) => entry,
+            Err(_) => {
+                remember_sweep(&mut first_err, sweep_dir_unreadable(dir));
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_staged_import_secret_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                remember_sweep(
+                    &mut first_err,
+                    ConfigError::ImportSecret { path, reason: SWEEP_UNLINK_FAILED },
+                );
+            }
+        }
+    }
+    if removed {
+        if let Err(sync_err) = sync_import_secret_dir(dir) {
+            first_err = Some(attach_sweep_sync(first_err, sync_err));
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+#[derive(PartialEq)]
+pub(crate) struct DeclaredKeystore {
+    valid: bool,
+}
+
+pub(crate) type DeclaredKeystores = HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>;
+
+fn note_declared(
+    declared: &mut HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>,
+    pubkey: [u8; crypto::PUBLIC_KEY_BYTES_LEN],
+    valid: bool,
+) {
+    let entry = declared.entry(pubkey).or_insert(DeclaredKeystore { valid: false });
+    if valid {
+        entry.valid = true;
+    }
+}
+
+/// File name import writes: `0x` + lowercase bare pubkey hex + `.json`.
+fn canonical_keystore_name(name: &str) -> Option<[u8; crypto::PUBLIC_KEY_BYTES_LEN]> {
+    let stem = name.strip_suffix(".json")?;
+    parse_import_secret_name(stem)
+}
+
+/// Read a keystore candidate that stays inside `base`.
+///
+/// A symlink is followed only when its target is a regular file inside
+/// `base`. `None` means the entry cannot be read that way.
+fn read_declared_keystore(base: &Path, path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let target = if meta.file_type().is_symlink() || meta.is_file() {
+        let target = path.canonicalize().ok()?;
+        if !target.starts_with(base) || !target.is_file() {
+            return None;
+        }
+        target
+    } else {
+        return None;
+    };
+    fs::read_to_string(target).ok()
+}
+
+/// One pass over `*.json` files.
+///
+/// [`canonical_keystore_name`] is that pubkey's keystore. An empty, truncated,
+/// or unreadable file at that name is corrupt, as is a document that does not
+/// validate as the same pubkey. Any other name counts only when the document
+/// validates or its `crypto` field is present. A valid file wins over a
+/// corrupt file for the same pubkey. Deposit data and slashing interchange do
+/// not have a keystore shape.
+fn index_declared_keystores(
+    keystore_dir: &Path,
+) -> Result<HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>, ConfigError> {
+    let mut declared = HashMap::new();
+    let base = keystore_dir.canonicalize().map_err(|_| ConfigError::ImportSecret {
+        path: keystore_dir.to_path_buf(),
+        reason: "unreadable",
+    })?;
+    let entries = fs::read_dir(&base).map_err(|_| ConfigError::ImportSecret {
+        path: keystore_dir.to_path_buf(),
+        reason: "unreadable",
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ConfigError::ImportSecret {
+            path: keystore_dir.to_path_buf(),
+            reason: "unreadable",
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || name.ends_with(".import_meta.json") {
+            continue;
+        }
+        let named = canonical_keystore_name(name);
+        match read_declared_keystore(&base, &path) {
+            Some(content) => record_keystore_file(&mut declared, name, &content),
+            None => {
+                if let Some(pk) = named {
+                    note_declared(&mut declared, pk, false);
+                }
+            }
+        }
+    }
+    Ok(declared)
+}
+
+fn record_keystore_file(
+    declared: &mut HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>,
+    name: &str,
+    content: &str,
+) {
+    if let Some(named) = canonical_keystore_name(name) {
+        match keystore_declaration(content) {
+            Some((body, valid)) => {
+                note_declared(declared, body, valid);
+                if body != named {
+                    note_declared(declared, named, false);
+                }
+            }
+            None => note_declared(declared, named, false),
+        }
+        return;
+    }
+    if let Some((body, valid)) = noncanonical_keystore_declaration(content) {
+        note_declared(declared, body, valid);
+    }
+}
+
+/// `(pubkey, valid)` for a non-canonical `*.json` file.
+///
+/// Valid means [`crypto::Keystore::from_json`] accepted it. Corrupt means a
+/// `crypto` field is present and validation failed. A pubkey plus only a
+/// `version` field is not a keystore.
+fn noncanonical_keystore_declaration(
+    content: &str,
+) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_LEN], bool)> {
+    if let Some((pubkey, true)) = keystore_declaration(content) {
+        return Some((pubkey, true));
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = value.as_object()?;
+    if !obj.contains_key("crypto") {
+        return None;
+    }
+    let pubkey = obj
+        .get("pubkey")
+        .and_then(|field| field.as_str())
+        .and_then(crypto::decode_password_map_key)?;
+    Some((pubkey, false))
+}
+
+/// `(pubkey, valid)` for a keystore-shaped document.
+///
+/// Valid means [`crypto::Keystore::from_json`] accepted it. Corrupt means the
+/// JSON has a pubkey and a `crypto` or `version` field, and validation
+/// failed. A missing `version` or a `crypto` value that is not an object is
+/// still that shape. JSON with neither field is not a keystore.
+/// [`index_declared_keystores`] applies the corrupt result to
+/// [`canonical_keystore_name`] only.
+fn keystore_declaration(content: &str) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_LEN], bool)> {
+    if let Ok(keystore) = crypto::Keystore::from_json(content) {
+        let pubkey = keystore.pubkey.as_deref().and_then(crypto::decode_password_map_key)?;
+        return Some((pubkey, true));
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = value.as_object()?;
+    let pubkey = obj
+        .get("pubkey")
+        .and_then(|field| field.as_str())
+        .and_then(crypto::decode_password_map_key)?;
+    if !obj.contains_key("crypto") && !obj.contains_key("version") {
+        return None;
+    }
+    Some((pubkey, false))
+}
+
+/// Redacts credentials, the query, and the fragment from a URL for safe logging.
+///
+/// The function keeps text only for inputs on an allowlist. Every other input
+/// with a scheme becomes `<scheme>://***`, and every other input without a
+/// scheme becomes `***`. A URL with a scheme is kept only if all these rules
+/// are true:
+///
+/// 1. Each character is ASCII, visible, and not `\` or `%`. Thus no escape,
+///    look-alike `@`, control character, or space is in the text.
+/// 2. The text starts with `http://` or `https://` (any case), and the next
+///    character is not `/`. [`Url::parse`] accepts the text.
+/// 3. The text has no `@`, or exactly one `@` with no `/`, `?`, or `#` before
+///    it, and the parser finds a userinfo.
+///
+/// The output is the parsed URL with no query and no fragment. A userinfo
+/// becomes `***:***`.
+///
+/// Proof: only a raw `@` can end a userinfo, and rule 1 removes every other
+/// form of `@`. With no `@`, the text has no credentials. With one `@`, all
+/// credential text is before it. For `http` and `https`, the parser reads
+/// the authority from the two slashes to the first `/`, `?`, `#`, or `\`.
+/// Rules 1 and 3 put the `@` in that authority. The parser thus reads all
+/// text before the `@` as the userinfo, and that userinfo becomes `***:***`.
+/// Rule 1 also removes the tab, newline, and other characters that the
+/// parser removes or changes, so the raw text and the parsed text agree.
+///
+/// A string without `://` is kept, without its query and fragment, only if
+/// it passes rule 1 and has no `@` and no `:`.
+pub fn redact_url(raw: &str) -> String {
+    let Some(scheme) = leading_scheme(raw) else {
+        if raw.contains(['@', ':']) || !raw.chars().all(is_plain_url_char) {
+            return REDACTED_URL.to_string();
+        }
+        return redact_unparsed_url(raw);
+    };
+    let only_scheme = || format!("{}://{REDACTED_URL}", scheme.to_ascii_lowercase());
+    let after_scheme = &raw[scheme.len() + "://".len()..];
+    if !raw.chars().all(is_plain_url_char) || after_scheme.starts_with('/') {
+        return only_scheme();
+    }
+    let Ok(mut parsed) = Url::parse(raw) else {
+        return only_scheme();
+    };
+    if !KEPT_URL_SCHEMES.contains(&parsed.scheme()) {
+        return only_scheme();
+    }
+    match after_scheme.split('@').collect::<Vec<_>>().as_slice() {
+        [_] => {}
+        [userinfo, _] => {
+            let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+            if userinfo.contains(['/', '?', '#'])
+                || !has_userinfo
+                || parsed.set_username(REDACTED_URL).is_err()
+                || parsed.set_password(Some(REDACTED_URL)).is_err()
+            {
+                return only_scheme();
+            }
+        }
+        _ => return only_scheme(),
+    }
+    without_query_and_fragment(parsed)
+}
+
+/// Schemes of the URLs that rvc logs: beacon nodes, signers, monitoring, and
+/// the proposer config.
+const KEPT_URL_SCHEMES: [&str; 2] = ["http", "https"];
+
+/// The scheme before the first `://`, if that text is a valid scheme.
+///
+/// A scheme is ASCII alpha followed by ASCII alphanumerics, `+`, `-`, or `.`.
+fn leading_scheme(raw: &str) -> Option<&str> {
+    let (scheme, _) = raw.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
+}
+
+/// Visible ASCII, but not `\` or `%`.
+fn is_plain_url_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '\\' | '%')
+}
+
+/// [`redact_url`] for each URL of a list, for example a beacon-node pool.
+pub fn redact_urls(urls: &[String]) -> Vec<String> {
+    urls.iter().map(|url| redact_url(url)).collect()
+}
+
+/// Text that replaces redacted URL credentials.
+const REDACTED_URL: &str = "***";
+
+fn without_query_and_fragment(mut parsed: Url) -> String {
+    parsed.set_fragment(None);
+    if parsed.query().is_some() {
+        parsed.set_query(None);
+    }
+    parsed.to_string()
+}
+
+/// Replace the query and drop the fragment of a string without `://`.
+fn redact_unparsed_url(raw: &str) -> String {
+    let without_fragment = raw.split_once('#').map(|(before, _)| before).unwrap_or(raw);
+    match without_fragment.split_once('?') {
+        Some((before, _)) => format!("{before}?redacted"),
+        None => without_fragment.to_string(),
     }
 }
 
@@ -1470,6 +2449,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    use crate::config::ParseKind;
 
     fn overlay(f: impl FnOnce(&mut StartArgs)) -> Config {
         let mut cli = StartArgs::default();
@@ -1582,10 +2563,11 @@ allow_fresh_db = true
     }
 
     #[test]
-    fn test_effective_genesis_time_override() {
+    fn test_effective_genesis_time_override_on_named_network_fails() {
         let config =
             Config { network: Network::Mainnet, genesis_time: Some(12345), ..Default::default() };
-        assert_eq!(config.effective_genesis_time().unwrap(), 12345);
+        let err = config.effective_genesis_time().expect_err("named network is not overridable");
+        assert!(err.to_string().contains("preset"), "{err}");
     }
 
     #[test]
@@ -1922,16 +2904,29 @@ aggregate_due_bps = 10001
     }
 
     #[test]
-    fn test_timing_bps_non_integer_fails_naming_key() {
-        let err = toml::from_str::<Config>(
-            r#"
-[timing]
-attestation_due_bps = "not-an-integer"
-"#,
-        )
-        .expect_err("non-integer bps must fail");
+    fn test_timing_bps_non_integer_fails_without_echoing_the_value() {
+        let mut file = NamedTempFile::new().expect("temp config");
+        write!(file, "[timing]\nattestation_due_bps = \"not-an-integer\"\n",).expect("write");
+        let err = Config::load(Some(file.path()), StartArgs::default())
+            .expect_err("non-integer bps must fail");
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Parse {
+                    kind: ParseKind::InvalidType { expected },
+                    path: Some(path),
+                    file: Some(p),
+                    ..
+                } if path == "timing.attestation_due_bps"
+                    && !expected.contains("not-an-integer")
+                    && p == file.path()
+            ),
+            "{err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("attestation_due_bps"), "{msg}");
+        assert!(msg.contains("invalid type"), "{msg}");
+        assert!(!msg.contains("not-an-integer"), "{msg}");
     }
 
     #[test]
@@ -2217,6 +3212,449 @@ payload_attestation_due_bps = 4000
 
         assert_eq!(passwords.len(), 1);
         assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), second_pw);
+    }
+
+    fn config_at(dir: &std::path::Path, password_file: Option<std::path::PathBuf>) -> Config {
+        Config { keystore_path: dir.to_path_buf(), password_file, ..Default::default() }
+    }
+
+    fn assert_import_secret_err(err: &ConfigError, reason: &str, secret: &str) {
+        let msg = err.to_string();
+        assert!(msg.contains("import password secret"), "{msg}");
+        assert!(msg.contains(reason), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!format!("{err:?}").contains(secret), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    fn write_import_secret(keystore: &std::path::Path, name: &str, bytes: &[u8], mode: u32) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = keystore.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(dir.join(name))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        let mut perms = file.metadata().unwrap().permissions();
+        perms.set_mode(mode);
+        file.set_permissions(perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn secret_name(pubkey: &[u8; 48]) -> String {
+        format!("0x{}", hex::encode(pubkey))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_overlays_a_secret_without_a_password_file() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0xabu8; 48];
+        let secret = " import-secret-value";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        let stored = passwords.get(&hex::encode(pubkey)).unwrap();
+        assert_eq!(stored.expose_secret(), secret);
+        assert!(!format!("{stored:?}").contains(secret.trim()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_secret_replaces_the_per_pubkey_entry_and_keeps_wildcard() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0xcd; 48];
+        let bare = hex::encode(pubkey);
+        let secret = "secret-wins-value";
+        let file_pw = "file-entry-value";
+        let wildcard = "wildcard-entry-value";
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "*={wildcard}\n{bare}={file_pw}").unwrap();
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords =
+            config_at(dir.path(), Some(file.path().to_path_buf())).load_passwords().unwrap();
+        assert_eq!(passwords.get(&bare).unwrap().expose_secret(), secret);
+        assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), wildcard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_0644_secret() {
+        // The mode is set with `chmod`, not `open`, so a root umask cannot
+        // turn the fixture into 0600 and hide the rejection.
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x11; 48]);
+        let secret = "mode-0644-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o644);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file permissions must be 0600", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secrets_directory_that_is_not_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x22; 48];
+        let secret = "dir-mode-secret";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&secrets, perms).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "directory permissions must be 0700", secret);
+        assert!(err.to_string().contains(Config::IMPORT_SECRETS_DIR), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_non_utf8_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x33; 48]);
+        write_import_secret(dir.path(), &name, &[0xff, 0xfe], 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not valid utf-8", "\u{fffd}");
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secret_filename_that_is_not_a_pubkey() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = "notes-secret";
+        write_import_secret(dir.path(), "notes.txt", secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", secret);
+        assert!(err.to_string().contains("notes.txt"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_uppercase_pubkey_filename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0xab; 48]).to_ascii_uppercase().replace("0X", "0x");
+        assert!(name.contains('A'), "{name}");
+        let secret = "upper-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_directory_named_like_a_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&secrets, perms).unwrap();
+        std::fs::create_dir(secrets.join(secret_name(&[0x44; 48]))).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not a regular file", "unused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_symlink_secret_without_reading_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let marker = "leak-marker-value";
+        let target = outside.path().join("outside-secret");
+        std::fs::write(&target, marker).unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&secrets, perms).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, secrets.join(secret_name(&[0x55; 48]))).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "path escapes the keystore directory", marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secrets_directory_symlink_inside_the_keystore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("nested-secrets");
+        std::fs::create_dir(&nested).unwrap();
+        let mut perms = std::fs::metadata(&nested).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&nested, perms).unwrap();
+        std::os::unix::fs::symlink(&nested, dir.path().join(Config::IMPORT_SECRETS_DIR)).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "path escapes the keystore directory", "nested-secrets");
+    }
+
+    #[test]
+    fn load_passwords_rejects_a_secrets_path_that_is_not_a_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(Config::IMPORT_SECRETS_DIR), b"not-a-directory").unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not a directory", "not-a-directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_checks_a_secret_before_a_missing_password_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x77; 48]);
+        let secret = "checked-before-password-file";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o644);
+        let missing = dir.path().join("no-such-passwords.txt");
+        let err = config_at(dir.path(), Some(missing)).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file permissions must be 0600", secret);
+        assert!(!matches!(err, ConfigError::PasswordFileNotFound(_)), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_accepts_a_secret_at_the_size_limit() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x79; 48];
+        let secret = "x".repeat(4096);
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_keeps_multibyte_and_newline_bytes() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x7a; 48];
+        let secret = "café\nsecond line\n";
+        assert!(
+            secret.len() != secret.chars().count(),
+            "the fixture must contain a multibyte character"
+        );
+        assert!(secret.contains('\n'));
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_oversized_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x78; 48]);
+        let secret = "x".repeat(4097);
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "secret is too large", &secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweeps_a_stale_secret_partial() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x88; 48];
+        let secret = "kept-after-sweep";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let partial_name = format!(".0x{}.1.2.keymanager-secret.partial", "ab".repeat(48));
+        let partial = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&partial_name);
+        std::fs::write(&partial, b"stale-partial-body").unwrap();
+        let r1 = dir.path().join(format!(".0x{}.9.8.keymanager-secret.partial", "cd".repeat(48)));
+        std::fs::write(&r1, b"r1-partial-body").unwrap();
+        let suffix_only = dir.path().join("notes.keymanager-secret.partial");
+        std::fs::write(&suffix_only, b"not-a-staged-secret").unwrap();
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+        assert!(!partial.exists(), "boot removes a staged import secret partial");
+        assert!(!r1.exists(), "boot removes an R1 partial from the keystore directory");
+        assert!(suffix_only.exists(), "a suffix-only name is not a staged secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_reports_a_sweep_directory_sync_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x89; 48];
+        let secret = "kept-when-sweep-sync-fails";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let partial_name = format!(".0x{}.1.2.keymanager-secret.partial", "ef".repeat(48));
+        let partial = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&partial_name);
+        std::fs::write(&partial, b"stale-partial-body").unwrap();
+        struct ClearSweepSync;
+        impl Drop for ClearSweepSync {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweepSync;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "sync import secret directory failed", secret);
+        assert!(!partial.exists(), "the partial is unlinked before the directory fsync");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweep_keeps_the_unlink_error_when_the_sync_also_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x8a; 48];
+        let secret = "kept-when-unlink-and-sync-fail";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let removed = secrets.join(format!(".0x{}.1.2.keymanager-secret.partial", "11".repeat(48)));
+        let blocked = secrets.join(format!(".0x{}.3.4.keymanager-secret.partial", "22".repeat(48)));
+        std::fs::write(&removed, b"stale-partial-body").unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        struct ClearSweep;
+        impl Drop for ClearSweep {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweep;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("staged import secret could not be removed"), "{msg}");
+        assert!(msg.contains("sync import secret directory failed"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!removed.exists(), "a removable partial is unlinked before the fsync");
+        assert!(blocked.is_dir(), "the partial that could not be removed is still there");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweep_keeps_an_entry_error_when_the_sync_also_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x8b; 48];
+        let secret = "kept-when-entry-and-sync-fail";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let first = secrets.join(format!(".0x{}.1.2.keymanager-secret.partial", "33".repeat(48)));
+        let second = secrets.join(format!(".0x{}.3.4.keymanager-secret.partial", "44".repeat(48)));
+        std::fs::write(&first, b"first-partial").unwrap();
+        std::fs::write(&second, b"second-partial").unwrap();
+        struct ClearSweep;
+        impl Drop for ClearSweep {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+                super::IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        super::IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweep;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unreadable"), "{msg}");
+        assert!(msg.contains("sync import secret directory failed"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        let left = [first.exists(), second.exists()];
+        assert_eq!(left.iter().filter(|exists| **exists).count(), 1, "{left:?}");
+    }
+
+    #[test]
+    fn note_declared_keeps_a_valid_keystore_after_a_corrupt_file() {
+        let mut declared = std::collections::HashMap::new();
+        let pubkey = [0xab; 48];
+        note_declared(&mut declared, pubkey, true);
+        note_declared(&mut declared, pubkey, false);
+        assert!(declared.get(&pubkey).expect("recorded").valid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secret_owned_by_someone_else() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x79; 48]);
+        let secret = "other-owner-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let path = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&name);
+        let other_uid = std::fs::metadata(&path).unwrap().uid().wrapping_add(1);
+        struct ClearOwner;
+        impl Drop for ClearOwner {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_EXPECT_UID.with(|slot| slot.set(None));
+            }
+        }
+        super::IMPORT_SECRET_EXPECT_UID.with(|slot| slot.set(Some(other_uid)));
+        let _guard = ClearOwner;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file owner must be the current user", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_unreadable_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x66; 48]);
+        let secret = "unreadable-secret-value";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        struct ClearReadFail;
+        impl Drop for ClearReadFail {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_READ_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_READ_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearReadFail;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "unreadable", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_non_utf8_secret_filename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&secrets, perms).unwrap();
+        }
+        let path = secrets.join(std::ffi::OsString::from_vec(vec![0xff, 0xfe]));
+        std::fs::write(&path, b"non-utf8-name").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", "non-utf8-name");
     }
 
     #[test]
@@ -2776,6 +4214,222 @@ log_level = "info"
     fn test_redact_url_empty_input() {
         let result = redact_url("");
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_redact_url_drops_the_query() {
+        let result = redact_url("https://cfg.example/config?token=super-secret&x=1");
+        assert!(!result.contains("super-secret"), "{result}");
+        assert!(!result.contains("token="), "{result}");
+        assert!(result.starts_with("https://cfg.example/config"), "{result}");
+    }
+
+    #[test]
+    fn test_redact_url_query_only_is_not_echoed() {
+        let result = redact_url("?token=super-secret");
+        assert!(!result.contains("super-secret"), "{result}");
+        assert_eq!(result, "?redacted");
+    }
+
+    #[test]
+    fn test_redact_url_masks_password_without_a_scheme() {
+        let result = redact_url("user:s3cret-token@cfg.example/path");
+        assert!(!result.contains("s3cret-token"), "{result}");
+        assert!(!result.contains('@'), "{result}");
+        assert_eq!(result, "***");
+    }
+
+    #[test]
+    fn test_redact_url_masks_password_when_the_user_is_empty() {
+        let result = redact_url("https://:s3cret@cfg.example/path");
+        assert!(!result.contains("s3cret"), "{result}");
+        assert!(result.contains("cfg.example"), "{result}");
+        assert!(result.contains("***"), "{result}");
+    }
+
+    #[test]
+    fn test_redact_url_strips_userinfo_when_unparsed() {
+        let empty_user = redact_url(":s3cret@cfg.example/x");
+        assert!(!empty_user.contains("s3cret"), "{empty_user}");
+        assert_eq!(empty_user, "***");
+    }
+
+    #[test]
+    fn test_redact_url_drops_the_fragment() {
+        let parsed = redact_url("https://cfg.example/config#super-secret");
+        assert!(!parsed.contains("super-secret"), "{parsed}");
+        assert!(!parsed.contains('#'), "{parsed}");
+        let bare = redact_url("not-a-url#super-secret");
+        assert!(!bare.contains("super-secret"), "{bare}");
+        assert_eq!(bare, "not-a-url");
+    }
+
+    /// `(input, password text that must not appear, expected output)`.
+    ///
+    /// An `@` that the parser does not read as the end of the userinfo makes
+    /// the input ambiguous. Such an input keeps only its scheme.
+    const REDACT_URL_CASES: &[(&str, &[&str], &str)] = &[
+        ("user:SECRET@host?next=https://x", &["SECRET"], "***"),
+        ("https://alice:SECRET@host:bad/path://x@y", &["SECRET"], "https://***"),
+        ("https://alice:SECRET@host/p?q=1#f", &["SECRET"], "https://***:***@host/p"),
+        ("https://:SECRET@host", &["SECRET"], "https://***:***@host/"),
+        ("alice:SECRET@host", &["SECRET"], "***"),
+        ("https://alice:p%40SECRET@[::1]:8443/x", &["SECRET"], "https://***"),
+        ("https://alice:SECRET@host:99999/x", &["SECRET"], "https://***"),
+        ("user:pw@host/?r=https://x", &["pw"], "***"),
+        ("user:pw@host#https://x", &["pw"], "***"),
+        ("https://alice@host", &["alice"], "https://***:***@host/"),
+        ("https://alice:SE@CRET@host/x", &["SE", "CRET"], "https://***"),
+        ("https://alice:SE@CRET@host:bad/x", &["SE", "CRET"], "https://***"),
+        ("alice:SE@CRET@host/x", &["SE", "CRET"], "***"),
+        ("https://alice:SE/CRET@host", &["SE", "CRET"], "https://***"),
+        ("https:alice:SECRET@host", &["SECRET"], "***"),
+        ("HTTPS://alice:SECRET@HOST/x", &["SECRET"], "https://***:***@host/x"),
+        ("  https://alice:SECRET@host", &["SECRET"], "***"),
+        ("https://alice:pa#ss@host", &["pa", "pa#ss"], "https://***"),
+        ("https://alice:SE?CRET@host", &["SE", "CRET"], "https://***"),
+        ("alice:pa#ss@host", &["pa", "ss"], "***"),
+        ("https://alice:/SECRET@host", &["SECRET"], "https://***"),
+        ("https://alice:12/cd@host", &["12", "cd"], "https://***"),
+        ("https://DOMAIN\\alice:SECRET@host", &["SECRET"], "https://***"),
+        ("https://u:a@b/c@host", &["b/c"], "https://***"),
+        ("https://host:8443/x?e=a@b", &["8443/x"], "https://***"),
+        ("https://alice:a@b/c@host/..", &["b/"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/..", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/%2e%2e", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/./..", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ss\tw0rd/x@bn.example/..", &["w0rd"], "https://***"),
+        ("https://alice:SECRET\u{ff20}host", &["SECRET"], "https://***"),
+        ("https://alice:SECRET\u{fe6b}host", &["SECRET"], "https://***"),
+        ("https://alice:SECRET%40host", &["SECRET"], "https://***"),
+        ("https://TOKEN\u{ff20}host/x", &["TOKEN"], "https://***"),
+        ("alice:SECRET\u{ff20}host", &["SECRET"], "***"),
+        ("https://host:bad/x", &[], "https://***"),
+        ("https://host/x/../y", &[], "https://host/y"),
+        ("localhost:5052", &[], "***"),
+        ("not-a-url/x", &[], "not-a-url/x"),
+        ("", &[], ""),
+        ("https://beacon.example.com:5052/eth/v1", &[], "https://beacon.example.com:5052/eth/v1"),
+        ("https://cfg.example/c?token=x#f", &["token"], "https://cfg.example/c"),
+        ("not-a-url?token=x", &["token"], "not-a-url?redacted"),
+        ("https:///alice:SECRET%40host/x", &["SECRET"], "https://***"),
+        ("https:///alice:SECRET\u{ff20}host", &["SECRET"], "https://***"),
+        ("https://\\alice:SECRET%40host", &["SECRET"], "https://***"),
+        ("//alice:SECRET%40host", &["SECRET"], "***"),
+        ("https://DOMAIN\\alice:SECRET%40bn.example:5052", &["SECRET"], "https://***"),
+        ("https://DOMAIN\\alice:SECRET\u{ff20}bn.example", &["SECRET"], "https://***"),
+        ("grpc://TOKEN%40signer:9000", &["TOKEN"], "grpc://***"),
+        ("foo://alice:SECRET@host/x", &["SECRET"], "foo://***"),
+        ("https:///host/x", &[], "https://***"),
+        ("https://host/a%20b", &[], "https://***"),
+        ("https://host/a b", &[], "https://***"),
+        ("http://user:pass@host:5052", &["pass"], "http://***:***@host:5052/"),
+        ("localhost", &[], "localhost"),
+    ];
+
+    #[test]
+    fn test_validate_beacon_url_errors_redact_the_url() {
+        let cases = [
+            Config { beacon_url: "HTTPS://alice:SECRET@bn:5052".to_string(), ..Default::default() },
+            Config {
+                beacon_nodes: vec!["ftp://alice:SECRET@bn1:5052".to_string()],
+                ..Default::default()
+            },
+            Config {
+                proposer_nodes: vec!["ftp://alice:SECRET@pn1:5052".to_string()],
+                ..Default::default()
+            },
+        ];
+        for config in cases {
+            let msg = config.validate().expect_err("not http or https").to_string();
+            assert!(msg.contains("must start with http:// or https://"), "{msg}");
+            assert!(msg.contains("***"), "{msg}");
+            assert!(!msg.contains("SECRET"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_redact_url_table_never_leaks_the_password() {
+        for &(input, secrets, expected) in REDACT_URL_CASES {
+            let out = redact_url(input);
+            assert!(!out.contains("SECRET"), "{input:?} gave {out:?}");
+            for secret in secrets {
+                assert!(!out.contains(secret), "{input:?} gave {out:?}");
+            }
+            assert_eq!(out, expected, "{input:?}");
+        }
+    }
+
+    /// The password and each part of it between reserved characters.
+    fn password_fragments(password: &str) -> Vec<&str> {
+        let mut fragments: Vec<&str> = password
+            .split(['#', '?', '/', '\\', '@', ':', '\u{ff20}'])
+            .flat_map(|part| part.split("%40"))
+            .filter(|part| part.len() >= 2)
+            .collect();
+        fragments.push(password);
+        fragments
+    }
+
+    #[test]
+    fn test_redact_url_never_leaks_a_generated_password() {
+        let passwords = [
+            "Pq7PASSq7P",
+            "Qz#PASS",
+            "Qz?PASS",
+            "Qz/PASS",
+            "Qz\\PASS",
+            "Qz@PASS",
+            "Qz:PASS",
+            "12/QzPASS",
+            "Qz/PA?SS#QQ@ZZ\\WW:VV",
+            "Qz@PA/SS",
+            "Qz\u{ff20}PASS",
+            "Qz%40PASS",
+        ];
+        let schemes = [
+            "https://",
+            "HTTP://",
+            "HTTPS://",
+            "foo://",
+            "file://",
+            "https:",
+            "https:/",
+            "https:///",
+            "https://\\",
+            "//",
+            "",
+        ];
+        let users = ["alice", "", "a.b", "DOM\\alice"];
+        let hosts = ["host", "host:8443", "[::1]:9000", "host:bad", "host:99999"];
+        let paths = ["", "/", "/p", "/p://x@y", "/a/b://c", "/..", "/%2e%2e", "/./.."];
+        let queries = ["", "?q=1", "?next=https://x", "?r=a@b://c"];
+        let fragments = ["", "#f", "#https://x", "#a@b://c"];
+        let mut checked = 0usize;
+        for password in passwords {
+            let secrets = password_fragments(password);
+            for scheme in schemes {
+                for user in users {
+                    for host in hosts {
+                        for path in paths {
+                            for query in queries {
+                                for fragment in fragments {
+                                    let input = format!(
+                                        "{scheme}{user}:{password}@{host}{path}{query}{fragment}"
+                                    );
+                                    let out = redact_url(&input);
+                                    for secret in &secrets {
+                                        assert!(!out.contains(secret), "{input:?} gave {out:?}");
+                                    }
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 12 * 11 * 4 * 5 * 8 * 4 * 4);
     }
 
     #[test]
@@ -3397,6 +5051,106 @@ broadcast = ["blocks", "attestations"]
         assert!(config.proposer_config.url_insecure);
     }
 
+    fn proposer_refresh(url: Option<&str>, interval: u64) -> Config {
+        Config {
+            proposer_config: ProposerConfigSource {
+                url: url.map(str::to_string),
+                refresh_interval: interval,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_proposer_config_refresh_interval_bounds() {
+        let max = rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS;
+        assert!(proposer_refresh(None, 0).validate().is_ok(), "0 without a URL stays valid");
+        let err = proposer_refresh(Some("https://cfg.example/c"), 0)
+            .validate()
+            .expect_err("0 with a URL");
+        let msg = err.to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(proposer_refresh(Some("https://cfg.example/c"), max).validate().is_ok());
+        let err = proposer_refresh(Some("https://cfg.example/c"), max + 1)
+            .validate()
+            .expect_err("max+1 with a URL");
+        let msg = err.to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most"), "{msg}");
+        assert!(msg.contains("from default"), "{msg}");
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+proposer_config_url = "https://cfg.example/c"
+proposer_config_refresh_interval = 0
+"#
+        )
+        .unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        let msg = loaded.validate().expect_err("file interval 0").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(msg.contains("from file"), "{msg}");
+        assert!(msg.contains(&file.path().display().to_string()), "{msg}");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.url = Some("https://cfg.example/c".to_string());
+            cli.proposer.proposer_config.refresh_interval = Some(0);
+        });
+        let msg = from_cli.validate().expect_err("cli interval 0").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(msg.contains("from cli"), "{msg}");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.url = Some("https://cfg.example/c".to_string());
+            cli.proposer.proposer_config.refresh_interval = Some(90_000);
+        });
+        let msg = from_cli.validate().expect_err("cli 90000 with a URL").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most 86400"), "{msg}");
+        assert!(msg.contains("from cli"), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_refresh_interval_over_max_from_file_names_the_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+proposer_config_url = "https://cfg.example/c"
+proposer_config_refresh_interval = 90000
+"#
+        )
+        .unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        let msg = loaded.validate().expect_err("file 90000 with a URL").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most 86400"), "{msg}");
+        assert!(msg.contains("from file"), "{msg}");
+        assert!(msg.contains(&file.path().display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_refresh_interval_over_max_without_url_starts() {
+        assert!(proposer_refresh(None, 90_000).validate().is_ok());
+        assert!(proposer_refresh(None, u64::MAX).validate().is_ok());
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "proposer_config_refresh_interval = 90000").unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        assert!(loaded.validate().is_ok(), "no URL: the file interval is ignored");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.refresh_interval = Some(90_000);
+        });
+        assert!(from_cli.validate().is_ok(), "no URL: the cli interval is ignored");
+    }
+
     // -- RF5-11: typed config enums (fail-early deserialize) --
 
     #[test]
@@ -3616,6 +5370,41 @@ builders = ["not a url"]
             "valid entry must be present (prefix stripped)"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    #[test]
+    fn test_fee_recipient_policy_defaults_to_sign_and_parses_reject() {
+        let defaulted: Config = toml::from_str("").expect("empty config");
+        assert_eq!(defaulted.fee_recipient_policy, FeeRecipientPolicy::Sign);
+        let snapshot = serde_json::to_value(&defaulted).expect("snapshot");
+        assert!(snapshot.get("fee_recipient_policy").is_none());
+
+        let reject: Config =
+            toml::from_str("fee_recipient_policy = \"reject\"").expect("reject parses");
+        assert_eq!(reject.fee_recipient_policy, FeeRecipientPolicy::Reject);
+        assert!(reject.validate().is_ok());
+    }
+
+    /// An unknown policy name is rejected. The variant text is kept; the value is not.
+    #[test]
+    fn unknown_fee_recipient_policy_is_rejected_without_echoing_the_value() {
+        let err = toml::from_str::<Config>("fee_recipient_policy = \"sometimes\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown variant"), "{msg}");
+        assert!(!msg.contains("sometimes"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_top_level_key_on_the_serde_path_has_no_file() {
+        let value: toml::Value = toml::from_str("x = 1").expect("x = 1 is valid TOML");
+        let err = Config::from_toml_value(value).expect_err("unknown key");
+        assert!(
+            matches!(err, ConfigError::UnknownKey { ref key, file: None } if key == "x"),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains('x'), "{msg}");
+        assert!(!msg.contains(" in "), "{msg}");
     }
 
     // -- RF5-13: nested call sites; flat shims deleted --

@@ -1,28 +1,35 @@
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use std::sync::Mutex;
 use std::time::Instant;
 
 use tracing::{debug, error, info, warn, Instrument};
 
-use beacon::{GloasBlockContents, ProduceBlockV4Body, WireBody};
-use crypto::PublicKey;
-use eth_types::{
-    blinded_body_tree_hash_root, body_tree_hash_root, ForkName, ForkSchedule, Root, Slot,
-    SLOTS_PER_EPOCH, SLOT_DURATION_MS,
+use beacon::{
+    block_value, display_value_parse, GloasBlockContents, ProduceBlockV4Body, RankedBlock,
+    ShapeConstraint, WireBody,
 };
+use crypto::PublicKey;
+use eth_types::{ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
-use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
+use signer::{
+    BeaconAdmission, BeaconBlockHeaderFields, CircuitBreakerState, SigningDuty, ValidatorSigner,
+};
 use timing::{due_ms, DeadlineBps, DeadlineSchedule};
 use validator_store::ValidatorStore;
 
-use crate::metrics::{proposal_outcome, RVC_PROPOSALS_TOTAL};
-use crate::traits::{
-    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
+use crate::metrics::{
+    proposal_outcome, RVC_BLOCK_SHAPE_REJECTIONS_TOTAL, RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL,
+    RVC_PROPOSALS_TOTAL,
 };
-use crate::types::BlockSelectionMode;
-use crate::validation::BlockResponseValidator;
+use crate::traits::{
+    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse, ProduceDuty,
+};
+use crate::types::{BlockSelectionMode, CandidateShape};
+use crate::validation::{
+    check_mode_shape, constraint_for_mode, BlockResponseValidator, ExpectedParents,
+};
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -31,6 +38,12 @@ pub struct BlockProposalResult {
     pub slot: Slot,
     pub block_root: Root,
     pub is_blinded: bool,
+    /// The beacon node accepted a builder-path block.
+    ///
+    /// Pre-Gloas this is a blinded block. On Gloas it is an external bid.
+    /// A local block, including a self-build, is false. The breaker resets
+    /// only when this is true.
+    pub builder_path: bool,
     pub consensus_version: String,
     pub value_wei: Option<String>,
 }
@@ -45,8 +58,23 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     circuit_breaker: Arc<CircuitBreakerState>,
     builder_config_provider: Option<Arc<dyn BuilderConfigProvider>>,
     deadline_schedule: DeadlineSchedule,
+    /// Beacon-node slot length in milliseconds for the Gloas payload deadline.
+    ///
+    /// [`Self::new`] keeps 12 s. Production passes the resolved duration.
+    slot_duration_ms: u64,
     #[cfg(test)]
     envelope_deadline_note: Mutex<Option<EnvelopeDeadlineNote>>,
+    /// Runs after produce returns and before the fence is checked again.
+    /// Integration tests revoke a pool here. Not compiled into production.
+    #[cfg(any(test, feature = "test-utils"))]
+    after_produce: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs at the start of each `discard_revoked_fences` call.
+    ///
+    /// A test bumps one generation on a chosen call so a later discard can be
+    /// removed without the earlier discard hiding that. Not compiled into
+    /// production.
+    #[cfg(any(test, feature = "test-utils"))]
+    before_discard: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(test)]
@@ -64,10 +92,15 @@ pub(crate) struct PayloadDeadline {
 }
 
 impl PayloadDeadline {
-    fn new(fork: ForkName, schedule: &DeadlineSchedule, start: Instant) -> Self {
+    fn new(
+        fork: ForkName,
+        schedule: &DeadlineSchedule,
+        start: Instant,
+        slot_duration_ms: u64,
+    ) -> Self {
         Self {
             start,
-            deadline_ms: due_ms(schedule.for_fork(fork).payload, SLOT_DURATION_MS),
+            deadline_ms: due_ms(schedule.for_fork(fork).payload, slot_duration_ms),
             first_overrun_stage: None,
         }
     }
@@ -132,8 +165,64 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             circuit_breaker,
             builder_config_provider: None,
             deadline_schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
+            slot_duration_ms: SLOT_DURATION_MS,
             #[cfg(test)]
             envelope_deadline_note: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            after_produce: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            before_discard: Mutex::new(None),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_after_produce(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.after_produce.lock() {
+            *slot = Some(Arc::new(hook));
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_before_discard(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.before_discard.lock() {
+            *slot = Some(Arc::new(hook));
+        }
+    }
+
+    fn admission_blocks(duty: SigningDuty, fence: &beacon::DutyFence) -> bool {
+        signer::duty_requires_beacon_admission(duty) && !fence.holds()
+    }
+
+    async fn under_admission<T>(
+        fence: &beacon::DutyFence,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut generations = fence.generations();
+        let Some((seen, current)) = generations.next() else {
+            return fut.await;
+        };
+        let mut admission = BeaconAdmission::new(seen, current);
+        for (seen, current) in generations {
+            admission = admission.and_generation(seen, current);
+        }
+        signer::with_beacon_admission(admission, fut).await
+    }
+
+    fn discard_revoked_fences(
+        &self,
+        fences: &[&beacon::DutyFence],
+    ) -> Result<(), BlockServiceError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(hook) = self.before_discard.lock().ok().and_then(|guard| guard.clone()) {
+            hook();
+        }
+        if fences.iter().any(|fence| Self::admission_blocks(SigningDuty::Block, fence)) {
+            warn!("beacon node admission revoked; block candidate discarded");
+            Err(BlockServiceError::Beacon(
+                "beacon node response dropped: admission revoked in flight".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -152,11 +241,33 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         self
     }
 
+    /// Slot length used by the Gloas payload deadline.
+    ///
+    /// Production passes the duration resolved from the beacon node.
+    pub fn with_slot_duration_ms(mut self, slot_duration_ms: u64) -> Self {
+        self.slot_duration_ms = slot_duration_ms;
+        self
+    }
+
+    /// Slot length in milliseconds stored for [`PayloadDeadline`].
+    pub fn slot_duration_ms(&self) -> u64 {
+        self.slot_duration_ms
+    }
+
+    fn payload_deadline(&self, fork: ForkName, start: Instant) -> PayloadDeadline {
+        PayloadDeadline::new(fork, &self.deadline_schedule, start, self.slot_duration_ms)
+    }
+
     #[cfg(test)]
     pub(crate) fn last_envelope_deadline_note(&self) -> Option<EnvelopeDeadlineNote> {
         self.envelope_deadline_note.lock().ok().and_then(|g| *g)
     }
 
+    /// V4 produce body for this slot.
+    ///
+    /// A boost of 0 clears `builders`. A provider entry must not keep a
+    /// non-zero boost after execution-only or a tripped breaker. Any other
+    /// boost writes that boost and the store `min_bid` onto every entry.
     async fn v4_builder_config(&self, pubkey: &[u8; 48], slot: Slot, boost: u64) -> BuilderConfig {
         let mut config = match &self.builder_config_provider {
             Some(provider) => provider.builder_config_for(pubkey, slot).await,
@@ -166,17 +277,48 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 builders: Vec::new(),
             },
         };
+        let min_bid = self.validator_store.min_bid(pubkey);
         config.builder_boost_factor = boost;
-        config.min_bid = self.validator_store.min_bid(pubkey);
+        config.min_bid = min_bid;
+        if boost == 0 {
+            config.builders.clear();
+        } else {
+            for entry in &mut config.builders {
+                entry.builder_boost_factor = boost;
+                entry.min_bid = min_bid;
+            }
+        }
         config
     }
 
     /// Propose a block for the given duty slot and validator key.
     ///
     /// Validates `proposer_index` against `expected_proposer_index` and, when
-    /// `expected_parent_root` is `Some`, validates `parent_root` against the
-    /// previous-slot parent before calling the signer. On validation failure the
-    /// duty is dropped with an `error!` log and no signer call is made (H-4).
+    /// `expected_parents` is `Some`, validates `parent_root` against that set
+    /// before calling the signer. On validation failure the duty is dropped
+    /// with a `warn!` and no signer call is made (H-4).
+    pub async fn propose_block(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        expected_proposer_index: u64,
+        expected_parents: Option<ExpectedParents>,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        self.propose_block_until(
+            slot,
+            pubkey,
+            expected_proposer_index,
+            expected_parents,
+            None,
+            &beacon::DutyFence::open(),
+        )
+        .await
+    }
+
+    /// [`Self::propose_block`] with a per-call block-production deadline.
+    ///
+    /// `deadline` caps only the proposer-pool produce call. Publication keeps
+    /// its own budget. `None` uses the configured block-production timeout.
     #[tracing::instrument(
         name = "block.propose",
         level = "debug",
@@ -188,20 +330,18 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             block.value_wei = tracing::field::Empty,
         )
     )]
-    pub async fn propose_block(
+    pub async fn propose_block_until(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
         expected_proposer_index: u64,
-        expected_parent_root: Option<Root>,
+        expected_parents: Option<ExpectedParents>,
+        deadline: Option<tokio::time::Instant>,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
-        let validator = BlockResponseValidator {
-            expected_proposer_index,
-            expected_parent_root,
-            expected_slot: slot,
-        };
-        self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
+        let validator = BlockResponseValidator { expected_proposer_index, expected_parents };
+        self.propose_block_impl(slot, pubkey, mode, Some(&validator), deadline, capture_fence).await
     }
 
     /// Mode-override entry point for tests. Not part of the public API —
@@ -215,7 +355,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
     ) -> Result<BlockProposalResult, BlockServiceError> {
-        self.propose_block_impl(slot, pubkey, mode, None).await
+        self.propose_block_impl(slot, pubkey, mode, None, None, &beacon::DutyFence::open()).await
     }
 
     async fn propose_block_impl(
@@ -224,6 +364,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
         validator: Option<&BlockResponseValidator>,
+        deadline: Option<tokio::time::Instant>,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let proposal_start = Instant::now();
@@ -232,14 +374,31 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
-        let mut payload_deadline =
-            PayloadDeadline::new(fork, &self.deadline_schedule, proposal_start);
+        let mut payload_deadline = self.payload_deadline(fork, proposal_start);
+
+        let fence = self.beacon.duty_fence()?;
+        if Self::admission_blocks(SigningDuty::RandaoReveal, &fence) {
+            warn!(slot, "no admitted beacon node; duties halted");
+            return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
+        }
+        if Self::admission_blocks(SigningDuty::RandaoReveal, capture_fence) {
+            warn!(slot, "beacon node admission revoked; block candidate discarded");
+            return Err(BlockServiceError::Beacon(
+                "beacon node response dropped: admission revoked in flight".into(),
+            ));
+        }
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
-        let randao_sig = self
-            .signer
-            .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
+        let randao_sig = Self::under_admission(
+                &fence,
+                self.signer.sign_randao_reveal(
+                    epoch,
+                    pubkey,
+                    &self.fork_schedule,
+                    &self.genesis_validators_root,
+                ),
+            )
             .instrument(tracing::info_span!("sign.randao"))
             .await
             .map_err(|e| {
@@ -260,36 +419,22 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let graffiti = self.validator_store.effective_graffiti(&pubkey_bytes);
         let graffiti_hex = graffiti.map(|g| format!("0x{}", hex::encode(g)));
 
-        // Check circuit breaker for builder modes first
-        let circuit_breaker_tripped = self.circuit_breaker.is_tripped();
-
-        let boost = match mode {
-            BlockSelectionMode::ExecutionOnly => {
-                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
-                0
-            }
-            BlockSelectionMode::MaxProfit => {
-                if circuit_breaker_tripped {
+        // One sample. Boost, the duty shape, and the sign-time mode all use it.
+        // A later trip does not change this proposal.
+        let breaker_tripped = self.circuit_breaker.is_tripped();
+        if breaker_tripped {
+            match mode {
+                BlockSelectionMode::ExecutionOnly => {}
+                BlockSelectionMode::MaxProfit => {
                     warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
-                    0
-                } else {
-                    self.validator_store.builder_boost_factor(&pubkey_bytes)
                 }
-            }
-            BlockSelectionMode::BuilderAlways => {
-                if circuit_breaker_tripped {
+                BlockSelectionMode::BuilderAlways => {
                     warn!(
                         slot = slot,
                         "BuilderAlways: circuit breaker tripped, falling back to local"
                     );
-                    0
-                } else {
-                    debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
-                    u64::MAX
                 }
-            }
-            BlockSelectionMode::BuilderOnly => {
-                if circuit_breaker_tripped {
+                BlockSelectionMode::BuilderOnly => {
                     error!(
                         slot = slot,
                         pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -299,30 +444,83 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         "circuit breaker tripped — proposal missed".to_string(),
                     ));
                 }
+            }
+        }
+        let mut effective_mode = selection_effective_mode(mode, breaker_tripped);
+        if local_only_because_builder_flag_off(
+            fork,
+            effective_mode,
+            self.validator_store.is_builder_enabled(&pubkey_bytes),
+        ) {
+            debug!(
+                slot = slot,
+                mode = %mode,
+                "builder_proposals is off; pre-Gloas produce is local-only"
+            );
+            effective_mode = BlockSelectionMode::ExecutionOnly;
+        }
+        let shape = constraint_for_mode(effective_mode);
+        let boost = match effective_mode {
+            BlockSelectionMode::ExecutionOnly => {
+                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
+                0
+            }
+            BlockSelectionMode::MaxProfit => {
+                self.validator_store.builder_boost_factor(&pubkey_bytes)
+            }
+            BlockSelectionMode::BuilderAlways => {
+                debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
+                u64::MAX
+            }
+            BlockSelectionMode::BuilderOnly => {
                 debug!(slot = slot, "BuilderOnly: builder_boost_factor=u64::MAX");
                 u64::MAX
             }
         };
+
+        // Captured once, before produce. The penalty compares against this
+        // duty fee, not a later read of the validator store. The Gloas arm
+        // does not build a V3 duty, so it does not use this value.
+        let duty_fee =
+            validator.map(|_| self.validator_store.effective_fee_recipient(&pubkey_bytes));
 
         // 3. Request block from beacon node. Dispatch on the slot fork, never
         // on response headers: Gloas is V4, pre-Gloas stays V3 verbatim.
         let produce_result = if fork >= ForkName::Gloas {
             let builder_config = self.v4_builder_config(&pubkey_bytes, slot, boost).await;
             self.beacon
-                .produce_block_v4(slot, &randao_hex, graffiti_hex.as_deref(), &builder_config)
+                .produce_block_v4_by(
+                    slot,
+                    &randao_hex,
+                    graffiti_hex.as_deref(),
+                    &builder_config,
+                    deadline,
+                )
                 .instrument(tracing::info_span!("beacon.produce_block_v4"))
                 .await
+                .map(Produced::V4)
         } else {
+            let duty = validator.zip(duty_fee).map(|(checks, fee_recipient)| {
+                duty_from_validator(checks, fee_recipient, fork, shape)
+            });
             self.beacon
-                .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
+                .produce_block_v3_ranked_by(
+                    slot,
+                    &randao_hex,
+                    graffiti_hex.as_deref(),
+                    Some(boost),
+                    duty,
+                    deadline,
+                )
                 .instrument(tracing::info_span!("beacon.produce_block_v3"))
                 .await
+                .map(Produced::V3)
         };
 
         // Handle block-production failure, tagging the error so the coordinator
         // can apply H-3 circuit-breaker scoping.
-        let response = match produce_result {
-            Ok(resp) => resp,
+        let produced = match produce_result {
+            Ok(produced) => produced,
             Err(e) => {
                 if mode == BlockSelectionMode::BuilderOnly {
                     // BuilderOnly: never fall back; always fail the proposal.
@@ -356,78 +554,61 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         };
 
         payload_deadline.mark("produce");
-
-        // Record dynamic attributes after block production
-        let span = tracing::Span::current();
-        span.record("block.consensus_version", &response.consensus_version);
-        if let Some(ref value) = response.execution_payload_value {
-            span.record("block.value_wei", value.as_str());
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(hook) = self.after_produce.lock().ok().and_then(|guard| guard.clone()) {
+            hook();
         }
+        self.discard_revoked_fences(&[&fence, capture_fence])?;
 
-        if fork >= ForkName::Gloas {
-            info!(
-                slot = slot,
-                fork = fork.as_ref(),
-                execution_payload_value =
-                    response.execution_payload_value.as_deref().unwrap_or("none"),
-                "Block production response received"
-            );
-        } else {
-            info!(
-                slot = slot,
-                is_blinded = response.is_blinded,
-                execution_payload_value =
-                    response.execution_payload_value.as_deref().unwrap_or("none"),
-                "Block production response received"
-            );
-            span.record("block.blinded", response.is_blinded);
-        }
-
-        // Sign and publish. Fork is resolved from the slot; V4 never
-        // dispatches on Eth-Consensus-Version or is_blinded. Once a signature
-        // exists this response is committed — no re-produce and no second sign.
-        let (block_root, is_blinded) = if fork >= ForkName::Gloas {
+        // Sign and publish. The slot fork picks V4 or the ranked V3 list.
+        // V4 rejects a blinded flag before signing; the shape is the bid
+        // builder_index. Pre-Gloas signs the first candidate that passes
+        // slot, proposer, and expected parents. Once a signature exists
+        // that candidate is committed — no second sign and no re-produce.
+        let signed = if fork >= ForkName::Gloas {
+            let Produced::V4(response) = produced else {
+                return Err(BlockServiceError::Parse(
+                    "Gloas slot produced a pre-Gloas candidate list".to_string(),
+                ));
+            };
+            record_produced_response(slot, &response, fork);
             self.sign_and_publish_v4(
                 &response,
                 slot,
                 pubkey,
                 validator,
                 fork,
+                effective_mode,
                 &mut payload_deadline,
+                &fence,
+                capture_fence,
             )
             .await
+            .map(|(block_root, is_blinded, builder_path)| SignedProposal {
+                block_root,
+                is_blinded,
+                builder_path,
+                consensus_version: response.consensus_version,
+                value_wei: response.execution_payload_value,
+            })
         } else {
-            reject_blinded_at_gloas(
-                response.is_blinded,
-                &response.consensus_version,
+            let Produced::V3(candidates) = produced else {
+                return Err(BlockServiceError::Parse(
+                    "pre-Gloas slot produced a V4 block".to_string(),
+                ));
+            };
+            self.sign_first_v3_candidate(
+                candidates,
                 slot,
-                &self.fork_schedule,
-            )?;
-            reject_gloas_version_pre_gloas(&response.consensus_version, fork)?;
-            // Pre-Gloas keeps response.consensus_version for format/publish (V3 verbatim).
-            debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
-            if response.is_ssz {
-                self.sign_and_publish_ssz(
-                    &response,
-                    slot,
-                    pubkey,
-                    validator,
-                    response.is_blinded,
-                    &response.consensus_version,
-                )
+                pubkey,
+                validator,
+                fork,
+                effective_mode,
+                &fence,
+                capture_fence,
+                duty_fee,
+            )
                 .await
-            } else if response.is_blinded {
-                self.sign_and_publish_blinded(&response, slot, pubkey, validator).await
-            } else {
-                self.sign_and_publish_full(
-                    &response,
-                    slot,
-                    pubkey,
-                    validator,
-                    &response.consensus_version,
-                )
-                .await
-            }
         }
         .map_err(|e| {
             if matches!(e, BlockServiceError::EnvelopeAfterPublish(_)) {
@@ -436,6 +617,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     error = %e,
                     "Self-build envelope failed after block publish"
+                );
+            } else if rejected_before_publish(&e) {
+                warn!(
+                    slot = slot,
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    "Block response rejected before publication"
                 );
             } else {
                 error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
@@ -446,22 +634,28 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         info!(
             slot = slot,
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            block_root = %TruncatedRoot::new(&block_root),
-            is_blinded = is_blinded,
+            block_root = %TruncatedRoot::new(&signed.block_root),
+            is_blinded = signed.is_blinded,
             duration_ms = proposal_start.elapsed().as_millis() as u64,
             "Block publication success"
         );
 
         Ok(BlockProposalResult {
             slot,
-            block_root,
-            is_blinded,
-            consensus_version: response.consensus_version,
-            value_wei: response.execution_payload_value,
+            block_root: signed.block_root,
+            is_blinded: signed.is_blinded,
+            builder_path: signed.builder_path,
+            consensus_version: signed.consensus_version,
+            value_wei: signed.value_wei,
         })
     }
 
-    /// Gloas V4 sign+publish. Self-build vs builder-win from the decoded body.
+    /// Gloas V4 sign+publish. Self-build vs external bid is the bid `builder_index`.
+    ///
+    /// The mode check, the envelope/bid pairing, and the bid and envelope
+    /// bindings all run before `sign_block_header`. A blinded flag is rejected
+    /// here, same as pre-Gloas.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_and_publish_v4(
         &self,
         response: &ProduceBlockResponse,
@@ -469,10 +663,33 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
         fork: ForkName,
+        mode: BlockSelectionMode,
         payload_deadline: &mut PayloadDeadline,
-    ) -> Result<(Root, bool), BlockServiceError> {
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
+    ) -> Result<(Root, bool, bool), BlockServiceError> {
         cross_check_consensus_version(&response.consensus_version, fork)?;
+        reject_blinded_at_gloas(
+            response.is_blinded,
+            &response.consensus_version,
+            slot,
+            &self.fork_schedule,
+        )?;
         let body = response.decode_v4_body()?;
+        let body_ssz = match &body {
+            ProduceBlockV4Body::BeaconBlock { block, .. } => block.body.clone(),
+            ProduceBlockV4Body::BlockContents(contents) => contents.block.body.clone(),
+        };
+        let bid = rvc_gloas::gloas_bid_binding(&body_ssz)?;
+        let shape = if bid.builder_index == rvc_gloas::BUILDER_INDEX_SELF_BUILD {
+            CandidateShape::SelfBuild
+        } else {
+            CandidateShape::BuilderWin
+        };
+        enforce_mode_shape(mode, shape).map_err(|err| {
+            warn!(slot, error = %err, "BN block response rejected");
+            err
+        })?;
         let (block, block_ssz, envelope) = match body {
             ProduceBlockV4Body::BeaconBlock { block, block_ssz } => (block, block_ssz, None),
             ProduceBlockV4Body::BlockContents(GloasBlockContents {
@@ -488,67 +705,123 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 "BlockContents must not include Eth-Builder-Url".to_string(),
             ));
         }
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        let self_build = bid.builder_index == rvc_gloas::BUILDER_INDEX_SELF_BUILD;
+        if envelope.is_some() != self_build {
+            return Err(BlockServiceError::Parse(if self_build {
+                "self-build bid requires an execution payload envelope".to_string()
+            } else {
+                "execution payload envelope requires a self-build bid".to_string()
+            }));
         }
-        if let Some(v) = validator {
-            v.validate_full(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
-                e
-            })?;
+        check_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
+        let (header, block_root) = gloas_header_and_root(&block)?;
+        if bid.slot != block.slot {
+            return Err(BlockServiceError::Parse(format!(
+                "bid slot {} does not match block slot {}",
+                bid.slot, block.slot
+            )));
+        }
+        if bid.parent_block_root != block.parent_root {
+            return Err(BlockServiceError::Parse(format!(
+                "bid parent_block_root 0x{} does not match block parent root 0x{}",
+                hex::encode(bid.parent_block_root),
+                hex::encode(block.parent_root)
+            )));
         }
         let envelope_root = if let Some((ref envelope_body, _, _)) = envelope {
             let envelope_ssz = envelope_ssz_for_island(envelope_body)?;
+            let binding = rvc_gloas::gloas_envelope_binding(&envelope_ssz)?;
+            if binding.builder_index != bid.builder_index {
+                return Err(BlockServiceError::Parse(format!(
+                    "self-build envelope builder_index {} does not match bid builder_index {}",
+                    binding.builder_index, bid.builder_index
+                )));
+            }
+            if binding.beacon_block_root != block_root {
+                return Err(BlockServiceError::Parse(format!(
+                    "self-build envelope beacon_block_root 0x{} does not match block root 0x{}",
+                    hex::encode(binding.beacon_block_root),
+                    hex::encode(block_root)
+                )));
+            }
+            if binding.parent_beacon_block_root != block.parent_root {
+                return Err(BlockServiceError::Parse(format!(
+                    "self-build envelope parent_beacon_block_root 0x{} does not match block parent root 0x{}",
+                    hex::encode(binding.parent_beacon_block_root),
+                    hex::encode(block.parent_root)
+                )));
+            }
             Some(rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)?)
         } else {
             None
         };
-        let (header, block_root) = gloas_header_and_root(&block)?;
-        let sig = self
-            .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        self.discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_block_header(
+                &header,
+                pubkey,
+                &self.fork_schedule,
+                &self.genesis_validators_root,
+            ),
+        )
+        .instrument(tracing::info_span!("sign.block"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         payload_deadline.mark("sign_block");
-        let builder_url = if envelope.is_some() { None } else { response.builder_url.as_deref() };
-        if let Some(ref block_ssz) = block_ssz {
-            let signed_ssz =
-                beacon::ssz_deser::serialize_signed_beacon_block_ssz(block_ssz, &sig.to_bytes())
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            self.beacon
-                .publish_block_ssz(&signed_ssz, fork.as_ref(), false, builder_url)
-                .instrument(tracing::info_span!("beacon.publish_block"))
-                .await?;
-        } else {
-            let signed =
-                eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
-            self.beacon
-                .publish_block(&signed, fork.as_ref(), builder_url)
-                .instrument(tracing::info_span!("beacon.publish_block"))
-                .await?;
-        }
-        payload_deadline.mark("publish_block");
-        if let (Some((envelope_body, blobs, proofs)), Some(object_root)) = (envelope, envelope_root)
-        {
-            if let Err(e) = self
-                .sign_and_publish_envelope(
-                    response,
-                    &envelope_body,
-                    &blobs,
-                    &proofs,
-                    object_root,
-                    slot,
-                    pubkey,
-                    fork,
-                    payload_deadline,
+        let published = async {
+            let builder_url =
+                if envelope.is_some() { None } else { response.builder_url.as_deref() };
+            if let Some(ref block_ssz) = block_ssz {
+                let signed_ssz = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
+                    block_ssz,
+                    &sig.to_bytes(),
                 )
-                .await
-            {
-                return Err(BlockServiceError::EnvelopeAfterPublish(e.to_string()));
+                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+                self.beacon
+                    .publish_block_ssz(&signed_ssz, fork.as_ref(), false, builder_url)
+                    .instrument(tracing::info_span!("beacon.publish_block"))
+                    .await?;
+            } else {
+                let signed = eth_types::SignedBeaconBlock {
+                    message: block,
+                    signature: sig.to_bytes().to_vec(),
+                };
+                self.beacon
+                    .publish_block(&signed, fork.as_ref(), builder_url)
+                    .instrument(tracing::info_span!("beacon.publish_block"))
+                    .await?;
             }
+            payload_deadline.mark("publish_block");
+            if let (Some((envelope_body, blobs, proofs)), Some(object_root)) =
+                (envelope, envelope_root)
+            {
+                if let Err(e) = self
+                    .sign_and_publish_envelope(
+                        response,
+                        &envelope_body,
+                        &blobs,
+                        &proofs,
+                        object_root,
+                        slot,
+                        pubkey,
+                        fork,
+                        payload_deadline,
+                        fence,
+                        capture_fence,
+                    )
+                    .await
+                {
+                    return Err(BlockServiceError::EnvelopeAfterPublish(e.to_string()));
+                }
+            }
+            Ok((block_root, false, !self_build))
         }
-        Ok((block_root, false))
+        .await;
+        let builder_path = !self_build;
+        published
+            .map_err(demote_post_sign)
+            .map_err(|err| builder_publish_failure(err, builder_path))
     }
 
     /// Self-build envelope: never before the block publish; same produce body.
@@ -564,6 +837,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         fork: ForkName,
         payload_deadline: &mut PayloadDeadline,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<(), BlockServiceError> {
         if !response.payload_included {
             return Err(BlockServiceError::Parse(
@@ -571,18 +846,22 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     .to_string(),
             ));
         }
-        let sig = self
-            .signer
-            .sign_execution_payload_envelope_root(
+        // The header scope ended when that future completed. Re-enter it, and
+        // re-check the capture fence taken before produce.
+        self.discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_execution_payload_envelope_root(
                 &object_root,
                 slot,
                 pubkey,
                 &self.fork_schedule,
                 &self.genesis_validators_root,
-            )
-            .instrument(tracing::info_span!("sign.envelope"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+            ),
+        )
+        .instrument(tracing::info_span!("sign.envelope"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         payload_deadline.mark("sign_envelope");
         let signed = signed_envelope_wire(envelope_body, &sig.to_bytes())?;
         let publish = self
@@ -612,223 +891,746 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
     }
 
-    async fn sign_and_publish_ssz(
+    /// Walk pre-Gloas candidates. A prepare failure is logged once and skipped.
+    /// The first candidate that prepares is signed and published. A signer or
+    /// publish error returns immediately and does not try the next candidate.
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_first_v3_candidate(
         &self,
-        response: &ProduceBlockResponse,
+        candidates: Vec<RankedBlock>,
         slot: Slot,
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
-        is_blinded: bool,
-        consensus_version: &str,
-    ) -> Result<(Root, bool), BlockServiceError> {
-        let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
-            BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
-        })?;
+        fork: ForkName,
+        mode: BlockSelectionMode,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
+        expected_fee: Option<[u8; 20]>,
+    ) -> Result<SignedProposal, BlockServiceError> {
+        if candidates.is_empty() {
+            return Err(BlockServiceError::Beacon(
+                "produce_block_v3 returned no candidate".to_string(),
+            ));
+        }
+        let mut last_error = None;
+        let mut builder_only_error = None;
+        for candidate in candidates {
+            let response = &candidate.response;
+            match self.prepare_v3(response, slot, validator, fork, mode) {
+                Ok(prepared) => {
+                    record_produced_response(slot, response, fork);
+                    debug!(
+                        slot = slot,
+                        bn_index = candidate.bn_index,
+                        is_blinded = response.is_blinded,
+                        "Blinded/unblinded path chosen"
+                    );
+                    return self
+                        .sign_and_publish_prepared(
+                            prepared,
+                            slot,
+                            pubkey,
+                            fence,
+                            capture_fence,
+                            candidate.bn_index,
+                            response,
+                            expected_fee,
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    warn!(
+                        slot,
+                        bn_index = candidate.bn_index,
+                        execution_payload_value =
+                            response.execution_payload_value.as_deref().unwrap_or(""),
+                        consensus_block_value =
+                            response.consensus_block_value.as_deref().unwrap_or(""),
+                        value_wei = block_value(response),
+                        error = %err,
+                        "BN block response rejected"
+                    );
+                    if matches!(err, BlockServiceError::BuilderOnly(_)) {
+                        builder_only_error.get_or_insert(err);
+                    } else {
+                        last_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = builder_only_error {
+            return Err(err);
+        }
+        match last_error {
+            Some(err) => Err(err),
+            None => {
+                Err(BlockServiceError::Beacon("produce_block_v3 returned no candidate".to_string()))
+            }
+        }
+    }
+}
 
-        let format = ssz_block_format(is_blinded, consensus_version)?;
-        // Blobs-offset failures must happen before the header is signed.
-        let contents = if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-            Some(
-                beacon::ssz_deser::deserialize_block_contents_ssz(ssz_bytes, format)
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?,
-            )
-        } else {
-            None
-        };
-        let (block_root, header): (Root, BeaconBlockHeaderFields) = if is_blinded {
-            let (block, _) =
-                beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_blinded(&block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ blinded block validation failed — dropping duty");
-                    e
-                })?;
-            }
-            (compute_blinded_block_root(&block)?, header_from_blinded(&block)?)
-        } else if let Some(contents) = contents.as_ref() {
-            let block = &contents.block;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_full(block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
-                    e
-                })?;
-            }
-            // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
-            // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
-            // this fingerprint is an rvc-internal binding (NOT spec-aligned —
-            // see kzg_commitment_list_root doc) separate from the signing scope.
-            if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
-                // Fail closed: malformed body must not fingerprint as empty list.
-                let kzg_count = block
-                    .blob_kzg_count(layout)
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                let commitment_root = block
-                    .kzg_commitment_root(layout)
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                debug!(
-                    slot = slot,
-                    kzg_count = kzg_count,
-                    commitment_root = %TruncatedRoot::new(&commitment_root),
-                    "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
-                );
-            }
-            (compute_block_root(block)?, header_from_full(block)?)
-        } else {
-            let (block, _) =
-                beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
-                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_full(&block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
-                    e
-                })?;
-            }
-            (compute_block_root(&block)?, header_from_full(&block)?)
-        };
+/// A signature already exists. Unsigned-rejection variants are relabeled so
+/// the log does not say the block was rejected before publication.
+fn demote_post_sign(err: BlockServiceError) -> BlockServiceError {
+    if matches!(err, BlockServiceError::EnvelopeAfterPublish(_)) {
+        return err;
+    }
+    if rejected_before_publish(&err) {
+        BlockServiceError::Beacon(err.to_string())
+    } else {
+        err
+    }
+}
 
+/// True when the duty was dropped before a block publish was attempted.
+fn rejected_before_publish(err: &BlockServiceError) -> bool {
+    matches!(
+        err,
+        BlockServiceError::ModeShapeMismatch { .. }
+            | BlockServiceError::BuilderOnly(_)
+            | BlockServiceError::SlotMismatch { .. }
+            | BlockServiceError::Parse(_)
+            | BlockServiceError::ProposerIndexMismatch { .. }
+            | BlockServiceError::ParentRootMismatch { .. }
+            | BlockServiceError::BlindedNotSupportedAtGloas { .. }
+            | BlockServiceError::ConsensusVersionMismatch { .. }
+            | BlockServiceError::UnknownSszConsensusVersion(_)
+            | BlockServiceError::Gloas(_)
+            | BlockServiceError::Unsupported(_)
+    )
+}
+
+/// Warn and count a readable fee mismatch after the header signature succeeds.
+///
+/// A blinded block is skipped. An unreadable fee does not warn. A fee that
+/// matches `expected` does not warn. The head of the ranked list is not
+/// counted when a later candidate is the one that prepares. `expected` is the
+/// fee on the produce duty.
+fn note_signed_fee_penalty(
+    bn_index: usize,
+    response: &ProduceBlockResponse,
+    expected: [u8; 20],
+    slot: Slot,
+    proposer: u64,
+    parent: &[u8; 32],
+    fork: &str,
+) {
+    if response.is_blinded {
+        return;
+    }
+    let Some(got) = execution_fee_address(response) else {
+        return;
+    };
+    if got == expected {
+        return;
+    }
+    warn!(
+        slot,
+        bn_index,
+        proposer,
+        parent = %hex_root(parent),
+        fork,
+        fee_expected = %hex_fee(&expected),
+        fee_got = %hex_fee(&got),
+        value_parse = %display_value_parse(response),
+        "signing block with fee-recipient mismatch"
+    );
+    inc_signed_fee_penalty();
+}
+
+fn hex_root(bytes: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn inc_signed_fee_penalty() {
+    #[cfg(test)]
+    {
+        with_signed_fee_penalty_lock(|| RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc());
+    }
+    #[cfg(not(test))]
+    {
+        RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
+    }
+}
+
+/// Execution-payload fee recipient, when the signed block carries one.
+///
+/// JSON may put the address on `execution_payload.fee_recipient` or encode
+/// the body as hex SSZ. SSZ responses decode the body the same way. A blinded
+/// block, a Gloas body, and a body that does not decode are `None`.
+fn execution_fee_address(response: &ProduceBlockResponse) -> Option<[u8; 20]> {
+    if response.is_ssz {
+        let bytes = response.ssz_bytes.as_deref()?;
+        let format = ssz_block_format(false, &response.consensus_version).ok()?;
+        let (block, _) =
+            beacon::ssz_deser::deserialize_beacon_block_from_ssz(bytes, format).ok()?;
+        return fee_from_body_ssz(&response.consensus_version, &block.body);
+    }
+    let block = eth_types::block_object(&response.data).ok()?;
+    let body = block.get("body")?;
+    if let Some(hex_body) = body.as_str() {
+        let raw = decode_0x(hex_body)?;
+        return fee_from_body_ssz(&response.consensus_version, &raw);
+    }
+    let text = body.get("execution_payload")?.get("fee_recipient")?.as_str()?;
+    decode_fee(text)
+}
+
+fn fee_from_body_ssz(consensus_version: &str, body: &[u8]) -> Option<[u8; 20]> {
+    let fork = ForkName::from_str(consensus_version).ok()?;
+    match fork.body_layout()? {
+        eth_types::BodyForkLayout::Deneb => eth_types::decode_beacon_block_body_deneb(body)
+            .ok()
+            .map(|decoded| decoded.execution_payload.fee_recipient),
+        eth_types::BodyForkLayout::Electra => eth_types::decode_beacon_block_body_electra(body)
+            .ok()
+            .map(|decoded| decoded.execution_payload.fee_recipient),
+        eth_types::BodyForkLayout::Gloas => None,
+    }
+}
+
+fn decode_0x(text: &str) -> Option<Vec<u8>> {
+    let hex_str = text.strip_prefix("0x").unwrap_or(text);
+    hex::decode(hex_str).ok()
+}
+
+fn decode_fee(text: &str) -> Option<[u8; 20]> {
+    let bytes = decode_0x(text)?;
+    let address: [u8; 20] = bytes.try_into().ok()?;
+    Some(address)
+}
+
+fn hex_fee(bytes: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIGNED_FEE_PENALTY_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+static SIGNED_FEE_PENALTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static SHAPE_REJECTION_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+static SHAPE_REJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize shape-rejection increments so a unit test can read an exact delta.
+#[cfg(test)]
+pub(crate) fn with_shape_rejection_lock<R>(body: impl FnOnce() -> R) -> R {
+    if SHAPE_REJECTION_HELD.with(std::cell::Cell::get) {
+        return body();
+    }
+    let _guard = SHAPE_REJECTION_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    SHAPE_REJECTION_HELD.with(|held| held.set(true));
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            SHAPE_REJECTION_HELD.with(|held| held.set(false));
+        }
+    }
+    let _clear = ClearHold;
+    body()
+}
+
+/// Serialize fee-penalty increments so a unit test can read an exact delta.
+#[cfg(test)]
+fn with_signed_fee_penalty_lock<R>(body: impl FnOnce() -> R) -> R {
+    if SIGNED_FEE_PENALTY_HELD.with(std::cell::Cell::get) {
+        return body();
+    }
+    let _guard = SIGNED_FEE_PENALTY_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    SIGNED_FEE_PENALTY_HELD.with(|held| held.set(true));
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            SIGNED_FEE_PENALTY_HELD.with(|held| held.set(false));
+        }
+    }
+    let _clear = ClearHold;
+    body()
+}
+
+impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
+    /// Decode and check one pre-Gloas candidate. Does not sign.
+    fn prepare_v3(
+        &self,
+        response: &ProduceBlockResponse,
+        slot: Slot,
+        validator: Option<&BlockResponseValidator>,
+        fork: ForkName,
+        mode: BlockSelectionMode,
+    ) -> Result<PreparedProposal, BlockServiceError> {
+        reject_blinded_at_gloas(
+            response.is_blinded,
+            &response.consensus_version,
+            slot,
+            &self.fork_schedule,
+        )?;
+        reject_gloas_version_pre_gloas(&response.consensus_version, fork)?;
+        // Every fork, not only Gloas: the header must name the slot fork
+        // before the body is decoded or signed.
+        cross_check_consensus_version(&response.consensus_version, fork)?;
+        let shape =
+            if response.is_blinded { CandidateShape::Blinded } else { CandidateShape::Unblinded };
+        enforce_mode_shape(mode, shape)?;
+        // JSON calls `check_preparable(` before the arm builds the header.
+        // SSZ slot-checks inside `prepare_ssz` first, then calls it there.
+        if !response.is_ssz {
+            map_prepare_reject(
+                beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+                slot,
+                mode,
+                response,
+            )?;
+        }
+        let (header, block_root, payload) = if response.is_ssz {
+            prepare_ssz(response, slot, validator, fork, mode)?
+        } else if response.is_blinded {
+            prepare_blinded(response, slot, validator, fork, mode)?
+        } else {
+            prepare_full(response, slot, validator, fork, mode)?
+        };
+        Ok(PreparedProposal {
+            header,
+            block_root,
+            is_blinded: response.is_blinded,
+            consensus_version: response.consensus_version.clone(),
+            builder_url: response.builder_url.clone(),
+            execution_payload_value: response.execution_payload_value.clone(),
+            payload,
+        })
+    }
+
+    /// Sign one prepared candidate and publish it. Any error is final.
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_and_publish_prepared(
+        &self,
+        prepared: PreparedProposal,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
+        bn_index: usize,
+        response: &ProduceBlockResponse,
+        expected_fee: Option<[u8; 20]>,
+    ) -> Result<SignedProposal, BlockServiceError> {
         let sign_start = std::time::Instant::now();
-        let sig = self
-            .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        self.discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_block_header(
+                &prepared.header,
+                pubkey,
+                &self.fork_schedule,
+                &self.genesis_validators_root,
+            ),
+        )
+        .instrument(tracing::info_span!("sign.block"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        if let Some(expected) = expected_fee {
+            note_signed_fee_penalty(
+                bn_index,
+                response,
+                expected,
+                slot,
+                prepared.header.proposer_index,
+                &prepared.header.parent_root,
+                &prepared.consensus_version,
+            );
+        }
         debug!(
             slot = slot,
             duration_ms = sign_start.elapsed().as_millis() as u64,
             "Block signing duration"
         );
-
-        // BlockContents was split before signing. Frame that bounded block and
-        // copy proofs and blobs outside it. Blinded and pre-Deneb stay a bare
-        // SignedBeaconBlock (the whole buffer).
-        let signed_ssz = if let Some(contents) = contents.as_ref() {
-            let signed_block = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
-                contents.block_ssz,
-                &sig.to_bytes(),
-            )
-            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            beacon::ssz_deser::serialize_signed_block_contents_ssz(
-                &signed_block,
-                contents.kzg_proofs,
-                contents.blobs,
-            )
-        } else {
-            beacon::ssz_deser::serialize_signed_beacon_block_ssz(ssz_bytes, &sig.to_bytes())
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?
-        };
-
-        self.beacon
-            .publish_block_ssz(
-                &signed_ssz,
-                consensus_version,
-                is_blinded,
-                response.builder_url.as_deref(),
-            )
-            .instrument(tracing::info_span!("beacon.publish_block"))
-            .await?;
-
-        if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-            crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
-                .with_label_values(&[consensus_version])
-                .inc();
-        }
-
-        Ok((block_root, is_blinded))
-    }
-
-    async fn sign_and_publish_full(
-        &self,
-        response: &ProduceBlockResponse,
-        slot: Slot,
-        pubkey: &PublicKey,
-        validator: Option<&BlockResponseValidator>,
-        consensus_version: &str,
-    ) -> Result<(Root, bool), BlockServiceError> {
-        let block_contents = response.parse_full_block()?;
-        let block = block_contents.block().clone();
-
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
-        }
-
-        // H-4: validate proposer_index and parent_root before signing.
-        if let Some(v) = validator {
-            v.validate_full(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
-                e
-            })?;
-        }
-
-        // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
-        //
-        // The signing scope is the spec block root (`hash_tree_root` over the
-        // typed Electra body — SEC-6c). Here we additionally parse the
-        // commitments, compute an internal list fingerprint, and verify that the
-        // commitment count in the body matches the number of blobs.
-        // This does NOT change the BN-facing signing scope; it is a rvc-internal
-        // consistency check performed before the signature is created.
-        //
-        // Proof cardinality is separate and fail-closed, before the signer is
-        // called. It uses the fork name: `body_fork_layout` maps Fulu to Electra,
-        // which would apply the one-proof rule to cell proofs. The commitment-count
-        // check below stays warn-only.
-        if let eth_types::BlockContents::BlockAndBlobs { ref kzg_proofs, ref blobs, .. } =
-            block_contents
-        {
-            let proof_count = kzg_proofs.len();
-            let blob_count = blobs.len();
-            let fork = ForkName::from_str(consensus_version).map_err(|_| {
-                BlockServiceError::Parse(format!(
-                    "kzg proof cardinality: unknown fork {consensus_version} ({proof_count} proofs, {blob_count} blobs)"
-                ))
-            })?;
-            let expected = eth_types::expected_kzg_proof_count(fork, blob_count).map_err(|e| {
-                BlockServiceError::Parse(format!(
-                    "kzg proof cardinality is not defined for fork {consensus_version} ({proof_count} proofs, {blob_count} blobs): {e}"
-                ))
-            })?;
-            if proof_count != expected {
-                return Err(BlockServiceError::Parse(format!(
-                    "kzg proof cardinality mismatch for fork {consensus_version}: expected {expected} proofs, got {proof_count} proofs for {blob_count} blobs"
-                )));
-            }
-            if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
-                // Fail closed: malformed body must not fingerprint as empty list.
-                let kzg_commitments = block_contents
-                    .blob_kzg_commitments(layout)
+        let signature = sig.to_bytes();
+        let builder_path = prepared.is_blinded;
+        let published = async {
+            match prepared.payload {
+                PreparedPayload::SszWhole(bytes) => {
+                    let signed_ssz =
+                        beacon::ssz_deser::serialize_signed_beacon_block_ssz(&bytes, &signature)
+                            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+                    self.beacon
+                        .publish_block_ssz(
+                            &signed_ssz,
+                            &prepared.consensus_version,
+                            prepared.is_blinded,
+                            prepared.builder_url.as_deref(),
+                        )
+                        .instrument(tracing::info_span!("beacon.publish_block"))
+                        .await?;
+                }
+                PreparedPayload::SszContents { block_ssz, kzg_proofs, blobs } => {
+                    let signed_block = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
+                        &block_ssz, &signature,
+                    )
                     .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
-                debug!(
-                    slot = slot,
-                    blobs = blob_count,
-                    kzg_in_body = kzg_commitments.len(),
-                    commitment_root = %TruncatedRoot::new(&commitment_root),
-                    "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
-                );
-                // Intentionally warn-only: the signing scope covers the typed body
-                // (self-consistent). Sidecar propagation is the BN's responsibility.
-                // Aborting here would drop proposals on legitimate BN inconsistencies
-                // during fork transitions.
+                    let signed_ssz = beacon::ssz_deser::serialize_signed_block_contents_ssz(
+                        &signed_block,
+                        &kzg_proofs,
+                        &blobs,
+                    );
+                    self.beacon
+                        .publish_block_ssz(
+                            &signed_ssz,
+                            &prepared.consensus_version,
+                            false,
+                            prepared.builder_url.as_deref(),
+                        )
+                        .instrument(tracing::info_span!("beacon.publish_block"))
+                        .await?;
+                    crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
+                        .with_label_values(&[prepared.consensus_version.as_str()])
+                        .inc();
+                }
+                PreparedPayload::Json(eth_types::BlockContents::BlockAndBlobs {
+                    block,
+                    kzg_proofs,
+                    blobs,
+                }) => {
+                    let layout = eth_types::body_fork_layout(&prepared.consensus_version)
+                        .ok_or_else(|| {
+                            BlockServiceError::Parse(format!(
+                                "no JSON body layout for consensus version {}",
+                                prepared.consensus_version
+                            ))
+                        })?;
+                    let contents = signed_block_contents_json(
+                        block,
+                        signature.to_vec(),
+                        kzg_proofs,
+                        blobs,
+                        layout,
+                    )?;
+                    self.beacon
+                        .publish_block_contents(
+                            &contents,
+                            &prepared.consensus_version,
+                            prepared.builder_url.as_deref(),
+                        )
+                        .instrument(tracing::info_span!("beacon.publish_block_contents"))
+                        .await?;
+                    crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
+                        .with_label_values(&[prepared.consensus_version.as_str()])
+                        .inc();
+                }
+                PreparedPayload::Json(eth_types::BlockContents::Block(block)) => {
+                    let signed = eth_types::SignedBeaconBlock {
+                        message: block,
+                        signature: signature.to_vec(),
+                    };
+                    self.beacon
+                        .publish_block(
+                            &signed,
+                            &prepared.consensus_version,
+                            prepared.builder_url.as_deref(),
+                        )
+                        .instrument(tracing::info_span!("beacon.publish_block"))
+                        .await?;
+                }
+                PreparedPayload::Blinded(block) => {
+                    let signed = eth_types::SignedBlindedBeaconBlock {
+                        message: block,
+                        signature: signature.to_vec(),
+                    };
+                    self.beacon
+                        .publish_blinded_block(&signed, &prepared.consensus_version)
+                        .instrument(tracing::info_span!("beacon.publish_block"))
+                        .await?;
+                }
+            }
+            Ok(SignedProposal {
+                block_root: prepared.block_root,
+                is_blinded: prepared.is_blinded,
+                builder_path,
+                consensus_version: prepared.consensus_version,
+                value_wei: prepared.execution_payload_value,
+            })
+        }
+        .await;
+        published
+            .map_err(demote_post_sign)
+            .map_err(|err| builder_publish_failure(err, builder_path))
+    }
+}
+
+/// One pre-Gloas candidate after decode and duty checks, before the signer.
+struct PreparedProposal {
+    header: BeaconBlockHeaderFields,
+    block_root: Root,
+    is_blinded: bool,
+    consensus_version: String,
+    builder_url: Option<String>,
+    execution_payload_value: Option<String>,
+    payload: PreparedPayload,
+}
+
+enum PreparedPayload {
+    /// Blinded SSZ: the whole unsigned block buffer.
+    ///
+    /// A pre-Deneb full SSZ body is not published through this variant.
+    /// `ssz_block_format` selects `BeaconBlock`, then `full_body_layout`
+    /// rejects that fork before a header is signed.
+    SszWhole(Vec<u8>),
+    /// Deneb+ `BlockContents` regions, copied out before the signature.
+    SszContents {
+        block_ssz: Vec<u8>,
+        kzg_proofs: Vec<u8>,
+        blobs: Vec<u8>,
+    },
+    Json(eth_types::BlockContents),
+    Blinded(eth_types::BlindedBeaconBlock),
+}
+
+/// Gloas returns one block. Pre-Gloas returns the ranked candidate list.
+enum Produced {
+    V4(ProduceBlockResponse),
+    V3(Vec<RankedBlock>),
+}
+
+struct SignedProposal {
+    block_root: Root,
+    is_blinded: bool,
+    builder_path: bool,
+    consensus_version: String,
+    value_wei: Option<String>,
+}
+
+fn duty_from_validator(
+    checks: &BlockResponseValidator,
+    fee_recipient: [u8; 20],
+    fork: ForkName,
+    shape: ShapeConstraint,
+) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: checks.expected_proposer_index,
+        expected_parent_root: checks
+            .expected_parents
+            .filter(|parents| !parents.closed)
+            .map(|parents| parents.root),
+        alternate_parent_root: checks
+            .expected_parents
+            .filter(|parents| !parents.closed)
+            .and_then(|parents| parents.parent),
+        parent_closed: checks.expected_parents.is_some_and(|parents| parents.closed),
+        expected_fee_recipient: Some(fee_recipient),
+        expected_consensus_version: fork,
+        shape,
+    }
+}
+
+/// Pre-Gloas, a key that is not builder-enabled does not ask for a builder bid.
+///
+/// Max-profit and builder-always become execution-only: boost 0 and
+/// [`ShapeConstraint::LocalOnly`]. Builder-only stays on the builder walk and
+/// fails closed there. Gloas is unchanged: V4 `builders` already follow the store.
+fn local_only_because_builder_flag_off(
+    fork: ForkName,
+    mode: BlockSelectionMode,
+    builder_enabled: bool,
+) -> bool {
+    fork < ForkName::Gloas
+        && !builder_enabled
+        && matches!(mode, BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways)
+}
+
+/// Max-profit and builder-always behave as execution-only while the breaker is tripped.
+///
+/// Builder-only is unchanged: the caller misses the slot before this runs.
+fn selection_effective_mode(mode: BlockSelectionMode, breaker_tripped: bool) -> BlockSelectionMode {
+    match mode {
+        BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways if breaker_tripped => {
+            BlockSelectionMode::ExecutionOnly
+        }
+        other => other,
+    }
+}
+
+/// A builder-path publish failure counts as a builder miss.
+///
+/// A local publish, a signer error, and an envelope failure after a self-build
+/// stay on their own variants. Over-counting a beacon-node error on a blinded
+/// publish is the safe direction: the breaker falls back to local blocks.
+fn builder_publish_failure(err: BlockServiceError, builder_path: bool) -> BlockServiceError {
+    if !builder_path {
+        return err;
+    }
+    match err {
+        BlockServiceError::BuilderFailure(_)
+        | BlockServiceError::BuilderOnly(_)
+        | BlockServiceError::Signer(_)
+        | BlockServiceError::EnvelopeAfterPublish(_) => err,
+        other => BlockServiceError::BuilderFailure(other.to_string()),
+    }
+}
+
+fn record_produced_response(slot: Slot, response: &ProduceBlockResponse, slot_fork: ForkName) {
+    let span = tracing::Span::current();
+    span.record("block.consensus_version", response.consensus_version.as_str());
+    if let Some(value) = response.execution_payload_value.as_deref() {
+        span.record("block.value_wei", value);
+    }
+    if slot_fork >= ForkName::Gloas {
+        info!(
+            slot = slot,
+            fork = slot_fork.as_ref(),
+            execution_payload_value = response.execution_payload_value.as_deref().unwrap_or("none"),
+            "Block production response received"
+        );
+    } else {
+        info!(
+            slot = slot,
+            is_blinded = response.is_blinded,
+            execution_payload_value = response.execution_payload_value.as_deref().unwrap_or("none"),
+            "Block production response received"
+        );
+        span.record("block.blinded", response.is_blinded);
+    }
+}
+
+fn prepare_ssz(
+    response: &ProduceBlockResponse,
+    slot: Slot,
+    validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
+) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
+    let ssz_bytes = response
+        .ssz_bytes
+        .as_ref()
+        .ok_or_else(|| BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string()))?;
+    let format = ssz_block_format(response.is_blinded, &response.consensus_version)?;
+    let (got_slot, proposer, parent) = if response.is_blinded {
+        let (block, _) =
+            beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+        (block.slot, block.proposer_index, block.parent_root)
+    } else {
+        let (block, _) = beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
+            .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+        (block.slot, block.proposer_index, block.parent_root)
+    };
+    validate_response_block(validator, slot, got_slot, proposer, parent)?;
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    header_from_prepared(response, prepared, slot)
+}
+
+fn prepare_full(
+    response: &ProduceBlockResponse,
+    slot: Slot,
+    validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
+) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    let block = match &prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonFull(contents) => contents.block().clone(),
+        _ => {
+            return Err(BlockServiceError::Parse(
+                "prepare kind was not a full JSON block".to_string(),
+            ))
+        }
+    };
+    validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
+    header_from_prepared(response, prepared, slot)
+}
+
+fn prepare_blinded(
+    response: &ProduceBlockResponse,
+    slot: Slot,
+    validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
+) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    let block = match &prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonBlinded(block) => block.clone(),
+        _ => {
+            return Err(BlockServiceError::Parse(
+                "prepare kind was not a blinded JSON block".to_string(),
+            ))
+        }
+    };
+    validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
+    header_from_prepared(response, prepared, slot)
+}
+
+fn map_prepare_reject(
+    result: Result<beacon::prepare_check::Prepared, beacon::PrepareReject>,
+    slot: Slot,
+    mode: BlockSelectionMode,
+    response: &ProduceBlockResponse,
+) -> Result<beacon::prepare_check::Prepared, BlockServiceError> {
+    result.map_err(|err| match err {
+        beacon::PrepareReject::BlindedAtGloas => {
+            error!(
+                slot = slot,
+                consensus_version = %response.consensus_version,
+                "Blinded block at Gloas — dropping duty"
+            );
+            BlockServiceError::BlindedNotSupportedAtGloas { slot }
+        }
+        beacon::PrepareReject::ConsensusVersion { expected, got } => {
+            BlockServiceError::ConsensusVersionMismatch { expected, got }
+        }
+        beacon::PrepareReject::Shape => {
+            let shape = if response.is_blinded {
+                CandidateShape::Blinded
+            } else {
+                CandidateShape::Unblinded
+            };
+            match enforce_mode_shape(mode, shape) {
+                Err(err) => err,
+                Ok(()) => BlockServiceError::Parse(
+                    "shape constraint rejected the blinded flag".to_string(),
+                ),
+            }
+        }
+        beacon::PrepareReject::UnknownSszVersion(version) => {
+            BlockServiceError::UnknownSszConsensusVersion(version)
+        }
+        beacon::PrepareReject::Parse(message) => BlockServiceError::Parse(message),
+    })
+}
+
+fn header_from_prepared(
+    response: &ProduceBlockResponse,
+    prepared: beacon::prepare_check::Prepared,
+    slot: Slot,
+) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
+    let block_root = prepared.block_root;
+    match prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonFull(contents) => {
+            if let eth_types::BlockContents::BlockAndBlobs { ref blobs, .. } = contents {
+                let layout = full_body_layout(&response.consensus_version)?;
+                let kzg_commitments = contents
+                    .blob_kzg_commitments(layout)
+                    .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+                let blob_count = blobs.len();
                 if kzg_commitments.len() != blob_count {
                     warn!(
                         slot = slot,
@@ -838,112 +1640,120 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     );
                 }
             }
+            let block = contents.block().clone();
+            let layout = full_body_layout(&response.consensus_version)?;
+            let header = header_from_full(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::Json(contents)))
         }
-
-        let block_root = compute_block_root(&block)?;
-        let header = header_from_full(&block)?;
-
-        let sign_start = std::time::Instant::now();
-        let sig = self
-            .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        debug!(
-            slot = slot,
-            duration_ms = sign_start.elapsed().as_millis() as u64,
-            "Block signing duration"
-        );
-
-        // Wire boundary. `BlockAndBlobs` publishes `SignedBlockContents` with the
-        // original arrays moved in, not a bare signed block. A response without
-        // those arrays (pre-Deneb, or a block that never carried sidecars) stays
-        // a single block. Gloas has no JSON body codec and errors before publish.
-        let signature = sig.to_bytes().to_vec();
-        match block_contents {
-            eth_types::BlockContents::BlockAndBlobs { block, kzg_proofs, blobs } => {
-                let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
-                    BlockServiceError::Parse(format!(
-                        "no JSON body layout for consensus version {consensus_version}"
-                    ))
-                })?;
-                let contents =
-                    signed_block_contents_json(block, signature, kzg_proofs, blobs, layout)?;
-                self.beacon
-                    .publish_block_contents(
-                        &contents,
-                        consensus_version,
-                        response.builder_url.as_deref(),
-                    )
-                    .instrument(tracing::info_span!("beacon.publish_block_contents"))
-                    .await?;
-                crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
-                    .with_label_values(&[consensus_version])
-                    .inc();
-            }
-            eth_types::BlockContents::Block(block) => {
-                let signed = eth_types::SignedBeaconBlock { message: block, signature };
-                self.beacon
-                    .publish_block(&signed, consensus_version, response.builder_url.as_deref())
-                    .instrument(tracing::info_span!("beacon.publish_block"))
-                    .await?;
-            }
+        beacon::prepare_check::PreparedKind::JsonBlinded(block) => {
+            let layout = blinded_body_layout(&response.consensus_version)?;
+            let header = header_from_blinded(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::Blinded(block)))
         }
-
-        Ok((block_root, false))
+        beacon::prepare_check::PreparedKind::SszFull { block, block_ssz, kzg_proofs, blobs } => {
+            let layout = full_body_layout(&response.consensus_version)?;
+            let kzg_count = block
+                .blob_kzg_count(layout)
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+            let commitment_root = block
+                .kzg_commitment_root(layout)
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+            debug!(
+                slot = slot,
+                kzg_count = kzg_count,
+                commitment_root = %TruncatedRoot::new(&commitment_root),
+                "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+            );
+            let header = header_from_full(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::SszContents { block_ssz, kzg_proofs, blobs }))
+        }
+        beacon::prepare_check::PreparedKind::SszBlinded { block, ssz } => {
+            let layout = blinded_body_layout(&response.consensus_version)?;
+            let header = header_from_blinded(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::SszWhole(ssz)))
+        }
     }
+}
 
-    async fn sign_and_publish_blinded(
-        &self,
-        response: &ProduceBlockResponse,
-        slot: Slot,
-        pubkey: &PublicKey,
-        validator: Option<&BlockResponseValidator>,
-    ) -> Result<(Root, bool), BlockServiceError> {
-        reject_blinded_at_gloas(true, &response.consensus_version, slot, &self.fork_schedule)?;
-        let block = response.parse_blinded_block()?;
-
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
-        }
-
-        // H-4: validate proposer_index and parent_root before signing.
-        if let Some(v) = validator {
-            v.validate_blinded(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN blinded block response validation failed — dropping duty");
-                e
-            })?;
-        }
-
-        let block_root = compute_blinded_block_root(&block)?;
-        let header = header_from_blinded(&block)?;
-
-        let sign_start = std::time::Instant::now();
-        let sig = self
-            .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        debug!(
-            slot = slot,
-            duration_ms = sign_start.elapsed().as_millis() as u64,
-            "Block signing duration"
-        );
-
-        // Wire boundary: eth_types::Signature is Vec<u8> for JSON/SSZ serde.
-        let signed = eth_types::SignedBlindedBeaconBlock {
-            message: block,
-            signature: sig.to_bytes().to_vec(),
-        };
-        self.beacon
-            .publish_blinded_block(&signed, &response.consensus_version)
-            .instrument(tracing::info_span!("beacon.publish_block"))
-            .await?;
-
-        Ok((block_root, true))
+fn validate_response_block(
+    validator: Option<&BlockResponseValidator>,
+    slot: Slot,
+    got_slot: Slot,
+    proposer_index: u64,
+    parent_root: Root,
+) -> Result<(), BlockServiceError> {
+    if got_slot != slot {
+        return Err(BlockServiceError::SlotMismatch { requested: slot, got: got_slot });
     }
+    if let Some(validator) = validator {
+        validator.validate(proposer_index, parent_root)?;
+    }
+    Ok(())
+}
+
+/// [`check_mode_shape`], with builder-only rewritten to [`BlockServiceError::BuilderOnly`].
+///
+/// The coordinator records a builder miss only for `BuilderOnly` and
+/// `BuilderFailure`. A shape rejection under builder-only stays on that path
+/// and names the shape. Execution-only keeps [`BlockServiceError::ModeShapeMismatch`]
+/// so a blinded response does not trip the breaker.
+fn enforce_mode_shape(
+    mode: BlockSelectionMode,
+    shape: CandidateShape,
+) -> Result<(), BlockServiceError> {
+    match check_mode_shape(mode, shape) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            note_shape_rejection(mode, shape);
+            if mode == BlockSelectionMode::BuilderOnly {
+                Err(BlockServiceError::BuilderOnly(format!(
+                    "response shape {shape} contradicts builder-only"
+                )))
+            } else {
+                Err(BlockServiceError::ModeShapeMismatch { mode, shape })
+            }
+        }
+    }
+}
+
+fn note_shape_rejection(mode: BlockSelectionMode, shape: CandidateShape) {
+    let inc = || {
+        RVC_BLOCK_SHAPE_REJECTIONS_TOTAL
+            .with_label_values(&[&mode.to_string(), &shape.to_string()])
+            .inc();
+    };
+    #[cfg(test)]
+    {
+        with_shape_rejection_lock(inc);
+    }
+    #[cfg(not(test))]
+    {
+        inc();
+    }
+}
+
+/// One pre-sign check for every produce arm that logs on its own.
+///
+/// Slot is compared to the duty first. Proposer index and parent root run only
+/// when a validator is present (`propose_block_with_mode` passes `None`). A
+/// rejection is logged at WARN and returned; the signer is not called.
+/// The pre-Gloas candidate walk uses [`validate_response_block`] and logs once
+/// itself, so this function is the V4 path.
+fn check_response_block(
+    validator: Option<&BlockResponseValidator>,
+    slot: Slot,
+    got_slot: Slot,
+    proposer_index: u64,
+    parent_root: Root,
+) -> Result<(), BlockServiceError> {
+    validate_response_block(validator, slot, got_slot, proposer_index, parent_root).map_err(|err| {
+        warn!(slot, error = %err, "BN block response rejected");
+        err
+    })
 }
 
 /// Encode a signed block plus the produce-time arrays. The signed block is not published.
@@ -1028,8 +1838,9 @@ fn gloas_header_and_root(
 
 fn header_from_full(
     block: &eth_types::BeaconBlock,
+    layout: eth_types::BodyForkLayout,
 ) -> Result<BeaconBlockHeaderFields, BlockServiceError> {
-    let body_root = body_tree_hash_root(&block.body)
+    let body_root = eth_types::body_tree_hash_root_for_layout(&block.body, layout)
         .map(|h| h.0)
         .map_err(|e| BlockServiceError::Parse(format!("invalid block body for body leaf: {e}")))?;
     Ok(BeaconBlockHeaderFields {
@@ -1043,12 +1854,49 @@ fn header_from_full(
     })
 }
 
+/// Layout named by the header. Pre-Deneb has none; trial decoding is not used.
+fn full_body_layout(
+    consensus_version: &str,
+) -> Result<eth_types::BodyForkLayout, BlockServiceError> {
+    eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BlockServiceError::Parse(format!(
+            "full block body is unsupported for consensus version {consensus_version}"
+        ))
+    })
+}
+
+fn blinded_body_layout(
+    consensus_version: &str,
+) -> Result<eth_types::BodyForkLayout, BlockServiceError> {
+    eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BlockServiceError::Parse(format!(
+            "JSON blinded block is unsupported for consensus version {consensus_version}"
+        ))
+    })
+}
+
+/// `tree_hash` 0.9 of the header must be the block root that was hashed.
+fn require_block_root_matches_header(
+    header: &BeaconBlockHeaderFields,
+    block_root: Root,
+) -> Result<(), BlockServiceError> {
+    if header.object_root() != block_root {
+        return Err(BlockServiceError::Parse(
+            "block root diverged from header object_root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn header_from_blinded(
     block: &eth_types::BlindedBeaconBlock,
+    layout: eth_types::BodyForkLayout,
 ) -> Result<BeaconBlockHeaderFields, BlockServiceError> {
-    let body_root = blinded_body_tree_hash_root(&block.body).map(|h| h.0).map_err(|e| {
-        BlockServiceError::Parse(format!("invalid blinded block body for body leaf: {e}"))
-    })?;
+    let body_root = eth_types::blinded_body_tree_hash_root_for_layout(&block.body, layout)
+        .map(|h| h.0)
+        .map_err(|e| {
+            BlockServiceError::Parse(format!("invalid blinded block body for body leaf: {e}"))
+        })?;
     Ok(BeaconBlockHeaderFields {
         slot: block.slot,
         proposer_index: block.proposer_index,
@@ -1060,11 +1908,22 @@ fn header_from_blinded(
     })
 }
 
-/// Spec `hash_tree_root(BeaconBlock)` via typed Electra/Deneb body leaf (SEC-6c/6d).
+/// Spec `hash_tree_root(BeaconBlock)` with the header's [`eth_types::BodyForkLayout`].
 ///
-/// **Production root path** for proposal signing (prefer this over
-/// `TreeHash::tree_hash_root`, which panics on malformed body SSZ).
-/// Malformed body SSZ returns [`BlockServiceError::Parse`] rather than panicking.
+/// Tests compare this root to a header. Production signing uses the root from
+/// [`beacon::prepare_check::Prepared`] and [`require_block_root_matches_header`].
+#[cfg(test)]
+fn compute_block_root_for_layout(
+    block: &eth_types::BeaconBlock,
+    layout: eth_types::BodyForkLayout,
+) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root_for_layout(layout).map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid block body for tree_hash_root: {e}"))
+    })
+}
+
+/// Auto-detect body fork. Tests only; production uses [`compute_block_root_for_layout`].
+#[cfg(test)]
 fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServiceError> {
     block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
         BlockServiceError::Parse(format!("invalid block body for tree_hash_root: {e}"))
@@ -1075,10 +1934,25 @@ fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServi
 ///
 /// **Production root path** for blinded proposal signing (prefer this over
 /// `TreeHash::tree_hash_root`). Malformed body → [`BlockServiceError::Parse`].
+#[cfg(test)]
 fn compute_blinded_block_root(
     block: &eth_types::BlindedBeaconBlock,
 ) -> Result<Root, BlockServiceError> {
     block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid blinded block body for tree_hash_root: {e}"))
+    })
+}
+
+/// Block root for the layout `consensus_version` names.
+///
+/// Tests compare this root to a blinded header. Production signing uses the
+/// root from [`beacon::prepare_check::Prepared`].
+#[cfg(test)]
+fn compute_blinded_block_root_for_layout(
+    block: &eth_types::BlindedBeaconBlock,
+    layout: eth_types::BodyForkLayout,
+) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root_for_layout(layout).map(|h| h.0).map_err(|e| {
         BlockServiceError::Parse(format!("invalid blinded block body for tree_hash_root: {e}"))
     })
 }

@@ -4,10 +4,11 @@ use super::*;
 use async_trait::async_trait;
 use beacon::WireBody;
 use eth_types::{
-    BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    BeaconBlock, BlindedBeaconBlock, ForkName, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedBlockContentsJson,
 };
 use signer::{BeaconBlockHeaderFields, SignerError};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use validator_store::ValidatorStore;
@@ -96,6 +97,8 @@ pub(crate) struct MockSigner {
     pub(crate) header_calls: Mutex<Vec<CapturedSignBlockHeaderCall>>,
     pub(crate) envelope_calls: Mutex<Vec<CapturedSignEnvelopeCall>>,
     pub(crate) call_trace: Arc<Mutex<Vec<&'static str>>>,
+    /// Return `false` to refuse the signature before it is produced.
+    pub(crate) before_header: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl MockSigner {
@@ -109,6 +112,7 @@ impl MockSigner {
             header_calls: Mutex::new(Vec::new()),
             envelope_calls: Mutex::new(Vec::new()),
             call_trace: Arc::new(Mutex::new(Vec::new())),
+            before_header: Mutex::new(None),
         }
     }
 
@@ -233,6 +237,11 @@ impl ValidatorSigner for MockSigner {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<crypto::Signature, SignerError> {
+        if let Some(hook) = self.before_header.lock().unwrap().clone() {
+            if !hook() {
+                return Err(SignerError::KeyNotFound("admission revoked".to_string()));
+            }
+        }
         self.header_calls.lock().unwrap().push(CapturedSignBlockHeaderCall {
             header: header.clone(),
             pubkey: pubkey.clone(),
@@ -392,12 +401,23 @@ pub(crate) fn mock_envelope_sig() -> crypto::Signature {
 
 // --- Mock Beacon Client ---
 
+/// Which `_by` produce method recorded a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedProduce {
+    V3,
+    V4,
+}
+
 pub(crate) struct MockBeaconClient {
     pub(crate) produce_response: Option<ProduceBlockResponse>,
     /// Extra produce answers, consumed in order before `produce_response`.
     pub(crate) produce_queue: Mutex<Vec<ProduceBlockResponse>>,
+    /// When set, `produce_block_v3_ranked` returns this list and does not drain
+    /// `produce_queue`. `None` keeps the one-candidate default.
+    pub(crate) ranked_candidates: Mutex<Option<Vec<ProduceBlockResponse>>>,
     pub(crate) fail_produce: bool,
     pub(crate) fail_publish: bool,
+    pub(crate) fail_publish_parse: bool,
     pub(crate) envelope_delay: Duration,
     pub(crate) publish_calls: Mutex<Vec<String>>,
     pub(crate) publish_blinded_calls: Mutex<Vec<String>>,
@@ -410,6 +430,16 @@ pub(crate) struct MockBeaconClient {
     pub(crate) publish_blinded_full_calls: Mutex<Vec<CapturedPublishCall>>,
     pub(crate) envelope_publish_calls: Mutex<Vec<CapturedEnvelopePublish>>,
     pub(crate) call_trace: Arc<Mutex<Vec<&'static str>>>,
+    pub(crate) refuse_admission: bool,
+    pub(crate) revocation: Arc<AtomicU64>,
+    pub(crate) also_revocation: Option<Arc<AtomicU64>>,
+    pub(crate) third_revocation: Option<Arc<AtomicU64>>,
+    /// Duty passed to the last `produce_block_v3_ranked` call.
+    pub(crate) last_duty: Mutex<Option<crate::ProduceDuty>>,
+    /// Deadline of each `produce_block_v3_ranked_by` / `produce_block_v4_by` call,
+    /// in call order, tagged with which method recorded it. Stored on this
+    /// client, not in a process-global.
+    recorded_deadline: Mutex<Vec<(RecordedProduce, Option<tokio::time::Instant>)>>,
 }
 
 impl MockBeaconClient {
@@ -417,8 +447,10 @@ impl MockBeaconClient {
         Self {
             produce_response,
             produce_queue: Mutex::new(Vec::new()),
+            ranked_candidates: Mutex::new(None),
             fail_produce: false,
             fail_publish: false,
+            fail_publish_parse: false,
             envelope_delay: Duration::ZERO,
             publish_calls: Mutex::new(Vec::new()),
             publish_blinded_calls: Mutex::new(Vec::new()),
@@ -431,7 +463,17 @@ impl MockBeaconClient {
             publish_blinded_full_calls: Mutex::new(Vec::new()),
             envelope_publish_calls: Mutex::new(Vec::new()),
             call_trace: Arc::new(Mutex::new(Vec::new())),
+            refuse_admission: false,
+            revocation: Arc::new(AtomicU64::new(0)),
+            also_revocation: None,
+            third_revocation: None,
+            last_duty: Mutex::new(None),
+            recorded_deadline: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn recorded_deadline(&self) -> Vec<(RecordedProduce, Option<tokio::time::Instant>)> {
+        self.recorded_deadline.lock().unwrap().clone()
     }
 
     pub(crate) fn with_trace(mut self, trace: Arc<Mutex<Vec<&'static str>>>) -> Self {
@@ -455,6 +497,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -470,6 +513,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -498,6 +542,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -519,11 +564,39 @@ impl MockBeaconClient {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
             .collect();
         let mut client = Self::new_with_response(None);
         client.produce_queue = Mutex::new(responses);
         client
+    }
+
+    /// Ranked produce answers returned together. Does not drain `produce_queue`.
+    pub(crate) fn with_ranked_responses(self, responses: Vec<ProduceBlockResponse>) -> Self {
+        *self.ranked_candidates.lock().unwrap() = Some(responses);
+        self
+    }
+
+    /// Ranked produce answers returned together. Does not drain `produce_queue`.
+    pub(crate) fn with_ranked_blocks(self, blocks: Vec<BeaconBlock>) -> Self {
+        let responses = blocks
+            .into_iter()
+            .map(|block| ProduceBlockResponse {
+                data: serde_json::to_value(&block).unwrap(),
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: Some("12345".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
+            })
+            .collect();
+        *self.ranked_candidates.lock().unwrap() = Some(responses);
+        self
     }
 
     pub(crate) fn with_produce_error(mut self) -> Self {
@@ -534,6 +607,22 @@ impl MockBeaconClient {
     pub(crate) fn with_publish_error(mut self) -> Self {
         self.fail_publish = true;
         self
+    }
+
+    /// Publish returns a parse error after the header has been signed.
+    pub(crate) fn with_publish_parse_error(mut self) -> Self {
+        self.fail_publish_parse = true;
+        self
+    }
+
+    fn publish_failure(&self) -> Result<(), BlockServiceError> {
+        if self.fail_publish_parse {
+            return Err(BlockServiceError::Parse("publish body".to_string()));
+        }
+        if self.fail_publish {
+            return Err(BlockServiceError::Beacon("publish failed".to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) fn from_response(response: ProduceBlockResponse) -> Self {
@@ -649,6 +738,20 @@ impl MockBeaconClient {
 
 #[async_trait]
 impl BeaconBlockClient for MockBeaconClient {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BlockServiceError> {
+        if self.refuse_admission {
+            return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
+        }
+        let mut fence = beacon::DutyFence::at(0, Arc::clone(&self.revocation));
+        if let Some(also) = &self.also_revocation {
+            fence = fence.and_fence(beacon::DutyFence::at(0, Arc::clone(also)));
+        }
+        if let Some(third) = &self.third_revocation {
+            fence = fence.and_fence(beacon::DutyFence::at(0, Arc::clone(third)));
+        }
+        Ok(fence)
+    }
+
     async fn produce_block_v3(
         &self,
         slot: Slot,
@@ -668,6 +771,52 @@ impl BeaconBlockClient for MockBeaconClient {
             return Err(BlockServiceError::Beacon("beacon down".to_string()));
         }
         Ok(self.next_produce_response())
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<crate::ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        *self.last_duty.lock().unwrap() = duty;
+        if let Some(list) = self.ranked_candidates.lock().unwrap().clone() {
+            let call = CapturedProduceCall {
+                slot,
+                randao_reveal: randao_reveal.to_string(),
+                graffiti: graffiti.map(|s| s.to_string()),
+                builder_boost_factor,
+            };
+            self.produce_v3_calls.lock().unwrap().push(call.clone());
+            self.produce_full_calls.lock().unwrap().push(call);
+            if self.fail_produce {
+                return Err(BlockServiceError::Beacon("beacon down".to_string()));
+            }
+            return Ok(list
+                .into_iter()
+                .enumerate()
+                .map(|(bn_index, response)| RankedBlock { bn_index, response })
+                .collect());
+        }
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<crate::ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        self.recorded_deadline.lock().unwrap().push((RecordedProduce::V3, deadline));
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
     }
 
     async fn produce_block_v4(
@@ -696,6 +845,18 @@ impl BeaconBlockClient for MockBeaconClient {
             .ok_or_else(|| BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
+    async fn produce_block_v4_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.recorded_deadline.lock().unwrap().push((RecordedProduce::V4, deadline));
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
+
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
@@ -711,10 +872,7 @@ impl BeaconBlockClient for MockBeaconClient {
             signature_bytes: signed_block.signature.clone(),
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_blinded_block(
@@ -730,10 +888,7 @@ impl BeaconBlockClient for MockBeaconClient {
             signature_bytes: signed_block.signature.clone(),
             builder_url: None,
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_block_ssz(
@@ -750,10 +905,7 @@ impl BeaconBlockClient for MockBeaconClient {
             is_blinded,
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_block_contents(
@@ -768,10 +920,7 @@ impl BeaconBlockClient for MockBeaconClient {
             consensus_version: consensus_version.to_string(),
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_execution_payload_envelope(
@@ -792,10 +941,18 @@ impl BeaconBlockClient for MockBeaconClient {
         if !self.envelope_delay.is_zero() {
             tokio::time::sleep(self.envelope_delay).await;
         }
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: crate::ProduceDuty,
+    ) -> Result<crate::ProduceBlockResponse, crate::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
     }
 }
 // --- Helpers ---
@@ -809,7 +966,9 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
         bellatrix_fork_version: [2, 0, 0, 0],
         capella_fork_epoch: 30,
         capella_fork_version: [3, 0, 0, 0],
-        deneb_fork_epoch: 40,
+        // Proposal mocks advertise "deneb". prepare_v3 requires that header
+        // to match the slot fork, so Deneb is active from genesis until Electra.
+        deneb_fork_epoch: 0,
         deneb_fork_version: [4, 0, 0, 0],
         electra_fork_epoch: 50,
         electra_fork_version: [5, 0, 0, 0],
@@ -822,6 +981,54 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
 
 /// Test-only Gloas activation after Fulu (epoch 60). Never a real network value.
 pub(crate) const TEST_GLOAS_EPOCH: u64 = 70;
+
+/// Schedule on which `version` is the fork at every epoch.
+///
+/// Later forks are unscheduled. Unknown text keeps [`test_fork_schedule`].
+pub(crate) fn test_fork_schedule_for(version: &str) -> ForkSchedule {
+    use std::str::FromStr;
+    let mut fork = test_fork_schedule();
+    let Ok(active) = ForkName::from_str(version) else {
+        return fork;
+    };
+    let unscheduled = u64::MAX;
+    if active == ForkName::Phase0 {
+        fork.altair_fork_epoch = unscheduled;
+        fork.bellatrix_fork_epoch = unscheduled;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Altair {
+        fork.altair_fork_epoch = 0;
+        fork.bellatrix_fork_epoch = unscheduled;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Bellatrix {
+        fork.bellatrix_fork_epoch = 0;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Capella {
+        fork.capella_fork_epoch = 0;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Deneb {
+        fork.deneb_fork_epoch = 0;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Electra {
+        fork.electra_fork_epoch = 0;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Fulu {
+        fork.fulu_fork_epoch = 0;
+    }
+    fork
+}
 
 pub(crate) fn test_fork_schedule_with_near_gloas() -> ForkSchedule {
     let mut fork = test_fork_schedule();
@@ -842,21 +1049,74 @@ pub(crate) fn gloas_body_ssz() -> Vec<u8> {
 }
 
 pub(crate) fn gloas_block(slot: Slot) -> BeaconBlock {
+    let parent_root = [1u8; 32];
+    let spec = gloas_body_ssz();
+    let index = rvc_gloas::gloas_bid_builder_index(&spec).expect("spec body");
     BeaconBlock {
         slot,
         proposer_index: 42,
-        parent_root: [1u8; 32],
+        parent_root,
         state_root: [2u8; 32],
-        body: gloas_body_ssz(),
+        body: bid_aligned(&spec, index, slot, parent_root),
     }
+}
+
+/// Spec body with the bid index, slot, and beacon parent set for a signed header.
+fn bid_aligned(
+    body: &[u8],
+    builder_index: u64,
+    slot: Slot,
+    parent_block_root: [u8; 32],
+) -> Vec<u8> {
+    rvc_gloas::body_with_bid_binding(body, builder_index, slot, parent_block_root)
+        .expect("spec body accepts a bid binding")
+}
+
+/// Spec body with `builder_index == BUILDER_INDEX_SELF_BUILD` and a matching slot and parent.
+pub(crate) fn self_build_body(slot: Slot, parent_block_root: [u8; 32]) -> Vec<u8> {
+    bid_aligned(&gloas_body_ssz(), rvc_gloas::BUILDER_INDEX_SELF_BUILD, slot, parent_block_root)
+}
+
+/// Spec body with external bid index 1 and a matching slot and parent.
+pub(crate) fn external_bid_body(slot: Slot, parent_block_root: [u8; 32]) -> Vec<u8> {
+    bid_aligned(&gloas_body_ssz(), 1, slot, parent_block_root)
+}
+
+pub(crate) fn self_build_block(slot: Slot) -> BeaconBlock {
+    let mut block = gloas_block(slot);
+    block.body = self_build_body(slot, block.parent_root);
+    block
+}
+
+pub(crate) fn external_bid_block(slot: Slot) -> BeaconBlock {
+    let mut block = gloas_block(slot);
+    block.body = external_bid_body(slot, block.parent_root);
+    block
+}
+
+/// Envelope whose index, block root, and beacon parent match `block`.
+pub(crate) fn bound_self_build_envelope(block: &BeaconBlock) -> Vec<u8> {
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    rvc_gloas::envelope_with_binding(
+        &gloas_envelope_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding")
 }
 
 pub(crate) fn gloas_envelope_ssz() -> Vec<u8> {
     hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap()
-}
-
-pub(crate) fn gloas_envelope_hex() -> String {
-    format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
 }
 
 pub(crate) fn build_gloas_beacon_block_ssz(
@@ -900,12 +1160,14 @@ pub(crate) fn build_gloas_block_contents_ssz(
 }
 
 pub(crate) fn self_build_json_response(slot: Slot) -> ProduceBlockResponse {
+    let block = self_build_block(slot);
+    let envelope = format!("0x{}", hex::encode(bound_self_build_envelope(&block)));
     let proofs = serde_json::json!(["0xaa"]);
     let blobs = serde_json::json!(["0xbb"]);
     ProduceBlockResponse {
         data: serde_json::json!({
-            "block": gloas_block(slot),
-            "execution_payload_envelope": gloas_envelope_hex(),
+            "block": block,
+            "execution_payload_envelope": envelope,
             "kzg_proofs": proofs,
             "blobs": blobs,
         }),
@@ -917,13 +1179,26 @@ pub(crate) fn self_build_json_response(slot: Slot) -> ProduceBlockResponse {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
 pub(crate) fn self_build_ssz_response(slot: Slot) -> ProduceBlockResponse {
-    let block_ssz =
-        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
-    let envelope = gloas_envelope_ssz();
+    let block = BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: self_build_body(slot, [0x11; 32]),
+    };
+    let block_ssz = build_gloas_beacon_block_ssz(
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.state_root,
+        &block.body,
+    );
+    let envelope = bound_self_build_envelope(&block);
     let kzg = vec![0xaa, 0xab];
     let blobs = vec![0xbb, 0xbc, 0xbd];
     let ssz_bytes = build_gloas_block_contents_ssz(&block_ssz, &envelope, &kzg, &blobs);
@@ -937,11 +1212,14 @@ pub(crate) fn self_build_ssz_response(slot: Slot) -> ProduceBlockResponse {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
+/// Default full-body fixture. Matches `MockBeaconClient::unblinded`, which
+/// advertises Deneb. An Electra body under that header is a parse error.
 pub(crate) fn test_body_ssz() -> Vec<u8> {
-    eth_types::external_vector_electra_body().as_ssz_bytes()
+    eth_types::external_vector_deneb_body().as_ssz_bytes()
 }
 
 /// Full body SSZ matching `consensus_version` (typed Deneb vs Electra).
@@ -950,14 +1228,21 @@ pub(crate) fn test_body_ssz() -> Vec<u8> {
 /// same schema the BN advertised.
 pub(crate) fn test_body_ssz_for_version(consensus_version: &str) -> Vec<u8> {
     match consensus_version {
+        "deneb" => eth_types::external_vector_deneb_body().as_ssz_bytes(),
         "electra" | "fulu" => eth_types::external_vector_electra_body().as_ssz_bytes(),
-        _ => eth_types::external_vector_deneb_body().as_ssz_bytes(),
+        // No pre-Deneb or Gloas full-body fixture. These headers are built so
+        // the layout check can reject a Deneb body, not so the body is Capella.
+        "phase0" | "altair" | "bellatrix" | "capella" | "gloas" => {
+            eth_types::external_vector_deneb_body().as_ssz_bytes()
+        }
+        other => panic!("no full-body SSZ fixture for fork {other}"),
     }
 }
 
 pub(crate) fn test_blinded_body_ssz() -> Vec<u8> {
-    // Distinct graffiti so full vs blinded roots differ when headers match.
-    let mut body = eth_types::external_vector_blinded_electra_body();
+    // Deneb, matching the mock's "deneb" consensus version. An Electra body
+    // under that header is rejected before signing.
+    let mut body = eth_types::external_vector_blinded_deneb_body();
     body.graffiti = [0xbe; 32];
     body.as_ssz_bytes()
 }
@@ -1007,6 +1292,7 @@ pub(crate) fn test_validator_store(pubkey: &PublicKey) -> ValidatorStore {
     let pk_bytes = pubkey.to_bytes();
     let mut config = validator_store::ValidatorConfig::new(pk_bytes);
     config.builder_boost_factor = Some(150);
+    config.builder_proposals = true;
     let mut graffiti = [0u8; 32];
     graffiti[..5].copy_from_slice(b"hello");
     config.graffiti = Some(graffiti);
@@ -1479,7 +1765,7 @@ pub(crate) async fn test_assert_last_sign_block_domain_fails_on_wrong_fork() {
     assert!(result.is_ok());
 
     let mut wrong_fork = test_fork_schedule();
-    wrong_fork.altair_fork_epoch = 999;
+    wrong_fork.deneb_fork_version = [9, 9, 9, 9];
     signer_arc.assert_last_sign_block_domain(&wrong_fork, &gvr);
 }
 

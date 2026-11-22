@@ -5,10 +5,8 @@
 ///    as a failure (reconnect / failover). It is not skipped in place.
 /// 2. Content-Type check: wrong CT causes connection drop.
 /// 3. Bounded mpsc dispatch: full channel drops events; loop continues.
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rvc_bn_manager::sse::{subscribe_events, SseConfig, SseEvent};
@@ -189,50 +187,96 @@ async fn test_wrong_content_type_disconnects() {
     );
 }
 
+/// Unblocks the parked SSE callback when the test returns or unwinds.
+struct ReleaseParked(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ReleaseParked {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.0;
+        if let Ok(mut ready) = lock.lock() {
+            *ready = true;
+            cv.notify_all();
+        }
+    }
+}
+
 // ── H-11 test 3: saturated channel drops events; loop continues ──────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_callback_full_drops_event() {
-    // Build 200 small events
     let events: String = (0u64..200).map(|i| sse_event_line("head", &head_event_json(i))).collect();
 
     let (port, server_handle) = start_sse_server(events).await;
+    let drop_rx = rvc_bn_manager::sse::testing_subscribe_sse_drops();
 
     let received: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let received_clone = received.clone();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let release_cb = Arc::clone(&release);
+    // Dropped on panic as well as on the success path, so a failed wait does
+    // not leave the callback parked through runtime teardown.
+    let release_on_unwind = ReleaseParked(Arc::clone(&release));
+    let held_first = AtomicBool::new(true);
 
     let (tx_shutdown, rx_shutdown) = watch::channel(false);
     let config = SseConfig::new(format!("http://127.0.0.1:{port}"));
 
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let handle = tokio::spawn(async move {
         subscribe_events(
             vec![config],
             move |_event: SseEvent| {
-                // Slow callback to saturate the bounded channel
                 received_clone.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(20));
+                if held_first.swap(false, Ordering::Relaxed) {
+                    let _ = entered_tx.send(());
+                    let (lock, cv) = &*release_cb;
+                    let mut ready = lock.lock().expect("callback release");
+                    let limit = std::time::Instant::now() + Duration::from_secs(30);
+                    while !*ready {
+                        let remaining = limit.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            panic!("callback was not released within 30s");
+                        }
+                        let (next, timed) =
+                            cv.wait_timeout(ready, remaining).expect("callback release");
+                        ready = next;
+                        if timed.timed_out() && !*ready {
+                            panic!("callback was not released within 30s");
+                        }
+                    }
+                }
             },
             rx_shutdown,
         )
         .await;
     });
 
-    // Subscribe for 300 ms — with 20 ms/callback × ~15 events = ~300 ms.
-    // The SSE loop must NOT block even after the channel fills up.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5))),
+    )
+    .await
+    .expect("callback entry wait hung")
+    .expect("callback entry wait")
+    .expect("callback did not run");
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::task::spawn_blocking(move || drop_rx.recv_timeout(Duration::from_secs(5))),
+    )
+    .await
+    .expect("sse drop wait hung")
+    .expect("sse drop wait")
+    .expect("callback channel did not drop an event");
 
+    drop(release_on_unwind);
     tx_shutdown.send(true).unwrap();
-    // If subscribe_events blocks (e.g. blocking .send().await), this times out.
     let subscribe_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert!(subscribe_result.is_ok(), "subscribe_events must not block when channel is full");
     server_handle.abort();
 
     let got = received.load(Ordering::Relaxed);
-    // With slow callback and 200 events, not all 200 can be dispatched in 300 ms.
-    // The channel (64) + callback throughput (~15 in 300 ms) means some events
-    // were dropped because the channel was full.
-    // We just assert: process completed fast enough and some events were received.
-    assert!(got > 0, "expected at least 1 event to be received, got {got}");
-    // The loop must have completed (not blocked on a full channel)
-    // — verified above by timeout check.
+    assert!(
+        (1..200).contains(&got),
+        "a full callback channel must deliver some events and drop the rest, got {got}"
+    );
 }

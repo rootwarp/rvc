@@ -147,7 +147,7 @@ scripts/devnet/attach-rvc.sh --profile fast --run-dir scripts/devnet/runs/manual
 | Inventory | `{kind:pid,name:rvc}` | `{kind:container,name:eth-devnet-rvc}` **before** `docker run` |
 | `rvc.json` | `pid` | plus `launch_mode` and `container_id` |
 | Logs | process stdout → `data/rvc/rvc.log` | `docker logs -f` teed into the same file |
-| Idempotency | live pid + `/health` 200 owned by that pid | running container + HTTP `/health` 200. Not `State.Health` — the image probes `/healthz`, which RVC does not serve, so the run uses `--no-healthcheck` |
+| Idempotency | live pid + `/health` 200 owned by that pid | running container + HTTP `/health` 200. Not `State.Health`: the run reads `/health` itself and uses `--no-healthcheck` |
 
 `--force` removes **both** a live pidfile rvc and `eth-devnet-rvc`, and a second attach no-ops if either occupant is healthy, regardless of `--docker`. A kill between inventory append and readiness still leaves `down.sh` able to `docker rm -f` the name; `down.sh --data` then leaves no container and no `data/rvc/slashing_protection.sqlite`. `-u "$(id -u):$(id -g)"` overrides `USER rvc` (uid 10001) so that bind-mounted sqlite stays host-owned.
 
@@ -315,7 +315,7 @@ Missing `target/release/rvc` → usage **2** naming `cargo build --release`, **b
 | `SOAK_START_OFFSET_EPOCHS` | 0 | 3 |
 | `FAIL_UNDER` | unset | `$REPORT_FAIL_UNDER` (`participation_rate=0.95,target_rate=0.95`) |
 
-RVC omits `--no-doppelganger-detection` when `DOPPELGANGER=on` (CLI polarity; the TOML key is `[safety] doppelganger_detection`). The Lighthouse VC gets `--enable-doppelganger-protection` only under `safe`. Detection does **not** exit the process: it permanently closes the gate and logs `error!` once; that log line is the only detection signal. `run.json` records `soak_start_offset_epochs` and `fail_under`. `report.sh` forwards `--fail-under` from `FAIL_UNDER` (comma-split), never from `REPORT_FAIL_UNDER`.
+RVC omits `--no-doppelganger-detection` when `DOPPELGANGER=on` (CLI polarity; the TOML key is `[safety] doppelganger_detection`). The Lighthouse VC gets `--enable-doppelganger-protection` only under `safe`. Detection writes `.rvc.doppelganger_detected` and, after that write succeeds, exits 12. The log line is `doppelganger detected; refusing new signatures and requesting shutdown`. `run.json` records `soak_start_offset_epochs` and `fail_under`. `report.sh` forwards `--fail-under` from `FAIL_UNDER` (comma-split), never from `REPORT_FAIL_UNDER`.
 
 ### Why the soak starts at epoch 3 (P6-A2)
 
@@ -340,7 +340,7 @@ If `03-chain.sh`'s block-production health gate trips in the first ~2 epochs wit
 | `rvc_attestations_total{status="success"}` delta | increase (disjoint keys) | not observed |
 | `verdict.json` `participation_rate` / `target_rate` | ≥ 0.95 | not observed |
 | `run.json` `profile` / `soak_start_offset_epochs` / `fail_under` | `safe` / `3` / `participation_rate=0.95,target_rate=0.95` | not written |
-| `grep -c 'doppelganger Detected' data/rvc/rvc.log` | 0 on a non-empty log with startup markers | not observed (no log) |
+| `grep -c 'doppelganger detected; refusing new signatures' data/rvc/rvc.log` | 0 on a non-empty log with startup markers | not observed (no log) |
 | `report.sh --fail-under participation_rate=1.01` | exit 4, chain still up | not reached |
 
 The live command stopped at `_resolve_rvc_bin` (usage **2**, missing `target/release/rvc`, `/usr/bin/time -p` real **0.52 s** on 2026-09-13T07:47:18Z). That 0.52 s is the usage-2 command, **not** a soak wall-clock. Even a release binary would still fail `00-preflight.sh` on this Docker VM (`docker info --format '{{.NCPU}} {{.MemTotal}}'` → `4 4107141120` → 3 GiB < 8). `--keep`, soak, KPI-breach re-report, and `down.sh --data` were not reached. Per-stage `run.json` `stages.*.seconds` do not exist. Do not invent them.
@@ -563,7 +563,7 @@ Attach timeout (`--timeout`, default 120 s) kills the spawned pid, copies `rvc.l
 
 ### Doppelganger only under `--profile safe`
 
-`fast` sets `FAST_DOPPELGANGER=off` so S1/S3 fit in one sitting (~2 epochs ≈ 12.8 min otherwise). `--profile safe` turns detection on (`SAFE_DOPPELGANGER=on`) and is what proves the DN-5 disjoint split (DN-18, Phase 6). A `fast` green run does **not** prove "no key overlap".
+`fast` sets `FAST_DOPPELGANGER=off` so S1/S3 fit in one sitting (three closed epochs otherwise, and a gap delays that). `--profile safe` turns detection on (`SAFE_DOPPELGANGER=on`) and is what proves the DN-5 disjoint split (DN-18, Phase 6). A `fast` green run does **not** prove "no key overlap".
 
 ### Docker VM RAM / missing binary (this host's 5.6 / 6.6 snag)
 

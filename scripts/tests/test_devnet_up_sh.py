@@ -439,8 +439,7 @@ def test_ci_scripts_job_no_cargo_no_devnet():
     assert "cargo" not in body.lower()
     assert "rust-toolchain" not in body
     assert "dtolnay" not in body
-    assert re.search(r"astral-sh/setup-uv@[0-9a-f]{40}", body)
-    assert "v10.1.0" in body
+    assert re.search(r"astral-sh/setup-uv@[0-9a-f]{40}\s+#\s+v10\.1\.0", body)
     assert "persist-credentials: false" in body
     assert "contents: read" in body
     assert "0.12.13" in body

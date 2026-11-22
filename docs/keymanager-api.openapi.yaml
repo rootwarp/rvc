@@ -563,8 +563,15 @@ components:
       type: string
       enum: [deleted, not_active, not_found, error]
       description: >
-        `not_active` is a defined value in the spec/schema but is not
-        currently produced by the handler implementation (dead in practice).
+        `deleted` means this call removed a loaded key, a matching keystore
+        file, or the validators row. `not_active` means no loaded key and no
+        remote registration remain, no matching keystore was found in the
+        directory, and slashing history was exported. `not_found` means no
+        matching keystore was found in the directory and there is no history;
+        the interchange still carries an empty record under the node's
+        genesis validators root. Unreadable files and symlinks that resolve
+        outside the directory are left in place and count as no matching
+        keystore. `error` includes a pubkey that is only a remote key.
 
     DeleteKeystoreResult:
       type: object

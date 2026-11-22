@@ -34,10 +34,10 @@ pub use aggregation::{
     SignedAggregateAndProof, SignedElectraAggregateAndProof,
 };
 pub use block::{
-    body_fork_layout, expected_kzg_proof_count, kzg_commitment_list_root, BeaconBlock,
-    BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody, BlockContents,
-    BlockContentsShapeError, BodyForkLayout, KzgProofCountError, ProducedBlock, SignedBeaconBlock,
-    SignedBlindedBeaconBlock, CELLS_PER_EXT_BLOB,
+    block_object, body_fork_layout, expected_kzg_proof_count, kzg_commitment_list_root,
+    BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody,
+    BlockContents, BlockContentsShapeError, BlockObjectError, BodyForkLayout, KzgProofCountError,
+    ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock, CELLS_PER_EXT_BLOB,
 };
 pub use block_body::{
     blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
@@ -47,7 +47,7 @@ pub use block_body::{
     BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra,
     BodySszError, ExecutionPayload, ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
-pub use signed_block_contents_json::SignedBlockContentsJson;
+pub use signed_block_contents_json::{SignedBlindedBeaconBlockJson, SignedBlockContentsJson};
 
 /// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).
 ///
@@ -59,12 +59,17 @@ pub mod fixtures {
     pub use crate::block::{
         external_vector_deneb_blinded_block, external_vector_deneb_block,
         external_vector_electra_blinded_block, external_vector_electra_block,
+        EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX, EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX, EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_SLOT, EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
     };
     pub use crate::block_body::{
         external_vector_blinded_deneb_body, external_vector_blinded_electra_body,
         external_vector_deneb_body, external_vector_electra_body,
         external_vector_execution_payload_header, EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX,
-        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_DENEB_BLOCK_ROOT_HEX,
+        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX,
+        EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX, EXTERNAL_DENEB_BLOCK_ROOT_HEX,
         EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
         EXTERNAL_ELECTRA_BODY_ROOT_HEX,
     };
@@ -120,6 +125,15 @@ pub const SIGNATURE_BYTES_LEN: usize = 96;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SLOT_DURATION_MS: u64 = 12_000;
+
+/// Inclusive bounds for a beacon-reported slot length.
+///
+/// One second is the duty-clock floor. Sixty seconds still accepts the 6 s
+/// and 12 s lengths this client runs. A length inside this range can still
+/// stretch epoch 0 well past real genesis (60 s × 32 slots). The bound does
+/// not prove the chain is pre-genesis.
+pub const MIN_SLOT_DURATION_MS: u64 = 1_000;
+pub const MAX_SLOT_DURATION_MS: u64 = 60_000;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
 /// SSZ preset bound on a single committee's size. Sets the `Bitlist[N]` limit for a pre-Electra

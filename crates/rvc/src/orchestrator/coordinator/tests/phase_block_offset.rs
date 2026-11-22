@@ -5,7 +5,6 @@ use metrics::definitions::{
     slot_phase_cache, slot_phase_offset, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
     RVC_SLOT_PHASE_OFFSET_MS,
 };
-use timing::SystemSlotClock;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -17,6 +16,38 @@ fn empty_duty_body() -> serde_json::Value {
     })
 }
 
+fn slot_from_block_id(slot: &str) -> u64 {
+    if slot.is_empty() || !slot.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 1;
+    }
+    let mut value = 0u64;
+    for byte in slot.bytes() {
+        value = value.saturating_mul(10).saturating_add(u64::from(byte - b'0'));
+    }
+    value
+}
+
+fn consistent_stub_header(slot: &str) -> String {
+    let slot_n = slot_from_block_id(slot);
+    let parent = [2u8; 32];
+    let state = [3u8; 32];
+    let body = [4u8; 32];
+    let header = eth_types::BeaconBlockHeader {
+        slot: slot_n,
+        proposer_index: 1,
+        parent_root: parent,
+        state_root: state,
+        body_root: body,
+    };
+    let root = hex::encode(header.hash_tree_root_bytes());
+    format!(
+        r#"{{"execution_optimistic":false,"finalized":false,"data":{{"root":"0x{root}","canonical":true,"header":{{"message":{{"slot":"{slot_n}","proposer_index":"1","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+        hex::encode(parent),
+        hex::encode(state),
+        hex::encode(body),
+    )
+}
+
 fn block_root_body() -> serde_json::Value {
     serde_json::json!({
         "execution_optimistic": false,
@@ -25,27 +56,16 @@ fn block_root_body() -> serde_json::Value {
 }
 
 /// Mount empty attester/proposer duty responses and a block-root for `SlotContext`.
-async fn mount_slot_loop_mocks(
-    mock_server: &MockServer,
-    duty_delay: Option<Duration>,
-    root_delay: Option<Duration>,
-) {
-    let mut attester = ResponseTemplate::new(200).set_body_json(empty_duty_body());
-    let mut proposer = ResponseTemplate::new(200).set_body_json(empty_duty_body());
-    if let Some(d) = duty_delay {
-        attester = attester.set_delay(d);
-        proposer = proposer.set_delay(d);
-    }
-
+async fn mount_slot_loop_mocks(mock_server: &MockServer) {
     Mock::given(method("POST"))
         .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
-        .respond_with(attester)
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_duty_body()))
         .mount(mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
-        .respond_with(proposer)
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_duty_body()))
         .mount(mock_server)
         .await;
 
@@ -56,13 +76,22 @@ async fn mount_slot_loop_mocks(
         .mount(mock_server)
         .await;
 
-    let mut root = ResponseTemplate::new(200).set_body_json(block_root_body());
-    if let Some(d) = root_delay {
-        root = root.set_delay(d);
-    }
     Mock::given(method("GET"))
         .and(path_regex(r"/eth/v1/beacon/blocks/.*/root"))
-        .respond_with(root)
+        .respond_with(ResponseTemplate::new(200).set_body_json(block_root_body()))
+        .mount(mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/eth/v1/beacon/headers/.*"))
+        .respond_with(move |request: &wiremock::Request| {
+            let id = request.url.path().rsplit('/').next().unwrap_or("1");
+            let slot = if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+                id
+            } else {
+                "1"
+            };
+            ResponseTemplate::new(200).set_body_string(consistent_stub_header(slot))
+        })
         .mount(mock_server)
         .await;
 }
@@ -79,17 +108,13 @@ fn phase_offset_count(phase: &str) -> u64 {
     RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_count()
 }
 
-fn phase_offset_sum(phase: &str) -> f64 {
-    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_sum()
-}
-
 /// Drive one slot through `run()` and assert the M2 histogram records a sample.
 #[tokio::test(flavor = "current_thread")]
 async fn test_slot_phase_block_start_offset_is_recorded_each_slot() {
     let _guard = m2_metric_lock().await;
 
     let mock_server = MockServer::start().await;
-    mount_slot_loop_mocks(&mock_server, None, None).await;
+    mount_slot_loop_mocks(&mock_server).await;
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     // Non-boundary slot; past 2/3 so phase waits are zero.
@@ -155,42 +180,32 @@ async fn test_slot_phase_block_start_offset_is_recorded_each_slot() {
     assert!(observed >= 0.0, "offset must be >= 0, got {observed}");
 }
 
-/// Mock BN parent-root delay must appear in the recorded offset (instrument credibility).
-#[tokio::test(flavor = "current_thread")]
+/// The t=0 parent-header delay appears in the cold block-start sample
+/// (instrument credibility). Paused clock: the delay is the mock's virtual
+/// sleep, and the sample is read from this thread's mirror.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_offset_reflects_pre_proposal_work() {
+    use bn_manager::MockMethod;
+
     let _guard = m2_metric_lock().await;
 
-    let mock_server = MockServer::start().await;
-    // Wall-clock delay large enough for second-resolution SystemSlotClock.
     let delay = Duration::from_secs(2);
-    mount_slot_loop_mocks(&mock_server, None, Some(delay)).await;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let slot = 65u64;
+    clock.set_slot_with_offset_ms(slot, 0);
 
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let slot = 1_000u64;
-    let slot_secs = 12u64;
-    // Genesis so wall "now" sits near the start of `slot`.
-    let genesis = now.saturating_sub(slot * slot_secs);
-    let clock =
-        Arc::new(SystemSlotClock::new(genesis, Duration::from_secs(slot_secs), 32).unwrap());
-
-    let beacon_config = BeaconClientConfig::new(mock_server.uri())
-        .with_timeout(Duration::from_secs(30))
-        .with_max_retries(0);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["0x01".to_string()]));
-
+    let beacon = Arc::new(
+        bn_manager::MockBeaconNodeClient::new()
+            .with_slot_aware_block_root(slot, &[], |_| format!("0x{}", "01".repeat(32)))
+            .with_method_delay(MockMethod::GetBlockHeader, delay)
+            .with_method_delay(MockMethod::GetBlockRoot, delay),
+    );
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
     let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
-
-    // Deadline must exceed the injected parent-root delay so capture completes.
-    let timeouts = OperationTimeouts { duty_fetch: Duration::from_secs(10), ..fast_timeouts() };
-
-    let cold_sum_before = histogram_sum(slot_phase_cache::COLD);
-    let cold_count_before = histogram_count(slot_phase_cache::COLD);
-    let warm_count_before = histogram_count(slot_phase_cache::WARM);
 
     let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
@@ -202,37 +217,41 @@ async fn test_offset_reflects_pre_proposal_work() {
         None,
         create_mock_validator_store(),
         create_test_config()
-            .with_timeouts(timeouts)
-            .with_pre_proposal_deadline(Duration::from_secs(10)),
+            .with_timeouts(fast_timeouts())
+            // Each parent lookup step may use 3 s of 20 s, more than the delay.
+            .with_pre_proposal_deadline(Duration::from_secs(20))
+            .with_cold_proposer_fetch_deadline(Duration::ZERO),
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    // Parent-root delay can be multi-second; allow headroom then shut down.
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        handle.shutdown();
-    });
+    let (cold_count_before, cold_sum_before) = crate::test_metrics::block_start_cold();
+    let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+    testing_set_phase_block_recorded(Some(recorded_tx));
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            // Paused sleeps let the clock reach the mock's delay.
+            let recorded = tokio::time::timeout(Duration::from_secs(12), async {
+                while recorded_rx.try_recv().is_err() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(recorded.is_ok(), "phase=block was not recorded within one slot");
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+    testing_set_phase_block_recorded(None);
 
-    let _ = orchestrator.run().await;
-
-    let cold_count_after = histogram_count(slot_phase_cache::COLD);
-    let warm_count_after = histogram_count(slot_phase_cache::WARM);
-    let samples = (cold_count_after - cold_count_before) + (warm_count_after - warm_count_before);
-    assert!(samples >= 1, "expected at least one offset sample, got {samples}");
-
-    // First sample is cold (post-boot); its contribution is the delta on cold sum
-    // when only one cold sample was added.
-    let cold_added = cold_count_after - cold_count_before;
-    assert!(cold_added >= 1, "post-boot sample must be labelled cold");
-    let cold_sum_after = histogram_sum(slot_phase_cache::COLD);
-    // Lower-bound the newest cold observations: total cold sum increase / cold samples
-    // is at least the injected delay (sequential fetches often exceed D).
-    let sum_delta = cold_sum_after - cold_sum_before;
-    let min_per_sample = sum_delta / cold_added as f64;
-    assert!(
-        min_per_sample >= delay.as_millis() as f64,
-        "offset must reflect pre-proposal parent-root delay D={}ms; got avg cold offset {min_per_sample}ms \
-         (sum_delta={sum_delta}, cold_added={cold_added})",
+    let (cold_count, cold_sum) = crate::test_metrics::block_start_cold();
+    assert_eq!(cold_count - cold_count_before, 1, "the post-boot slot records one cold sample");
+    let sample = cold_sum - cold_sum_before;
+    assert_eq!(
+        sample,
+        delay.as_millis() as f64,
+        "the cold sample is the parent-header delay D={}ms, got {sample}ms",
         delay.as_millis()
     );
 }
@@ -243,7 +262,7 @@ async fn test_offset_labels_cold_after_key_gen_invalidation() {
     let _guard = m2_metric_lock().await;
 
     let mock_server = MockServer::start().await;
-    mount_slot_loop_mocks(&mock_server, None, None).await;
+    mount_slot_loop_mocks(&mock_server).await;
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(65);
@@ -349,24 +368,41 @@ async fn phase_block_start_offset_reports_the_true_offset() {
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    let cold_count_before = histogram_count(slot_phase_cache::COLD);
-    let cold_sum_before = histogram_sum(slot_phase_cache::COLD);
-    let block_count_before = phase_offset_count(slot_phase_offset::BLOCK);
-    let block_sum_before = phase_offset_sum(slot_phase_offset::BLOCK);
+    let (cold_count_before, cold_sum_before) = crate::test_metrics::block_start_cold();
+    let (block_count_before, block_sum_before) = crate::test_metrics::phase_block();
 
+    let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+    testing_set_phase_block_recorded(Some(recorded_tx));
     tokio::select! {
         biased;
         _ = orchestrator.run() => {}
         () = async {
-            // Phase 0 records before the bps waits. Shut down once that sample exists.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // `start_paused` does not wake `spawn_blocking`. Poll the signal.
+            // Wall time only: a paused sleep here would move the slot clock.
+            let wall_deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match recorded_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= wall_deadline {
+                            panic!("phase=block was not recorded within 30s");
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("phase=block was not recorded");
+                    }
+                }
+            }
             handle.shutdown();
             std::future::pending::<()>().await;
         } => {}
     }
+    testing_set_phase_block_recorded(None);
 
-    let cold_added = histogram_count(slot_phase_cache::COLD) - cold_count_before;
-    let sum_delta = histogram_sum(slot_phase_cache::COLD) - cold_sum_before;
+    let (cold_after, cold_sum_after) = crate::test_metrics::block_start_cold();
+    let cold_added = cold_after - cold_count_before;
+    let sum_delta = cold_sum_after - cold_sum_before;
     assert!(cold_added >= 1, "post-boot slot must record cache=cold, added {cold_added}");
     let observed = sum_delta / cold_added as f64;
     assert!(
@@ -375,8 +411,9 @@ async fn phase_block_start_offset_reports_the_true_offset() {
          (sum_delta={sum_delta}, cold_added={cold_added})"
     );
 
-    let block_added = phase_offset_count(slot_phase_offset::BLOCK) - block_count_before;
-    let block_sum = phase_offset_sum(slot_phase_offset::BLOCK) - block_sum_before;
+    let (block_after, block_sum_after) = crate::test_metrics::phase_block();
+    let block_added = block_after - block_count_before;
+    let block_sum = block_sum_after - block_sum_before;
     assert!(block_added >= 1, "phase=block must be recorded, added {block_added}");
     let block_observed = block_sum / block_added as f64;
     assert!(

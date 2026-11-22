@@ -205,6 +205,64 @@ pub struct BeaconBlockHeader {
     pub body_root: Root,
 }
 
+impl BeaconBlockHeader {
+    /// SSZ `hash_tree_root` of this header, as 32 bytes.
+    ///
+    /// The container is the same from phase0 through Gloas. This does not
+    /// check a signature. Tests only.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn hash_tree_root_bytes(&self) -> [u8; 32] {
+        use tree_hash::TreeHash;
+        let hashed = self.tree_hash_root();
+        let mut root = [0u8; 32];
+        root.copy_from_slice(hashed.as_slice());
+        root
+    }
+}
+
+/// Official consensus-spec `ssz_static` `BeaconBlockHeader` root.
+///
+/// `ethereum/consensus-specs` tag `v1.7.0-beta.2`,
+/// `tests/minimal/gloas/ssz_static/BeaconBlockHeader/ssz_random/case_0`
+/// (`roots.yaml` in that release's `minimal.tar.gz`). `consensus-spec-tests`
+/// is archived and does not publish this Gloas case. The header container is
+/// the same from phase0 through Gloas.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX: &str =
+    "5b18ad5300570f50558dece01042d7dcc597946fc4ba0598f2f9b3f30bc1f072";
+
+/// Decoded `serialized.ssz_snappy` for that same `BeaconBlockHeader` case.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX: &str = concat!(
+    "dae48901d19e4ebdcf3f1d9d938d1352ae70c0ffe5f6258d04c55ea694c117da",
+    "da19468c4821c40496efc662fd36de4c7e088265842a34eb2edad5e17d353b36",
+    "5fe48afb51fb906e5c7d2e91681e56ffb2c3c345a8a774e83fe0298a24d84e05",
+    "65509084256a9b3c9676048da1899bc1",
+);
+
+/// Slot field of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_SLOT: u64 = 13_641_014_941_862_978_778;
+
+/// Proposer index of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX: u64 = 5_914_226_400_803_241_935;
+
+/// `parent_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX: &str =
+    "ae70c0ffe5f6258d04c55ea694c117dada19468c4821c40496efc662fd36de4c";
+
+/// `state_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX: &str =
+    "7e088265842a34eb2edad5e17d353b365fe48afb51fb906e5c7d2e91681e56ff";
+
+/// `body_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX: &str =
+    "b2c3c345a8a774e83fe0298a24d84e0565509084256a9b3c9676048da1899bc1";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindedBeaconBlock {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -238,6 +296,64 @@ pub enum BlockContents {
     Block(BeaconBlock),
 }
 
+/// Beacon-block fields that make a JSON value a block rather than a wrapper.
+const BLOCK_OBJECT_FIELDS: &[&str] =
+    &["slot", "proposer_index", "parent_root", "state_root", "body"];
+
+/// The beacon block inside a produce JSON document.
+///
+/// A bare block is `value` itself. Beacon-API block contents nest it under
+/// `block`. A document that has both a top-level block field and a `block`
+/// key is [`BlockObjectError::Hybrid`]: the fee check and the decoder must
+/// not read different objects. No conforming beacon node sends both shapes.
+/// A non-object document, or a `block` value that is not an object, is
+/// [`BlockObjectError::NotAnObject`].
+///
+/// # Examples
+///
+/// ```
+/// use rvc_eth_types::block_object;
+/// let nested = serde_json::json!({"block": {"slot": "1"}, "kzg_proofs": [], "blobs": []});
+/// assert_eq!(block_object(&nested).unwrap()["slot"], "1");
+/// let hybrid = serde_json::json!({"slot": "1", "block": {"slot": "2"}});
+/// assert!(block_object(&hybrid).is_err());
+/// assert!(block_object(&serde_json::json!([1])).is_err());
+/// assert!(block_object(&serde_json::json!({"block": "0x"})).is_err());
+/// ```
+///
+/// # Errors
+///
+/// Returns [`BlockObjectError::Hybrid`] when a top-level block field and a
+/// `block` key are both present. A null field still counts.
+/// Returns [`BlockObjectError::NotAnObject`] when `value` or the nested
+/// `block` is not a JSON object.
+pub fn block_object(value: &serde_json::Value) -> Result<&serde_json::Value, BlockObjectError> {
+    let Some(map) = value.as_object() else {
+        return Err(BlockObjectError::NotAnObject);
+    };
+    let Some(nested) = map.get("block") else {
+        return Ok(value);
+    };
+    if !nested.is_object() {
+        return Err(BlockObjectError::NotAnObject);
+    }
+    if BLOCK_OBJECT_FIELDS.iter().any(|field| map.contains_key(*field)) {
+        return Err(BlockObjectError::Hybrid);
+    }
+    Ok(nested)
+}
+
+/// A produce document named two block objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlockObjectError {
+    /// A BeaconBlock field sits beside a `block` key.
+    #[error("JSON block document has both top-level block fields and a nested block")]
+    Hybrid,
+    /// The document, or its nested `block`, is not a JSON object.
+    #[error("JSON block document is not an object")]
+    NotAnObject,
+}
+
 /// Exactly one of `kzg_proofs` or `blobs` was present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BlockContentsShapeError {
@@ -253,6 +369,8 @@ impl<'de> serde::Deserialize<'de> for BlockContents {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
+        // One block object. A hybrid is rejected before either shape is chosen.
+        block_object(&value).map_err(serde::de::Error::custom)?;
         let has_proofs = value.get("kzg_proofs").is_some();
         let has_blobs = value.get("blobs").is_some();
         match (has_proofs, has_blobs) {
@@ -1176,6 +1294,34 @@ mod tests {
         assert_eq!(independent_header_root(&zero), ZERO_HASH_3);
     }
 
+    /// The published `ssz_static` header decodes to the `EXTERNAL_*` fields and root.
+    #[test]
+    fn external_beacon_block_header_matches_ssz_static_case() {
+        use ssz::Decode;
+        use tree_hash::TreeHash;
+
+        let bytes = hex::decode(super::EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX).unwrap();
+        let decoded = BeaconBlockHeader::from_ssz_bytes(&bytes).unwrap();
+        assert_eq!(decoded.slot, super::EXTERNAL_BEACON_BLOCK_HEADER_SLOT);
+        assert_eq!(decoded.proposer_index, super::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX);
+        assert_eq!(
+            hex::encode(decoded.parent_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.state_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.body_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.tree_hash_root().as_slice()),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX
+        );
+    }
+
     /// KAT: the derived `tree_hash_root` matches an independent raw-sha256
     /// Merkleization (spec field order) for a non-trivial header — the
     /// load-bearing field-order + per-leaf-encoding check.
@@ -1309,6 +1455,83 @@ mod tests {
             let err = expected_kzg_proof_count(fork, 1).expect_err("unsupported");
             assert!(matches!(err, KzgProofCountError::UnsupportedFork { .. }), "{fork:?} {err:?}");
         }
+    }
+
+    /// Top-level block fields and a nested `block` are two shapes. Neither is chosen.
+    #[test]
+    fn hybrid_block_contents_document_is_rejected() {
+        let parent = format!("0x{}", "ab".repeat(32));
+        let state = format!("0x{}", "00".repeat(32));
+        let nested = serde_json::json!({
+            "slot": "1",
+            "proposer_index": "7",
+            "parent_root": parent,
+            "state_root": state,
+            "body": "0xabcd",
+        });
+        let proofs = serde_json::json!(["0xab"]);
+        let blobs = serde_json::json!(["0xcd"]);
+        let hybrid = serde_json::json!({
+            "slot": "1",
+            "proposer_index": "7",
+            "parent_root": parent,
+            "state_root": state,
+            "body": { "execution_payload": { "fee_recipient": format!("0x{}", "11".repeat(20)) } },
+            "block": nested,
+            "kzg_proofs": proofs,
+            "blobs": blobs,
+        });
+        let err = serde_json::from_value::<BlockContents>(hybrid.clone()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("both top-level block fields and a nested block"), "{msg}");
+        assert!(matches!(block_object(&hybrid), Err(BlockObjectError::Hybrid)));
+
+        for field in ["slot", "proposer_index", "parent_root", "state_root", "body"] {
+            let mut doc = serde_json::json!({
+                "block": nested,
+                "kzg_proofs": ["0xab"],
+                "blobs": ["0xcd"],
+            });
+            doc[field] = serde_json::Value::Null;
+            let err = serde_json::from_value::<BlockContents>(doc).unwrap_err();
+            assert!(
+                err.to_string().contains("both top-level block fields and a nested block"),
+                "{field} must be a hybrid, got {err}"
+            );
+        }
+
+        let nested_only = serde_json::json!({
+            "block": nested,
+            "kzg_proofs": ["0xab"],
+            "blobs": ["0xcd"],
+        });
+        match serde_json::from_value::<BlockContents>(nested_only).unwrap() {
+            BlockContents::BlockAndBlobs { block, .. } => assert_eq!(block.slot, 1),
+            BlockContents::Block(_) => panic!("conforming BlockContents must stay nested"),
+        }
+
+        let bare = serde_json::json!({
+            "slot": "1",
+            "proposer_index": "7",
+            "parent_root": parent,
+            "state_root": state,
+            "body": "0xabcd",
+        });
+        match serde_json::from_value::<BlockContents>(bare).unwrap() {
+            BlockContents::Block(block) => assert_eq!(block.proposer_index, 7),
+            BlockContents::BlockAndBlobs { .. } => panic!("a bare block must stay a block"),
+        }
+
+        assert!(matches!(
+            block_object(&serde_json::json!([1])),
+            Err(BlockObjectError::NotAnObject)
+        ));
+        assert!(matches!(
+            block_object(&serde_json::json!({"block": "0xabcd"})),
+            Err(BlockObjectError::NotAnObject)
+        ));
+        let err = serde_json::from_value::<BlockContents>(serde_json::json!(null)).unwrap_err();
+        assert!(err.to_string().contains("not an object"), "{err}");
     }
 
     #[test]

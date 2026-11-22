@@ -5,6 +5,8 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn, Instrument};
 
+use crate::config::redact_url;
+
 /// beaconcha.in monitoring API v1 payload for the validator process.
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitoringPayload {
@@ -138,7 +140,7 @@ pub async fn start_monitoring_push(
 ) {
     if !config.insecure && !config.endpoint.starts_with("https://") {
         warn!(
-            endpoint = %config.endpoint,
+            endpoint = %redact_url(&config.endpoint),
             "Monitoring endpoint requires HTTPS. Use --monitoring-endpoint-insecure to allow HTTP."
         );
         return;
@@ -234,8 +236,9 @@ async fn push_with_retry(client: &reqwest::Client, endpoint: &str, payload: &Mon
                 );
             }
             Err(e) => {
+                // The URL can carry a query secret, for example `?apikey=`.
                 warn!(
-                    error = %e,
+                    error = %e.without_url(),
                     attempt = attempt + 1,
                     "Monitoring push request failed, retrying"
                 );
@@ -254,6 +257,31 @@ async fn push_with_retry(client: &reqwest::Client, endpoint: &str, payload: &Mon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn transport_error_log_drops_the_endpoint_query() {
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let payload = collect_metrics(0, 0);
+        push_with_retry(&client, "http://127.0.0.1:1/push?apikey=MONKEY", &payload).await;
+        assert!(logs_contain("Monitoring push request failed"));
+        assert!(!logs_contain("MONKEY"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn https_refusal_redacts_the_endpoint() {
+        let config = MonitoringConfig {
+            endpoint: "http://alice:MONSECRET@mon:9/push?token=MONTOKEN".to_string(),
+            interval: Duration::from_secs(60),
+            insecure: false,
+        };
+        start_monitoring_push(config, CancellationToken::new(), || (0, 0)).await;
+        assert!(logs_contain("Monitoring endpoint requires HTTPS"));
+        assert!(logs_contain("mon:9"));
+        assert!(!logs_contain("MONSECRET"));
+        assert!(!logs_contain("MONTOKEN"));
+    }
 
     #[test]
     fn test_monitoring_payload_serialization() {

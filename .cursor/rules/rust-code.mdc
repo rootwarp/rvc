@@ -1,0 +1,32 @@
+---
+description: Rust coding rules for rvc (TDD, idiomatic Rust, conventions)
+globs: "**/*.rs"
+alwaysApply: true
+---
+# Rust code
+
+## TDD (required)
+1. Red: one failing test for the next behavior, failing for the right reason.
+2. Green: minimum production code to pass. No extra traits or modules.
+3. Refactor under green tests. Repeat, one behavior per cycle. Spikes are thrown away and redone TDD.
+- Unit tests in `#[cfg(test)] mod tests`; integration tests in `tests/`. Table-driven by default. Cover `Err` paths with `Ok`.
+- Fakes over mock crates. No sleep-based tests (inject time / `tokio::time::pause`).
+- A test that cannot fail is not a test. Prove the red before the PR.
+- Timing tests: tolerant bounds, or `#[ignore]` with a reason for coverage/loaded runs.
+- Own `TempDir`; never `mem::forget` it.
+- Test-only hooks behind `#[cfg(test)]` or a `test-utils` feature enabled only from dev-dependencies.
+
+## Idiomatic Rust
+- Model ownership in types. Don't `.clone()` to silence the borrow checker. Interior mutability is a last resort; document lock order and what each mutex protects.
+- Make invalid states unrepresentable: newtypes, enums over bools/string modes, private fields + constructors.
+- Libraries return `Result`/`Option`; `thiserror` for libs, `anyhow` for binaries; `?` over nested matches. No `unwrap`; `expect` only for true invariants, naming the invariant.
+- Small traits only for real sharing or a second impl (incl. a test fake). Prefer generics over `dyn`.
+- One idea per module; thin `lib.rs`/`main.rs`; minimal `pub`.
+
+## Conventions
+- `rustfmt` always; clippy clean with `-D warnings`.
+- Happy path down, early return with `?`. Comments explain why; `///` on public items. No commented-out code, no dead `pub`; TODOs carry an issue.
+- Std first; avoid new dependencies without reason.
+- Structured logging. Secrets/keys never in logs, errors, or `Debug` output.
+- Every task/thread has a stop path; bound concurrency; don't block the async executor; handle cancellation/`Drop`.
+- `unsafe` only behind a tiny safe API with a `SAFETY:` comment and tests; validate all FFI input.

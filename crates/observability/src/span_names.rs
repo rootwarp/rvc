@@ -31,6 +31,7 @@ pub const ALL: &[&str] = &[
     "beacon.get_aggregate_attestation",
     "beacon.get_attestation_data",
     "beacon.get_attester_duties",
+    "beacon.get_block_header",
     "beacon.get_block_root",
     "beacon.get_config_spec",
     "beacon.get_fork",
@@ -63,6 +64,7 @@ pub const ALL: &[&str] = &[
     "beacon.submit_payload_attestations",
     "beacon.submit_proposer_preferences",
     "beacon.submit_sync_committee_messages",
+    "beacon.submit_sync_committee_subscriptions",
     "beacon.submit_voluntary_exit",
     "block.propose",
     "bn.attempt",
@@ -91,6 +93,7 @@ pub const ALL: &[&str] = &[
     "duty_tracker.get_proposer_duty",
     "duty_tracker.get_sync_committee_duties",
     "epoch.boundary",
+    "epoch.boundary.runner",
     "grpc.sign",
     "grpc_signer.connect",
     "index.resolve",
@@ -256,6 +259,14 @@ mod tests {
                 follows_naming_rule(name) || SEEDED_UNDOTTED.contains(name),
                 "{name} breaks the naming rule"
             );
+        }
+    }
+
+    #[test]
+    fn epoch_boundary_runner_and_sync_subscription_names_are_registered() {
+        for name in ["epoch.boundary.runner", "beacon.submit_sync_committee_subscriptions"] {
+            assert!(contains(name), "{name} missing from the span-name registry");
+            assert!(follows_naming_rule(name), "{name} breaks the naming rule");
         }
     }
 

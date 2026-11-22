@@ -112,10 +112,7 @@ fn refuses_block(blocks: &[ParsedBlock], slot: u64, signing_root: &Option<String
     }
     // Condition 2, except a repeat determined by the signing root.
     let min_slot = blocks.iter().map(|block| block.slot).min().expect("non-empty");
-    if slot <= min_slot && !repeat_block(blocks, slot, signing_root) {
-        return true;
-    }
-    false
+    slot <= min_slot && !repeat_block(blocks, slot, signing_root)
 }
 
 fn repeat_block(blocks: &[ParsedBlock], slot: u64, signing_root: &Option<String>) -> bool {

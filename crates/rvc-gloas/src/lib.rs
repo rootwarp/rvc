@@ -8,9 +8,12 @@
 //! let _: rvc_gloas::Root = [0u8; 32];
 //! ```
 //!
-//! ```compile_fail
-//! let _ = rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT;
-//! ```
+// `test-fixtures` re-exports the KAT constants, so this check exists only
+// without that feature.
+#![cfg_attr(
+    not(feature = "test-fixtures"),
+    doc = "```compile_fail\nlet _ = rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT;\n```"
+)]
 
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.2";
@@ -48,9 +51,15 @@ pub mod roots;
 
 pub use error::GloasError;
 pub use roots::{
-    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root, gloas_body_root,
-    gloas_execution_payload_envelope_root, gloas_indexed_attestation_root, HeaderFields,
+    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_bid_binding,
+    gloas_bid_builder_index, gloas_block_root, gloas_body_root, gloas_envelope_binding,
+    gloas_execution_payload_envelope_root, gloas_indexed_attestation_root, BidBinding,
+    EnvelopeBinding, HeaderFields, BUILDER_INDEX_SELF_BUILD,
 };
+
+/// Body and envelope rewriters for tests. Not on the default public surface.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use roots::{body_with_bid_binding, body_with_bid_builder_index, envelope_with_binding};
 
 #[cfg(test)]
 mod public_surface_tests {
@@ -81,6 +90,26 @@ mod public_surface_tests {
             crate::gloas_execution_payload_envelope_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::roots::gloas_execution_payload_envelope_root;
+        let _: fn(&[u8]) -> Result<u64, crate::GloasError> = crate::gloas_bid_builder_index;
+        let _: fn(&[u8]) -> Result<crate::BidBinding, crate::GloasError> = crate::gloas_bid_binding;
+        let _: fn(&[u8]) -> Result<crate::EnvelopeBinding, crate::GloasError> =
+            crate::gloas_envelope_binding;
+        let _: u64 = crate::BUILDER_INDEX_SELF_BUILD;
+        // Signature pins for the test-fixture rewriters. The envelope fn pointer
+        // is above clippy's type-complexity threshold; the pin is the point.
+        #[allow(clippy::type_complexity)]
+        {
+            let _: fn(&[u8], u64) -> Result<Vec<u8>, crate::GloasError> =
+                crate::body_with_bid_builder_index;
+            let _: fn(&[u8], u64, u64, eth_types::Root) -> Result<Vec<u8>, crate::GloasError> =
+                crate::body_with_bid_binding;
+            let _: fn(
+                &[u8],
+                u64,
+                eth_types::Root,
+                eth_types::Root,
+            ) -> Result<Vec<u8>, crate::GloasError> = crate::envelope_with_binding;
+        }
     }
 }
 
@@ -96,7 +125,9 @@ mod kat;
 pub mod test_fixtures {
     pub use crate::kat::{
         KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT, KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT,
-        KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+        KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_BOUND_ENVELOPE_ROOT,
+        KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT, KAT_GLOAS_SELF_BUILD_BLOCK_ROOT,
+        KAT_GLOAS_SELF_BUILD_BODY_ROOT,
     };
     pub use crate::spec_kat::mainnet::{
         SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT as SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT_MAINNET,
@@ -113,7 +144,9 @@ pub mod test_fixtures {
 #[cfg(feature = "test-fixtures")]
 pub use test_fixtures::{
     KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT, KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT,
-    KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+    KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_BOUND_ENVELOPE_ROOT,
+    KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT, KAT_GLOAS_SELF_BUILD_BLOCK_ROOT,
+    KAT_GLOAS_SELF_BUILD_BODY_ROOT,
 };
 
 #[cfg(test)]

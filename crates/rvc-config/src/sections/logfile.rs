@@ -82,7 +82,7 @@ impl LogfileArgs {
 ///
 /// No flat-legacy `#[serde(alias)]` here: those bind inside `[logfile]` (4f SEC).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LogfileConfig {
     /// Path to the log file (`logfile` flat key, lifted by `Config`'s custom Deserialize).
     #[serde(default, skip_serializing_if = "Option::is_none")]

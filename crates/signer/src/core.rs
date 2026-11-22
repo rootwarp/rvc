@@ -57,9 +57,11 @@ use doppelganger::SigningEnablement;
 use eth_types::{ForkName, Root};
 use observability::logging::TruncatedPubkey;
 use slashing::{
-    CommittedReservation, PendingAudit, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
-    SlashingDb, SlashingError, StagedAttestation, StagedBlock,
+    CommittedReservation, PubkeyScopedDb, ReconcileOutcome, ReservationKind, SlashingDb,
+    SlashingError,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use slashing::{PendingAudit, StagedAttestation, StagedBlock};
 use tracing::{error, warn};
 
 use crate::error::SigningGateError;
@@ -75,7 +77,7 @@ pub const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 
 // ── Non-slashable core ────────────────────────────────────────────────────────
 
-/// Neutral failure of [`sign_nonslashable_core`].
+/// Neutral failure of `sign_nonslashable_core`.
 ///
 /// Wrappers map this onto [`SigningGateError`] or [`crate::SignerError`] so the
 /// two crate boundaries keep their own error types (ARCH-5c / ARCH-P1-6).
@@ -113,22 +115,86 @@ pub enum NonSlashableFailure {
 ///
 /// # TOCTOU note
 ///
-/// There is a micro-window between `SigningEnablement::is_signing_enabled`
-/// returning `true` and `signer.sign().await` completing during which the
-/// doppelganger state could theoretically change.  This window is
-/// intentionally accepted: these operations are **not slashable**, so the
-/// worst case is a signature produced for a pubkey that was concurrently
-/// disabled — a tolerable transient condition.  No additional
-/// synchronization is needed to shrink this window.
-pub async fn sign_nonslashable_core(
+/// The enablement check is the admission boundary. It is not atomic with the
+/// backend call. Detection can land after [`signing_allowed`] returns true.
+/// A non-slashable sign that already passed this check may finish, bounded by
+/// `sign_timeout`. A slashable sign that has not yet called BLS is refused by
+/// the post-reserve check and keeps its reserved row. A BLS call that has
+/// already started, including a request already sent to a remote signer, still
+/// finishes inside the timeout.
+///
+/// [`signing_allowed`]: doppelganger::signing_allowed
+pub(crate) async fn sign_nonslashable_core(
     enablement: &dyn SigningEnablement,
     signer: &dyn Signer,
     pubkey: &PublicKey,
     signing_root: Root,
     sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
 ) -> Result<Signature, NonSlashableFailure> {
-    if !enablement.is_signing_enabled(pubkey) {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        return sign_nonslashable_inner(
+            enablement,
+            signer,
+            pubkey,
+            signing_root,
+            sign_timeout,
+            duty,
+            None,
+        )
+        .await;
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    {
+        sign_nonslashable_inner(enablement, signer, pubkey, signing_root, sign_timeout, duty).await
+    }
+}
+
+/// Same flow as [`sign_nonslashable_core`], parking after the enablement check.
+///
+/// The barrier is the accepted gap after admission and before the backend runs.
+/// Test builds only.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn sign_nonslashable_core_paused(
+    enablement: &dyn SigningEnablement,
+    signer: &dyn Signer,
+    pubkey: &PublicKey,
+    signing_root: Root,
+    sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
+    after_check: Option<Arc<dyn PreReserveBarrier>>,
+) -> Result<Signature, NonSlashableFailure> {
+    sign_nonslashable_inner(
+        enablement,
+        signer,
+        pubkey,
+        signing_root,
+        sign_timeout,
+        duty,
+        after_check,
+    )
+    .await
+}
+
+async fn sign_nonslashable_inner(
+    enablement: &dyn SigningEnablement,
+    signer: &dyn Signer,
+    pubkey: &PublicKey,
+    signing_root: Root,
+    sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
+    #[cfg(any(test, feature = "test-utils"))] after_check: Option<Arc<dyn PreReserveBarrier>>,
+) -> Result<Signature, NonSlashableFailure> {
+    // `duty` is matched exhaustively in `signing_allowed`. Only
+    // `SigningDuty::VoluntaryExit` unlocks an exit-only enablement.
+    if !doppelganger::signing_allowed(enablement, pubkey, duty) {
         return Err(NonSlashableFailure::Blocked);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(barrier) = after_check {
+        barrier.wait().await;
     }
 
     let pubkey_bytes = pubkey.to_bytes();
@@ -211,9 +277,10 @@ impl TimeoutPolicySource {
 // ── Staged row trait ──────────────────────────────────────────────────────────
 
 /// Minimal commit/discard surface shared by [`StagedBlock`] and [`StagedAttestation`].
-#[deprecated(
-    note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
-)]
+///
+/// Superseded by `reserve_then_sign` (ADR-005); compiled only for the pre/post
+/// comparison tests.
+#[cfg(any(test, feature = "test-utils"))]
 pub trait StagedRow {
     /// Persist the staged row (or close an idempotent re-sign txn).
     fn commit_row(self) -> Result<(), SlashingError>;
@@ -221,7 +288,7 @@ pub trait StagedRow {
     fn discard_row(self);
 }
 
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl StagedRow for StagedBlock<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -231,7 +298,7 @@ impl StagedRow for StagedBlock<'_> {
     }
 }
 
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl StagedRow for StagedAttestation<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -244,7 +311,7 @@ impl StagedRow for StagedAttestation<'_> {
 /// ARCH-1a compile bridge: `PubkeyScopedDb::stage_*` returns `(staged, PendingAudit)`.
 /// Emit the deferred audit only after commit/discard releases the connection mutex
 /// so a DB-reading tracing subscriber cannot deadlock (ADR-006 / C2).
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 impl<S: StagedRow> StagedRow for (S, PendingAudit) {
     fn commit_row(self) -> Result<(), SlashingError> {
         let result = self.0.commit_row();
@@ -342,8 +409,8 @@ impl SignHooks for StandardSlashableHooks {
 /// State for finishing a staged or reserved sign inside `spawn_blocking`.
 ///
 /// Created by [`sign_slashable`]. Production reserves through the single core
-/// consumer. Unit tests may still call [`SlashableSignSession::stage_then_sign`]
-/// directly (deprecated; retained for pre/post comparison).
+/// consumer. Tests may still call `stage_then_sign` directly (compiled only for
+/// tests and `test-utils`; retained for pre/post comparison).
 pub struct SlashableSignSession {
     handle: tokio::runtime::Handle,
     signer: Arc<dyn Signer>,
@@ -359,7 +426,7 @@ pub struct SlashableSignSession {
     hooks: Arc<dyn SignHooks>,
     op_name: &'static str,
     /// Used by [`Self::reserve_then_sign`] to build [`PubkeyScopedDb`] for
-    /// `reconcile_unsigned` (C2 / ARCH-5g). Unused by [`Self::stage_then_sign`].
+    /// `reconcile_unsigned` (C2 / ARCH-5g). Unused by `stage_then_sign`.
     slashing_db: Arc<SlashingDb>,
     /// Audit CN for scoped compensate (gate: caller mTLS CN; VC: `"local-vc"`).
     client_cn: String,
@@ -367,6 +434,14 @@ pub struct SlashableSignSession {
     gvr: Root,
     /// Resolved fork when the caller knows it; `None` → version label `unknown`.
     fork_name: Option<ForkName>,
+    /// Re-checked after the slashing-DB reservation and before the BLS call.
+    enablement: Arc<dyn SigningEnablement>,
+    /// The caller task's beacon admission, captured right after the
+    /// under-lock check (task-locals are not readable on the blocking
+    /// thread). Re-checked after the doppelganger check, before BLS.
+    admission: crate::CapturedAdmission,
+    /// Duty `admission` is checked for.
+    duty: doppelganger::SigningDuty,
 }
 
 impl SlashableSignSession {
@@ -403,6 +478,9 @@ impl SlashableSignSession {
             client_cn: "test".to_string(),
             gvr: [0u8; 32],
             fork_name: None,
+            enablement: Arc::new(crate::AlwaysEnabled),
+            admission: crate::CapturedAdmission::Missing { revokes: false },
+            duty: doppelganger::SigningDuty::Block,
         }
     }
 
@@ -410,10 +488,9 @@ impl SlashableSignSession {
     ///
     /// `stage` is invoked on this blocking thread and must return a staged guard
     /// that lives only for the duration of this call (the `!Send` constraint).
-    #[deprecated(
-        note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
-    )]
-    #[allow(deprecated)]
+    /// Superseded by [`Self::reserve_then_sign`] (ADR-005); compiled only for the
+    /// pre/post comparison tests.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn stage_then_sign<S, F>(mut self, stage: F) -> Result<Vec<u8>, SigningGateError>
     where
         S: StagedRow,
@@ -504,16 +581,28 @@ impl SlashableSignSession {
         }
     }
 
+    fn blocked_by_doppelganger(&self) -> bool {
+        match PublicKey::from_bytes(&self.pubkey_bytes) {
+            Ok(pk) => self.enablement.blocked_by_doppelganger(&pk),
+            // Invalid bytes are not a key we can prove is clear.
+            Err(_) => true,
+        }
+    }
+
     /// Reserve (commit) a history row, then sign, then dispatch on architecture §5.3.
     ///
-    /// Sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
-    /// [`StagedRow`] impl (VD-5.4): `discard_row` returns `()`, which would drop
+    /// Sibling of `stage_then_sign` (ARCH-5i / ADR-005). **Not** a
+    /// `StagedRow` impl (VD-5.4): `discard_row` returns `()`, which would drop
     /// the compensating-delete failure signal. Production calls this method
     /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
-    /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → sign →
-    /// §5.3 table. `on_tx_hold_ms` keeps the ARCH-5b window (reserve-start →
-    /// sign-return). The reserve-only series is observed at reserve return.
+    /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → doppelganger
+    /// → beacon admission → sign → §5.3 table. A doppelganger refusal keeps the
+    /// reserved row. An admission refusal deletes the row this call inserted
+    /// (no backend has seen the root; a failed delete keeps it) and returns
+    /// [`SigningGateError::BeaconAdmissionRevoked`]. `on_tx_hold_ms` keeps the
+    /// ARCH-5b window (reserve-start → sign-return, or → the admission
+    /// refusal). The reserve-only series is observed at reserve return.
     pub fn reserve_then_sign<F>(mut self, reserve: F) -> Result<Vec<u8>, SigningGateError>
     where
         F: FnOnce() -> Result<CommittedReservation, SlashingError>,
@@ -551,6 +640,37 @@ impl SlashableSignSession {
         // reconcile. That is still fail-closed. `fail_closed_max` itself is unchanged.
         if let Some(ref recheck) = self.policy_recheck {
             self.policy = TimeoutPolicySource::fail_closed_max(self.policy, recheck());
+        }
+
+        // The row is committed. This check is the admission boundary for a
+        // slashable sign that has not called BLS. It is not atomic with the
+        // backend: detection can land after it passes, and a BLS call that
+        // has already started still finishes inside the sign timeout. If
+        // detection has closed signing, do not call BLS. Leave the row so a
+        // later process cannot sign this duty. Delete quiesce is not this
+        // check: a sign that already passed `is_signing_enabled` still signs
+        // when only the quiesce registry closed.
+        if self.blocked_by_doppelganger() {
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                "sign_slashable: blocked by doppelganger gate after reserve, before BLS"
+            );
+            return Err(SigningGateError::BlockedByDoppelganger);
+        }
+
+        // Last check before BLS, on the admission captured on the caller task.
+        // No backend has seen the root, so the row this call inserted is deleted.
+        if crate::admission_revoked_by(&self.admission, self.duty) {
+            let reconciled = self.reconcile_reservation(&reservation);
+            self.hooks.on_tx_hold_ms(tx_start.elapsed().as_secs_f64() * 1000.0);
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                reconciled,
+                "reserve_then_sign: beacon node admission revoked after reserve, before BLS"
+            );
+            return Err(SigningGateError::BeaconAdmissionRevoked);
         }
 
         let sign_result = self.handle.block_on(tokio::time::timeout(
@@ -705,7 +825,7 @@ impl SlashableSignSession {
         }
     }
 
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn finish_timeout<S: StagedRow>(
         self,
         staged: S,
@@ -739,7 +859,7 @@ impl SlashableSignSession {
     }
 
     /// Ambiguous non-timeout signer failure: discard or retain per policy.
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn finish_ambiguous_error<S: StagedRow>(
         self,
         staged: S,
@@ -773,7 +893,7 @@ impl SlashableSignSession {
     }
 
     /// Commit staged row then return `SigningFailed` (history retained, not discarded).
-    #[allow(deprecated)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn retain_staged_row<S: StagedRow>(
         self,
         staged: S,
@@ -844,6 +964,13 @@ impl SlashableKind {
             Self::Attestation { .. } => "attestation",
         }
     }
+
+    fn signing_duty(self) -> doppelganger::SigningDuty {
+        match self {
+            Self::Block { .. } => doppelganger::SigningDuty::Block,
+            Self::Attestation { .. } => doppelganger::SigningDuty::Attestation,
+        }
+    }
 }
 
 /// 1-in-N rate for the attestation-stage trace (issue 5.3).
@@ -859,7 +986,7 @@ static ATTESTATION_STAGE_TRACE_CTR: AtomicU64 = AtomicU64::new(0);
 pub struct SignSlashableRequest<'a> {
     pub locks: &'a ValidatorLockMap,
     pub pubkey: &'a PublicKey,
-    pub enablement: &'a dyn SigningEnablement,
+    pub enablement: Arc<dyn SigningEnablement>,
     pub signer: Arc<dyn Signer>,
     pub signing_root: Root,
     pub sign_timeout: Duration,
@@ -877,7 +1004,7 @@ pub struct SignSlashableRequest<'a> {
     pub kind: SlashableKind,
     /// Resolved fork when known (VC path). Gate callers pass `None`.
     pub fork_name: Option<ForkName>,
-    /// Park after the under-lock enablement check and before reserve.
+    /// Park after the under-lock enablement and admission checks and before reserve.
     ///
     /// `None` in every production call. The field itself is compiled out of
     /// builds that do not enable `test-utils` (and are not this crate's tests).
@@ -886,7 +1013,7 @@ pub struct SignSlashableRequest<'a> {
 }
 
 /// Test-only park on the slashable path, between the under-lock enablement
-/// re-check and reserve.
+/// and admission re-checks and reserve.
 ///
 /// Present only under `cfg(test)` or `rvc-signer`'s `test-utils` feature so a
 /// release build of `rvc-bin` does not contain it. `None` does not park.
@@ -901,14 +1028,22 @@ pub trait PreReserveBarrier: Send + Sync {
 ///
 /// 1. Acquire the per-validator async lock (moved into `spawn_blocking` so a
 ///    dropped caller cannot release it while the blocking body is still running).
-/// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
-///    Test builds may then park on a pre-reserve barrier while that lock is
-///    still held. The hook is compiled out unless `test` / `test-utils` is on.
+/// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU),
+///    then the caller task's beacon admission scope: a generation that moved
+///    during the lock wait returns [`SigningGateError::BeaconAdmissionRevoked`]
+///    before any reservation. That scope is then captured for step 4, on this
+///    task. Test builds may then park on a pre-reserve barrier while that lock
+///    is still held. The hook is compiled out unless `test` / `test-utils` is
+///    on.
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
 /// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
-///    then [`SlashableSignSession::reserve_then_sign`] signs with timeout and
-///    reconciles per policy.
+///    re-check enablement, then the admission captured in step 2, after that
+///    reservation and before the BLS call, then
+///    [`SlashableSignSession::reserve_then_sign`] signs with timeout and
+///    reconciles per policy. A doppelganger refusal after reserve leaves the
+///    committed row. An admission refusal deletes the row this call inserted
+///    (a failed delete keeps it).
 ///
 /// # Errors
 ///
@@ -1044,7 +1179,7 @@ fn log_stage_rejected(pubkey_hex: &str, kind: SlashableKind, err: SlashingError)
     err
 }
 
-/// Lock → enablement re-check → policy resolve → `spawn_blocking(body)`.
+/// Lock → enablement and admission re-check → policy resolve → `spawn_blocking(body)`.
 async fn sign_slashable_with_body<F>(
     req: SignSlashableRequest<'_>,
     body: F,
@@ -1066,8 +1201,10 @@ where
     // blocking body returns.
     let guard = req.locks.lock(&pubkey_bytes).await;
 
-    // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
-    if !req.enablement.is_signing_enabled(req.pubkey) {
+    // Step 2: re-check enablement, then beacon admission, under the lock
+    // (SigningGate / SignerService parity). Doppelganger stays first.
+    if !doppelganger::signing_allowed(req.enablement.as_ref(), req.pubkey, req.kind.signing_duty())
+    {
         warn!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
             op = op_name,
@@ -1075,9 +1212,21 @@ where
         );
         return Err(SigningGateError::BlockedByDoppelganger);
     }
+    // Same task-local scope the entry check read, so this can only turn a
+    // hold into a refusal. No slashing row exists yet.
+    if crate::beacon_admission_revoked(req.kind.signing_duty()) {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            op = op_name,
+            "sign_slashable: beacon node admission revoked (under lock)"
+        );
+        return Err(SigningGateError::BeaconAdmissionRevoked);
+    }
+    // On this task: the blocking thread cannot read the task-locals.
+    let admission = crate::capture_admission();
 
-    // Test-only: still holding the per-pubkey lock, after the enablement
-    // re-check and before reserve. Production builds skip this entirely.
+    // Test-only: still holding the per-pubkey lock, after the enablement and
+    // admission re-checks and before reserve. Production builds skip this entirely.
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(barrier) = req.pre_reserve_barrier.clone() {
         barrier.wait().await;
@@ -1110,6 +1259,9 @@ where
         client_cn: req.client_cn,
         gvr: req.gvr,
         fork_name: req.fork_name,
+        enablement: Arc::clone(&req.enablement),
+        admission,
+        duty: req.kind.signing_duty(),
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1141,6 +1293,7 @@ mod tests {
 
     use async_trait::async_trait;
     use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError};
+    use slashing::metrics::reconcile_outcome;
     use slashing::SlashingDb;
 
     const GVR: Root = [0xc0; 32];
@@ -1156,6 +1309,14 @@ mod tests {
     impl SigningEnablement for FlipEnablement {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
             self.enabled.load(Ordering::SeqCst)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            false
         }
     }
 
@@ -1174,6 +1335,12 @@ mod tests {
                 tx_hold: AtomicU64::new(0),
                 success: AtomicU64::new(0),
             }
+        }
+
+        /// `[safe, blocked, tx_hold, success]`.
+        fn counts(&self) -> [u64; 4] {
+            [&self.safe, &self.blocked, &self.tx_hold, &self.success]
+                .map(|c| c.load(Ordering::SeqCst))
         }
     }
     impl SignHooks for CountingHooks {
@@ -1239,7 +1406,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: TEST_TIMEOUT,
@@ -1315,7 +1482,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1355,7 +1522,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1405,7 +1572,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: TEST_TIMEOUT,
@@ -1447,7 +1614,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1471,8 +1638,170 @@ mod tests {
         assert_eq!(hooks.success.load(Ordering::SeqCst), 1);
     }
 
-    /// Enablement re-check under the lock: a concurrent flip to disabled must refuse.
+    /// Counts `sign` calls; a refusal on the reserve path must leave it at 0.
+    struct CountingSigner {
+        inner: Arc<dyn Signer>,
+        calls: Arc<AtomicU64>,
+    }
+    #[async_trait]
+    impl Signer for CountingSigner {
+        async fn sign(
+            &self,
+            signing_root: &Root,
+            pubkey: &[u8; 48],
+        ) -> Result<Signature, SigningError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.sign(signing_root, pubkey).await
+        }
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.inner.public_keys()
+        }
+    }
+
+    /// W4-S2: the evaluator's source > target refusal reaches the gate as a
+    /// slashable `SlashingBlocked` (HTTP 412), before any BLS call or row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sign_slashable_refuses_source_above_target_as_slashing_blocked() {
+        use slashing::AttestationSlashingViolation;
+
+        let sk = SecretKey::generate();
+        let (pubkey, inner) = make_local(sk);
+        let sign_calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> =
+            Arc::new(CountingSigner { inner, calls: Arc::clone(&sign_calls) });
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = ValidatorLockMap::new();
+        let hooks = Arc::new(CountingHooks::new());
+
+        let err = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: Arc::new(AlwaysEnabled),
+            signer,
+            signing_root: [0x55; 32],
+            sign_timeout: Duration::from_secs(4),
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+            op_name: "test_source_above_target",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Attestation { source_epoch: 20, target_epoch: 9 },
+            fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
+        })
+        .await
+        .expect_err("source above target must be refused");
+
+        assert!(
+            matches!(
+                &err,
+                SigningGateError::SlashingBlocked(SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::SourceExceedsTarget {
+                        source_epoch: 20,
+                        target_epoch: 9
+                    }
+                ))
+            ),
+            "expected SlashingBlocked(SourceExceedsTarget {{ 20, 9 }}), got {err:?}"
+        );
+        assert_eq!(hooks.blocked.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.success.load(Ordering::SeqCst), 0);
+        assert_eq!(sign_calls.load(Ordering::SeqCst), 0, "BLS must not be reached");
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        assert!(db.get_attestations(&pubkey_hex).expect("rows").is_empty());
+
+        match crate::classify(&err) {
+            crate::GateErrClass::SlashingBlocked {
+                client_message, is_slashable_violation, ..
+            } => {
+                assert!(is_slashable_violation, "a rule refusal, not a DB error");
+                assert!(
+                    client_message.contains("source epoch 20 is above target epoch 9"),
+                    "{client_message}"
+                );
+            }
+            other => panic!("expected the SlashingBlocked class, got {other:?}"),
+        }
+    }
+
+    /// Hang guard for joins on the parked-sign tests. Not an ordering wait.
+    const JOIN_GUARD: Duration = Duration::from_secs(30);
+
+    /// Live `Arc`s on `pubkey`'s lock: the map entry, each guard, each parked
+    /// `lock_owned` future and this probe.
+    fn lock_handles(locks: &ValidatorLockMap, pubkey: &[u8; 48]) -> usize {
+        Arc::strong_count(&locks.get(pubkey))
+    }
+
+    struct ParkedSign {
+        locks: Arc<ValidatorLockMap>,
+        pubkey: PublicKey,
+        enablement: Arc<dyn SigningEnablement>,
+        signer: Arc<dyn Signer>,
+        db: Arc<SlashingDb>,
+        kind: SlashableKind,
+        /// `None` installs no scope (the `test-utils` missing-scope rule).
+        admission: Option<crate::BeaconAdmission>,
+        hooks: Arc<dyn SignHooks>,
+    }
+
+    /// Spawn [`sign_slashable`] while the caller holds the per-pubkey lock and
+    /// return once the sign is parked on that lock.
+    ///
+    /// Needs a current-thread runtime. The spawned task fires `parked`, then
+    /// runs without yielding until the held lock parks it, so the caller
+    /// resumes only after that. The `lock_handles` assertion checks it.
+    async fn spawn_parked_on_lock(
+        p: ParkedSign,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, SigningGateError>> {
+        let ParkedSign { locks, pubkey, enablement, signer, db, kind, admission, hooks } = p;
+        let pubkey_bytes = pubkey.to_bytes();
+        let probe = Arc::clone(&locks);
+        let before = lock_handles(&probe, &pubkey_bytes);
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let fired = Arc::clone(&parked);
+        let join = tokio::spawn(async move {
+            let sign = async move {
+                fired.notify_one();
+                sign_slashable(SignSlashableRequest {
+                    locks: locks.as_ref(),
+                    pubkey: &pubkey,
+                    enablement,
+                    signer,
+                    signing_root: [0x44; 32],
+                    sign_timeout: Duration::from_secs(4),
+                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                    hooks,
+                    op_name: "test_parked_sign",
+                    slashing_db: db,
+                    client_cn: "test".into(),
+                    gvr: GVR,
+                    kind,
+                    fork_name: None,
+                    #[cfg(any(test, feature = "test-utils"))]
+                    pre_reserve_barrier: None,
+                })
+                .await
+            };
+            match admission {
+                Some(admission) => crate::with_beacon_admission(admission, sign).await,
+                None => sign.await,
+            }
+        });
+        parked.notified().await;
+        assert_eq!(
+            lock_handles(&probe, &pubkey_bytes),
+            before + 1,
+            "the sign must be parked on the held per-pubkey lock"
+        );
+        join
+    }
+
+    /// Enablement re-check under the lock: a flip to disabled during the lock
+    /// wait must refuse.
+    #[tokio::test(flavor = "current_thread")]
     async fn test_core_enablement_recheck_under_lock() {
         let sk = SecretKey::generate();
         let (pubkey, signer) = make_local(sk);
@@ -1483,43 +1812,637 @@ mod tests {
 
         // Hold the per-pubkey lock so sign_slashable blocks before recheck.
         let held = locks.lock(&pubkey_bytes).await;
+        let join = spawn_parked_on_lock(ParkedSign {
+            locks: Arc::clone(&locks),
+            pubkey: pubkey.clone(),
+            enablement: Arc::clone(&enablement) as Arc<dyn SigningEnablement>,
+            signer,
+            db: Arc::clone(&db),
+            kind: SlashableKind::Block { slot: 13 },
+            admission: None,
+            hooks: Arc::new(NoopSignHooks),
+        })
+        .await;
 
-        let locks_c = Arc::clone(&locks);
-        let en_c = Arc::clone(&enablement);
-        let db_c = Arc::clone(&db);
-        let pk = pubkey.clone();
-        let join = tokio::spawn(async move {
-            sign_slashable(SignSlashableRequest {
-                locks: locks_c.as_ref(),
-                pubkey: &pk,
-                enablement: en_c.as_ref(),
-                signer,
-                signing_root: [0x44; 32],
-                sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(NoopSignHooks),
-                op_name: "test_recheck",
-                slashing_db: db_c,
-                client_cn: "test".into(),
-                gvr: GVR,
-                kind: SlashableKind::Block { slot: 13 },
-                fork_name: None,
-                #[cfg(any(test, feature = "test-utils"))]
-                pre_reserve_barrier: None,
-            })
-            .await
-        });
-
-        // Give the spawned task time to block on the lock, then flip closed and release.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         enablement.enabled.store(false, Ordering::SeqCst);
         drop(held);
 
-        let result = join.await.expect("join");
+        let result =
+            tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
         assert!(
             matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
             "recheck under lock must refuse after flip; got {result:?}"
         );
+    }
+
+    /// W4-S4a (766-1, 766-2): a generation that moves while the sign waits for
+    /// the per-validator lock refuses under the lock, before any reserve.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_admission_recheck_under_lock() {
+        // (case, generation count, index bumped during the lock wait)
+        let cases: [(&str, usize, Option<usize>); 3] = [
+            ("one generation, bumped", 1, Some(0)),
+            ("three generations, middle bumped", 3, Some(1)),
+            ("one generation, unchanged (control)", 1, None),
+        ];
+        for (case, count, bumped) in cases {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_bytes = pubkey.to_bytes();
+            let pubkey_hex = hex::encode(pubkey_bytes);
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let locks = Arc::new(ValidatorLockMap::new());
+            let generations: Vec<Arc<AtomicU64>> =
+                (0..count).map(|i| Arc::new(AtomicU64::new(10 * i as u64))).collect();
+            let admission = generations.iter().skip(1).fold(
+                crate::BeaconAdmission::new(0, Arc::clone(&generations[0])),
+                |admission, g| admission.and_generation(g.load(Ordering::Acquire), Arc::clone(g)),
+            );
+            let hooks = Arc::new(CountingHooks::new());
+
+            let held = locks.lock(&pubkey_bytes).await;
+            let join = spawn_parked_on_lock(ParkedSign {
+                locks: Arc::clone(&locks),
+                pubkey: pubkey.clone(),
+                enablement: Arc::new(AlwaysEnabled),
+                signer,
+                db: Arc::clone(&db),
+                kind: SlashableKind::Attestation { source_epoch: 3, target_epoch: 4 },
+                admission: Some(admission),
+                hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+            })
+            .await;
+            if let Some(i) = bumped {
+                generations[i].fetch_add(1, Ordering::Release);
+            }
+            drop(held);
+
+            let result =
+                tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
+            let rows = db.get_attestations(&pubkey_hex).expect("rows");
+            assert!(
+                locks.get(&pubkey_bytes).try_lock().is_ok(),
+                "{case}: the per-validator lock must be free once the sign returns"
+            );
+            if bumped.is_some() {
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}: BLS must not be reached");
+                assert!(rows.is_empty(), "{case}: no attestation row may be written: {rows:?}");
+                assert!(
+                    matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                    "{case}: expected BeaconAdmissionRevoked, got {result:?}"
+                );
+                assert_eq!(
+                    hooks.counts(),
+                    [0, 0, 0, 0],
+                    "{case}: refused before reserve: hooks [safe, blocked, tx_hold, success]"
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("{case}: an unchanged admission signs: {e:?}"));
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{case}: one BLS call");
+                assert_eq!(rows.len(), 1, "{case}: one attestation row: {rows:?}");
+            }
+        }
+    }
+
+    /// Detected and revoked during the same lock wait: doppelganger is checked
+    /// first, so the refusal stays `BlockedByDoppelganger` (#736 contract).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_doppelganger_wins_under_lock_when_admission_also_moved() {
+        let (pubkey, inner) = make_local(SecretKey::generate());
+        let pubkey_bytes = pubkey.to_bytes();
+        let calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> = Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = Arc::new(ValidatorLockMap::new());
+        let enablement = Arc::new(FlipEnablement { enabled: AtomicBool::new(true) });
+        let generation = Arc::new(AtomicU64::new(0));
+
+        let held = locks.lock(&pubkey_bytes).await;
+        let join = spawn_parked_on_lock(ParkedSign {
+            locks: Arc::clone(&locks),
+            pubkey: pubkey.clone(),
+            enablement: Arc::clone(&enablement) as Arc<dyn SigningEnablement>,
+            signer,
+            db: Arc::clone(&db),
+            kind: SlashableKind::Block { slot: 21 },
+            admission: Some(crate::BeaconAdmission::new(0, Arc::clone(&generation))),
+            hooks: Arc::new(NoopSignHooks),
+        })
+        .await;
+        enablement.enabled.store(false, Ordering::SeqCst);
+        generation.fetch_add(1, Ordering::Release);
+        drop(held);
+
+        let result =
+            tokio::time::timeout(JOIN_GUARD, join).await.expect("hang guard").expect("join");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "BLS must not be reached");
+        let rows = db.get_blocks(&hex::encode(pubkey_bytes)).expect("rows");
+        assert!(rows.is_empty(), "no block row may be written: {rows:?}");
+        assert!(
+            matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+            "doppelganger must win over a moved admission; got {result:?}"
+        );
+    }
+
+    /// W4-S4a (D5): a direct core caller with no admission scope fails closed
+    /// under the lock, as in a production build. The core has no entry check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_core_missing_scope_refused_under_lock() {
+        for kind in [
+            SlashableKind::Block { slot: 31 },
+            SlashableKind::Attestation { source_epoch: 5, target_epoch: 6 },
+        ] {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_bytes = pubkey.to_bytes();
+            let pubkey_hex = hex::encode(pubkey_bytes);
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let locks = ValidatorLockMap::new();
+            let hooks = Arc::new(CountingHooks::new());
+
+            let result =
+                crate::require_beacon_admission_scope(sign_slashable(SignSlashableRequest {
+                    locks: &locks,
+                    pubkey: &pubkey,
+                    enablement: Arc::new(AlwaysEnabled),
+                    signer,
+                    signing_root: [0x66; 32],
+                    sign_timeout: Duration::from_secs(4),
+                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                    hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+                    op_name: "test_missing_scope",
+                    slashing_db: Arc::clone(&db),
+                    client_cn: "test".into(),
+                    gvr: GVR,
+                    kind,
+                    fork_name: None,
+                    #[cfg(any(test, feature = "test-utils"))]
+                    pre_reserve_barrier: None,
+                }))
+                .await;
+
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{kind:?}: a missing scope must be refused; got {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{kind:?}: BLS must not be reached");
+            let blocks = db.get_blocks(&pubkey_hex).expect("block rows");
+            let attestations = db.get_attestations(&pubkey_hex).expect("attestation rows");
+            assert!(
+                blocks.is_empty() && attestations.is_empty(),
+                "{kind:?}: no slashing row may be written: {blocks:?} {attestations:?}"
+            );
+            assert_eq!(
+                hooks.counts(),
+                [0, 0, 0, 0],
+                "{kind:?}: refused before reserve: hooks [safe, blocked, tx_hold, success]"
+            );
+            assert!(
+                locks.get(&pubkey_bytes).try_lock().is_ok(),
+                "{kind:?}: the per-validator lock must be free once the sign returns"
+            );
+        }
+    }
+
+    // ── W4-S4b: admission re-check after the reservation ──────────────────────
+
+    /// Doppelganger double: detection closes `is_signing_enabled` and opens
+    /// `blocked_by_doppelganger` at once.
+    struct DetectableEnablement {
+        detected: AtomicBool,
+    }
+    impl SigningEnablement for DetectableEnablement {
+        fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+            !self.detected.load(Ordering::SeqCst)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            self.detected.load(Ordering::SeqCst)
+        }
+    }
+
+    fn reconcile_count(kind: &str, outcome: &str) -> u64 {
+        slashing::metrics::RVC_SLASHING_RECONCILE_TOTAL.with_label_values(&[kind, outcome]).get()
+    }
+
+    fn slashing_rows(db: &SlashingDb, pubkey_hex: &str, kind: SlashableKind) -> usize {
+        match kind {
+            SlashableKind::Block { .. } => db.get_blocks(pubkey_hex).expect("block rows").len(),
+            SlashableKind::Attestation { .. } => {
+                db.get_attestations(pubkey_hex).expect("attestation rows").len()
+            }
+        }
+    }
+
+    struct AfterReserveRun {
+        result: Result<Vec<u8>, SigningGateError>,
+        bls_calls: u64,
+        /// Slashing rows for the pubkey once the sign returned.
+        rows: usize,
+        hooks: Arc<CountingHooks>,
+    }
+
+    /// `sign_slashable` under `admission`, with a `ResolveUnderLock` closure
+    /// that runs `after_reserve` on its second call. That call is the SEC-1
+    /// re-resolve inside `reserve_then_sign`: after the reservation, before the
+    /// doppelganger and admission checks and BLS.
+    ///
+    /// Deliberately not inside `require_beacon_admission_scope`: a capture
+    /// that lost the scope to the blocking thread reads as open and signs.
+    async fn sign_with_after_reserve_hook(
+        kind: SlashableKind,
+        policy: TimeoutPolicy,
+        admission: crate::BeaconAdmission,
+        enablement: Arc<dyn SigningEnablement>,
+        db: Arc<SlashingDb>,
+        after_reserve: impl Fn() + Send + Sync + 'static,
+    ) -> AfterReserveRun {
+        let (pubkey, inner) = make_local(SecretKey::generate());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let calls = Arc::new(AtomicU64::new(0));
+        let signer: Arc<dyn Signer> = Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+        let hooks = Arc::new(CountingHooks::new());
+        let locks = ValidatorLockMap::new();
+        let resolves = Arc::new(AtomicU64::new(0));
+        let rows_at_hook = Arc::new(AtomicU64::new(u64::MAX));
+        let (resolves_c, rows_c, db_c, pk_c) =
+            (Arc::clone(&resolves), Arc::clone(&rows_at_hook), Arc::clone(&db), pubkey_hex.clone());
+        let resolve = move || {
+            if resolves_c.fetch_add(1, Ordering::SeqCst) == 1 {
+                rows_c.store(slashing_rows(&db_c, &pk_c, kind) as u64, Ordering::SeqCst);
+                after_reserve();
+            }
+            policy
+        };
+
+        let result = crate::with_beacon_admission(
+            admission,
+            sign_slashable(SignSlashableRequest {
+                locks: &locks,
+                pubkey: &pubkey,
+                enablement,
+                signer,
+                signing_root: [0x77; 32],
+                sign_timeout: Duration::from_secs(4),
+                policy: TimeoutPolicySource::ResolveUnderLock(Arc::new(resolve)),
+                hooks: Arc::clone(&hooks) as Arc<dyn SignHooks>,
+                op_name: "test_after_reserve",
+                slashing_db: Arc::clone(&db),
+                client_cn: "test".into(),
+                gvr: GVR,
+                kind,
+                fork_name: None,
+                #[cfg(any(test, feature = "test-utils"))]
+                pre_reserve_barrier: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resolves.load(Ordering::SeqCst), 2, "{kind:?}: policy resolved twice");
+        assert_eq!(
+            rows_at_hook.load(Ordering::SeqCst),
+            1,
+            "{kind:?}: the hook must run after the reservation committed"
+        );
+        assert!(
+            locks.get(&pubkey_bytes).try_lock().is_ok(),
+            "{kind:?}: the per-validator lock must be free once the sign returns"
+        );
+        AfterReserveRun {
+            result,
+            bls_calls: calls.load(Ordering::SeqCst),
+            rows: slashing_rows(&db, &pubkey_hex, kind),
+            hooks,
+        }
+    }
+
+    /// W4-S4b (766-1): a generation that moves after the reservation refuses
+    /// before BLS and deletes the reserved row under either timeout policy:
+    /// no backend has seen the root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_admission_recheck_after_reserve_before_bls() {
+        let cases = [
+            ("discard, bumped", TimeoutPolicy::DiscardStagedRow, true),
+            ("retain, bumped", TimeoutPolicy::RetainStagedRow, true),
+            ("discard, unchanged (control)", TimeoutPolicy::DiscardStagedRow, false),
+        ];
+        for (case, policy, bump) in cases {
+            let generation = Arc::new(AtomicU64::new(0));
+            let moved = Arc::clone(&generation);
+            let deleted_before = reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::DELETED);
+            let run = sign_with_after_reserve_hook(
+                SlashableKind::Block { slot: 51 },
+                policy,
+                crate::BeaconAdmission::new(0, generation),
+                Arc::new(AlwaysEnabled),
+                Arc::new(SlashingDb::open_in_memory().expect("db")),
+                move || {
+                    if bump {
+                        moved.fetch_add(1, Ordering::Release);
+                    }
+                },
+            )
+            .await;
+            let hooks = run.hooks.counts();
+
+            if !bump {
+                run.result
+                    .unwrap_or_else(|e| panic!("{case}: an unchanged admission signs: {e:?}"));
+                assert_eq!(run.bls_calls, 1, "{case}: one BLS call");
+                assert_eq!(run.rows, 1, "{case}: the block row stays");
+                continue;
+            }
+            assert_eq!(run.bls_calls, 0, "{case}: BLS must not be reached");
+            assert_eq!(run.rows, 0, "{case}: the reserved block row must be deleted");
+            // Lower bound: the counter is process-global (`cargo test` shares it).
+            assert!(
+                reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::DELETED) > deleted_before,
+                "{case}: rvc_slashing_reconcile_total{{kind=block,outcome=deleted}} must move"
+            );
+            assert!(
+                matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{case}: expected BeaconAdmissionRevoked, got {:?}",
+                run.result
+            );
+            assert_eq!(hooks, [1, 0, 1, 0], "{case}: hooks [safe, blocked, tx_hold, success]");
+        }
+    }
+
+    /// W4-S4b: the compensating delete fails, so the reserved row stays
+    /// (fail closed) and the sign is still refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_refusal_keeps_the_row_when_reconcile_fails() {
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (moved, faulty) = (Arc::clone(&generation), Arc::clone(&db));
+        let failed_before = reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::FAILED);
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Block { slot: 53 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, generation),
+            Arc::new(AlwaysEnabled),
+            db,
+            move || {
+                moved.fetch_add(1, Ordering::Release);
+                faulty.fail_next_commits(1);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 1, "a failed delete keeps the reserved row");
+        assert!(
+            reconcile_count(tx_hold_kind::BLOCK, reconcile_outcome::FAILED) > failed_before,
+            "rvc_slashing_reconcile_total{{kind=block,outcome=failed}} must move"
+        );
+        assert!(
+            matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+            "a failed delete still refuses; got {:?}",
+            run.result
+        );
+    }
+
+    /// W4-S4b: the second of two attached generations moves after the
+    /// reservation of an attestation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_admission_recheck_after_reserve_for_an_attestation() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let proposer = Arc::new(AtomicU64::new(7));
+        let moved = Arc::clone(&proposer);
+        let deleted_before = reconcile_count(tx_hold_kind::ATTESTATION, reconcile_outcome::DELETED);
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Attestation { source_epoch: 8, target_epoch: 9 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, primary).and_generation(7, proposer),
+            Arc::new(AlwaysEnabled),
+            Arc::new(SlashingDb::open_in_memory().expect("db")),
+            move || {
+                moved.fetch_add(1, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 0, "the reserved attestation row must be deleted");
+        assert!(
+            reconcile_count(tx_hold_kind::ATTESTATION, reconcile_outcome::DELETED) > deleted_before,
+            "rvc_slashing_reconcile_total{{kind=attestation,outcome=deleted}} must move"
+        );
+        assert!(
+            matches!(run.result, Err(SigningGateError::BeaconAdmissionRevoked)),
+            "expected BeaconAdmissionRevoked, got {:?}",
+            run.result
+        );
+    }
+
+    /// W4-S4b: detected and revoked after the reservation. Doppelganger is
+    /// checked first, so the refusal is `BlockedByDoppelganger` and the row
+    /// stays (a doppelganger may sign the same duty).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doppelganger_wins_after_reserve_and_keeps_the_row() {
+        let enablement = Arc::new(DetectableEnablement { detected: AtomicBool::new(false) });
+        let generation = Arc::new(AtomicU64::new(0));
+        let (detect, moved) = (Arc::clone(&enablement), Arc::clone(&generation));
+        let run = sign_with_after_reserve_hook(
+            SlashableKind::Block { slot: 55 },
+            TimeoutPolicy::DiscardStagedRow,
+            crate::BeaconAdmission::new(0, generation),
+            enablement,
+            Arc::new(SlashingDb::open_in_memory().expect("db")),
+            move || {
+                detect.detected.store(true, Ordering::SeqCst);
+                moved.fetch_add(1, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert_eq!(run.bls_calls, 0, "BLS must not be reached");
+        assert_eq!(run.rows, 1, "a doppelganger refusal keeps the reserved row");
+        assert!(
+            matches!(run.result, Err(SigningGateError::BlockedByDoppelganger)),
+            "doppelganger must win over a moved admission after reserve; got {:?}",
+            run.result
+        );
+    }
+
+    /// `fmt` output buffer for a thread-local subscriber.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// W4-S4b: the after-reserve refusal logs one WARN with `reconciled` and
+    /// a truncated pubkey; `reconciled=false` when the delete fails. The
+    /// refusal returns before `block_on`, so the session runs on this thread
+    /// and a thread-local subscriber sees it.
+    #[test]
+    fn test_reserve_then_sign_admission_refusal_warns_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let _context = runtime.enter();
+        for (case, delete_fails) in [("row deleted", false), ("delete fails", true)] {
+            let (pubkey, signer) = make_local(SecretKey::generate());
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let mut session = session_for_reserve(
+                signer,
+                &pubkey,
+                [0x78; 32],
+                Duration::from_secs(4),
+                TimeoutPolicy::DiscardStagedRow,
+                None,
+                Arc::clone(&db),
+                Arc::new(NoopSignHooks),
+            );
+            session.admission = crate::CapturedAdmission::Missing { revokes: true };
+            let logs = LogBuf::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let (db_r, pk) = (Arc::clone(&db), pubkey_hex.clone());
+            let result = tracing::subscriber::with_default(subscriber, || {
+                session.reserve_then_sign(move || {
+                    let reservation =
+                        db_r.reserve_block(&pk, 57, Some(hex::encode([0x78; 32])), &GVR);
+                    if delete_fails {
+                        db_r.fail_next_commits(1);
+                    }
+                    reservation
+                })
+            });
+
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{case}: expected BeaconAdmissionRevoked, got {result:?}"
+            );
+            let rows = db.get_blocks(&pubkey_hex).expect("rows").len();
+            assert_eq!(rows, usize::from(delete_fails), "{case}: block rows after the refusal");
+            let text = String::from_utf8(logs.0.lock().clone()).expect("utf8 log");
+            let warns: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("beacon node admission revoked after reserve, before BLS"))
+                .collect();
+            assert_eq!(warns.len(), 1, "{case}: one refusal line: {text}");
+            let reconciled = format!("reconciled={}", !delete_fails);
+            assert!(
+                warns[0].contains("WARN") && warns[0].contains(&reconciled),
+                "{case}: expected {reconciled}: {}",
+                warns[0]
+            );
+            assert_eq!(
+                text.lines()
+                    .filter(|l| {
+                        l.contains("ERROR")
+                            && l.contains("reserve_then_sign: compensating delete failed")
+                    })
+                    .count(),
+                usize::from(delete_fails),
+                "{case}: retained-row ERROR lines: {text}"
+            );
+            assert!(
+                !text.contains(&pubkey_hex),
+                "{case}: the full pubkey must not be logged: {text}"
+            );
+        }
+    }
+
+    /// W4-S4b: a refused identical re-sign (`inserted: false`) keeps the
+    /// earlier row, which backs a completed sign. Only the row this call
+    /// inserted may be deleted.
+    #[test]
+    fn admission_refusal_keeps_a_preexisting_identical_row() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let _context = runtime.enter();
+        let root = [0x79; 32];
+        for kind in [
+            SlashableKind::Block { slot: 61 },
+            SlashableKind::Attestation { source_epoch: 3, target_epoch: 4 },
+        ] {
+            let (pubkey, inner) = make_local(SecretKey::generate());
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let calls = Arc::new(AtomicU64::new(0));
+            let signer: Arc<dyn Signer> =
+                Arc::new(CountingSigner { inner, calls: Arc::clone(&calls) });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let reserve = {
+                let (db, pk) = (Arc::clone(&db), pubkey_hex.clone());
+                move || match kind {
+                    SlashableKind::Block { slot } => {
+                        db.reserve_block(&pk, slot, Some(hex::encode(root)), &GVR)
+                    }
+                    SlashableKind::Attestation { source_epoch, target_epoch } => db
+                        .reserve_attestation(
+                            &pk,
+                            source_epoch,
+                            target_epoch,
+                            Some(hex::encode(root)),
+                            &GVR,
+                        ),
+                }
+            };
+            let earlier = reserve().expect("earlier reserve");
+            assert!(earlier.inserted, "{kind:?}: the earlier sign inserted the row");
+            let label = reservation_metric_kind(earlier.kind);
+
+            let mut session = session_for_reserve(
+                signer,
+                &pubkey,
+                root,
+                Duration::from_secs(4),
+                TimeoutPolicy::DiscardStagedRow,
+                None,
+                Arc::clone(&db),
+                Arc::new(NoopSignHooks),
+            );
+            session.admission = crate::CapturedAdmission::Missing { revokes: true };
+            session.duty = kind.signing_duty();
+            let resign_inserted = Arc::new(AtomicBool::new(true));
+            let seen = Arc::clone(&resign_inserted);
+            let not_applicable_before = reconcile_count(label, reconcile_outcome::NOT_APPLICABLE);
+            let result = session.reserve_then_sign(move || {
+                let reservation = reserve()?;
+                seen.store(reservation.inserted, Ordering::SeqCst);
+                Ok(reservation)
+            });
+
+            assert!(
+                !resign_inserted.load(Ordering::SeqCst),
+                "{kind:?}: the identical re-sign reserves as inserted: false"
+            );
+            assert!(
+                matches!(result, Err(SigningGateError::BeaconAdmissionRevoked)),
+                "{kind:?}: expected BeaconAdmissionRevoked, got {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{kind:?}: BLS must not be reached");
+            assert_eq!(
+                slashing_rows(&db, &pubkey_hex, kind),
+                1,
+                "{kind:?}: the earlier identical row must stay"
+            );
+            // Lower bound: the counter is process-global (`cargo test` shares it).
+            assert!(
+                reconcile_count(label, reconcile_outcome::NOT_APPLICABLE) > not_applicable_before,
+                "{kind:?}: rvc_slashing_reconcile_total{{kind={label},outcome=not_applicable}} must move"
+            );
+        }
     }
 
     /// TimeoutPolicy has no Default (compile-time contract documented via explicit use).
@@ -1600,6 +2523,9 @@ mod tests {
             client_cn: "test".to_string(),
             gvr: GVR,
             fork_name: None,
+            enablement: Arc::new(crate::AlwaysEnabled),
+            admission: crate::CapturedAdmission::Missing { revokes: false },
+            duty: doppelganger::SigningDuty::Block,
         }
     }
 

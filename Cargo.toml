@@ -10,7 +10,7 @@ resolver = "2"
 unsafe_code = "deny"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -50,11 +50,12 @@ rvc-spec-vectors = { path = "crates/rvc-spec-vectors" }
 # External
 async-trait = "0.1.92"
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 serde_yaml = "0.9"
 toml = "0.8"
 parking_lot = "0.12"
@@ -98,7 +99,7 @@ ethereum_serde_utils = "0.8"
 # Crypto
 blst = "0.3"
 hex = "0.4"
-rand = "0.8"
+rand = "0.8.6"
 ssz = { package = "ethereum_ssz", version = "0.9" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
 # ethereum_ssz 0.8 (lib name `ssz`) aliased as `ssz08` for BeaconBlockBody Encode/Decode.
@@ -131,6 +132,7 @@ subtle = "2.6"
 hkdf = "0.12"
 num-bigint = "0.4"
 bip39 = { version = "2.2", features = ["zeroize", "rand"] }
+unicode-normalization = "0.1"
 rpassword = "5"
 tiny-keccak = { version = "2", features = ["keccak"] }
 rayon = "1"
@@ -145,7 +147,7 @@ bls12_381_plus = "0.8"
 bytes = "1"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # File locking
 fd-lock = "4"
@@ -154,7 +156,6 @@ fd-lock = "4"
 libc = "0.2"
 
 # Log rotation
-logroller = "0.1"
 tracing-appender = "0.2"
 flate2 = "1"
 snap = "1"

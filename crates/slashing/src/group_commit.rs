@@ -18,18 +18,15 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::db::watermarks::{read_watermark, WatermarkKind};
+use crate::db::to_sql_i64;
 use crate::error::SlashingError;
-use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
-use crate::rules::{
-    check_attestation, check_block, AttestationCandidate, AttestationVerdict,
-    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
-};
+use crate::evaluate::{evaluate_attestation, evaluate_block};
+use crate::rules::{AttestationVerdict, BlockVerdict};
 use crate::stage::{
     persist_reserved_row, with_immediate_txn, CommittedReservation, ReservationKind, AUDIT_ORIGIN,
 };
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, Root, Slot};
 
 /// Operator knobs for slashing-DB group commit.
 ///
@@ -162,6 +159,22 @@ impl ReserveSpec {
             Self::Block { gvr_hex, .. } | Self::Attestation { gvr_hex, .. } => gvr_hex,
         }
     }
+
+    /// Refuse a slot or epoch above `i64::MAX` before the spec is queued.
+    ///
+    /// Source is checked before target. Built on [`to_sql_i64`] (`i64::try_from`).
+    pub(crate) fn check_bounds(&self) -> Result<(), SlashingError> {
+        match self {
+            Self::Block { slot, .. } => {
+                to_sql_i64(*slot, "slot")?;
+            }
+            Self::Attestation { source_epoch, target_epoch, .. } => {
+                to_sql_i64(*source_epoch, "source_epoch")?;
+                to_sql_i64(*target_epoch, "target_epoch")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct QueuedReserve {
@@ -256,7 +269,6 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<CommittedReservation, SlashingError> {
-        self.check_gvr_before_lock(gvr, "reserve_block")?;
         let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let spec = ReserveSpec::Block {
             pubkey: pubkey.to_string(),
@@ -265,6 +277,9 @@ impl SlashingDb {
             gvr: *gvr,
             gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
         };
+        // Before `check_gvr_before_lock`: a cold `pinned_gvr` takes `conn`.
+        spec.check_bounds()?;
+        self.check_gvr_before_lock(gvr, "reserve_block")?;
         self.enqueue_and_wait(spec)
     }
 
@@ -276,7 +291,6 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<CommittedReservation, SlashingError> {
-        self.check_gvr_before_lock(gvr, "reserve_attestation")?;
         let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let spec = ReserveSpec::Attestation {
             pubkey: pubkey.to_string(),
@@ -286,6 +300,9 @@ impl SlashingDb {
             gvr: *gvr,
             gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
         };
+        // Before `check_gvr_before_lock`: a cold `pinned_gvr` takes `conn`.
+        spec.check_bounds()?;
+        self.check_gvr_before_lock(gvr, "reserve_attestation")?;
         self.enqueue_and_wait(spec)
     }
 
@@ -299,24 +316,19 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<(), SlashingError> {
-        self.check_gvr_before_lock(gvr, "reserve_block")?;
         let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
+        let spec = ReserveSpec::Block {
+            pubkey: pubkey.to_string(),
+            slot,
+            signing_root_hex,
+            gvr: *gvr,
+            gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
+        };
+        spec.check_bounds()?;
+        self.check_gvr_before_lock(gvr, "reserve_block")?;
         let (tx, rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(true));
-        self.push_pending(
-            QueuedReserve {
-                spec: ReserveSpec::Block {
-                    pubkey: pubkey.to_string(),
-                    slot,
-                    signing_root_hex,
-                    gvr: *gvr,
-                    gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
-                },
-                tx,
-                cancelled,
-            },
-            false,
-        );
+        self.push_pending(QueuedReserve { spec, tx, cancelled }, false);
         drop(rx);
         Ok(())
     }
@@ -331,24 +343,19 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<CancellableReserve, SlashingError> {
-        self.check_gvr_before_lock(gvr, "reserve_block")?;
         let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
+        let spec = ReserveSpec::Block {
+            pubkey: pubkey.to_string(),
+            slot,
+            signing_root_hex,
+            gvr: *gvr,
+            gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
+        };
+        spec.check_bounds()?;
+        self.check_gvr_before_lock(gvr, "reserve_block")?;
         let (tx, rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(true));
-        self.push_pending(
-            QueuedReserve {
-                spec: ReserveSpec::Block {
-                    pubkey: pubkey.to_string(),
-                    slot,
-                    signing_root_hex,
-                    gvr: *gvr,
-                    gvr_hex: crate::db::SlashingDb::root_to_hex(gvr),
-                },
-                tx,
-                cancelled: Arc::clone(&cancelled),
-            },
-            false,
-        );
+        self.push_pending(QueuedReserve { spec, tx, cancelled: Arc::clone(&cancelled) }, false);
         Ok(CancellableReserve { rx: Some(rx), cancelled })
     }
 
@@ -609,12 +616,7 @@ fn check_spec_in_txn(
     wait_eval_gate(db);
     match spec {
         ReserveSpec::Block { pubkey, slot, signing_root_hex, .. } => {
-            let strict = db.fork_aware_strict(*slot / SLOTS_PER_EPOCH);
-            let watermark = read_watermark(conn, pubkey, WatermarkKind::Block)?;
-            let history = TargetedSqlBlockHistory::new(conn, pubkey);
-            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
-            let candidate = BlockCandidate { slot: *slot, signing_root: signing_root_hex.clone() };
-            let outcome = check_block(pubkey, &history, &watermarks, &candidate, strict)?;
+            let outcome = evaluate_block(db, conn, pubkey, *slot, signing_root_hex.clone())?;
             let inserted = !matches!(outcome, BlockVerdict::Resign);
             Ok(CommittedReservation {
                 pubkey_hex: pubkey.clone(),
@@ -626,20 +628,14 @@ fn check_spec_in_txn(
         ReserveSpec::Attestation {
             pubkey, source_epoch, target_epoch, signing_root_hex, ..
         } => {
-            let strict = db.fork_aware_strict(*target_epoch);
-            let wm_source = read_watermark(conn, pubkey, WatermarkKind::AttestationSource)?;
-            let wm_target = read_watermark(conn, pubkey, WatermarkKind::AttestationTarget)?;
-            let history = TargetedSqlAttestationHistory::new(conn, pubkey);
-            let watermarks = AttestationWatermarks {
-                source: wm_source.map(|w| w as Epoch),
-                target: wm_target.map(|w| w as Epoch),
-            };
-            let candidate = AttestationCandidate {
-                source_epoch: *source_epoch,
-                target_epoch: *target_epoch,
-                signing_root: signing_root_hex.clone(),
-            };
-            let verdict = check_attestation(pubkey, &history, &watermarks, &candidate, strict)?;
+            let verdict = evaluate_attestation(
+                db,
+                conn,
+                pubkey,
+                *source_epoch,
+                *target_epoch,
+                signing_root_hex.clone(),
+            )?;
             let inserted = !matches!(verdict, AttestationVerdict::Duplicate);
             Ok(CommittedReservation {
                 pubkey_hex: pubkey.clone(),
@@ -661,11 +657,12 @@ fn insert_spec(
     }
     match spec {
         ReserveSpec::Block { pubkey, slot, signing_root_hex, gvr_hex, .. } => {
+            let slot = to_sql_i64(*slot, "slot")?;
             conn.execute(
                 "INSERT INTO blocks
                  (client_cn, pubkey, slot, signing_root, genesis_validators_root)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                (AUDIT_ORIGIN, pubkey.as_str(), *slot as i64, signing_root_hex, gvr_hex),
+                (AUDIT_ORIGIN, pubkey.as_str(), slot, signing_root_hex, gvr_hex),
             )
             .map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))?;
         }
@@ -684,8 +681,8 @@ fn insert_spec(
                 (
                     AUDIT_ORIGIN,
                     pubkey.as_str(),
-                    *source_epoch as i64,
-                    *target_epoch as i64,
+                    to_sql_i64(*source_epoch, "source_epoch")?,
+                    to_sql_i64(*target_epoch, "target_epoch")?,
                     signing_root_hex,
                     gvr_hex,
                 ),

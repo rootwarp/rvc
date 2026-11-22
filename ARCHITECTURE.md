@@ -351,8 +351,8 @@ sequenceDiagram
     Orch->>Sync: produce_contributions(slot, duties, head_root)
     Sync->>BNM: submit_contribution_and_proofs(proofs)
 
-    Note over Clock,Builder: Post-duty (epoch boundary only)
-    Orch->>Builder: register_validators (with jitter)
+    Note over Clock,Builder: Separate runner task: first processed slot of each epoch, then retries at later processed slots.<br/>EpochBoundaryRunner::run_pending: BreakerReset → ReorgCheck → DutyFetch → PrepareProposers → CommitteeSubscriptions (E, then E+1) → BuilderRegistration → ProposerPreferences
+    Orch->>Builder: runner BuilderRegistration step: submit_epoch_registrations (every epoch)
 ```
 
 ## Block Proposal Lifecycle
@@ -376,7 +376,7 @@ flowchart TD
     style J fill:#51cf66,color:#fff
 ```
 
-`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1067` and `core.rs:1116` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
+`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1077` and `core.rs:1126` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
 
 ## Signing Flow
 
@@ -529,7 +529,7 @@ Central coordination crate. Contains:
 - **`DutyOrchestrator<C, S, B>`** — Main loop with 3-phase slot processing: t=0 block proposals, t=slot/3 attestations + sync messages, t=2*slot/3 aggregations + contributions. Generic over `SlotClock`, `AttestationSubmitter`, and `BeaconBlockClient` for testability.
 - **`Config`** / **`Network`** — Configuration types with network presets (Mainnet, Hoodi, Custom).
 - **`OrchestratorConfig`** — Fork schedule, genesis root, shutdown timeout.
-- **Adapter modules** — `beacon_adapter`, `doppelganger_adapter`, `keymanager_adapters` bridge domain traits to concrete services.
+- **Adapter modules** — `beacon_adapter`, `keymanager_adapters` bridge domain traits to concrete services.
 - **gRPC DutyTracker service** — Exposes a `Healthz` RPC via tonic.
 
 ### `crates/bn-manager` — Multi-BN Management
@@ -557,8 +557,7 @@ Builder registration management and proposer preparation.
 
 - **`BuilderService`** — Batch-signs `ValidatorRegistrationV1` with `DOMAIN_APPLICATION_BUILDER` (zeroed genesis root), submits via `register_validator` endpoint.
 - **`prepare_proposers`** — Sends fee recipients to BN at epoch start.
-- **Jitter** — Random 0–30s delay before registration to spread load.
-- Registration runs at epoch boundary AFTER all duty phases.
+- Registration is the epoch boundary runner's BuilderRegistration step. It re-sends every builder key's registration in each epoch, signs only new or changed keys, and retries a failed send at the next slot of the epoch.
 
 ### `crates/doppelganger` — Doppelganger Detection
 
@@ -661,7 +660,7 @@ Slot timing abstraction:
 
 ### `crates/metrics` — Prometheus Metrics & Health
 
-Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics` and `/healthz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
+Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics`, `/health`, `/livez`, and `/readyz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
 
 ### `crates/secret-provider` — Cloud Secret Management
 
@@ -689,7 +688,7 @@ Client library for connecting `bin/rvc` to `bin/rvc-signer` via gRPC with mTLS:
 Provides distributed tracing infrastructure using OpenTelemetry:
 
 - **`TelemetryConfig`** — Endpoint, exporter kind, sample rate, batch processor tuning (max queue size, max export batch size).
-- **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace, gated behind `gcp-trace` feature).
+- **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace through the OTLP endpoint of the Telemetry API with ADC auth, gated behind `gcp-trace` feature).
 - **`init_tracing`** — Sets up `tracing-opentelemetry` layer with `ParentBased(TraceIdRatioBased)` sampler. Returns `TracingGuard`.
 - **`TracingGuard`** — RAII `#[must_use]` guard that flushes pending spans on drop (5-second timeout).
 - **W3C propagation** — Injects `traceparent` into outbound beacon-node HTTP headers and, behind feature `grpc`, into outbound gRPC signer metadata.
@@ -744,7 +743,7 @@ The validator client is configured via a TOML file (`config.toml`) or CLI flags:
 - Doppelganger detection (`--no-doppelganger` to disable)
 - Keymanager API (`--keymanager-enabled`, address, token file)
 - Remote signer URL (`--remote-signer-url`)
-- Metrics port (default 8080) with `/metrics` and `/healthz`
+- Metrics port (default 8080) with `/metrics`, `/health`, `/livez`, and `/readyz`
 - gRPC port (default 50051) with `Healthz` RPC
 - Network preset or custom genesis parameters
 - Per-operation timeouts (attestation, block production, aggregate, sync committee)

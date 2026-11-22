@@ -107,16 +107,13 @@
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
 
-use crate::db::watermarks::{read_watermark, WatermarkKind};
+use crate::db::to_sql_i64;
 use crate::error::SlashingError;
-use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
+use crate::evaluate::{evaluate_attestation, evaluate_block};
 use crate::metrics;
-use crate::rules::{
-    check_attestation, check_block, AttestationCandidate, AttestationVerdict,
-    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
-};
+use crate::rules::{AttestationVerdict, BlockVerdict};
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, Root, Slot};
 use observability::logging::TruncatedPubkey;
 
 /// Fixed audit origin written to the `client_cn` column on INSERT.
@@ -275,7 +272,7 @@ impl<'db> StagedBlock<'db> {
                 (
                     AUDIT_ORIGIN,
                     &self.row.pubkey,
-                    self.row.slot as i64,
+                    to_sql_i64(self.row.slot, "slot")?,
                     &self.row.signing_root,
                     &self.row.gvr_hex,
                 ),
@@ -361,8 +358,8 @@ impl<'db> StagedAttestation<'db> {
                 (
                     AUDIT_ORIGIN,
                     &self.row.pubkey,
-                    self.row.source_epoch as i64,
-                    self.row.target_epoch as i64,
+                    to_sql_i64(self.row.source_epoch, "source_epoch")?,
+                    to_sql_i64(self.row.target_epoch, "target_epoch")?,
                     &self.row.signing_root,
                     &self.row.gvr_hex,
                 ),
@@ -437,6 +434,8 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<StagedBlock<'db>, SlashingError> {
+        // Before `pinned_gvr`: a cold cache takes `conn`.
+        to_sql_i64(slot, "slot")?;
         // M-6: GVR check before acquiring the main mutex to avoid nested-lock deadlock.
         // pinned_gvr() may itself briefly acquire the mutex on a cold cache, then release it.
         if let Some(pinned) = self.pinned_gvr()? {
@@ -455,21 +454,13 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.fork_aware_strict(slot / SLOTS_PER_EPOCH);
-        // Run violation checks inside a closure so any error — whether a SQL
-        // I/O error from `?`-propagation or an EIP-3076 violation — funnels
-        // through a single ROLLBACK before we return. Without this wrapper a
-        // SQL error between `BEGIN IMMEDIATE` and the guard transfer would
-        // drop the MutexGuard with the transaction still open, leaving the
-        // connection in a broken "transaction within transaction" state.
-        let outcome = (|| -> Result<BlockVerdict, SlashingError> {
-            let watermark = read_watermark(&guard, pubkey.as_ref(), WatermarkKind::Block)?;
-
-            let history = TargetedSqlBlockHistory::new(&guard, pubkey.as_ref());
-            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
-            let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
-            check_block(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
-        })();
+        // Any evaluator error — whether a SQL I/O error from `?`-propagation
+        // or an EIP-3076 violation — funnels through a single ROLLBACK before
+        // we return. Without this a SQL error between `BEGIN IMMEDIATE` and
+        // the guard transfer would drop the MutexGuard with the transaction
+        // still open, leaving the connection in a broken "transaction within
+        // transaction" state.
+        let outcome = evaluate_block(self, &guard, pubkey.as_ref(), slot, signing_root_hex.clone());
 
         let outcome = match outcome {
             Ok(o) => o,
@@ -519,6 +510,9 @@ impl SlashingDb {
         signing_root_hex: Option<String>,
         gvr: &Root,
     ) -> Result<StagedAttestation<'db>, SlashingError> {
+        // Source before target. Before `pinned_gvr`: a cold cache takes `conn`.
+        to_sql_i64(source_epoch, "source_epoch")?;
+        to_sql_i64(target_epoch, "target_epoch")?;
         // M-6: GVR check before acquiring the main mutex.
         if let Some(pinned) = self.pinned_gvr()? {
             if pinned != *gvr {
@@ -536,28 +530,17 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.fork_aware_strict(target_epoch);
-        // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
-        // funnels through a single ROLLBACK before we return.  See the
-        // matching note in `stage_block`.
-        let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
-            let wm_source =
-                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
-            let wm_target =
-                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
-
-            let history = TargetedSqlAttestationHistory::new(&guard, pubkey.as_ref());
-            let watermarks = AttestationWatermarks {
-                source: wm_source.map(|w| w as Epoch),
-                target: wm_target.map(|w| w as Epoch),
-            };
-            let candidate = AttestationCandidate {
-                source_epoch,
-                target_epoch,
-                signing_root: signing_root_hex.clone(),
-            };
-            check_attestation(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
-        })();
+        // Any evaluator error — SQL I/O or EIP-3076 — funnels through a
+        // single ROLLBACK before we return.  See the matching note in
+        // `stage_block`.
+        let outcome = evaluate_attestation(
+            self,
+            &guard,
+            pubkey.as_ref(),
+            source_epoch,
+            target_epoch,
+            signing_root_hex.clone(),
+        );
 
         let verdict = match outcome {
             Ok(v) => v,
@@ -709,8 +692,7 @@ fn reconcile_delete_txn(
     let before = if cfg!(debug_assertions) { Some(snapshot_watermarks(conn)?) } else { None };
 
     let pubkey = crate::db::normalize_pubkey(&reservation.pubkey_hex)?;
-    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)
-        .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))?;
+    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)?;
     if changes > 1 {
         return Err(SlashingError::ReconcileFailed(format!(
             "targeted delete affected {changes} rows (cap is 1)"
@@ -736,19 +718,28 @@ fn delete_reserved_row(
     conn: &Connection,
     pubkey: &str,
     reservation: &CommittedReservation,
-) -> rusqlite::Result<usize> {
+) -> Result<usize, SlashingError> {
     match reservation.kind {
-        ReservationKind::Block { slot } => conn.execute(
-            "DELETE FROM blocks
-             WHERE pubkey = ?1 AND slot = ?2 AND signing_root IS ?3",
-            (pubkey, slot as i64, &reservation.signing_root_hex),
-        ),
-        ReservationKind::Attestation { source, target } => conn.execute(
-            "DELETE FROM attestations
-             WHERE pubkey = ?1 AND source_epoch = ?2 AND target_epoch = ?3
-               AND signing_root IS ?4",
-            (pubkey, source as i64, target as i64, &reservation.signing_root_hex),
-        ),
+        ReservationKind::Block { slot } => {
+            let slot = to_sql_i64(slot, "slot")?;
+            conn.execute(
+                "DELETE FROM blocks
+                 WHERE pubkey = ?1 AND slot = ?2 AND signing_root IS ?3",
+                (pubkey, slot, &reservation.signing_root_hex),
+            )
+            .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))
+        }
+        ReservationKind::Attestation { source, target } => {
+            let source = to_sql_i64(source, "source_epoch")?;
+            let target = to_sql_i64(target, "target_epoch")?;
+            conn.execute(
+                "DELETE FROM attestations
+                 WHERE pubkey = ?1 AND source_epoch = ?2 AND target_epoch = ?3
+                   AND signing_root IS ?4",
+                (pubkey, source, target, &reservation.signing_root_hex),
+            )
+            .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))
+        }
     }
 }
 

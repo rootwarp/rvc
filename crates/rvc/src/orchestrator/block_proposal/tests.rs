@@ -117,8 +117,8 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
     ));
 
     // Invoke the proposer path directly.
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    let ctx = SlotContext::bare(slot, epoch);
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // H-4: a forged proposer_index must drop the duty before any
     // signing or publishing occurs.
@@ -229,8 +229,8 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
         pubkey_map,
     ));
 
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    let ctx = SlotContext::bare(slot, epoch);
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // D-3: the block must NOT be proposed when is_signing_enabled=false.
     // publish_called stays false because the gate returns early before
@@ -247,7 +247,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
 #[tokio::test]
 async fn test_proposal_passes_previous_slot_as_expected_parent() {
     use async_trait::async_trait;
-    use beacon::{BlockRootData, DataResponse, DependentRootResponse, ProposerDuty};
+    use beacon::{BlockRootData, BlockRootResponse, DependentRootResponse, ProposerDuty};
     use block_service::{
         BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse,
     };
@@ -285,6 +285,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         }
 
@@ -338,6 +339,54 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
         ) -> Result<(), BlockServiceError> {
             Ok(())
         }
+
+        async fn produce_block_v3_for_duty(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            _duty: block_service::ProduceDuty,
+        ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+        }
+
+        async fn produce_block_v3_ranked(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            _duty: Option<block_service::ProduceDuty>,
+        ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+            let response =
+                self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+            Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+        }
+
+        async fn produce_block_v3_ranked_by(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            duty: Option<block_service::ProduceDuty>,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+            self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+                .await
+        }
+
+        async fn produce_block_v4_by(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_config: &block_service::BuilderConfig,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+            self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+        }
     }
 
     let slot: Slot = 100;
@@ -345,29 +394,44 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     let validator_index = 42u64;
     let r_prev: Root = [0x11; 32];
     let r_curr: Root = [0x22; 32];
-    let r_prev_hex = format!("0x{}", hex::encode(r_prev));
     let r_curr_hex = format!("0x{}", hex::encode(r_curr));
 
     let secret_key = SecretKey::generate();
     let pubkey = secret_key.public_key();
     let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
+    let reorg_parent: Root = [0x33; 32];
     let beacon = Arc::new(
         MockBeaconNodeClient::new()
+            .with_get_block_header({
+                move |block_id| {
+                    if block_id != (slot - 1).to_string() {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Ok(beacon::BlockHeaderSummary {
+                        root: r_prev,
+                        slot: slot - 1,
+                        proposer_index: 1,
+                        parent_root: reorg_parent,
+                    })
+                }
+            })
             .with_get_block_root({
-                let r_prev_hex = r_prev_hex.clone();
                 let r_curr_hex = r_curr_hex.clone();
                 move |block_id| {
                     let root = if block_id == slot.to_string() {
                         r_curr_hex.clone()
-                    } else if block_id == (slot - 1).to_string() {
-                        r_prev_hex.clone()
                     } else {
                         return Err(beacon::BeaconError::HttpError(format!(
                             "unexpected block_id {block_id}"
                         )));
                     };
-                    Ok(DataResponse { data: BlockRootData { root } })
+                    Ok(BlockRootResponse {
+                        execution_optimistic: None,
+                        data: BlockRootData { root },
+                    })
                 }
             })
             .with_get_proposer_duties({
@@ -437,11 +501,20 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     ));
 
     let mut ctx = SlotContext::capture_parent(beacon.as_ref(), slot, epoch).await;
-    ctx.capture_head(beacon.as_ref()).await;
+    ctx.apply_phase2_head(beacon.as_ref()).await;
     assert_eq!(ctx.parent_root, Some(r_prev), "t=0 parent must be slot N-1");
+    assert_eq!(
+        ctx.expected_parents,
+        Some(block_service::ExpectedParents {
+            root: r_prev,
+            parent: Some(reorg_parent),
+            closed: false
+        }),
+        "a header at N-1 keeps its parent for a single-slot re-org"
+    );
     assert_eq!(ctx.head_root, Some(r_curr), "phase-2 head must be slot N");
 
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     assert!(
         publish_called.load(Ordering::SeqCst),
@@ -496,6 +569,7 @@ async fn test_successful_proposal_increments_success_outcome() {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         }
 
@@ -548,6 +622,54 @@ async fn test_successful_proposal_increments_success_outcome() {
             _broadcast_validation: Option<&str>,
         ) -> Result<(), BlockServiceError> {
             Ok(())
+        }
+
+        async fn produce_block_v3_for_duty(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            _duty: block_service::ProduceDuty,
+        ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+        }
+
+        async fn produce_block_v3_ranked(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            _duty: Option<block_service::ProduceDuty>,
+        ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+            let response =
+                self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+            Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+        }
+
+        async fn produce_block_v3_ranked_by(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+            duty: Option<block_service::ProduceDuty>,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+            self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+                .await
+        }
+
+        async fn produce_block_v4_by(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_config: &block_service::BuilderConfig,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+            self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
         }
     }
 
@@ -624,8 +746,8 @@ async fn test_successful_proposal_increments_success_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+        let ctx = SlotContext::bare(slot, epoch);
+        orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert!(published.load(Ordering::SeqCst), "success path must publish");
         assert_eq!(
@@ -715,8 +837,8 @@ async fn test_failed_proposal_increments_failed_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+        let ctx = SlotContext::bare(slot, epoch);
+        orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert_eq!(
             proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED),
@@ -730,4 +852,472 @@ async fn test_failed_proposal_increments_failed_outcome() {
         );
     })
     .await;
+}
+
+/// One produce step, then the publish outcome for that step.
+#[derive(Clone, Copy)]
+enum PublishStep {
+    BlindedFail,
+    BlindedOk,
+    LocalOk,
+    LocalFail,
+    BlindedHang,
+}
+
+struct ScriptedBeacon {
+    steps: std::sync::Mutex<std::collections::VecDeque<PublishStep>>,
+    current: std::sync::Mutex<Option<PublishStep>>,
+    index: u64,
+    /// Deadline of each `produce_block_v3_ranked_by` call, in order.
+    recorded_deadline: std::sync::Mutex<Vec<Option<tokio::time::Instant>>>,
+}
+
+impl ScriptedBeacon {
+    fn new(index: u64, steps: Vec<PublishStep>) -> Self {
+        Self {
+            steps: std::sync::Mutex::new(steps.into()),
+            current: std::sync::Mutex::new(None),
+            index,
+            recorded_deadline: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn recorded_deadline(&self) -> Vec<Option<tokio::time::Instant>> {
+        self.recorded_deadline.lock().expect("deadline").clone()
+    }
+
+    fn take(&self) -> PublishStep {
+        let step = self.steps.lock().expect("steps").pop_front().expect("a step");
+        *self.current.lock().expect("current") = Some(step);
+        step
+    }
+
+    fn block(
+        &self,
+        slot: Slot,
+        blinded: bool,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        let data = if blinded {
+            let mut block = eth_types::external_vector_deneb_blinded_block();
+            block.slot = slot;
+            block.proposer_index = self.index;
+            serde_json::to_value(&block)
+        } else {
+            let mut block = eth_types::external_vector_deneb_block();
+            block.slot = slot;
+            block.proposer_index = self.index;
+            serde_json::to_value(&block)
+        }
+        .map_err(|err| block_service::BlockServiceError::Parse(err.to_string()))?;
+        Ok(block_service::ProduceBlockResponse {
+            data,
+            is_blinded: blinded,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
+        })
+    }
+
+    async fn finish(&self) -> Result<(), block_service::BlockServiceError> {
+        let step = *self.current.lock().expect("current");
+        match step {
+            Some(PublishStep::BlindedOk | PublishStep::LocalOk) => Ok(()),
+            Some(PublishStep::BlindedHang) => std::future::pending().await,
+            Some(PublishStep::BlindedFail | PublishStep::LocalFail) | None => {
+                Err(block_service::BlockServiceError::Beacon("publish failed".to_string()))
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl block_service::BeaconBlockClient for ScriptedBeacon {
+    async fn produce_block_v3(
+        &self,
+        slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        let blinded = matches!(
+            self.take(),
+            PublishStep::BlindedFail | PublishStep::BlindedOk | PublishStep::BlindedHang
+        );
+        self.block(slot, blinded)
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.recorded_deadline.lock().expect("deadline").push(deadline);
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &block_service::BuilderConfig,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("v4 unused".to_string()))
+    }
+
+    async fn publish_block(
+        &self,
+        _signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_block_contents(
+        &self,
+        _contents: &eth_types::SignedBlockContentsJson,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
+}
+
+struct ProposalRig {
+    orchestrator: DutyOrchestrator<MockSlotClock, MockSubmitter, ScriptedBeacon>,
+    breaker: Arc<signer::CircuitBreakerState>,
+    clock: Arc<MockSlotClock>,
+    epoch: u64,
+    beacon: Arc<ScriptedBeacon>,
+}
+
+async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> ProposalRig {
+    use bn_manager::MockBeaconNodeClient;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let secret = SecretKey::generate();
+    let pubkey = secret.public_key();
+    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+    let index = 1u64;
+    let epoch = slots[0] / SLOTS_PER_EPOCH;
+    let data = slots
+        .iter()
+        .map(|slot| {
+            serde_json::json!({
+                "pubkey": pubkey_hex,
+                "validator_index": index.to_string(),
+                "slot": slot.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Mock::given(method("GET"))
+        .and(path(format!("/eth/v1/validator/duties/proposer/{epoch}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": data,
+        })))
+        .mount(&server)
+        .await;
+
+    let beacon = Arc::new(BeaconClient::new(BeaconClientConfig::new(server.uri())).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex]));
+    duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+    let mut keys = KeyManager::new();
+    keys.insert(secret);
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(keys))),
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+        )
+        .with_enablement(always_enabled()),
+    );
+    let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
+    let mut validator = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    store.add_validator(validator).unwrap();
+    store.set_global_block_selection_mode(validator_store::BlockSelectionMode::MaxProfit);
+    let mut map = HashMap::new();
+    map.insert(pubkey.to_bytes(), pubkey);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let breaker = Arc::new(signer::CircuitBreakerState::new(limit, 0));
+    let beacon = Arc::new(ScriptedBeacon::new(index, steps));
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+        circuit_breaker: Arc::clone(&breaker),
+        attesting_enabled: Arc::new(AtomicBool::new(true)),
+        ..OrchestratorDeps::for_test(
+            Arc::clone(&clock),
+            duty_tracker,
+            signer,
+            Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+            Arc::new(MockBeaconNodeClient::new()),
+            Arc::clone(&beacon),
+            None,
+            store,
+            create_test_config(),
+            Arc::new(parking_lot::RwLock::new(map)),
+        )
+    });
+    ProposalRig { orchestrator, breaker, clock, epoch, beacon }
+}
+
+async fn propose_at(rig: &ProposalRig, slot: u64) {
+    rig.clock.set_slot(slot);
+    let ctx = SlotContext::bare(slot, rig.epoch);
+    rig.orchestrator.maybe_propose_block(slot, rig.epoch, &ctx, None).await;
+}
+
+/// N consecutive blinded publish failures trip the breaker.
+#[tokio::test]
+async fn test_blinded_publish_failure_trips_breaker() {
+    let slots = [100u64, 101, 102];
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedFail, PublishStep::BlindedFail, PublishStep::BlindedFail],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 3);
+    assert_eq!(rig.breaker.epoch_misses(), 3);
+    assert!(rig.breaker.is_tripped());
+}
+
+/// A local block after a blinded failure does not reset the miss count.
+///
+/// Blinded failure, local success, repeated. The breaker trips on the blinded
+/// failures alone.
+#[tokio::test]
+async fn test_local_fallback_after_blinded_failure_does_not_reset_the_breaker() {
+    let slots = [100u64, 101, 102, 103, 104];
+    let rig = proposal_rig(
+        3,
+        vec![
+            PublishStep::BlindedFail,
+            PublishStep::LocalOk,
+            PublishStep::BlindedFail,
+            PublishStep::LocalOk,
+            PublishStep::BlindedFail,
+        ],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 3);
+    assert!(rig.breaker.is_tripped());
+}
+
+/// A blinded publish the beacon node accepted clears the consecutive count
+/// and leaves the epoch count.
+#[tokio::test]
+async fn test_successful_blinded_publish_resets_the_miss_count() {
+    let slots = [110u64, 111, 112];
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedFail, PublishStep::BlindedFail, PublishStep::BlindedOk],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert_eq!(rig.breaker.epoch_misses(), 2);
+    assert!(!rig.breaker.is_tripped());
+}
+
+/// A local publish failure is not a builder miss.
+#[tokio::test]
+async fn test_local_publish_failure_does_not_move_the_breaker() {
+    let rig = proposal_rig(3, vec![PublishStep::LocalFail], &[120]).await;
+    propose_at(&rig, 120).await;
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert_eq!(rig.breaker.epoch_misses(), 0);
+    assert!(!rig.breaker.is_tripped());
+}
+
+/// The outer proposal timeout cannot classify the publish, so it records nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn test_proposal_timeout_does_not_record_a_miss() {
+    let rig = proposal_rig(3, vec![PublishStep::BlindedHang], &[121]).await;
+    tokio::time::pause();
+    rig.clock.set_slot(121);
+    let allowance = super::block_proposal_allowance(&rig.orchestrator.config.timeouts);
+    let epoch = rig.epoch;
+    let orch = rig.orchestrator;
+    let task = tokio::spawn(async move {
+        let ctx = SlotContext::bare(121, epoch);
+        orch.maybe_propose_block(121, epoch, &ctx, None).await;
+    });
+    tokio::time::sleep(allowance).await;
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("the outer timeout ends the proposal")
+        .expect("proposal task");
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert!(!rig.breaker.is_tripped());
+}
+
+/// The outer allowance is `min(block proposal allowance, time left in the slot)`.
+///
+/// A hang returns at the shorter of those two. Tokio's timer wheel rounds a
+/// deadline up by at most one millisecond, so under pause the measured elapsed
+/// is that shorter duration or one millisecond more. A slot that is already
+/// over does not wait out the allowance.
+#[tokio::test(flavor = "current_thread")]
+async fn test_proposal_outer_timeout_is_clamped_to_slot_end() {
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedHang, PublishStep::BlindedHang, PublishStep::BlindedHang],
+        &[121, 122, 123],
+    )
+    .await;
+    tokio::time::pause();
+    let allowance = super::block_proposal_allowance(&rig.orchestrator.config.timeouts);
+    let slot_ms = 12_000u64;
+    assert!(Duration::from_millis(slot_ms) > allowance);
+    let epoch = rig.epoch;
+    // `deadline_to_tick` adds 999_999 ns. Elapsed is the armed duration, or
+    // one millisecond more when the paused instant is not on a millisecond.
+    let within_one_tick = |actual: Duration, armed: Duration| {
+        let tick = Duration::from_millis(1);
+        assert!(
+            actual == armed || actual == armed.saturating_add(tick),
+            "elapsed {actual:?}, armed {armed:?}"
+        );
+    };
+
+    // Slot already over: remaining is zero, shorter than the allowance.
+    rig.clock.set_slot_with_offset_ms(121, slot_ms);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(121, epoch);
+    rig.orchestrator.maybe_propose_block(121, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), Duration::ZERO);
+
+    // 40 ms left in the slot, shorter than the allowance.
+    rig.clock.set_slot_with_offset_ms(122, slot_ms - 40);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(122, epoch);
+    rig.orchestrator.maybe_propose_block(122, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), Duration::from_millis(40));
+
+    // A full slot remains, longer than the allowance. The allowance wins.
+    rig.clock.set_slot(123);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(123, epoch);
+    rig.orchestrator.maybe_propose_block(123, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), allowance);
+}
+
+/// `maybe_propose_block` passes the slot-end deadline into block production.
+/// Each call stores its own instant. `None` stays `None` on the next call.
+#[tokio::test(flavor = "current_thread")]
+async fn test_maybe_propose_block_forwards_the_slot_end_deadline() {
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::LocalOk, PublishStep::LocalOk, PublishStep::LocalOk],
+        &[130, 131, 132],
+    )
+    .await;
+    tokio::time::pause();
+    let epoch = rig.epoch;
+
+    rig.clock.set_slot(130);
+    let first = tokio::time::Instant::now() + Duration::from_millis(800);
+    let ctx = SlotContext::bare(130, epoch);
+    rig.orchestrator.maybe_propose_block(130, epoch, &ctx, Some(first)).await;
+
+    rig.clock.set_slot(131);
+    let second = tokio::time::Instant::now() + Duration::from_secs(2);
+    let ctx = SlotContext::bare(131, epoch);
+    rig.orchestrator.maybe_propose_block(131, epoch, &ctx, Some(second)).await;
+
+    rig.clock.set_slot(132);
+    let ctx = SlotContext::bare(132, epoch);
+    rig.orchestrator.maybe_propose_block(132, epoch, &ctx, None).await;
+
+    assert_eq!(rig.beacon.recorded_deadline(), vec![Some(first), Some(second), None]);
 }

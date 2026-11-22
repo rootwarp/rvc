@@ -4,6 +4,8 @@
 
 ## Overview
 
+Unknown keys in `config.toml` and in the validators file fail startup.
+
 `validators_config` is a separate TOML file (not the main `config.toml`) that holds:
 
 - **Global defaults** — fee recipient, gas limit, graffiti applied to every validator that doesn't override them.
@@ -76,7 +78,7 @@ pubkey = "0xdef456..."
 | `gas_limit` | integer | `30000000` | Execution-layer gas limit target passed to the builder/EL. |
 | `graffiti` | string | none (empty) | UTF-8 string. **Silently truncated to 32 bytes** if longer (byte-level truncation via `parse_graffiti`, `store.rs:435-440`) — unlike the HTTP API, which rejects oversized graffiti with `400` instead of truncating. |
 
-There is **no global `block_selection_mode` key under `[defaults]`** — block selection mode can only be set per-validator (see below) or via the Rust API (`ValidatorStore::set_global_block_selection_mode`), which nothing in the shipped binary currently calls (the effective global default is permanently `max-profit`).
+There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block-selection-mode` and the top-level TOML key `block_selection_mode` (on the rvc config, not in this file) set the global default. A per-validator `block_selection_mode` still wins. `ValidatorStore::set_global_block_selection_mode` sets the same global. When the flag and the TOML key are both unset, the global default is `max-profit`.
 
 ### `[[validators]]`
 
@@ -85,22 +87,37 @@ There is **no global `block_selection_mode` key under `[defaults]`** — block s
 | `pubkey` | string | **yes** | — | 48-byte BLS pubkey hex, `0x` prefix optional. Used as the table key for lookups (all HTTP/Rust APIs address validators by this value). |
 | `fee_recipient` | string | no | inherits `[defaults].fee_recipient` | Same format/validation as above. |
 | `gas_limit` | integer | no | inherits `[defaults].gas_limit` | |
-| `builder_proposals` | bool | no | `false` | Whether this validator opts in to builder (MEV-boost) block production at all. No global default — off unless explicitly enabled per validator. |
-| `builder_boost_factor` | integer | no | `100` | Weighting used when comparing local vs. builder block value; `0` effectively disables the builder path for this validator, `u64::MAX` forces builder-always/only semantics. |
+| `builder_proposals` | bool | no | `false` | Whether this validator opts in to builder (MEV-boost) block production at all. No global default — off unless explicitly enabled per validator. See [Builder flag, boost, and what the relay keeps](#builder-flag-boost-and-what-the-relay-keeps). |
+| `builder_boost_factor` | integer | no | `100` | Weight applied to a blinded block when beacon nodes are ranked against each other. A local block keeps its raw value. `0` ranks every local block above every blinded block. `u64::MAX` ranks every blinded block above every local block. |
 | `graffiti` | string | no | inherits `[defaults].graffiti` | Same truncation behavior as above. |
 | `enabled` | bool | no | `true` | Master per-validator signing gate — `false` blocks all attesting/proposing for this key. Unknown pubkeys (not listed here and not loaded from a keystore) are treated as `enabled = false` (fail-closed). |
-| `block_selection_mode` | string | no | falls back to the (currently fixed) global default `max-profit` | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). See below. |
+| `doppelganger_hold_until` | integer | no | none | Unix-second deadline. The store writes it only for a doppelganger import hold, beside `enabled = false`. An operator or slashing disable leaves it unset, so boot does not re-enable that row. |
+| `block_selection_mode` | string | no | the global default set by `--block-selection-mode` or the top-level TOML key `block_selection_mode` (`max-profit` when both are unset) | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). A per-validator value wins over that global default. See below. |
+| `builders` | array of strings | no | none | Per-validator Gloas builder URLs. Omitted falls through to the store global, then an empty list. Each URL must be `http` or `https` with a host, at most 2048 bytes. The store writes this key. |
+| `min_bid` | integer | no | none | Per-validator minimum bid in Gwei. Omitted falls through to the store global, then `0`. A value above `i64::MAX` is rejected. The store writes this key. |
 
 **Malformed entries fail the whole file:** an invalid hex string/length in any `fee_recipient` or `pubkey` (defaults or per-validator) makes `load_from_config` return an error and the process refuses to start — there's no partial/best-effort loading of a broken file.
+
+**Unknown keys fail closed.** A key that is not in the tables above, including `enable = false` (the field is `enabled`), fails startup. The error names the key and the validators file. The same rejection applies inside `[defaults]` and to a misspelled table such as `[default]`. A file the store itself writes uses only these keys and reloads.
 
 ### `block_selection_mode` values
 
 | Value | Effect |
 |---|---|
-| `max-profit` (default) | Request both local and builder blocks, propose whichever is worth more. |
+| `max-profit` (default) | With `builder_proposals` on, request a builder bid and propose whichever side is worth more after the boost. With the flag off, before Gloas, the proposal is local. |
 | `execution-only` | Forces `builder_boost_factor = 0` — never uses the builder. |
-| `builder-always` | Forces `builder_boost_factor = u64::MAX`; falls back to a local block if the builder fails or the circuit breaker has tripped. |
-| `builder-only` | Same weighting as `builder-always` but **never falls back** — the proposal fails outright if the builder is unavailable. Intended for DVT clusters where a local fallback would be unsafe/incorrect. |
+| `builder-always` | With the flag on, forces `builder_boost_factor = u64::MAX` and falls back to a local block if the builder fails or the circuit breaker has tripped. With the flag off, before Gloas, the proposal is local. |
+| `builder-only` | Same weighting as `builder-always` but **never falls back** — the proposal fails outright if the builder is unavailable. The flag does not turn this into a local proposal. Intended for DVT clusters where a local fallback would be unsafe/incorrect. |
+
+### Builder flag, boost, and what the relay keeps
+
+`builder_proposals` defaults to off. Startup warns, and does not exit, when a key's effective mode is `builder-only` and that flag is off, or when that key's Gloas builder URL list is empty. The warning is once per key. The log reason is `builder_only_without_builder`. It names the truncated pubkey, whether the flag is on, and how many Gloas builder URLs the key has. It does not name a relay URL or a fee recipient.
+
+Before Gloas, `max-profit` and `builder-always` with the flag off do not request a builder bid: the produce call uses boost 0 and accepts only a local block. `builder-only` still requests a builder block and fails the proposal when the only candidate is local. At Gloas the flag does not change the V4 boost or the builder list.
+
+When more than one beacon node returns a block, a blinded block is ranked at `value * builder_boost_factor / 100` and a local block at its raw value. The quotient saturates at the maximum `u128`. Boost `u64::MAX` puts every blinded block ahead of every local block. Boost `0` puts every local block ahead of every blinded block. A block on the primary parent still wins before that comparison.
+
+Setting `builder_proposals` to false stops this process from re-sending the validator's registration, from the next epoch. It does not deregister the validator at the relay: the relay keeps the last registration it received. When the flag is set back to true, this process signs a new registration and sends it again in each epoch.
 
 ---
 
@@ -131,19 +148,19 @@ This means changes made through the HTTP API **persist across restarts** without
 
 Safe **only while the process is stopped**. There is currently no reload trigger while `rvc` is running:
 
-- `ValidatorStore::reload_config()` exists (parses the file fresh, applies parse-first/apply-second so a broken file never partially mutates the store, and preserves any validator that was registered programmatically but isn't in the file) — but **nothing in the shipped `rvc` binary calls it**. No file watcher, no HTTP endpoint, no signal handler triggers it (SIGHUP only reloads the log filter).
+- `ValidatorStore::reload_config()` exists (parses the file fresh, applies parse-first/apply-second so a broken file never partially mutates the store, and preserves any validator that was registered programmatically but isn't in the file). It refuses an unknown key, and it refuses a missing or zero `[defaults] fee_recipient`, without changing defaults, rows, or URL ownership. **Nothing in the shipped `rvc` binary calls it.** No file watcher, no HTTP endpoint, no signal handler triggers it (SIGHUP only reloads the log filter).
 - Because HTTP writes call `update_config_durable`, which re-serializes from in-memory state rather than re-reading the file, a hand-edit made while the process is running can be **silently overwritten** the next time any fee-recipient/gas-limit/graffiti HTTP write fires.
 
 **Recommendation:** treat "edit the file directly" and "use the HTTP API" as mutually exclusive while the process is live. Stop `rvc`, edit, restart — or manage everything through the Keymanager API.
 
 ### 3. `proposer_config_url` / `proposer_config_file`
 
-These are separate, MEV-boost/Prysm-style config options (`Config.proposer_config_url`, `Config.proposer_config_file`) that parse a different JSON schema keyed by pubkey. As of the current codebase:
+These are separate, MEV-boost/Prysm-style config options (`Config.proposer_config_url`, `Config.proposer_config_file`) that parse a different JSON schema keyed by pubkey.
 
-- `proposer_config_url` is fetched and parsed on a timer, but the only call site logs the parsed updates and never applies them to `ValidatorStore`.
+- `proposer_config_url` is fetched on a timer and applied to the **live** store. Each fee recipient, gas limit, and builder flag is owned on its own. When the URL starts owning a field, the baseline is that field's live value at that moment. A keymanager write of an owned field, including a write of the same value, drops ownership and becomes the new baseline in memory and in this file. A later fetch that sets the field again owns it from the value at that moment. Omitting the pubkey restores each field the URL still owns. Omitting one field while the pubkey stays in the document restores that field when the live value is still the remote one, and leaves the fields the document still sets. A successful document that omits `default_config`, or omits one of its fields, restores that default the same way. A failed fetch does not. `reload_config` keeps URL ownership for a validator that is not in the file, so a later save still writes that validator's local baseline. For a validator the file contains, each field the file still holds at its baseline stays URL-owned (the live value stays the URL value, and a later save still writes that baseline) and a field the file changed becomes file-owned. A remote default field is kept when `[defaults]` still holds its baseline and cleared when the file changed that field. A body with neither `proposer_config` nor `default_config`, or any one invalid entry, is rejected and changes nothing. One bad entry rejects the whole fetch. A document that names the same validator twice is rejected, whether the JSON key is repeated exactly or the two keys are different spellings of one pubkey (`0x` prefix and hex case). No row from that document is applied. The response body is capped at 4 MiB: a `Content-Length` above the cap is rejected before the body is buffered, and a chunked body is rejected on the chunk that would pass the cap. A body of exactly 4 MiB is accepted. The connect timeout is 10 seconds and covers DNS, TCP, and TLS. The fetch deadline is 30 seconds for DNS, connect, TLS, redirects, and the body, plus a 10 second idle gap between body chunks that re-arms on every chunk; a 4 MiB body needs about 140 KB/s. Redirects stay on the same scheme, host, and port. A cross-origin redirect, including `https` to `http`, fails the fetch. `proposer_config_refresh_interval` must be from 1 to 86400 seconds when a URL is set. 0 is accepted when no URL is configured. The interval cannot exceed 24 hours. A document with only `default_config` is accepted and does not restore omitted pubkeys. Deleting a key and importing it again drops that key's ownership record. Fields the URL still owns are not written into this file. `default_config` changes the live defaults and is not written as `[defaults]`. After a restart with the remote document gone, validators fall back to the local `[defaults]`.
 - `proposer_config_file` is parsed as a config field but never read from disk by any code path.
 
-**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` and the Keymanager HTTP API populate fee recipient, gas limit, and builder settings. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
+`validators_config` and the Keymanager HTTP API remain the durable source for fee recipient, gas limit, and graffiti. Builder proposals have no HTTP setter; `ValidatorStore::update_config_durable` is the durable path. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
 
 ---
 
@@ -159,8 +176,8 @@ These are separate, MEV-boost/Prysm-style config options (`Config.proposer_confi
 | `is_signing_enabled(pubkey)` | read | none — fail-closed: unknown pubkey → `false` |
 | `list_enabled_pubkeys()` / `has_validator(pubkey)` / `get_config(pubkey)` | read | none |
 | `add_validator(config)` / `remove_validator(pubkey)` / `set_enabled(pubkey, bool)` / `update_config(pubkey, update)` | write | **in-memory only** — does not persist |
-| `save_config()` | write | atomically serializes the full in-memory snapshot to `config_path` (temp file + `fsync` + rename); errors if `config_path` is `None` |
-| `reload_config()` | write | re-reads `config_path` from disk, parse-first/apply-second; not called anywhere in the shipped binary today |
+| `save_config()` | write | atomically serializes the snapshot to `config_path` (temp file + `fsync` + rename). A field a proposer-config URL still owns is written as the local baseline from when the URL started owning it. A remote `default_config` is not written as `[defaults]`. Errors if `config_path` is `None` |
+| `reload_config()` | write | re-reads `config_path` from disk, parse-first/apply-second; not called anywhere in the shipped binary today. An unknown key or a missing or zero `[defaults] fee_recipient` returns before any change. URL ownership is kept for validators absent from the file. A field the file still holds at its baseline stays URL-owned and is re-stamped with the new generation; a field the file changed becomes file-owned. A remote default field is kept or cleared by that same comparison |
 
 `ValidatorConfigUpdate` (the argument to `update_config`) is a sparse patch: each optional field is `Option<Option<T>>` — outer `None` means "don't touch", `Some(None)` means "clear back to default", `Some(Some(v))` means "set to `v`".
 

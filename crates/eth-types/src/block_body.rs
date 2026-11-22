@@ -252,8 +252,15 @@ mod beacon_api_json {
             if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!("invalid uint256 decimal: {text}"));
             }
+            // 2^256-1 is 78 decimal digits. Leading zeros do not count, and
+            // are stripped once so a long zero prefix is not a per-digit loop.
+            let significant = text.trim_start_matches('0');
+            let significant = if significant.is_empty() { "0" } else { significant };
+            if significant.len() > 78 {
+                return Err(format!("uint256 overflow: {text}"));
+            }
             let mut be = [0u8; 32];
-            for digit in text.bytes().map(|byte| u16::from(byte - b'0')) {
+            for digit in significant.bytes().map(|byte| u16::from(byte - b'0')) {
                 let mut carry = digit;
                 for byte in be.iter_mut().rev() {
                     let cur = u16::from(*byte) * 10 + carry;
@@ -287,6 +294,25 @@ mod beacon_api_json {
                 assert_eq!(json, r#"{"value":"18446744073709551616"}"#);
                 let back: Wrap = serde_json::from_str(&json).unwrap();
                 assert_eq!(back, wrap, "{json}");
+            }
+
+            #[test]
+            fn caps_significant_digits_at_78_and_rejects_a_leading_plus() {
+                let max =
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+                assert_eq!(max.len(), 78);
+                assert!(super::from_decimal(max).is_ok());
+                let one_past =
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+                assert!(super::from_decimal(one_past).unwrap_err().contains("overflow"));
+                assert!(super::from_decimal(&"9".repeat(79)).unwrap_err().contains("overflow"));
+                assert!(super::from_decimal(&"1".repeat(78)).is_ok());
+                let padded = format!("{}1", "0".repeat(64));
+                assert_eq!(
+                    super::from_decimal(&padded).unwrap(),
+                    super::from_decimal("1").unwrap()
+                );
+                assert!(super::from_decimal("+1").unwrap_err().contains("invalid uint256"));
             }
         }
     }
@@ -476,8 +502,8 @@ macro_rules! ssz_container_parse {
         cfields: [$($cfields:tt)*],
         rest: [@end]
     ) => {
-        $($meta)*
         #[derive(Serialize, Deserialize)]
+        $($meta)*
         pub struct $ty {
             $($sfields)*
         }
@@ -1403,6 +1429,7 @@ ssz_container! {
     ///
     /// Spec order is merkleization-sensitive — do not reorder.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BeaconBlockBodyElectra {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1435,6 +1462,7 @@ impl BeaconBlockBodyElectra {
 ssz_container! {
     /// Electra blinded body: `execution_payload` → `ExecutionPayloadHeader`.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BlindedBeaconBlockBodyElectra {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1475,6 +1503,7 @@ ssz_container! {
     /// (`MAX_ATTESTER_SLASHINGS=2`, `MAX_ATTESTATIONS=128`, no `committee_bits`).
     /// Spec order is merkleization-sensitive — do not reorder.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BeaconBlockBodyDeneb {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1507,6 +1536,7 @@ ssz_container! {
     /// Deneb blinded body: `execution_payload` → `ExecutionPayloadHeader`, no
     /// `execution_requests`.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BlindedBeaconBlockBodyDeneb {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1654,6 +1684,20 @@ pub const EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX: &str =
 #[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX: &str =
     "6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24";
+
+/// Same blinded body as [`EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX`] plus one
+/// `WithdrawalRequest` (`source` `0xab` × 20, pubkey `0xcd` × 48, amount
+/// 32_000_000_000). `remerkleable==0.1.27` via `scripts/gen_blinded_electra_roots.py`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX: &str =
+    "852758253b54e21fb36a8d15ca0232b57b533f3bb30ace1a1989fd6f0fa03839";
+
+/// Withdrawal body plus one attestation (8 aggregation bits, committee bit 0),
+/// one blob KZG commitment `0xab` × 48. Same generator and preset as
+/// [`EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX: &str =
+    "e760f138a084fe0ac063f0776aa5caca22ba5c996c328bc37e63a0bdbe2cdcdd";
 
 /// Deneb full body root (`remerkleable`; graffiti `"rvc-sec6d-deneb-body!!!!!!!!!"`).
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -2269,6 +2313,55 @@ mod tests {
         );
         // Distinct from the full Electra empty-ops vector (different graffiti).
         assert_ne!(body.tree_hash_root(), hex32(EXTERNAL_ELECTRA_BODY_ROOT_HEX));
+    }
+
+    fn withdrawal_request() -> WithdrawalRequest {
+        WithdrawalRequest {
+            source_address: [0xab; 20],
+            validator_pubkey: [0xcd; 48],
+            amount: 32_000_000_000,
+        }
+    }
+
+    fn blinded_electra_with_withdrawal() -> BlindedBeaconBlockBodyElectra {
+        let mut body = external_vector_blinded_electra_body();
+        body.execution_requests.withdrawals = VariableList::from(vec![withdrawal_request()]);
+        body
+    }
+
+    /// 8 aggregation bits set, sentinel in the next byte: `Bitlist` encoding `0xff01`.
+    fn nonempty_blinded_electra() -> BlindedBeaconBlockBodyElectra {
+        let mut body = blinded_electra_with_withdrawal();
+        body.attestations = VariableList::from(vec![crate::ElectraAttestation {
+            aggregation_bits: vec![0xff, 0x01],
+            data: crate::AttestationData {
+                slot: 500,
+                index: 0,
+                beacon_block_root: [0xaa; 32],
+                source: crate::Checkpoint { epoch: 15, root: [0xbb; 32] },
+                target: crate::Checkpoint { epoch: 16, root: [0xcc; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+        }]);
+        body.blob_kzg_commitments = VariableList::from(vec![[0xab; 48]]);
+        body
+    }
+
+    #[test]
+    fn test_blinded_electra_withdrawal_body_root() {
+        assert_eq!(
+            blinded_electra_with_withdrawal().tree_hash_root(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX),
+        );
+    }
+
+    #[test]
+    fn test_blinded_electra_nonempty_ops_body_root() {
+        assert_eq!(
+            nonempty_blinded_electra().tree_hash_root(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX),
+        );
     }
 
     #[test]

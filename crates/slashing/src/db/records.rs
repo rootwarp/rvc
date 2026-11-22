@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-use super::{normalize_pubkey, SlashingDb};
+use super::{normalize_pubkey, to_sql_i64, SlashingDb};
 use crate::error::SlashingError;
 use crate::types::{SignedAttestation, SignedBlock};
 use eth_types::{Epoch, Root, Slot};
@@ -32,8 +32,8 @@ impl SlashingDb {
              VALUES ('local-vc', ?1, ?2, ?3, ?4, ?5)",
             (
                 pubkey,
-                attestation.source_epoch as i64,
-                attestation.target_epoch as i64,
+                i64::try_from(attestation.source_epoch).expect("test source fits i64"),
+                i64::try_from(attestation.target_epoch).expect("test target fits i64"),
                 signing_root,
                 &gvr_hex,
             ),
@@ -77,7 +77,13 @@ impl SlashingDb {
              WHERE NOT EXISTS (
                  SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
              )",
-            (pubkey.as_ref(), source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
+            (
+                pubkey.as_ref(),
+                to_sql_i64(source_epoch, "source_epoch")?,
+                to_sql_i64(target_epoch, "target_epoch")?,
+                &signing_root,
+                &gvr_hex,
+            ),
         )?;
         Ok(())
     }
@@ -140,7 +146,12 @@ impl SlashingDb {
         conn.execute(
             "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
              VALUES ('local-vc', ?1, ?2, ?3, ?4)",
-            (pubkey, block.slot as i64, signing_root, &gvr_hex),
+            (
+                pubkey,
+                i64::try_from(block.slot).expect("test slot fits i64"),
+                signing_root,
+                &gvr_hex,
+            ),
         )?;
         Ok(())
     }
@@ -236,7 +247,7 @@ impl SlashingDb {
              WHERE NOT EXISTS (
                  SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
              )",
-            (pubkey.as_ref(), slot as i64, &signing_root, &gvr_hex),
+            (pubkey.as_ref(), to_sql_i64(slot, "slot")?, &signing_root, &gvr_hex),
         )?;
         Ok(())
     }

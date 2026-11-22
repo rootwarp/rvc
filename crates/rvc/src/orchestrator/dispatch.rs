@@ -22,9 +22,18 @@ pub(crate) const SLOT_END_PUBLISH_OVERHANG: Duration = Duration::from_millis(500
 
 /// In-flight sign requests and publish waves for one attestation slot,
 /// one sync-message slot, one aggregation slot, and one payload-attestation slot.
+///
+/// Phase 2 shares one extra cap. [`Phase2SignerPermits`] is sized to
+/// `concurrency` and is acquired once per selection proof and once per
+/// `*_and_proof` signature. Aggregation and sync contributions together stay
+/// at that size. The 1/3 phase (attestations and sync messages) does not take
+/// those permits: each of those pipelines still signs up to `concurrency`
+/// requests at once, on its own `buffer_unordered`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchLimits {
     /// Sign requests issued together (`buffer_unordered` / `ready_chunks`).
+    ///
+    /// At phase 2 this is also the shared signer-call cap. See the struct docs.
     pub concurrency: u32,
     /// Publish waves in flight.
     pub publish_concurrency: u32,
@@ -51,6 +60,93 @@ impl DispatchLimits {
             return Err(DispatchLimitsError::PublishConcurrency { publish_concurrency });
         }
         Ok(Self { concurrency, publish_concurrency })
+    }
+}
+
+/// One phase-2 permit for a single signer call.
+///
+/// The permit is held only while that call runs. Fetches do not take one.
+/// `None` means the wait was cancelled or the deadline passed, and the caller
+/// must not sign.
+pub(crate) struct Phase2SignerPermits {
+    inner: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Phase2SignerPermits {
+    /// `permits` is [`DispatchLimits::concurrency`].
+    pub(crate) fn new(permits: usize) -> Self {
+        Self { inner: std::sync::Arc::new(tokio::sync::Semaphore::new(permits.max(1))) }
+    }
+
+    /// Wait until `deadline` for one permit.
+    ///
+    /// Dropping this future cancels the wait. A deadline that has already
+    /// passed does not wait. Either case returns `None` and the caller does
+    /// not sign.
+    pub(crate) async fn acquire_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        match tokio::time::timeout_at(deadline, std::sync::Arc::clone(&self.inner).acquire_owned())
+            .await
+        {
+            // `timeout_at` polls the acquire first. A permit that becomes free
+            // in the same poll as the deadline is dropped here.
+            Ok(Ok(permit)) if tokio::time::Instant::now() < deadline => Some(permit),
+            Ok(Ok(permit)) => {
+                drop(permit);
+                None
+            }
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+}
+
+/// Why a phase-2 sign did not return a signature.
+pub(crate) enum Phase2SignError<E> {
+    /// The permit wait was cancelled or the deadline passed. Nothing was signed.
+    Cancelled,
+    /// Beacon-node admission did not hold at the sign.
+    Revoked,
+    /// The signer returned an error. The call was inside the admission scope.
+    Failed(E),
+}
+
+/// Acquire one phase-2 permit, then poll `sign`.
+///
+/// The caller installs the admission scope on `sign` (the architecture scan
+/// requires that marker in the same block as the signer call). This function
+/// does not wrap `sign` a second time. The permit is dropped when this future
+/// completes, including on cancel. `sign` is not polled until a permit is
+/// held, the deadline is still ahead, and the fence still holds.
+pub(crate) async fn sign_with_phase2_permit<T, E, Fut>(
+    permits: &Phase2SignerPermits,
+    deadline: tokio::time::Instant,
+    fence: &beacon::DutyFence,
+    sign: Fut,
+) -> Result<T, Phase2SignError<E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    if !fence.holds() {
+        return Err(Phase2SignError::Revoked);
+    }
+    let _permit = match permits.acquire_until(deadline).await {
+        Some(permit) => permit,
+        None => return Err(Phase2SignError::Cancelled),
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Phase2SignError::Cancelled);
+    }
+    if !fence.holds() {
+        return Err(Phase2SignError::Revoked);
+    }
+    match sign.await {
+        Ok(value) => Ok(value),
+        Err(error) => Err(Phase2SignError::Failed(error)),
     }
 }
 
@@ -135,6 +231,117 @@ mod tests {
         assert!(DispatchLimits::validated(0, 2).is_err());
         assert!(DispatchLimits::validated(32, 0).is_err());
         assert!(DispatchLimits::validated(0, 0).is_err());
+    }
+
+    /// The permit becomes free in the same poll that the deadline is due.
+    /// `timeout_at` polls the acquire first, so the permit must be dropped.
+    #[tokio::test(start_paused = true)]
+    async fn permit_granted_at_the_deadline_is_not_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let permits = Phase2SignerPermits::new(1);
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::clone(&polled);
+        let fence = beacon::DutyFence::open();
+        let sign = async move {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        };
+        let run = sign_with_phase2_permit(&permits, deadline, &fence, sign);
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("signed while the only permit is held"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(held);
+        tokio::time::advance(Duration::from_millis(40)).await;
+        let result = (&mut run).await;
+        assert!(
+            matches!(result, Err(Phase2SignError::Cancelled)),
+            "a permit taken at the deadline must not sign"
+        );
+        assert_eq!(polled.load(Ordering::SeqCst), 0, "the signer must not be polled");
+    }
+
+    /// Dropping the sign future while it waits for a permit does not sign.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_waiting_phase2_sign_does_not_sign() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let permits = Phase2SignerPermits::new(1);
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::clone(&polled);
+        let fence = beacon::DutyFence::open();
+        {
+            let sign = async move {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(())
+            };
+            let run = sign_with_phase2_permit(&permits, deadline, &fence, sign);
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("signed while the only permit is held"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        drop(held);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            0,
+            "dropping a permit wait must not poll the signer"
+        );
+    }
+
+    /// Revocation lands after the pre-acquire check and before the permit is granted.
+    #[tokio::test(start_paused = true)]
+    async fn revoking_admission_during_the_permit_wait_refuses_the_sign() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let permits = Phase2SignerPermits::new(1);
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::clone(&polled);
+        let generation = Arc::new(AtomicU64::new(0));
+        let fence = beacon::DutyFence::at(0, Arc::clone(&generation));
+        let sign = async move {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        };
+        let run = sign_with_phase2_permit(&permits, deadline, &fence, sign);
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("signed while the only permit is held"),
+            _ = tokio::task::yield_now() => {}
+        }
+        generation.store(1, Ordering::Release);
+        drop(held);
+        let result = (&mut run).await;
+        assert!(
+            matches!(result, Err(Phase2SignError::Revoked)),
+            "a revocation during the permit wait must refuse the sign"
+        );
+        assert_eq!(polled.load(Ordering::SeqCst), 0, "the signer must not be polled");
     }
 
     #[test]

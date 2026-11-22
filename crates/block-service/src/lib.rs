@@ -10,8 +10,9 @@ mod traits;
 mod types;
 mod validation;
 
-pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
+pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, WireBody};
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::{BeaconBlockClient, BuilderConfigProvider};
-pub use types::BlockSelectionMode;
+pub use traits::{BeaconBlockClient, BuilderConfigProvider, ProduceDuty, ShapeConstraint};
+pub use types::{BlockSelectionMode, CandidateShape};
+pub use validation::ExpectedParents;

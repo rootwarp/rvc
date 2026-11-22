@@ -51,6 +51,22 @@ enum Command {
     /// Split a BLS secret key into Shamir shares stored as EIP-2335 keystores
     #[cfg(feature = "dvt")]
     SplitKey(SplitKeyCliArgs),
+
+    /// Probe the metrics listener one time (container HEALTHCHECK).
+    ///
+    /// Exits 0 on a 2xx status. Exits non-zero on any other status, a failed
+    /// connection, or no response within 3 s.
+    Health(HealthArgs),
+}
+
+/// Scrape route of the metrics listener on its default bind (`127.0.0.1:9101`).
+const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:9101/metrics";
+
+#[derive(clap::Args)]
+struct HealthArgs {
+    /// URL to probe
+    #[arg(long, default_value = DEFAULT_HEALTH_URL)]
+    url: url::Url,
 }
 
 #[cfg(feature = "dvt")]
@@ -113,10 +129,16 @@ async fn main() {
     // env only (default pretty) via `resolve(None)`.
     let cli = Cli::parse();
 
+    // The probe runs every 30 s. It starts no logging and no OTel export.
+    if let Command::Health(args) = &cli.command {
+        std::process::exit(run_health(args).await);
+    }
+
     let log_format = match &cli.command {
         Command::Serve(args) => telemetry::LogFormat::resolve(args.log_format.as_deref()),
         #[cfg(feature = "dvt")]
         Command::SplitKey(_) => telemetry::LogFormat::resolve(None),
+        Command::Health(_) => unreachable!("health exits before logging starts"),
     };
 
     // Flag → `OTEL_*` env → default (ADR-006 duplicate of `TracingConfig::resolve_*`).
@@ -179,11 +201,24 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Health(_) => unreachable!("health exits before logging starts"),
     }
 
     // After the subcommand returns. `None` is a no-op; `Some` awaits
     // `telemetry::shutdown_tracing` so BatchSpanProcessor flushes.
     shutdown_tracing_guard(tracing_guard).await;
+}
+
+/// Probes the health URL one time. Returns the process exit code.
+async fn run_health(args: &HealthArgs) -> i32 {
+    match telemetry::health_probe::probe(&args.url, telemetry::health_probe::DEFAULT_TIMEOUT).await
+    {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
+    }
 }
 
 /// Flush and stop the OTel pipeline, if `init_logging` returned a guard.
@@ -880,14 +915,31 @@ mod tests {
     /// `serve --log-format json` parses and resolves to `LogFormat::Json`; the
     /// default (flag omitted) stays `Pretty`. Same flag/semantics as `bin/rvc`.
     /// Pull the `ServeArgs` out of a parsed `Cli`, panicking on any other
-    /// subcommand. Written as a `match` (not `let…else`) so it is warning-free
-    /// whether or not the `dvt` feature adds a second `Command` variant.
+    /// subcommand.
     fn serve_args(cli: super::Cli) -> super::ServeArgs {
         match cli.command {
             super::Command::Serve(args) => args,
-            #[cfg(feature = "dvt")]
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn test_health_defaults_to_the_metrics_route_on_the_metrics_port() {
+        use clap::Parser;
+
+        let health_url = |argv: &[&str]| match super::Cli::try_parse_from(argv) {
+            Ok(super::Cli { command: super::Command::Health(args), .. }) => args.url,
+            Ok(_) => panic!("expected Health"),
+            Err(e) => panic!("health parses: {e}"),
+        };
+        assert_eq!(health_url(&["rvc-signer", "health"]).as_str(), "http://127.0.0.1:9101/metrics");
+        assert_eq!(
+            health_url(&["rvc-signer", "health", "--url", "http://10.0.0.3:9200/metrics"]).port(),
+            Some(9200)
+        );
+        assert!(super::Cli::try_parse_from(["rvc-signer", "health", "--url", "nope"]).is_err());
+        assert_eq!(super::DEFAULT_HEALTH_URL, "http://127.0.0.1:9101/metrics");
+        assert_eq!(signer_server::config::DEFAULT_METRICS_ADDRESS, "127.0.0.1:9101");
     }
 
     #[test]

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
-use eth_types::{
-    ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH, SLOT_DURATION_MS,
-};
+#[cfg(test)]
+use eth_types::SLOT_DURATION_MS;
+use eth_types::{ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH};
 use keymanager_api::error::ApiError;
 use keymanager_api::traits::{Pubkey, VoluntaryExitManager};
 use signer::{SignerService, ValidatorSigner};
@@ -20,17 +20,56 @@ pub struct VoluntaryExitManagerAdapter {
     signer: Arc<SignerService>,
     fork_schedule: Arc<ForkSchedule>,
     genesis_validators_root: Root,
+    /// Startup-validated slot length. Not re-read from a pool BN.
+    slot_duration_ms: u64,
+    /// Startup-validated genesis time. Not re-read from a pool BN.
+    genesis_time: u64,
+    /// Production passes [`system_now_unix_secs`]. Read only when the caller
+    /// omits an explicit epoch. Test builds replace it through `with_clock`.
+    now_unix_secs: fn() -> Result<u64, ApiError>,
 }
 
 impl VoluntaryExitManagerAdapter {
+    /// `genesis_time` is the startup-validated genesis. It has no zero default.
+    ///
+    /// `slot_duration_ms` is the startup-validated slot length. It is required:
+    /// there is no 12 s fallback.
     pub fn new(
         beacon: Arc<dyn BeaconNodeClient>,
         signer: Arc<SignerService>,
         fork_schedule: Arc<ForkSchedule>,
         genesis_validators_root: Root,
+        genesis_time: u64,
+        slot_duration_ms: u64,
     ) -> Self {
-        Self { beacon, signer, fork_schedule, genesis_validators_root }
+        Self {
+            beacon,
+            signer,
+            fork_schedule,
+            genesis_validators_root,
+            slot_duration_ms,
+            genesis_time,
+            now_unix_secs: system_now_unix_secs,
+        }
     }
+
+    /// Fix the clock. Compiled only for tests. [`Self::new`] keeps the system clock.
+    #[cfg(test)]
+    pub fn with_clock(mut self, now_unix_secs: fn() -> Result<u64, ApiError>) -> Self {
+        self.now_unix_secs = now_unix_secs;
+        self
+    }
+}
+
+/// Unix seconds from the system clock.
+///
+/// The same read the no-epoch branch used before the clock seam, including the
+/// "system time before UNIX epoch" error.
+fn system_now_unix_secs() -> Result<u64, ApiError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ApiError::Internal("system time before UNIX epoch".to_string()))
 }
 
 #[async_trait]
@@ -40,6 +79,18 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
         pubkey: &Pubkey,
         epoch: Option<u64>,
     ) -> Result<SignedVoluntaryExit, ApiError> {
+        // EIP-7044 exits are valid from Capella onward. An unscheduled Capella
+        // (`u64::MAX`) refuses every explicit epoch, including `u64::MAX`.
+        // A clock-derived epoch is not checked: a pre-Capella devnet can still exit.
+        if let Some(explicit) = epoch {
+            let capella_fork_epoch = self.fork_schedule.capella_fork_epoch;
+            if capella_fork_epoch == u64::MAX || explicit < capella_fork_epoch {
+                return Err(ApiError::BadRequest(format!(
+                    "exit epoch {explicit} is before the Capella fork epoch {capella_fork_epoch}"
+                )));
+            }
+        }
+
         let pubkey_hex = pubkey_hex(pubkey);
 
         // Resolve validator index from the beacon-node pool.
@@ -66,24 +117,8 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
         let epoch = match epoch {
             Some(e) => e,
             None => {
-                let expected_root = format!("0x{}", hex::encode(self.genesis_validators_root));
-                // A 200 whose validators root is not ours is not this chain's clock.
-                let genesis = self
-                    .beacon
-                    .get_genesis_matching_validators_root(&expected_root)
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("failed to get genesis: {e}")))?;
-
-                let genesis_time: u64 = genesis.data.genesis_time.parse().map_err(|e| {
-                    ApiError::Internal(format!("failed to parse genesis time: {e}"))
-                })?;
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system time before UNIX epoch")
-                    .as_secs();
-
-                current_epoch_at(now, genesis_time)
+                let now = (self.now_unix_secs)()?;
+                current_epoch_at(now, self.genesis_time, self.slot_duration_ms)?
             }
         };
 
@@ -113,10 +148,26 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
     }
 }
 
-/// Current epoch at `now_unix_secs` given genesis, using millisecond slot duration.
-fn current_epoch_at(now_unix_secs: u64, genesis_time: u64) -> u64 {
+/// Current epoch at `now_unix_secs` given genesis and the beacon-node slot length.
+///
+/// A zero duration is an error. Dividing by it would panic, and treating it as
+/// epoch 0 would sign an exit on the pre-genesis clock.
+fn current_epoch_at(
+    now_unix_secs: u64,
+    genesis_time: u64,
+    slot_duration_ms: u64,
+) -> Result<u64, ApiError> {
+    if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+        .contains(&slot_duration_ms)
+    {
+        return Err(ApiError::Internal(format!(
+            "slot duration {slot_duration_ms} ms is outside {}..={}",
+            eth_types::MIN_SLOT_DURATION_MS,
+            eth_types::MAX_SLOT_DURATION_MS
+        )));
+    }
     let elapsed_ms = now_unix_secs.saturating_sub(genesis_time).saturating_mul(1000);
-    elapsed_ms / SLOT_DURATION_MS / SLOTS_PER_EPOCH
+    Ok(elapsed_ms / slot_duration_ms / SLOTS_PER_EPOCH)
 }
 
 #[cfg(test)]
@@ -129,10 +180,18 @@ mod tests {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Fixed genesis. The clock sits in the middle of epoch 10 at 6 s slots.
+    const GENESIS: u64 = 1_700_000_000;
+    const EPOCH_TEN_AT_SIX_SECONDS: u64 = GENESIS + 10 * 192 + 96;
+
+    fn clock_at_epoch_ten() -> Result<u64, ApiError> {
+        Ok(EPOCH_TEN_AT_SIX_SECONDS)
+    }
+
     #[test]
     fn test_current_epoch_at_genesis_is_zero() {
         let genesis = 1_606_824_023_u64;
-        assert_eq!(current_epoch_at(genesis, genesis), 0);
+        assert_eq!(current_epoch_at(genesis, genesis, 12_000).unwrap(), 0);
     }
 
     #[test]
@@ -140,8 +199,40 @@ mod tests {
         let genesis = 1_606_824_023_u64;
         let epoch_secs = SLOT_DURATION_MS / 1000 * SLOTS_PER_EPOCH;
         assert_eq!(epoch_secs, 384, "one epoch is 384 s");
-        assert_eq!(current_epoch_at(genesis + epoch_secs, genesis), 1);
-        assert_eq!(current_epoch_at(genesis + epoch_secs - 1, genesis), 0);
+        assert_eq!(current_epoch_at(genesis + epoch_secs, genesis, 12_000).unwrap(), 1);
+        assert_eq!(current_epoch_at(genesis + epoch_secs - 1, genesis, 12_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_current_epoch_at_six_second_slots_is_twice_the_twelve_second_epoch() {
+        let genesis = 1_606_824_023_u64;
+        let ten_epochs_at_six_seconds = 10 * 192;
+        assert_eq!(
+            current_epoch_at(genesis + ten_epochs_at_six_seconds, genesis, 6_000).unwrap(),
+            10
+        );
+        assert_eq!(
+            current_epoch_at(genesis + ten_epochs_at_six_seconds, genesis, 12_000).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn test_current_epoch_at_future_genesis_is_zero() {
+        assert_eq!(current_epoch_at(1_000, 2_000, 12_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_current_epoch_at_zero_slot_duration_is_an_error() {
+        let err = current_epoch_at(100, 0, 0).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn test_current_epoch_at_huge_slot_duration_is_an_error() {
+        let err = current_epoch_at(1_700_000_000 + 10 * 192, 1_700_000_000, u64::MAX).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(current_epoch_at(1_700_000_000 + 10 * 192, 1_700_000_000, 86_400_000).is_err());
     }
 
     fn test_fork_schedule() -> Arc<ForkSchedule> {
@@ -168,13 +259,29 @@ mod tests {
         beacon: Arc<dyn BeaconNodeClient>,
         secret_key: SecretKey,
     ) -> VoluntaryExitManagerAdapter {
+        adapter_at_genesis(beacon, secret_key, 0, SLOT_DURATION_MS)
+    }
+
+    fn adapter_at_genesis(
+        beacon: Arc<dyn BeaconNodeClient>,
+        secret_key: SecretKey,
+        genesis_time: u64,
+        slot_duration_ms: u64,
+    ) -> VoluntaryExitManagerAdapter {
         let key_manager = KeyManager::new();
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         composite.add_local_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("memory db"));
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-        VoluntaryExitManagerAdapter::new(beacon, signer, test_fork_schedule(), [0xaa; 32])
+        VoluntaryExitManagerAdapter::new(
+            beacon,
+            signer,
+            test_fork_schedule(),
+            [0xaa; 32],
+            genesis_time,
+            slot_duration_ms,
+        )
     }
 
     fn validator_body(pubkey_hex: &str) -> serde_json::Value {
@@ -262,8 +369,8 @@ mod tests {
         mount_validators(&up, body, 200).await;
 
         let adapter = adapter_for(pool(vec![down.uri(), up.uri()]), sk);
-        let signed = adapter.sign_voluntary_exit(&pubkey, Some(9)).await.expect("failover");
-        assert_eq!(signed.message.epoch, 9);
+        let signed = adapter.sign_voluntary_exit(&pubkey, Some(30)).await.expect("failover");
+        assert_eq!(signed.message.epoch, 30);
         assert_eq!(signed.message.validator_index, 42);
 
         assert!(
@@ -327,9 +434,9 @@ mod tests {
 
         let adapter = adapter_for(pool(vec![empty.uri(), full.uri()]), sk);
         let signed =
-            adapter.sign_voluntary_exit(&pubkey, Some(11)).await.expect("empty 200 fails over");
+            adapter.sign_voluntary_exit(&pubkey, Some(31)).await.expect("empty 200 fails over");
         assert_eq!(signed.message.validator_index, 42);
-        assert_eq!(signed.message.epoch, 11);
+        assert_eq!(signed.message.epoch, 31);
 
         let full_paths = request_paths(&full).await;
         assert!(
@@ -351,7 +458,7 @@ mod tests {
 
         let adapter = adapter_for(pool(vec![wrong.uri(), right.uri()]), sk);
         let signed =
-            adapter.sign_voluntary_exit(&pubkey, Some(12)).await.expect("wrong pubkey fails over");
+            adapter.sign_voluntary_exit(&pubkey, Some(32)).await.expect("wrong pubkey fails over");
         assert_eq!(signed.message.validator_index, 42);
         assert_ne!(signed.message.validator_index, 7, "must not sign the other index");
 
@@ -363,37 +470,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_fails_over_when_genesis_root_does_not_match() {
-        let foreign = MockServer::start().await;
-        let ours = MockServer::start().await;
+    async fn default_exit_epoch_uses_cached_genesis_not_a_pool_bn() {
+        let server = MockServer::start().await;
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key().to_bytes();
+        let hex = super::pubkey_hex(pubkey);
+        mount_validators(&server, validator_body(&hex), 200).await;
+        // A pool BN that advertises a different clock must not move the epoch.
+        mount_genesis(&server, "1", &format!("0x{}", hex::encode([0xbb_u8; 32]))).await;
+        mount_spec(&server, "12000").await;
+
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
+        let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("cached genesis");
+        assert_eq!(signed.message.epoch, 10);
+
+        let paths = request_paths(&server).await;
+        assert!(
+            paths.iter().all(|p| !p.contains("genesis") && !p.contains("config/spec")),
+            "exit must not re-fetch genesis or spec, paths={paths:?}"
+        );
+    }
+
+    async fn mount_spec(server: &MockServer, slot_duration_ms: &str) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "SLOT_DURATION_MS": slot_duration_ms }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// A caller-supplied 6000 ms slot length is epoch 10. The removed 12 s
+    /// default would report epoch 5 for the same genesis.
+    #[tokio::test]
+    async fn test_exit_adapter_default_epoch_uses_the_given_slot_duration() {
+        let server = MockServer::start().await;
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key().to_bytes();
+        let hex = super::pubkey_hex(pubkey);
+        mount_validators(&server, validator_body(&hex), 200).await;
+
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
+        let signed =
+            adapter.sign_voluntary_exit(&pubkey, None).await.expect("6000 ms slot duration");
+        assert_eq!(signed.message.epoch, 10);
+    }
+
+    /// Default exit epoch follows a 6 s beacon node, not the 12 s constant.
+    #[tokio::test]
+    async fn default_exit_epoch_matches_six_second_slot_clock() {
+        let server = MockServer::start().await;
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
         let hex = super::pubkey_hex(pubkey);
         let configured = format!("0x{}", hex::encode([0xaa_u8; 32]));
-        let other_root = format!("0x{}", hex::encode([0xbb_u8; 32]));
-        // Both nodes know the validator. Only the genesis root differs, so a
-        // validators-only failover cannot explain which clock was signed.
-        mount_validators(&foreign, validator_body(&hex), 200).await;
-        mount_validators(&ours, validator_body(&hex), 200).await;
-        mount_genesis(&foreign, "1", &other_root).await;
-        // Far enough ahead of wall time that the epoch stays 0.
-        mount_genesis(&ours, "4000000000", &configured).await;
+        // Middle of epoch 10 at 6 s slots (192 s per epoch). A 12 s clock would
+        // report epoch 5 for the same genesis.
+        mount_validators(&server, validator_body(&hex), 200).await;
+        mount_genesis(&server, "1", &configured).await;
+        mount_spec(&server, "12000").await;
 
-        let adapter = adapter_for(pool(vec![foreign.uri(), ours.uri()]), sk);
-        let signed =
-            adapter.sign_voluntary_exit(&pubkey, None).await.expect("genesis root fails over");
-        assert_eq!(signed.message.validator_index, 42);
-        assert_eq!(signed.message.epoch, 0, "must not sign the foreign genesis_time");
-
-        let foreign_paths = request_paths(&foreign).await;
-        let our_paths = request_paths(&ours).await;
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, GENESIS, 6_000)
+            .with_clock(clock_at_epoch_ten);
+        let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("default epoch");
+        assert_eq!(signed.message.epoch, 10);
+        let paths = request_paths(&server).await;
         assert!(
-            foreign_paths.iter().any(|p| p.contains("genesis")),
-            "the first BN's genesis must be checked, paths={foreign_paths:?}"
+            paths.iter().all(|p| !p.contains("genesis")),
+            "exit must not re-fetch genesis, paths={paths:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn default_exit_epoch_rejects_zero_and_huge_stored_duration() {
+        let server = MockServer::start().await;
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key().to_bytes();
+        let hex = super::pubkey_hex(pubkey);
+        let configured = format!("0x{}", hex::encode([0xaa_u8; 32]));
+        mount_validators(&server, validator_body(&hex), 200).await;
+        mount_genesis(&server, "1606824023", &configured).await;
+        mount_spec(&server, "6000").await;
+
+        for bad in [0_u64, u64::MAX] {
+            // Duration is rejected before signing, so the local key is unused.
+            let adapter =
+                adapter_at_genesis(pool(vec![server.uri()]), SecretKey::generate(), 0, bad);
+            let err = adapter.sign_voluntary_exit(&pubkey, None).await.expect_err("bad duration");
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+        let paths = request_paths(&server).await;
         assert!(
-            our_paths.iter().any(|p| p.contains("genesis")),
-            "the second BN must be contacted for genesis, paths={our_paths:?}"
+            !paths.iter().any(|p| p.contains("config/spec")),
+            "exit must not re-fetch spec, paths={paths:?}"
         );
     }
 

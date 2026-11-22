@@ -12,7 +12,7 @@ use tracing::{debug, error, field, info, info_span, warn, Instrument};
 use async_trait::async_trait;
 use block_service::{BeaconBlockClient, BlockService, BuilderConfig, BuilderConfigProvider};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator};
-use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
+use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
@@ -31,15 +31,16 @@ use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
-use super::dispatch::DispatchLimits;
+use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
+use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
 use super::slot_anchor::SlotAnchor;
-use super::slot_context::SlotContext;
+use super::slot_context::{fetch_head_root, SlotContext};
 use super::sync_committee::SyncCommitteeService;
-use super::utils::{self, TimedOutcome};
+use super::utils::TimedOutcome;
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
 
 /// Shared, dynamically-updatable public key map.
@@ -233,9 +234,6 @@ impl AttestationOutcome {
     }
 }
 
-/// Timeout for builder registration API calls.
-const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Outcome of a timed wait that can be interrupted by shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitOutcome {
@@ -364,6 +362,8 @@ where
     pub(crate) beacon: Arc<dyn BeaconNodeClient>,
     pub(crate) duty_tracker: Arc<DutyTracker>,
     pub(crate) block_service: BlockService<SignerService, B>,
+    /// For tests that reach the builder service directly.
+    #[cfg(test)]
     pub(crate) builder_service: Option<Arc<BuilderService>>,
     pub(crate) circuit_breaker: Arc<CircuitBreakerState>,
     pub(crate) config: OrchestratorConfig,
@@ -375,7 +375,14 @@ where
     pub(crate) aggregation_service: AggregationService,
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
-    pub(crate) duty_management: DutyManagementService,
+    pub(crate) duty_management: Arc<DutyManagementService>,
+    /// The runner [`EpochBoundaryTask`] owns, for tests that drive one pass.
+    #[cfg(test)]
+    pub(crate) epoch_boundary: Arc<EpochBoundaryRunner>,
+    /// Each processed slot, for [`EpochBoundaryTask`].
+    processed_slot_tx: watch::Sender<Option<Slot>>,
+    /// Until [`Self::take_epoch_boundary_runner`].
+    epoch_boundary_task: Option<EpochBoundaryTask>,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -395,6 +402,64 @@ where
     last_resolved_fork: Option<ForkName>,
     /// `fork` label currently attached to `rvc_fork_next_activation_epoch`.
     next_activation_fork: Option<ForkName>,
+}
+
+/// One phase-2 capture per slot. The owner fetches; every other caller waits.
+pub(crate) struct Phase2Head {
+    started: AtomicBool,
+    done: watch::Sender<bool>,
+}
+
+struct Phase2Finish<'a>(&'a Phase2Head);
+
+impl Phase2Head {
+    pub(crate) fn new() -> Self {
+        let (done, _) = watch::channel(false);
+        Self { started: AtomicBool::new(false), done }
+    }
+
+    /// `true` for the caller that owns the fetch.
+    fn try_begin(&self) -> bool {
+        self.started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// Notifies waiters when the owner returns, including on cancel.
+    fn finish_on_drop(&self) -> Phase2Finish<'_> {
+        Phase2Finish(self)
+    }
+
+    fn finish(&self) {
+        // `send` drops the value when no receiver is alive. The contribution
+        // phase subscribes later, so the stored value has to survive that gap.
+        self.done.send_replace(true);
+    }
+
+    /// Returns when the owner finishes or `deadline` is due.
+    ///
+    /// The watch subscription is read before waiting, so a finish that
+    /// lands between the check and the wait is not missed.
+    async fn wait_until(&self, deadline: tokio::time::Instant) {
+        let mut done = self.done.subscribe();
+        loop {
+            if *done.borrow_and_update() || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::select! {
+                changed = done.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return,
+            }
+        }
+    }
+}
+
+impl Drop for Phase2Finish<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -437,7 +502,8 @@ where
             config.genesis_validators_root,
             circuit_breaker.clone(),
         )
-        .with_deadline_schedule(config.deadline_schedule);
+        .with_deadline_schedule(config.deadline_schedule)
+        .with_slot_duration_ms(clock.slot_duration().as_millis() as u64);
         if let Some(ref builder) = builder_service {
             block_service = block_service
                 .with_builder_config_provider(Arc::new(BuilderConfigAdapter(builder.clone())));
@@ -482,7 +548,7 @@ where
             validator_store.clone(),
         );
 
-        let duty_management = DutyManagementService::new(
+        let duty_management = Arc::new(DutyManagementService::new(
             signer,
             beacon.clone(),
             duty_tracker.clone(),
@@ -490,6 +556,24 @@ where
             pubkey_map.clone(),
             pubkey_index.clone(),
             config.clone(),
+        ));
+        let epoch_boundary = Arc::new(EpochBoundaryRunner::new(
+            Arc::clone(&duty_management),
+            circuit_breaker.clone(),
+            duty_tracker.clone(),
+            config.timeouts.clone(),
+            builder_service.clone(),
+            Arc::clone(&config.fork_schedule),
+            pubkey_map.clone(),
+            validator_store.clone(),
+            config.genesis_validators_root,
+        ));
+        let (processed_slot_tx, processed_slots) = watch::channel(None);
+        let epoch_boundary_task = EpochBoundaryTask::new(
+            Arc::clone(&epoch_boundary),
+            clock.clone(),
+            processed_slots,
+            shutdown_rx.clone(),
         );
 
         let sync_enabled = Arc::new(AtomicBool::new(true));
@@ -499,6 +583,7 @@ where
             beacon,
             duty_tracker,
             block_service,
+            #[cfg(test)]
             builder_service,
             circuit_breaker,
             config,
@@ -509,6 +594,10 @@ where
             sync_committee_service,
             payload_attestation_service,
             duty_management,
+            #[cfg(test)]
+            epoch_boundary,
+            processed_slot_tx,
+            epoch_boundary_task: Some(epoch_boundary_task),
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
@@ -528,13 +617,40 @@ where
     /// Runs the orchestrator main loop with four-phase slot processing:
     /// - t=0: bounded parent capture + block proposal
     /// - attestation due: attestations and sync messages concurrently
-    ///   (HeadEventGate wait; sync has its own span)
-    /// - aggregate due: sync committee contributions + aggregations
+    ///   (HeadEventGate wait; sync has its own span). Head capture is
+    ///   deadline-bounded and does not run while the slot-context lock is held.
+    ///   Attestations do not wait for that fetch.
+    /// - aggregate due: aggregation starts then. Contributions wait for the
+    ///   in-flight phase-2 head, bounded by the contribution signing deadline.
     /// - payload attestation due (Gloas+): payload attestations
-    /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
+    /// - post-duty: epoch duty fetches
+    ///
+    /// Each processed slot is then sent to the epoch boundary runner, which
+    /// runs on its own task (see [`Self::take_epoch_boundary_runner`]) and
+    /// fetches the duties its steps need itself, so it never waits on the
+    /// post-duty window. The runner also sends each epoch's builder
+    /// registration and preferences broadcast.
+    ///
+    /// This function is the slot loop alone. Startup preparation is the
+    /// runner's boot epoch: its passes prepare proposers, retried at each
+    /// processed slot of that epoch, and a start before genesis prepares
+    /// epoch 0 before slot 0.
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
+        self.run_slot_loop().await
+    }
 
+    /// The epoch boundary runner task, `Some` on the first call only.
+    ///
+    /// Spawn it beside [`Self::run`] on the Orchestrator shutdown tier. It
+    /// runs the boundary steps at the first processed slot of every epoch,
+    /// the boot epoch included, and epoch 0's before genesis. It ends when
+    /// shutdown is requested or this orchestrator is dropped.
+    pub fn take_epoch_boundary_runner(&mut self) -> Option<EpochBoundaryTask> {
+        self.epoch_boundary_task.take()
+    }
+
+    async fn run_slot_loop(&mut self) -> Result<(), OrchestratorError> {
         // Defence-in-depth behind the wall-based inter-slot wait. A backward
         // clock step must not re-run a slot whose phases already finished.
         let mut last_processed_slot: Option<Slot> = None;
@@ -591,6 +707,7 @@ where
             // One wall-clock read per slot, taken before the pre-proposal timeout.
             // Phase deadlines and offset stamps are absolute from this anchor.
             let anchor = SlotAnchor::capture(&*self.clock, current_slot);
+            let proposal_deadline = self.arm_operation_deadline(current_slot);
 
             // Check if keys changed (dynamic key import/delete via keymanager API).
             // has_changed() does NOT mark the value as seen — mark_unchanged() so
@@ -603,7 +720,13 @@ where
             // Head is captured at phase 2 and reused at phase 3 (H-5).
             let ctx = match tokio::time::timeout(self.config.pre_proposal_deadline, async {
                 self.maybe_cold_fetch_proposer_duties(current_slot, current_epoch).await;
-                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await
+                SlotContext::capture_parent_within(
+                    &*self.beacon,
+                    current_slot,
+                    current_epoch,
+                    self.config.pre_proposal_deadline,
+                )
+                .await
             })
             .await
             {
@@ -614,12 +737,11 @@ where
                         deadline_ms = self.config.pre_proposal_deadline.as_millis() as u64,
                         "Pre-proposal parent capture timed out"
                     );
-                    SlotContext {
-                        slot: current_slot,
-                        epoch: current_epoch,
-                        parent_root: None,
-                        head_root: None,
-                    }
+                    SlotContext::capture_timed_out(
+                        current_slot,
+                        current_epoch,
+                        self.beacon.duty_fence(),
+                    )
                 }
             };
             {
@@ -633,7 +755,9 @@ where
                 // Block fires at t=0: no bps wait, stamp at entry.
                 Self::record_time_into_slot(&phase_span, &anchor);
                 Self::record_phase_offset(slot_phase_offset::BLOCK, &anchor);
-                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
+                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx, Some(proposal_deadline))
+                    .instrument(phase_span)
+                    .await;
             }
 
             if self.check_shutdown() {
@@ -645,6 +769,7 @@ where
             // frozen MockSlotClock would fire aggregates at att+agg instead of
             // agg, and wall-clock production already uses remaining time.
             let ctx = tokio::sync::Mutex::new(ctx);
+            let phase2_head = Phase2Head::new();
             let att_phase_span = info_span!(
                 parent: &slot_span,
                 "slot.phase.attestation",
@@ -674,6 +799,7 @@ where
                     att_phase_span,
                     sync_phase_span,
                     &anchor,
+                    &phase2_head,
                 ),
                 self.run_aggregation_and_contribution_phases(
                     current_slot,
@@ -682,6 +808,7 @@ where
                     deadlines,
                     agg_phase_span,
                     &anchor,
+                    &phase2_head,
                 ),
                 self.run_payload_attestation_phase(
                     current_slot,
@@ -700,6 +827,8 @@ where
             }
 
             last_processed_slot = Some(current_slot);
+            // After the phases: boundary work never competes with this slot's duties.
+            self.processed_slot_tx.send_replace(Some(current_slot));
 
             // === Post-duty: host work in the next-slot wait ===
             // Occupants race the wait via `run_post_duty_window`. Incomplete
@@ -710,7 +839,6 @@ where
             // Inter-slot wait stays wall-based. Architecture §10.11: a backward slew
             // on a monotonic next-slot wait would re-process slot S.
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
-            let should_register = current_slot % SLOTS_PER_EPOCH == 0;
             let post_duty_work = async {
                 self.duty_management
                     .fetch_epoch_duties(current_epoch)
@@ -720,44 +848,6 @@ where
                     .fetch_epoch_duties(current_epoch + 1)
                     .instrument(slot_span.clone())
                     .await;
-
-                if should_register {
-                    self.circuit_breaker.reset_epoch(current_epoch);
-                    self.update_circuit_breaker_metrics();
-                    info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
-
-                    let epoch_span =
-                        info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                    let proposer_root_changed = self
-                        .duty_management
-                        .on_epoch_boundary(current_epoch, current_slot)
-                        .instrument(epoch_span)
-                        .await;
-                    if proposer_root_changed {
-                        self.on_proposer_dependent_root_changed(current_epoch).await;
-                    }
-
-                    if self.builder_service.is_some() {
-                        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-                        debug!(
-                            jitter_secs = jitter.as_secs(),
-                            "Delaying builder epoch-boundary work with jitter"
-                        );
-                        tokio::time::sleep(jitter).await;
-                        match tokio::time::timeout(
-                            BUILDER_REGISTRATION_TIMEOUT,
-                            self.run_builder_epoch_boundary(current_epoch),
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(_) => warn!(
-                                "Builder epoch-boundary work timed out after {}s (non-fatal)",
-                                BUILDER_REGISTRATION_TIMEOUT.as_secs()
-                            ),
-                        }
-                    }
-                }
 
                 // Why: fetches return immediately on a warm cache. Completing
                 // this future would take the ready work arm and busy-spin.
@@ -773,100 +863,17 @@ where
         }
     }
 
-    /// Legacy register (pre-Gloas) and preferences for Gloas+ proposal slots.
+    /// Slot end for proposer-pool block production.
     ///
-    /// Both may run at Gloas-1: register is still live, and next-epoch Gloas
-    /// slots are advertised one epoch early.
-    pub(crate) async fn run_builder_epoch_boundary(&self, current_epoch: u64) {
-        let Some(bs) = &self.builder_service else {
-            return;
-        };
-        let current_fork = ForkName::from_epoch(current_epoch, &self.config.fork_schedule);
-        if !legacy_proposer_ops_retired(current_fork) {
-            match bs.register_validators(current_epoch).await {
-                Ok(_) => info!("Builder registration completed"),
-                Err(e) => warn!(error = %e, "Builder registration failed (non-fatal)"),
-            }
-        }
-        self.broadcast_preferences(current_epoch).await;
-    }
-
-    /// Re-broadcast preferences after a proposer `dependent_root` change.
-    ///
-    /// Call when [`DutyTracker::cache_proposer_duties`] returns `true`.
-    pub(crate) async fn on_proposer_dependent_root_changed(&self, current_epoch: u64) {
-        self.broadcast_preferences(current_epoch).await;
-    }
-
-    async fn broadcast_preferences(&self, current_epoch: u64) {
-        let Some(bs) = &self.builder_service else {
-            return;
-        };
-        let proposals = self.upcoming_proposals(current_epoch).await;
-        match bs
-            .broadcast_proposer_preferences(
-                current_epoch,
-                &proposals,
-                &self.config.genesis_validators_root,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Proposer preferences broadcast failed (non-fatal)"),
-        }
-        match bs.broadcast_builder_preferences(current_epoch, &proposals).await {
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Builder preferences broadcast failed (non-fatal)"),
-        }
-    }
-
-    /// Local signing-enabled proposer duties for the current and next epoch.
-    async fn upcoming_proposals(&self, current_epoch: u64) -> Vec<UpcomingProposal> {
-        let mut out = Vec::new();
-        for epoch in [current_epoch, current_epoch.saturating_add(1)] {
-            out.extend(self.proposals_for_epoch(epoch).await);
-        }
-        out
-    }
-
-    async fn proposals_for_epoch(&self, epoch: u64) -> Vec<UpcomingProposal> {
-        let dependent_root = match self.duty_tracker.get_cached_proposer_dependent_root(epoch).await
-        {
-            Some(hex) => match eth_types::canonical::gvr_hex::parse_gvr_hex(&hex) {
-                Ok(root) => root,
-                Err(e) => {
-                    warn!(
-                        epoch,
-                        error = %e,
-                        "Invalid proposer dependent_root; skipping preferences"
-                    );
-                    return Vec::new();
-                }
-            },
-            None => {
-                debug!(epoch, "No cached proposer dependent_root for preferences");
-                return Vec::new();
-            }
-        };
-
-        let mut out = Vec::new();
-        for offset in 0..SLOTS_PER_EPOCH {
-            let slot = epoch.saturating_mul(SLOTS_PER_EPOCH).saturating_add(offset);
-            let Some(duty) = self.duty_tracker.get_proposer_duty(slot).await else {
-                continue;
-            };
-            let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) else {
-                continue;
-            };
-            let pubkey = pk.to_bytes();
-            if !self.validator_store.is_signing_enabled(&pubkey) {
-                continue;
-            }
-            let validator_index = duty.validator_index;
-            let proposal_slot = duty.slot;
-            out.push(UpcomingProposal { pubkey, validator_index, proposal_slot, dependent_root });
-        }
-        out
+    /// The returned instant is passed only into [`Self::maybe_propose_block`].
+    /// It does not change the main pool, and it does not change attestation,
+    /// sync, or aggregate publication. Those keep slot end plus 500 ms.
+    /// A missing clock reading fails closed: the deadline is now, so a hanging
+    /// proposer beacon node does not run with an unbounded budget.
+    pub(crate) fn arm_operation_deadline(&self, slot: Slot) -> tokio::time::Instant {
+        let remaining =
+            self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO);
+        tokio::time::Instant::now().checked_add(remaining).unwrap_or_else(tokio::time::Instant::now)
     }
 
     /// Bounded proposer-only fetch when the current epoch cache is empty.
@@ -947,7 +954,7 @@ where
         } else {
             slot_phase_cache::WARM
         };
-        RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).observe(offset_ms);
+        observe_block_start_offset(cache, offset_ms);
         self.phase_block_cache_cold = false;
     }
 
@@ -1117,10 +1124,77 @@ where
         }
     }
 
-    async fn capture_head_if_needed(&self, ctx: &tokio::sync::Mutex<SlotContext>) {
-        let mut ctx = ctx.lock().await;
-        if ctx.head_root.is_none() {
-            ctx.capture_head(&*self.beacon).await;
+    /// Earlier of slot end and `budget` from now.
+    ///
+    /// A budget `Instant` cannot add, or a slot that has already ended, yields
+    /// a deadline at or before now so [`fetch_head_root`] does not call the
+    /// beacon node.
+    fn head_fetch_deadline(
+        slot_end: tokio::time::Instant,
+        budget: Duration,
+    ) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let budget_at = now.checked_add(budget).unwrap_or(now);
+        slot_end.min(budget_at)
+    }
+
+    /// Deadline for a phase-2 head fetch started by the contribution phase.
+    ///
+    /// The earliest of slot end, `now` plus `attestation_fetch`, and the
+    /// contribution signing deadline. The signing deadline is a fresh
+    /// `now` plus `sync_contribution`, capped at slot end plus 500 ms, and
+    /// can therefore sit past slot end. This fetch does not use that
+    /// overhang. A budget `Instant` cannot add, or a slot that has already
+    /// ended, yields a deadline at or before now so [`fetch_head_root`] does
+    /// not call the beacon node.
+    fn contribution_head_deadline(
+        slot_end: tokio::time::Instant,
+        timeouts: &OperationTimeouts,
+    ) -> tokio::time::Instant {
+        let fetch_at = Self::head_fetch_deadline(slot_end, timeouts.attestation_fetch);
+        let (sign_at, _) =
+            super::sync_committee::contribution_deadline(slot_end, timeouts.sync_contribution);
+        fetch_at.min(sign_at)
+    }
+
+    /// Phase-2 head, when it is still unset.
+    ///
+    /// One capture runs per slot. A second caller waits until that capture
+    /// finishes or `deadline`, whichever is earlier, and does not start
+    /// another fetch. The slot-context lock is not held across the beacon
+    /// fetch. The first root written wins. No root is stored when the
+    /// deadline has already passed, the fetch times out, the slot is empty
+    /// (HTTP 404), the beacon node returns any other error, or the body is
+    /// not `0x` plus 64 hex digits. The parent captured at t=0 is kept in
+    /// each of those cases. That parent is not always a head this client
+    /// verified. After four misses the t=0 walk uses the beacon node's
+    /// `"head"` header and keeps it when that header's slot is below this
+    /// slot. Signing the kept root is valid and non-slashable for sync
+    /// messages.
+    async fn capture_head_if_needed(
+        &self,
+        ctx: &tokio::sync::Mutex<SlotContext>,
+        deadline: tokio::time::Instant,
+        gate: &Phase2Head,
+    ) {
+        if !gate.try_begin() {
+            gate.wait_until(deadline).await;
+            return;
+        }
+        let _finish = gate.finish_on_drop();
+        let slot = {
+            let guard = ctx.lock().await;
+            if guard.head_root.is_some() {
+                return;
+            }
+            guard.slot
+        };
+        let fetched = fetch_head_root(&*self.beacon, slot, deadline).await;
+        let mut guard = ctx.lock().await;
+        if guard.head_root.is_none() {
+            if let Some(root) = fetched.or(guard.parent_root) {
+                guard.set_head(root);
+            }
         }
     }
 
@@ -1139,7 +1213,7 @@ where
 
     /// Records `rvc_slot_phase_offset_ms{phase}` at the moment a phase fires.
     fn record_phase_offset(phase: &'static str, anchor: &SlotAnchor) {
-        RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(anchor.elapsed_ms() as f64);
+        observe_phase_offset(phase, anchor.elapsed_ms() as f64);
     }
 
     async fn run_attestation_phase(
@@ -1185,10 +1259,11 @@ where
         current_epoch: u64,
         agg_phase_span: tracing::Span,
         slot_end: tokio::time::Instant,
+        phase2_signer_permits: &Phase2SignerPermits,
     ) {
         if self.attesting_enabled.load(Ordering::Relaxed) {
             self.aggregation_service
-                .maybe_produce_aggregations(current_slot, current_epoch, slot_end)
+                .produce_aggregations(current_slot, current_epoch, slot_end, phase2_signer_permits)
                 .instrument(agg_phase_span)
                 .await;
         } else {
@@ -1212,6 +1287,7 @@ where
         att_phase_span: tracing::Span,
         sync_phase_span: tracing::Span,
         anchor: &SlotAnchor,
+        gate: &Phase2Head,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
             if matches!(
@@ -1235,16 +1311,19 @@ where
             Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
             Self::record_time_into_slot(&sync_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-            self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(anchor, deadlines.attestation);
-            // Snapshot before the join. Inside it, sync would block on the
-            // ctx mutex while attestation holds it across capture_head.
-            let snapshot = self.snapshot_ctx(ctx).await;
             let slot_end = anchor.slot_end();
+            let head_deadline =
+                Self::head_fetch_deadline(slot_end, self.config.timeouts.attestation_fetch);
             tokio::join!(
                 self.run_attestation_phase(current_slot, &att_phase_span, slot_end),
-                self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, slot_end)
-                    .instrument(sync_phase_span),
+                async {
+                    self.capture_head_if_needed(ctx, head_deadline, gate).await;
+                    let snapshot = self.snapshot_ctx(ctx).await;
+                    self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, slot_end)
+                        .instrument(sync_phase_span.clone())
+                        .await;
+                },
             );
             return WaitOutcome::Continue;
         }
@@ -1267,7 +1346,6 @@ where
                 }
                 Self::record_time_into_slot(&att_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
-                self.capture_head_if_needed(ctx).await;
                 self.warn_if_attestation_overrun(anchor, deadlines.attestation);
                 self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
                 WaitOutcome::Continue
@@ -1289,7 +1367,11 @@ where
                 }
                 Self::record_time_into_slot(&sync_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-                self.capture_head_if_needed(ctx).await;
+                let head_deadline = Self::head_fetch_deadline(
+                    anchor.slot_end(),
+                    self.config.timeouts.attestation_fetch,
+                );
+                self.capture_head_if_needed(ctx, head_deadline, gate).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
                 self.run_sync_messages_phase(
                     current_slot,
@@ -1313,6 +1395,16 @@ where
 
     /// Contributions share the aggregate wait while their bps match; otherwise
     /// each duty waits from slot start to its own offset.
+    ///
+    /// Aggregation starts at that wait. Contributions then wait for an
+    /// in-flight phase-2 capture, or run it when they win `try_begin`. The
+    /// bound is [`Self::contribution_head_deadline`]: slot end, `now` plus
+    /// `attestation_fetch`, or the contribution signing deadline, whichever
+    /// is earliest. The signing deadline can be slot end plus 500 ms. The
+    /// head fetch does not use that overhang. The wait does not delay
+    /// aggregation, and it does not start a second head fetch while the first
+    /// capture is running.
+    #[allow(clippy::too_many_arguments)]
     async fn run_aggregation_and_contribution_phases(
         &self,
         current_slot: Slot,
@@ -1321,7 +1413,12 @@ where
         deadlines: DeadlineBps,
         agg_phase_span: tracing::Span,
         anchor: &SlotAnchor,
+        gate: &Phase2Head,
     ) -> WaitOutcome {
+        // One cap for every phase-2 signer call in this slot: aggregation and
+        // sync contributions both acquire `phase2_signer_permits`.
+        let phase2_signer_permits =
+            Phase2SignerPermits::new(self.config.dispatch_limits.concurrency as usize);
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
                 self.wait_until_bps(
@@ -1342,18 +1439,33 @@ where
             }
             Self::record_time_into_slot(&agg_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
-            let snapshot = self.snapshot_ctx(ctx).await;
-            self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
-                .instrument(agg_phase_span.clone())
-                .await;
             Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
-            self.run_aggregation_phase(
-                current_slot,
-                current_epoch,
-                agg_phase_span,
-                anchor.slot_end(),
-            )
-            .await;
+            let slot_end = anchor.slot_end();
+            let contribution_span = agg_phase_span.clone();
+            tokio::join!(
+                async {
+                    let deadline =
+                        Self::contribution_head_deadline(slot_end, &self.config.timeouts);
+                    self.capture_head_if_needed(ctx, deadline, gate).await;
+                    let snapshot = self.snapshot_ctx(ctx).await;
+                    self.run_sync_contributions_phase(
+                        current_slot,
+                        current_epoch,
+                        &snapshot,
+                        slot_end,
+                        &phase2_signer_permits,
+                    )
+                    .instrument(contribution_span)
+                    .await;
+                },
+                self.run_aggregation_phase(
+                    current_slot,
+                    current_epoch,
+                    agg_phase_span,
+                    slot_end,
+                    &phase2_signer_permits,
+                ),
+            );
             return WaitOutcome::Continue;
         }
 
@@ -1374,11 +1486,20 @@ where
                     return WaitOutcome::Shutdown;
                 }
                 Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
-                self.capture_head_if_needed(ctx).await;
+                let slot_end = anchor.slot_end();
+                let head_deadline =
+                    Self::contribution_head_deadline(slot_end, &self.config.timeouts);
+                self.capture_head_if_needed(ctx, head_deadline, gate).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
-                self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
-                    .instrument(agg_phase_span.clone())
-                    .await;
+                self.run_sync_contributions_phase(
+                    current_slot,
+                    current_epoch,
+                    &snapshot,
+                    anchor.slot_end(),
+                    &phase2_signer_permits,
+                )
+                .instrument(agg_phase_span.clone())
+                .await;
                 WaitOutcome::Continue
             },
             async {
@@ -1403,6 +1524,7 @@ where
                     current_epoch,
                     agg_phase_span.clone(),
                     anchor.slot_end(),
+                    &phase2_signer_permits,
                 )
                 .await;
                 WaitOutcome::Continue
@@ -1467,9 +1589,21 @@ where
     }
 
     /// Runs the sync-committee contributions phase, gated by `sync_enabled`.
-    async fn run_sync_contributions_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+    ///
+    /// Intake stops at `slot_end`. A contribution fetch or publish still
+    /// running stops at `slot_end` plus [`super::dispatch::SLOT_END_PUBLISH_OVERHANG`].
+    async fn run_sync_contributions_phase(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
+        phase2_signer_permits: &Phase2SignerPermits,
+    ) {
         if self.sync_enabled.load(Ordering::Acquire) {
-            self.sync_committee_service.maybe_produce_sync_contributions(slot, epoch, ctx).await;
+            self.sync_committee_service
+                .produce_sync_contributions(slot, epoch, ctx, slot_end, phase2_signer_permits)
+                .await;
         }
     }
 
@@ -1516,8 +1650,18 @@ where
     ///
     /// A validator with `ValidatorStore::is_signing_enabled == false` is skipped
     /// before any selection proof (same store gate as aggregate production).
-    pub async fn submit_committee_subscriptions(&self, epoch: u64) {
-        self.duty_management.submit_committee_subscriptions(epoch).await;
+    /// `Ok` when the POST went out or there is nothing to send.
+    ///
+    /// # Errors
+    ///
+    /// [`OrchestratorError::Beacon`] when the POST fails, and
+    /// [`OrchestratorError::OperationTimedOut`] when it outlasts
+    /// `timeouts.preparation`.
+    pub async fn submit_committee_subscriptions(
+        &self,
+        epoch: u64,
+    ) -> Result<(), OrchestratorError> {
+        self.duty_management.submit_committee_subscriptions(epoch).await
     }
 
     /// Updates fork-resolution gauges and logs one info line per fork change.
@@ -1568,6 +1712,41 @@ impl BuilderConfigProvider for BuilderConfigAdapter {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+static PHASE_BLOCK_RECORDED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Install the sender `observe_phase_offset` notifies for `phase=block`.
+/// `None` clears it. The caller holds the metric gate across the install.
+///
+/// Defined after the fork-hazard sites so those line pins do not move.
+#[cfg(test)]
+pub(crate) fn testing_set_phase_block_recorded(tx: Option<std::sync::mpsc::Sender<()>>) {
+    *PHASE_BLOCK_RECORDED.lock().expect("phase recorded") = tx;
+}
+
+fn observe_block_start_offset(cache: &str, offset_ms: f64) {
+    RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).observe(offset_ms);
+    #[cfg(any(test, feature = "test-utils"))]
+    if cache == slot_phase_cache::COLD {
+        crate::test_metrics::add_block_start_cold(offset_ms);
+    }
+}
+
+fn observe_phase_offset(phase: &'static str, elapsed_ms: f64) {
+    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(elapsed_ms);
+    #[cfg(any(test, feature = "test-utils"))]
+    if phase == slot_phase_offset::BLOCK {
+        crate::test_metrics::add_phase_block(elapsed_ms);
+    }
+    #[cfg(test)]
+    if phase == slot_phase_offset::BLOCK {
+        if let Some(tx) = PHASE_BLOCK_RECORDED.lock().expect("phase recorded").as_ref() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// Watch sender with no live slot loop.
 ///

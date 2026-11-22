@@ -1,8 +1,18 @@
 //! Configuration error types.
+//!
+//! Parse classification lives in `validator-store` so the validators file and
+//! `config.toml` share one function. [`ParseKind`] is that type, re-exported.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use validator_store::{classify_data_error, classify_document_error, ClassifiedToml};
+
+pub use validator_store::ParseKind;
+
+fn escape_key(key: &str) -> String {
+    validator_store::escape_key(key)
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -12,8 +22,20 @@ pub enum ConfigError {
     #[error("failed to read config file: {0}")]
     ReadError(#[from] std::io::Error),
 
-    #[error("failed to parse config file: {0}")]
-    ParseError(#[from] toml::de::Error),
+    /// A TOML parse or type error. The value and the source line are not stored.
+    #[error("{}", format_parse(.file, .line, .column, .path, .kind))]
+    Parse {
+        /// Config file, when the error came from [`crate::config::Config::from_file`].
+        file: Option<PathBuf>,
+        /// 1-based row from `err.span()` over the file text. Absent when toml has no span.
+        line: Option<usize>,
+        /// 1-based column from `err.span()` over the file text.
+        column: Option<usize>,
+        /// Dotted key path. Display escapes and caps it. None for document syntax errors.
+        path: Option<String>,
+        /// Fixed category. Never the raw toml error.
+        kind: ParseKind,
+    },
 
     /// Field-level error that names the provenance layer (`defaults < file < CLI`).
     #[error("{field}: {message} (from {source_layer})")]
@@ -67,17 +89,30 @@ pub enum ConfigError {
     #[error("invalid port number: {0}")]
     InvalidPort(u16),
 
-    /// Leftover `grpc_port` / `grpc_address` after the healthz listener was
-    /// removed. Presence must fail startup; otherwise leftover TOML is ignored.
+    /// A key that is not a field of any config table.
+    ///
+    /// `key` is the name serde reported. Display escapes control characters and
+    /// caps the name at 64 characters; Debug keeps the raw name.
+    #[error("unknown key `{}`{}", escape_key(.key.as_str()), file_location(.file.as_ref()))]
+    UnknownKey {
+        /// Key name from serde's `unknown field` message.
+        key: String,
+        /// Config file, when the error came from a path-bearing load.
+        file: Option<PathBuf>,
+    },
+
+    /// A key removed in this release. `replacement` names what to write instead.
     #[error(
-        "`{key}` was removed in this release (gRPC healthz listener is gone). \
-         Use {replacement} instead"
+        "`{key}` was removed in this release. Use {replacement} instead{}",
+        file_location(.file.as_ref())
     )]
     RemovedKey {
-        /// Operator-facing key (`grpc_port` or `grpc_address`).
+        /// Operator-facing key (`grpc_port`, `provider`, …).
         key: &'static str,
-        /// Probe that replaces the removed listener.
+        /// What replaces the removed key.
         replacement: &'static str,
+        /// Config file, when the error came from a path-bearing load.
+        file: Option<PathBuf>,
     },
 
     #[error("invalid graffiti: {0}")]
@@ -88,6 +123,17 @@ pub enum ConfigError {
 
     #[error("failed to read password file: {0}")]
     PasswordReadError(String),
+
+    /// A persisted keymanager import password cannot be used at boot.
+    ///
+    /// `reason` is a fixed phrase. The password itself is never included.
+    #[error("import password secret at {path} is unusable: {reason}")]
+    ImportSecret {
+        /// File or directory that failed the check.
+        path: PathBuf,
+        /// Why it cannot be used. Never the password bytes.
+        reason: &'static str,
+    },
 
     #[error("key manager error: {0}")]
     KeyManagerError(#[from] crypto::KeyManagerError),
@@ -157,5 +203,185 @@ impl From<rvc_config::ConfigError> for ConfigError {
                 Self::Invalid { field, message, source_layer }
             }
         }
+    }
+}
+
+/// Map a toml deserialize error onto [`ConfigError`] without keeping the error.
+///
+/// Classification is [`classify_document_error`]: the same function the
+/// validators file uses. Line and column come from `err.span()` over `content`.
+/// An `unknown field` message becomes [`ConfigError::UnknownKey`]. The toml
+/// error is borrowed and dropped here: no variant stores it or a `String`
+/// built from its Display.
+pub(crate) fn parse_error(
+    err: &toml::de::Error,
+    content: Option<&str>,
+    file: Option<&Path>,
+) -> ConfigError {
+    classified_to_config(classify_document_error(err, content), file.map(Path::to_path_buf), None)
+}
+
+/// Map a semantic deserialize error. `path` is the key path, never the value.
+pub(crate) fn parse_data_error(err: &toml::de::Error, path: Option<String>) -> ConfigError {
+    classified_to_config(classify_data_error(err), None, path)
+}
+
+fn classified_to_config(
+    classified: ClassifiedToml,
+    file: Option<PathBuf>,
+    path: Option<String>,
+) -> ConfigError {
+    if let Some(key) = classified.unknown_key {
+        return ConfigError::UnknownKey { key, file };
+    }
+    ConfigError::Parse {
+        file,
+        line: classified.line,
+        column: classified.column,
+        path,
+        kind: classified.kind,
+    }
+}
+
+fn file_location(file: Option<&PathBuf>) -> String {
+    match file {
+        Some(path) => format!(" in {}", path.display()),
+        None => String::new(),
+    }
+}
+
+fn format_parse(
+    file: &Option<PathBuf>,
+    line: &Option<usize>,
+    column: &Option<usize>,
+    path: &Option<String>,
+    kind: &ParseKind,
+) -> String {
+    let mut message = match file {
+        Some(file) => format!("failed to parse {}", file.display()),
+        None => "failed to parse config".to_string(),
+    };
+    if let Some(path) = path {
+        message.push_str(&format!(": key `{}`", escape_key(path)));
+    }
+    message.push_str(&format!(": {kind}"));
+    if let (Some(line), Some(column)) = (line, column) {
+        message.push_str(&format!(" at line {line}, column {column}"));
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use validator_store::UNRECOGNIZED_PARSE;
+
+    fn boom<'de, D: serde::Deserializer<'de>>(_: D) -> Result<u8, D::Error> {
+        Err(serde::de::Error::custom(
+            "totally unexpected shape with https://alice:SECRET@host inside",
+        ))
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct CustomProbe {
+        #[serde(deserialize_with = "boom")]
+        value: u8,
+    }
+
+    const SECRET: &str = "https://alice:SECRET@host";
+
+    fn assert_no_secret(kind: &ParseKind, message: &str) {
+        let display = kind.to_string();
+        let debug = format!("{kind:?}");
+        assert!(!display.contains("SECRET"), "{message} -> {display}");
+        assert!(!debug.contains("SECRET"), "{message} -> {debug}");
+        assert!(!display.contains(SECRET), "{message} -> {display}");
+        assert!(!debug.contains(SECRET), "{message} -> {debug}");
+    }
+
+    #[test]
+    fn parse_kind_keeps_no_unexpected_value() {
+        let rows = [
+            (
+                format!("invalid type: string \"{SECRET}\", expected a sequence"),
+                "invalid type",
+                false,
+            ),
+            (
+                format!("invalid type: string \"value, expected {SECRET}\", expected a sequence"),
+                "invalid type",
+                false,
+            ),
+            (
+                format!("invalid value: string \"{SECRET}\", expected one of `sign`, `reject`"),
+                "invalid value",
+                false,
+            ),
+            (
+                format!("unknown variant `{SECRET}`, expected one of `mainnet`, `hoodi`"),
+                "unknown variant",
+                false,
+            ),
+            (format!("invalid type: string \"{SECRET}\""), UNRECOGNIZED_PARSE, true),
+            (format!("totally unexpected shape with {SECRET} inside"), UNRECOGNIZED_PARSE, true),
+        ];
+
+        for (message, needle, is_other) in rows {
+            let kind = ParseKind::from_serde_message(&message);
+            assert_no_secret(&kind, &message);
+            let display = kind.to_string();
+            assert!(display.contains(needle), "{message} -> {display}");
+            assert_eq!(matches!(kind, ParseKind::Other), is_other, "{message} -> {kind:?}");
+            if is_other {
+                assert_eq!(display, UNRECOGNIZED_PARSE);
+                assert!(!display.contains(&message), "{display}");
+            }
+        }
+
+        let missing = ParseKind::from_serde_message("missing field `fee_recipient`");
+        assert_eq!(missing, ParseKind::MissingField("fee_recipient".to_string()));
+        assert_no_secret(&missing, "missing field");
+
+        let duplicate = ParseKind::from_serde_message("duplicate key `beacon_url`");
+        assert_eq!(duplicate, ParseKind::DuplicateKey("beacon_url".to_string()));
+
+        let length = ParseKind::from_serde_message(&format!(
+            "invalid length 3, expected a tuple of size 2 holding {SECRET}"
+        ));
+        assert_eq!(length, ParseKind::InvalidLength);
+        assert_no_secret(&length, "invalid length");
+        assert_eq!(length.to_string(), "invalid length");
+    }
+
+    #[test]
+    fn data_path_custom_error_keeps_no_raw_text() {
+        let err = toml::from_str::<CustomProbe>("value = 1").expect_err("custom");
+        assert!(
+            err.message().contains("SECRET"),
+            "probe must carry the raw text: {}",
+            err.message()
+        );
+        let mapped = parse_data_error(&err, Some("value".to_string()));
+        assert!(
+            matches!(
+                &mapped,
+                ConfigError::Parse {
+                    kind: ParseKind::Other,
+                    path: Some(path),
+                    line: None,
+                    column: None,
+                    file: None,
+                } if path == "value"
+            ),
+            "{mapped:?}"
+        );
+        let display = mapped.to_string();
+        let debug = format!("{mapped:?}");
+        assert!(!display.contains("SECRET"), "{display}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(display.contains(UNRECOGNIZED_PARSE), "{display}");
+        assert!(display.contains("value"), "{display}");
     }
 }

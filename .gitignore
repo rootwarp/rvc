@@ -38,3 +38,7 @@ crates/rvc-spec-vectors/vectors/
 # Local devnet artifacts
 scripts/devnet/data/
 scripts/devnet/runs/
+
+# Python test artifacts
+.coverage
+__pycache__/

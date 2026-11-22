@@ -5,6 +5,7 @@
 //! are captured for assertions.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,11 +15,12 @@ use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
     BlockRootData, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse,
     GenesisResponse, PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
-    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, WireBody,
+    ProposerPreparation, PtcDutiesResponse, RankedBlock, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -27,14 +29,90 @@ use eth_types::{
 
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi, NodeStatusApi,
-    PayloadAttestationApi, SyncCommitteeApi,
+    PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
 };
 
 type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
 
+/// Mainnet fork keys of `/eth/v1/config/spec` before Fulu, as JSON object
+/// members. Splice them into a spec body after the other keys.
+pub const MAINNET_FORK_SPEC_FIELDS: &str = concat!(
+    r#""GENESIS_FORK_VERSION":"0x00000000","#,
+    r#""ALTAIR_FORK_EPOCH":"74240","ALTAIR_FORK_VERSION":"0x01000000","#,
+    r#""BELLATRIX_FORK_EPOCH":"144896","BELLATRIX_FORK_VERSION":"0x02000000","#,
+    r#""CAPELLA_FORK_EPOCH":"194048","CAPELLA_FORK_VERSION":"0x03000000","#,
+    r#""DENEB_FORK_EPOCH":"269568","DENEB_FORK_VERSION":"0x04000000","#,
+    r#""ELECTRA_FORK_EPOCH":"364544","ELECTRA_FORK_VERSION":"0x05000000","#,
+    r#""FULU_FORK_EPOCH":"18446744073709551615","FULU_FORK_VERSION":"0x06000000","#,
+    r#""GLOAS_FORK_EPOCH":"18446744073709551615","GLOAS_FORK_VERSION":"0x07000000""#,
+);
+
+/// [`MAINNET_FORK_SPEC_FIELDS`] as a `/eth/v1/config/spec` data map.
+pub fn mainnet_fork_spec() -> HashMap<String, serde_json::Value> {
+    serde_json::from_str(&format!("{{{MAINNET_FORK_SPEC_FIELDS}}}"))
+        .expect("mainnet fork spec fields are a JSON object")
+}
+
+/// The fork schedule that [`MAINNET_FORK_SPEC_FIELDS`] gives.
+pub fn mainnet_fork_schedule() -> ForkSchedule {
+    beacon::parse_fork_schedule(&mainnet_fork_spec()).expect("mainnet fork spec parses")
+}
+
+/// Which `_by` produce method recorded a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedProduce {
+    V3,
+    V4,
+}
+
 /// Same variant `BeaconClient` surfaces for HTTP 404 (`GET .../blocks/{block_id}/root`).
 fn block_root_not_found() -> BeaconError {
     BeaconError::ApiError { status: 404, message: "Block not found".to_string() }
+}
+
+/// `None` is `"head"` / `"finalized"`. A slot at or after `head_slot`, or a
+/// skipped slot, is a spec 404.
+fn resolve_block_id(
+    block_id: &str,
+    head_slot: Slot,
+    skipped: &[Slot],
+) -> Result<Option<Slot>, BeaconError> {
+    if block_id == "head" || block_id == "finalized" {
+        return Ok(None);
+    }
+    let parsed = block_id.parse::<Slot>().map_err(|_| block_root_not_found())?;
+    if parsed >= head_slot || skipped.contains(&parsed) {
+        return Err(block_root_not_found());
+    }
+    Ok(Some(parsed))
+}
+
+fn canonical_head_slot(head_slot: Slot, skipped: &[Slot]) -> Slot {
+    let mut slot = head_slot;
+    loop {
+        let Some(prev) = slot.checked_sub(1) else {
+            return 0;
+        };
+        if !skipped.contains(&prev) {
+            return prev;
+        }
+        slot = prev;
+    }
+}
+
+fn parse_mock_root(text: &str) -> Result<[u8; 32], BeaconError> {
+    let hex_str = text.strip_prefix("0x").unwrap_or(text);
+    if hex_str.len() != 64 {
+        return Err(BeaconError::ParseError("block root must be 32 bytes".to_string()));
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        let digits = &hex_str[start..start + 2];
+        *byte = u8::from_str_radix(digits, 16)
+            .map_err(|_| BeaconError::ParseError("block root is not hex".to_string()))?;
+    }
+    Ok(out)
 }
 
 struct MethodHook<A, R> {
@@ -86,6 +164,7 @@ pub enum MockMethod {
     GetFork,
     GetValidators,
     GetBlockRoot,
+    GetBlockHeader,
     GetNodeSyncing,
     GetNodeVersion,
     GetAttesterDuties,
@@ -108,6 +187,7 @@ pub enum MockMethod {
     GetAggregateAttestation,
     SubmitAggregateAndProofs,
     SubmitBeaconCommitteeSubscriptions,
+    SubmitSyncCommitteeSubscriptions,
     GetPayloadAttestationData,
     SubmitPayloadAttestations,
     SubmitSyncCommitteeMessages,
@@ -120,7 +200,7 @@ pub enum MockMethod {
 #[cfg(test)]
 impl MockMethod {
     /// Every role-trait method, discriminants `0..ALL.len()` with no gaps.
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 38] = [
         Self::GetGenesis,
         Self::GetGenesisMatchingValidatorsRoot,
         Self::GetConfigSpec,
@@ -128,6 +208,7 @@ impl MockMethod {
         Self::GetFork,
         Self::GetValidators,
         Self::GetBlockRoot,
+        Self::GetBlockHeader,
         Self::GetNodeSyncing,
         Self::GetNodeVersion,
         Self::GetAttesterDuties,
@@ -150,6 +231,7 @@ impl MockMethod {
         Self::GetAggregateAttestation,
         Self::SubmitAggregateAndProofs,
         Self::SubmitBeaconCommitteeSubscriptions,
+        Self::SubmitSyncCommitteeSubscriptions,
         Self::GetPayloadAttestationData,
         Self::SubmitPayloadAttestations,
         Self::SubmitSyncCommitteeMessages,
@@ -176,6 +258,7 @@ pub struct MockBeaconNodeClient {
     get_fork: MethodHook<String, StateForkResponse>,
     get_validators: MethodHook<Vec<String>, ValidatorsResponse>,
     get_block_root: MethodHook<String, BlockRootResponse>,
+    get_block_header: MethodHook<String, beacon::BlockHeaderSummary>,
     get_node_syncing: MethodHook<(), SyncingResponse>,
     get_node_version: MethodHook<(), String>,
     // DutiesProvider
@@ -187,6 +270,10 @@ pub struct MockBeaconNodeClient {
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
     produce_block_v4:
         MethodHook<(u64, String, Option<String>, BuilderConfig), ProduceBlockResponse>,
+    /// Deadline of each `produce_block_v3_ranked_by` / `produce_block_v4_by` call,
+    /// in call order, tagged with which method recorded it. Stored on this
+    /// client, not in a process-global.
+    recorded_deadline: Mutex<Vec<(RecordedProduce, Option<tokio::time::Instant>)>>,
     publish_block: MethodHook<(SignedBeaconBlock, String, Option<String>), ()>,
     publish_block_contents: MethodHook<(SignedBlockContentsJson, String, Option<String>), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
@@ -205,6 +292,7 @@ pub struct MockBeaconNodeClient {
         MethodHook<(u64, String, Option<u64>, ForkName), VersionedAggregateAttestation>,
     submit_aggregate_and_proofs: MethodHook<VersionedSignedAggregateAndProof, ()>,
     submit_beacon_committee_subscriptions: MethodHook<Vec<BeaconCommitteeSubscription>, ()>,
+    submit_sync_committee_subscriptions: MethodHook<Vec<SyncCommitteeSubscription>, ()>,
     // PayloadAttestationApi
     get_payload_attestation_data: MethodHook<u64, Option<PayloadAttestationDataResponse>>,
     submit_payload_attestations: MethodHook<Vec<PayloadAttestationMessage>, ()>,
@@ -219,6 +307,8 @@ pub struct MockBeaconNodeClient {
     request_delay: Duration,
     /// Per-method override. A present key wins over `request_delay`, including zero.
     method_delays: HashMap<MockMethod, Duration>,
+    /// Per-call override: call `n` of a method waits entry `n`, when listed.
+    call_delays: HashMap<MockMethod, Vec<Duration>>,
     /// One stamp per role-trait entry, taken before [`Self::charge`] sleeps.
     arrivals: Mutex<Vec<MockCallStamp>>,
     /// `submit_sync_committee_messages` futures that returned, after the delay
@@ -229,6 +319,10 @@ pub struct MockBeaconNodeClient {
     aggregate_completions: Mutex<Vec<tokio::time::Instant>>,
     /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
     get_attestation_data_error: Option<AttestationDataErrorInject>,
+    /// When set, duty fences track this generation instead of staying open.
+    tracked_admission: Mutex<Option<Arc<AtomicU64>>>,
+    revoke_after_attestation_data: AtomicBool,
+    revoke_after_aggregate: AtomicBool,
 }
 
 /// Arrival of one role-trait call, before the injected request delay.
@@ -244,6 +338,44 @@ pub struct MockCallStamp {
 impl MockBeaconNodeClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `duty_fence`, `admission_duty_fence`, `revocation_generation` and
+    /// `revocation_watch` follow this generation.
+    ///
+    /// A `DutyTracker` reads `revocation_generation` once, when it is built.
+    /// Call this first to get stamped duty caches.
+    pub fn track_admission(&self) -> Arc<AtomicU64> {
+        let mut slot = self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner());
+        slot.get_or_insert_with(|| Arc::new(AtomicU64::new(0))).clone()
+    }
+
+    /// After a successful attestation-data fetch, bump the tracked generation.
+    pub fn revoke_after_attestation_data(&self) {
+        let _ = self.track_admission();
+        self.revoke_after_attestation_data.store(true, Ordering::Release);
+    }
+
+    /// After a successful aggregate fetch, bump the tracked generation.
+    pub fn revoke_after_aggregate(&self) {
+        let _ = self.track_admission();
+        self.revoke_after_aggregate.store(true, Ordering::Release);
+    }
+
+    fn fence_now(&self) -> beacon::DutyFence {
+        let slot = self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner());
+        match slot.as_ref() {
+            Some(epoch) => beacon::DutyFence::at(epoch.load(Ordering::Acquire), Arc::clone(epoch)),
+            None => beacon::DutyFence::open(),
+        }
+    }
+
+    fn bump_tracked_admission(&self) {
+        if let Some(epoch) =
+            self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner()).as_ref()
+        {
+            epoch.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Sleep `delay` before every async role-trait method.
@@ -263,8 +395,21 @@ impl MockBeaconNodeClient {
         self
     }
 
-    fn effective_delay(&self, method: MockMethod) -> Duration {
-        self.method_delays.get(&method).copied().unwrap_or(self.request_delay)
+    /// Override both delays for the first calls of `method`: call `n` (from 0)
+    /// waits `delays[n]`. A call past the list waits the delay it would without it.
+    pub fn with_call_delays(
+        mut self,
+        method: MockMethod,
+        delays: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        self.call_delays.insert(method, delays.into_iter().collect());
+        self
+    }
+
+    fn effective_delay(&self, method: MockMethod, call: usize) -> Duration {
+        let listed = self.call_delays.get(&method).and_then(|delays| delays.get(call));
+        let fallback = || self.method_delays.get(&method).copied().unwrap_or(self.request_delay);
+        listed.copied().unwrap_or_else(fallback)
     }
 
     /// Stamps recorded since the client was built, in arrival order.
@@ -308,11 +453,13 @@ impl MockBeaconNodeClient {
     }
 
     async fn charge(&self, method: MockMethod) {
-        self.arrivals
-            .lock()
-            .expect("mock arrival log poisoned")
-            .push(MockCallStamp { method, at: tokio::time::Instant::now() });
-        let delay = self.effective_delay(method);
+        let call = {
+            let mut arrivals = self.arrivals.lock().expect("mock arrival log poisoned");
+            let call = arrivals.iter().filter(|stamp| stamp.method == method).count();
+            arrivals.push(MockCallStamp { method, at: tokio::time::Instant::now() });
+            call
+        };
+        let delay = self.effective_delay(method, call);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -368,28 +515,52 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_get_block_header(
+        self,
+        f: impl Fn(String) -> Result<beacon::BlockHeaderSummary, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_block_header.set_handler(Arc::new(f));
+        self
+    }
+
     /// Spec-honest block-root stub: `block_id` values that name a slot at or after
     /// `head_slot` answer `404` the way a conformant BN does (beacon-APIs
     /// `blocks/{block_id}/root`); `"head"`, `"finalized"` and slots <= head resolve
     /// to `root_for(slot)`. Skipped slots named in `skipped` also 404.
+    ///
+    /// The same rules answer `get_block_header`. A numeric id's header slot is
+    /// that id. `"head"` uses the greatest slot below `head_slot` that is not
+    /// skipped. The header parent is a fixed root distinct from `root_for`.
     pub fn with_slot_aware_block_root(
         self,
         head_slot: Slot,
         skipped: &[Slot],
         root_for: impl Fn(Option<Slot>) -> String + Send + Sync + 'static,
     ) -> Self {
+        let root_for: Arc<dyn Fn(Option<Slot>) -> String + Send + Sync> = Arc::new(root_for);
         let skipped = skipped.to_vec();
+        let root_for_header = Arc::clone(&root_for);
+        let skipped_header = skipped.clone();
         self.get_block_root.set_handler(Arc::new(move |block_id: String| {
-            let slot = if block_id == "head" || block_id == "finalized" {
-                None
-            } else {
-                let parsed = block_id.parse::<Slot>().map_err(|_| block_root_not_found())?;
-                if parsed >= head_slot || skipped.contains(&parsed) {
-                    return Err(block_root_not_found());
-                }
-                Some(parsed)
+            let slot = resolve_block_id(&block_id, head_slot, &skipped)?;
+            Ok(BlockRootResponse {
+                execution_optimistic: None,
+                data: BlockRootData { root: root_for(slot) },
+            })
+        }));
+        self.get_block_header.set_handler(Arc::new(move |block_id: String| {
+            let queried = resolve_block_id(&block_id, head_slot, &skipped_header)?;
+            let slot = match queried {
+                Some(slot) => slot,
+                None => canonical_head_slot(head_slot, &skipped_header),
             };
-            Ok(BlockRootResponse { data: BlockRootData { root: root_for(slot) } })
+            let root = parse_mock_root(&root_for_header(queried))?;
+            Ok(beacon::BlockHeaderSummary {
+                root,
+                slot,
+                proposer_index: 0,
+                parent_root: [0x42; 32],
+            })
         }));
         self
     }
@@ -654,6 +825,14 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_submit_sync_committee_subscriptions(
+        self,
+        f: impl Fn(Vec<SyncCommitteeSubscription>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_sync_committee_subscriptions.set_handler(Arc::new(f));
+        self
+    }
+
     // -- PayloadAttestationApi builders --
 
     pub fn with_get_payload_attestation_data(
@@ -761,6 +940,10 @@ impl MockBeaconNodeClient {
         self.get_block_root.calls()
     }
 
+    pub fn get_block_header_calls(&self) -> Vec<String> {
+        self.get_block_header.calls()
+    }
+
     pub fn get_fork_calls(&self) -> Vec<String> {
         self.get_fork.calls()
     }
@@ -785,6 +968,20 @@ impl MockBeaconNodeClient {
         self.produce_block_v4.calls()
     }
 
+    /// Deadlines passed to the `_by` produce methods, in call order, with the
+    /// method that recorded each one.
+    pub fn recorded_deadline(&self) -> Vec<(RecordedProduce, Option<tokio::time::Instant>)> {
+        self.recorded_deadline.lock().unwrap_or_else(|err| err.into_inner()).clone()
+    }
+
+    fn push_recorded_deadline(
+        &self,
+        kind: RecordedProduce,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        self.recorded_deadline.lock().unwrap_or_else(|err| err.into_inner()).push((kind, deadline));
+    }
+
     pub fn publish_block_contents_calls(
         &self,
     ) -> Vec<(SignedBlockContentsJson, String, Option<String>)> {
@@ -807,6 +1004,10 @@ impl MockBeaconNodeClient {
 
     pub fn submit_attestation_calls(&self) -> Vec<VersionedAttestation> {
         self.submit_attestation.calls()
+    }
+
+    pub fn submit_sync_committee_subscriptions_calls(&self) -> Vec<Vec<SyncCommitteeSubscription>> {
+        self.submit_sync_committee_subscriptions.calls()
     }
 }
 
@@ -834,6 +1035,14 @@ impl NodeStatusApi for MockBeaconNodeClient {
         )
     }
 
+    async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError> {
+        beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+            .map(|_| ())
+    }
+
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.charge(MockMethod::GetConfigSpec).await;
         self.get_config_spec.invoke("get_config_spec", ())
@@ -857,6 +1066,14 @@ impl NodeStatusApi for MockBeaconNodeClient {
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         self.charge(MockMethod::GetBlockRoot).await;
         self.get_block_root.invoke("get_block_root", block_id.to_string())
+    }
+
+    async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<beacon::BlockHeaderSummary, BeaconError> {
+        self.charge(MockMethod::GetBlockHeader).await;
+        self.get_block_header.invoke("get_block_header", block_id.to_string())
     }
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -908,6 +1125,10 @@ impl DutiesProvider for MockBeaconNodeClient {
         self.charge(MockMethod::PostPtcDuties).await;
         self.post_ptc_duties.invoke("post_ptc_duties", (epoch, validator_indices.to_vec()))
     }
+
+    fn revocation_generation(&self) -> Option<Arc<AtomicU64>> {
+        self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner()).clone()
+    }
 }
 
 #[async_trait]
@@ -938,6 +1159,32 @@ impl BlockProducer for MockBeaconNodeClient {
             "produce_block_v4",
             (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_config.clone()),
         )
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        self.push_recorded_deadline(RecordedProduce::V3, deadline);
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.push_recorded_deadline(RecordedProduce::V4, deadline);
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
 
     async fn publish_block(
@@ -1049,10 +1296,38 @@ impl BlockProducer for MockBeaconNodeClient {
         self.charge(MockMethod::SubmitBuilderPreferences).await;
         self.submit_builder_preferences.invoke("submit_builder_preferences", entries.to_vec())
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: crate::ProduceDuty,
+    ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<crate::ProduceDuty>,
+    ) -> Result<Vec<beacon::RankedBlock>, beacon::BeaconError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![beacon::RankedBlock { bn_index: 0, response }])
+    }
 }
 
 #[async_trait]
 impl AttestationApi for MockBeaconNodeClient {
+    fn admission_duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(self.fence_now())
+    }
+
     async fn get_attestation_data(
         &self,
         slot: u64,
@@ -1067,7 +1342,12 @@ impl AttestationApi for MockBeaconNodeClient {
             self.get_attestation_data.record((slot, committee_index));
             return Err(err);
         }
-        self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index))
+        let result =
+            self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index));
+        if result.is_ok() && self.revoke_after_attestation_data.load(Ordering::Acquire) {
+            self.bump_tracked_admission();
+        }
+        result
     }
 
     async fn submit_attestation(
@@ -1086,10 +1366,14 @@ impl AttestationApi for MockBeaconNodeClient {
         fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.charge(MockMethod::GetAggregateAttestation).await;
-        self.get_aggregate_attestation.invoke(
+        let result = self.get_aggregate_attestation.invoke(
             "get_aggregate_attestation",
             (slot, attestation_data_root.to_string(), committee_index, fork),
-        )
+        );
+        if result.is_ok() && self.revoke_after_aggregate.load(Ordering::Acquire) {
+            self.bump_tracked_admission();
+        }
+        result
     }
 
     async fn submit_aggregate_and_proofs(
@@ -1110,6 +1394,15 @@ impl AttestationApi for MockBeaconNodeClient {
         self.charge(MockMethod::SubmitBeaconCommitteeSubscriptions).await;
         self.submit_beacon_committee_subscriptions
             .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
+    }
+
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitSyncCommitteeSubscriptions).await;
+        self.submit_sync_committee_subscriptions
+            .invoke("submit_sync_committee_subscriptions", subscriptions.to_vec())
     }
 }
 
@@ -1195,11 +1488,48 @@ impl LivenessApi for MockBeaconNodeClient {
     }
 }
 
-impl BeaconNodeClient for MockBeaconNodeClient {}
+impl BeaconNodeClient for MockBeaconNodeClient {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(self.fence_now())
+    }
+
+    /// Open (the trait default) until [`Self::track_admission`] is called.
+    fn revocation_watch(&self) -> beacon::DutyFence {
+        self.fence_now()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revocation_watch_follows_the_generation_only_after_track_admission() {
+        let mock = MockBeaconNodeClient::new();
+        let untracked = mock.revocation_watch();
+        assert!(untracked.generation().is_none(), "untracked keeps the open default");
+        assert!(untracked.holds());
+
+        let generation = mock.track_admission();
+        generation.fetch_add(1, Ordering::Release);
+        let watch = mock.revocation_watch();
+        assert_eq!(watch.seen(), 1);
+        assert!(Arc::ptr_eq(&watch.generation().expect("tracked watch"), &generation));
+        assert!(watch.holds());
+        generation.fetch_add(1, Ordering::Release);
+        assert!(!watch.holds(), "a bump after the sample breaks the watch");
+        assert_eq!(mock.revocation_watch().seen(), 2);
+    }
+
+    /// The trait default: a client that does not track revocations has no
+    /// commit lock, so boot attaches none.
+    #[test]
+    fn a_client_without_revocation_tracking_has_no_commit_lock() {
+        let mock = MockBeaconNodeClient::new();
+        assert!(mock.revocation_commit().is_none());
+        let _ = mock.track_admission();
+        assert!(mock.revocation_commit().is_none(), "the mock keeps the trait default");
+    }
 
     #[tokio::test]
     async fn test_shared_mock_errors_by_default_for_unconfigured_methods() {
@@ -1259,6 +1589,49 @@ mod tests {
         assert_eq!(mock.submit_proposer_preferences_calls(), vec![prefs]);
     }
 
+    fn sample_sync_committee_subscription() -> SyncCommitteeSubscription {
+        SyncCommitteeSubscription {
+            validator_index: 7,
+            sync_committee_indices: vec![1, 300],
+            until_epoch: 512,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_submit_sync_committee_subscriptions_captures() {
+        let mock = MockBeaconNodeClient::new().with_submit_sync_committee_subscriptions(|_| Ok(()));
+        let subscriptions = vec![sample_sync_committee_subscription()];
+        mock.submit_sync_committee_subscriptions(&subscriptions).await.expect("handler set");
+        assert_eq!(mock.submit_sync_committee_subscriptions_calls(), vec![subscriptions]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_method_delay_holds_submit_sync_committee_subscriptions() {
+        use std::time::Duration;
+
+        let delay = Duration::from_millis(30);
+        let mock = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::SubmitSyncCommitteeSubscriptions, delay)
+            .with_submit_sync_committee_subscriptions(|_| Ok(()))
+            .with_submit_beacon_committee_subscriptions(|_| Ok(()));
+        let start = tokio::time::Instant::now();
+        mock.submit_sync_committee_subscriptions(&[sample_sync_committee_subscription()])
+            .await
+            .expect("handler set");
+        assert_eq!(start.elapsed(), delay);
+        mock.submit_beacon_committee_subscriptions(&[]).await.expect("handler set");
+        assert_eq!(start.elapsed(), delay, "the override is keyed to the sync method only");
+        let methods: Vec<MockMethod> =
+            mock.call_stamps().iter().map(|stamp| stamp.method).collect();
+        assert_eq!(
+            methods,
+            [
+                MockMethod::SubmitSyncCommitteeSubscriptions,
+                MockMethod::SubmitBeaconCommitteeSubscriptions
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_shared_mock_submit_builder_preferences_captures() {
         let mock = MockBeaconNodeClient::new()
@@ -1290,6 +1663,7 @@ mod tests {
                     payload_included: false,
                     builder_url: None,
                     consensus_block_value: None,
+                    candidate_memo: beacon::CandidateMemo::arc(),
                 })
             });
         let cfg = BuilderConfig::default();
@@ -1491,6 +1865,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_call_delays_hold_the_listed_calls_then_fall_back() {
+        use std::time::Duration;
+
+        let mock = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetAttestationData, Duration::from_millis(5))
+            .with_call_delays(
+                MockMethod::GetAttestationData,
+                [Duration::from_millis(40), Duration::ZERO],
+            );
+        let start = tokio::time::Instant::now();
+        let _ = mock.get_attestation_data(1, 0).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(40), "call 0 waits its listed delay");
+        let _ = mock.get_genesis().await;
+        let _ = mock.get_attestation_data(1, 1).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(40), "call 1 waits its listed zero");
+        let _ = mock.get_attestation_data(1, 2).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(45), "call 2 falls back");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn mock_default_request_delay_does_not_advance_virtual_time() {
         use std::time::Duration;
 
@@ -1583,6 +1977,9 @@ mod tests {
             MockMethod::GetBlockRoot => {
                 let _ = mock.get_block_root("head").await;
             }
+            MockMethod::GetBlockHeader => {
+                let _ = mock.get_block_header("head").await;
+            }
             MockMethod::GetNodeSyncing => {
                 let _ = mock.get_node_syncing().await;
             }
@@ -1651,6 +2048,9 @@ mod tests {
             }
             MockMethod::SubmitBeaconCommitteeSubscriptions => {
                 let _ = mock.submit_beacon_committee_subscriptions(&[]).await;
+            }
+            MockMethod::SubmitSyncCommitteeSubscriptions => {
+                let _ = mock.submit_sync_committee_subscriptions(&[]).await;
             }
             MockMethod::GetPayloadAttestationData => {
                 let _ = mock.get_payload_attestation_data(0).await;

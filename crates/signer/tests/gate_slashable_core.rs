@@ -24,6 +24,14 @@ impl SigningEnablement for FlipEnablement {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         self.enabled.load(Ordering::SeqCst)
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 /// Gate records the same metric families as SignerService on success and on block.

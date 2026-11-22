@@ -1,12 +1,29 @@
 //! Beacon node manager with multi-BN support, failover, and health tracking.
 
+mod admission;
 mod broadcast;
 mod error;
+mod fan_out;
+mod header_quorum;
+
+pub use admission::{
+    classify_identity, sync_check_interval_for, ChainIdentity, IdentityClass, IdentityField,
+};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use fan_out::{
+    testing_broadcast_improving_partial_then_slow, testing_broadcast_partial_then_slow,
+};
+pub use fan_out::{
+    AttestationPublishContext, KnownAttestationPublish, ATTESTATION_PUBLISH, BACKSTOP_MARGIN,
+    MAX_INFLIGHT_PER_BN,
+};
 mod health;
 mod manager;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 mod mock;
+mod revocation_commit;
 pub mod sse;
 mod submit;
 mod sync_status;
@@ -14,9 +31,17 @@ mod traits;
 pub mod types;
 
 pub use error::BnManagerError;
-pub use manager::{BnManager, ATTEMPT_TIMEOUT_FLOOR};
+pub use header_quorum::CheckedHeader;
+pub use manager::{BnManager, SpecAgreement, ATTEMPT_TIMEOUT_FLOOR};
+pub use metrics::{METRIC_POOL_MAIN, METRIC_POOL_PROPOSER};
 #[cfg(any(test, feature = "test-utils"))]
-pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod};
+pub use mock::{
+    mainnet_fork_schedule, mainnet_fork_spec, MockBeaconNodeClient, MockCallStamp, MockMethod,
+    RecordedProduce, MAINNET_FORK_SPEC_FIELDS,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use revocation_commit::ContentionHook;
+pub use revocation_commit::{RevocationCommit, RevocationCommitGuard};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
@@ -27,8 +52,8 @@ pub use submit::{
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
-    BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    PayloadAttestationApi, SyncCommitteeApi,
+    BroadcastTopics, DutiesProvider, FeeRecipientPolicy, LivenessApi, NodeStatusApi,
+    OperationTimeouts, PayloadAttestationApi, ProduceDuty, ShapeConstraint, SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 
@@ -43,10 +68,10 @@ pub use beacon::{
     PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedBuilderRequestAuth,
     SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorLiveness,
-    ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
-    FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingData, SyncingResponse,
+    ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody, FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
 };
 pub use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,

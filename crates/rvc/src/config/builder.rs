@@ -7,34 +7,92 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use observability::logging::RedactedUrl;
-
 use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement, TrackedKeys};
-use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
+use beacon::{BeaconClient, BeaconClientConfig};
 #[cfg(test)]
 use bn_manager::DutiesProvider;
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
-    DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
+    DoppelgangerDisabledByOperator, ForwardWindowMachine, MonotonicEpochClock, SigningEnablement,
     DEFAULT_MONITORING_EPOCHS,
 };
 #[cfg(test)]
 use duty_tracker::DutyTracker;
-use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH};
 use rvc_config::TimingConfig;
 use signer::{SignerService, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
 use timing::{DeadlineBps, DeadlineSchedule, SystemSlotClock};
-use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
 
-use super::error::ConfigError;
-use super::types::Config;
+use super::error::{parse_error, ConfigError};
+use super::types::{redact_url, redact_urls, Config};
+use validator_store::{validators_file_de_error, ValidatorStore, ValidatorStoreError};
+
+#[cfg(test)]
+type AfterLoadHook = Box<dyn FnOnce(&mut Result<KeyManager, crypto::KeyManagerError>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread, right after the boot keystore loader returns.
+    static AFTER_LOAD_HOOK: std::cell::RefCell<Option<AfterLoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_load_hook(
+    mut loaded: Result<KeyManager, crypto::KeyManagerError>,
+) -> Result<KeyManager, crypto::KeyManagerError> {
+    if let Some(hook) = AFTER_LOAD_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(&mut loaded);
+    }
+    loaded
+}
+
+/// Map a validators-file failure onto [`ConfigError`].
+///
+/// [`ValidatorStoreError::TomlParse`] is re-parsed from `raw` and passed
+/// through [`parse_error`], so boot names the file and drops the source line.
+/// Every other store error stays [`ConfigError::ValidatorStoreError`] and is
+/// prefixed with the path.
+fn validator_store_config_error(err: ValidatorStoreError, raw: &str, path: &Path) -> ConfigError {
+    match err {
+        ValidatorStoreError::TomlParse(_) => match validators_file_de_error(raw) {
+            Err(de) => parse_error(&de, Some(raw), Some(path)),
+            Ok(()) => ConfigError::ValidatorStoreError(format!(
+                "{}: validators file changed while loading",
+                path.display()
+            )),
+        },
+        other => ConfigError::ValidatorStoreError(format!("{}: {other}", path.display())),
+    }
+}
+
+fn log_fork_schedule(schedule: &ForkSchedule) {
+    info!(
+        genesis_version = %format_version(schedule.genesis_fork_version),
+        altair_epoch = schedule.altair_fork_epoch,
+        altair_version = %format_version(schedule.altair_fork_version),
+        bellatrix_epoch = schedule.bellatrix_fork_epoch,
+        bellatrix_version = %format_version(schedule.bellatrix_fork_version),
+        capella_epoch = schedule.capella_fork_epoch,
+        capella_version = %format_version(schedule.capella_fork_version),
+        deneb_epoch = schedule.deneb_fork_epoch,
+        deneb_version = %format_version(schedule.deneb_fork_version),
+        electra_epoch = schedule.electra_fork_epoch,
+        electra_version = %format_version(schedule.electra_fork_version),
+        fulu_epoch = schedule.fulu_fork_epoch,
+        fulu_version = %format_version(schedule.fulu_fork_version),
+        gloas_epoch = schedule.gloas_fork_epoch,
+        gloas_version = %format_version(schedule.gloas_fork_version),
+        "Loaded fork schedule from beacon node"
+    );
+}
 
 fn format_version(v: eth_types::Version) -> String {
     format!("0x{}", hex::encode(v))
@@ -72,6 +130,41 @@ fn paths_on_different_filesystems(a: &Path, b: &Path) -> Option<bool> {
     let a_id = filesystem_id(a)?;
     let b_id = filesystem_id(b)?;
     Some(a_id != b_id)
+}
+
+/// One warning per BuilderOnly key that cannot ask a builder.
+///
+/// A key whose effective mode is not BuilderOnly is silent. A key that is
+/// builder-enabled and has at least one Gloas builder URL is silent. Either
+/// missing piece is one warning, including when both are missing. The line
+/// names the truncated pubkey, `builder_enabled`, and `gloas_builders`. It
+/// does not name a relay URL or a fee recipient. Startup continues.
+fn warn_builder_only_without_builder(store: &ValidatorStore, pubkeys: &[[u8; 48]]) {
+    for pubkey in pubkeys {
+        if store.effective_block_selection_mode(pubkey)
+            != validator_store::BlockSelectionMode::BuilderOnly
+        {
+            continue;
+        }
+        let builder_enabled = store.is_builder_enabled(pubkey);
+        let gloas_builders = store.builders(pubkey).len();
+        if builder_enabled && gloas_builders > 0 {
+            continue;
+        }
+        let pk_hex = hex::encode(pubkey);
+        let message = match (builder_enabled, gloas_builders) {
+            (false, 0) => "builder-only key is not builder-enabled and has no Gloas builders",
+            (false, _) => "builder-only key is not builder-enabled",
+            (true, _) => "builder-only key has no Gloas builders",
+        };
+        warn!(
+            reason = "builder_only_without_builder",
+            pubkey = %observability::logging::TruncatedPubkey::new(&pk_hex),
+            builder_enabled,
+            gloas_builders,
+            "{message}"
+        );
+    }
 }
 
 /// SEC-3 post-open gate: a fresh create without opt-in must never proceed to sign.
@@ -129,12 +222,14 @@ pub struct ServiceBuilder {
 
 /// Wall-clock length of the doppelganger store hold and import-meta re-arm.
 ///
-/// [`DEFAULT_MONITORING_EPOCHS`] at the spec slot duration. Boot sidecar
-/// classification does not use this value: a sidecar stays unfinished until
-/// this process removes it after the forward window reaches Safe.
-pub(crate) fn doppelganger_import_window() -> Duration {
+/// [`DEFAULT_MONITORING_EPOCHS`] at `slot_duration_ms` from the beacon node.
+/// Boot sidecar classification does not use this value: a sidecar stays
+/// unfinished until this process removes it after the forward window reaches Safe.
+///
+/// `slot_duration_ms` must be the positive duration from the beacon node spec.
+pub(crate) fn doppelganger_import_window(slot_duration_ms: u64) -> Duration {
     Duration::from_millis(
-        DEFAULT_MONITORING_EPOCHS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(SLOT_DURATION_MS),
+        DEFAULT_MONITORING_EPOCHS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(slot_duration_ms),
     )
 }
 
@@ -409,6 +504,9 @@ fn open_doppelganger_holds(
     pubkey_map: &PubkeyMap,
     now_unix: u64,
 ) -> Result<HashSet<[u8; 48]>, String> {
+    // `load_from_config` returns a sanitized [`ValidatorStoreError`]. `%err`
+    // below is that Display: it names an unknown key and does not quote the
+    // source line. A parse failure still fails closed (`force_all`).
     let store = ValidatorStore::load_from_config(path).map_err(|e| e.to_string())?;
     let mut open = HashSet::new();
     for pubkey in pubkey_map.read().keys() {
@@ -429,12 +527,7 @@ impl ServiceBuilder {
     }
 
     pub fn log_effective_config(&self) {
-        let redacted_bns: Vec<String> = self
-            .config
-            .effective_beacon_nodes()
-            .iter()
-            .map(|u| format!("{}", RedactedUrl(u)))
-            .collect();
+        let redacted_bns = redact_urls(&self.config.effective_beacon_nodes());
 
         info!(
             bn_urls = ?redacted_bns,
@@ -497,7 +590,7 @@ impl ServiceBuilder {
 
         let client = BeaconClient::new(beacon_config)?;
         info!(
-            url = %self.config.beacon_url,
+            url = %redact_url(&self.config.beacon_url),
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created single-endpoint beacon client (not the keymanager exit path)"
         );
@@ -510,6 +603,7 @@ impl ServiceBuilder {
         let mut config =
             BnManagerConfig::new(endpoints).with_max_body_bytes(self.config.beacon_max_body_bytes);
         config.broadcast_topics = self.config.effective_broadcast_topics();
+        config.fee_recipient_policy = self.config.fee_recipient_policy;
         config
     }
 
@@ -531,7 +625,7 @@ impl ServiceBuilder {
             })?
             .with_operation_timeouts(timeouts);
         info!(
-            endpoints = ?endpoints,
+            endpoints = ?redact_urls(&endpoints),
             broadcast_topics = ?broadcast_topics,
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created BnManager with {} beacon nodes",
@@ -544,9 +638,13 @@ impl ServiceBuilder {
     ///
     /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
     ///
-    /// Uses the same body-size cap and broadcast-topic policy as the main pool
-    /// so dedicated proposer publish/produce honor operator DoS and broadcast
-    /// settings (not `BnManagerConfig` defaults alone).
+    /// Uses the same body-size cap, broadcast-topic policy, and per-operation
+    /// timeouts as the main pool, so dedicated proposer publish/produce honor
+    /// operator DoS, broadcast, and budget settings.
+    ///
+    /// An empty `proposer_nodes` list returns `Ok(None)` and does not connect.
+    /// A URL that is not `http` or `https` is [`ConfigError::InvalidBeaconUrl`]
+    /// and no manager is returned.
     pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
         if self.config.proposer_nodes.is_empty() {
             return Ok(None);
@@ -557,9 +655,10 @@ impl ServiceBuilder {
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
             })?
-            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+            .with_metric_pool(bn_manager::METRIC_POOL_PROPOSER)
+            .with_operation_timeouts(self.config.operation_timeouts());
         info!(
-            endpoints = ?endpoints,
+            endpoints = ?redact_urls(&endpoints),
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created proposer BnManager with {} proposer nodes",
             endpoints.len()
@@ -576,6 +675,12 @@ impl ServiceBuilder {
     /// Returns an owned [`KeyManager`] so callers (notably bootstrap
     /// `load_signing_keys`) can build a [`CompositeSigner`] without
     /// `Arc::try_unwrap`.
+    ///
+    /// Import secrets are checked after every load, including one that
+    /// returns an error, and an [`ConfigError::ImportSecret`] wins over the
+    /// loader error. When a secrets directory is present, the keystore
+    /// directory is indexed before and after the load, and a change for a
+    /// secret's pubkey fails startup.
     pub fn build_key_manager_owned_filtered(
         &self,
         denylist: Option<&std::collections::HashSet<[u8; 48]>>,
@@ -586,11 +691,35 @@ impl ServiceBuilder {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
-        let key_manager = KeyManager::load_from_directory_with_threads_filtered(
+        let before = self.config.index_keystores_before_load()?;
+        let mut report = crypto::KeystoreLoadReport::default();
+        let loaded = KeyManager::load_from_directory_with_threads_filtered_reporting(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
             denylist,
+            &mut report,
+        );
+        #[cfg(test)]
+        let loaded = run_after_load_hook(loaded);
+        let key_manager = match loaded {
+            Ok(manager) => manager,
+            Err(err) => {
+                let empty = KeyManager::new();
+                self.config.reject_undecrypted_import_secrets(
+                    &empty,
+                    denylist,
+                    &report,
+                    before.as_ref(),
+                )?;
+                return Err(err.into());
+            }
+        };
+        self.config.reject_undecrypted_import_secrets(
+            &key_manager,
+            denylist,
+            &report,
+            before.as_ref(),
         )?;
         info!(
             key_count = key_manager.len(),
@@ -757,10 +886,11 @@ impl ServiceBuilder {
     /// - When doppelganger detection is **enabled** (default): builds a
     ///   [`ForwardWindowMachine`], registers every loaded key at
     ///   `current_epoch`, and returns it as the enablement. Keys remain
-    ///   closed until the monitoring window elapses with complete liveness
-    ///   observations (driven by SEC-2c). Epoch-0 registration of a
-    ///   normally registered key is immediately `Safe` (pre-genesis bypass).
-    ///   Cost: ~[`DEFAULT_MONITORING_EPOCHS`] epochs (~12.8 min on mainnet).
+    ///   closed until `monitoring_epochs + 1` closed not-live epochs are
+    ///   observed (driven by SEC-2c). A gap delays `Safe`; there is no
+    ///   timeout. Epoch-0 registration of a normally registered key is
+    ///   immediately `Safe` (pre-genesis bypass). Default cost: three closed
+    ///   epochs (`DEFAULT_MONITORING_EPOCHS + 1`).
     /// - When **disabled** (`--no-doppelganger-detection`): returns
     ///   [`DoppelgangerDisabledByOperator`], which enables every key.
     ///
@@ -797,19 +927,32 @@ impl ServiceBuilder {
         gvr: Root,
         current_epoch: Epoch,
         pubkey_map: &PubkeyMap,
+        genesis_confirmed: bool,
     ) -> (Arc<dyn SigningEnablement>, Option<Arc<ForwardWindowMachine>>) {
+        let closed_epochs = DEFAULT_MONITORING_EPOCHS + 1;
         if !self.config.doppelganger_detection {
             tracing::warn!(
+                closed_epochs,
                 "Doppelganger detection disabled by operator (--no-doppelganger-detection). \
                  Forward-window protection is off; a duplicate live instance can double-sign. \
-                 Default on costs ~{DEFAULT_MONITORING_EPOCHS} epochs of withheld signing \
-                 (~12.8 min on mainnet)."
+                 Default on withholds signing until {closed_epochs} closed not-live epochs \
+                 are observed (a gap delays Safe)."
             );
             return (Arc::new(DoppelgangerDisabledByOperator), None);
         }
 
         let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
-        let machine = Arc::new(ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr));
+        let mut machine = ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr)
+            .with_detection_marker_path(crate::detection_marker::marker_path(
+                &self.config.keystore_path,
+            ))
+            .with_force_window_path(crate::detection_marker::force_window_path(
+                &self.config.keystore_path,
+            ));
+        if genesis_confirmed {
+            machine = machine.with_confirmed_genesis();
+        }
+        let machine = Arc::new(machine);
 
         // Unfinished imports must be classified before `register`. A later
         // `register_for_import` leaves an existing Safe state unchanged.
@@ -836,16 +979,17 @@ impl ServiceBuilder {
 
         info!(
             monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
+            closed_epochs,
             current_epoch,
             registered,
             import_strict,
             "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
-             {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
-             (~12.8 min on mainnet). The per-slot liveness loop (SEC-2c) feeds \
-             observe_liveness via bn-manager failover. Epoch-0 bypass and \
-             restart-aware safe-skip apply only to keys that are not an unfinished \
-             import (open hold, any import sidecar, staged sidecar, \
-             or an unreadable keystore directory or validators file)."
+             {closed_epochs} closed not-live epochs are observed (a gap delays \
+             Safe; there is no timeout). The liveness loop (SEC-2c) applies both \
+             epoch answers with apply_liveness_tick via bn-manager failover. \
+             Epoch-0 bypass and restart-aware safe-skip apply only to keys that \
+             are not an unfinished import (open hold, any import sidecar, staged \
+             sidecar, or an unreadable keystore directory or validators file)."
         );
 
         (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
@@ -878,28 +1022,88 @@ impl ServiceBuilder {
         Arc::new(tracker)
     }
 
+    /// Duration and confirmation from the configured beacon nodes.
+    ///
+    /// Named networks must report [`Network::slot_duration_ms`]. Responding
+    /// nodes must report the same duration, the same `SLOTS_PER_EPOCH` as
+    /// [`Network::slots_per_epoch`], and the same genesis time as the
+    /// configured genesis. A named network skips a BN that does not respond
+    /// and fails when none do. Custom requires every configured BN. A miss,
+    /// a bound failure, or a disagreement fails closed.
+    ///
+    /// The returned flag is the epoch-0 Safe bypass. It is set only on a
+    /// named network whose clock has reached genesis. Custom duration comes
+    /// from the beacon nodes, so an inflated length can hold the clock at
+    /// epoch 0; the flag stays false. A clock reading before genesis is not
+    /// a counted epoch, and the flag stays false there too.
     pub async fn resolve_slot_duration_ms(
         &self,
-        beacon: &dyn BeaconNodeClient,
-    ) -> Result<u64, ConfigError> {
-        info!("Fetching slot duration from beacon node config spec");
-        let spec = beacon.get_config_spec().await?;
-        let slot_duration_ms = parse_slot_duration_ms(&spec.data)?;
-        info!(slot_duration_ms, "Resolved slot duration from beacon node spec");
-        Ok(slot_duration_ms)
+        beacon: &BnManager,
+    ) -> Result<(u64, bool), ConfigError> {
+        info!("Fetching slot duration from configured beacon nodes");
+        let agreement = if matches!(self.config.network, super::Network::Custom) {
+            bn_manager::SpecAgreement::All
+        } else {
+            bn_manager::SpecAgreement::Responding
+        };
+        let configured_root = self.config.effective_genesis_validators_root()?;
+        let (slot_duration_ms, slots_per_epoch, genesis_time) =
+            beacon.agreed_spec_and_genesis(agreement, &configured_root).await?;
+        let expected_slots = self.config.network.slots_per_epoch();
+        if slots_per_epoch != expected_slots {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "SLOTS_PER_EPOCH {slots_per_epoch} does not match preset {expected_slots}"
+            )));
+        }
+        if !matches!(self.config.network, super::Network::Custom) {
+            let preset = self.config.network.slot_duration_ms();
+            if slot_duration_ms != preset {
+                return Err(ConfigError::InvalidNetwork(format!(
+                    "slot duration {slot_duration_ms} ms does not match {} preset {preset} ms",
+                    self.config.network
+                )));
+            }
+        }
+        let configured_genesis = self.config.effective_genesis_time()?;
+        if genesis_time != configured_genesis {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "beacon genesis_time {genesis_time} does not match configured {configured_genesis}"
+            )));
+        }
+        info!(slot_duration_ms, slots_per_epoch, genesis_time, "Resolved chain timing");
+        let named_network = !matches!(self.config.network, super::Network::Custom);
+        let genesis_confirmed =
+            MonotonicEpochClock::allow_epoch0_bypass(named_network, unix_now_secs(), genesis_time);
+        Ok((slot_duration_ms, genesis_confirmed))
     }
 
     pub fn build_slot_clock(
         &self,
         slot_duration_ms: u64,
     ) -> Result<Arc<SystemSlotClock>, ConfigError> {
+        if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+            .contains(&slot_duration_ms)
+        {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "slot duration {slot_duration_ms} ms is outside {}..={}",
+                eth_types::MIN_SLOT_DURATION_MS,
+                eth_types::MAX_SLOT_DURATION_MS
+            )));
+        }
         let genesis_time = self.config.effective_genesis_time()?;
         let slot_duration = Duration::from_millis(slot_duration_ms);
+        // Preset value. `resolve_slot_duration_ms` already rejected a BN that
+        // omitted SLOTS_PER_EPOCH or reported a different count.
         let slots_per_epoch = self.config.network.slots_per_epoch();
+        if slots_per_epoch == 0 {
+            return Err(ConfigError::InvalidNetwork(
+                "SLOTS_PER_EPOCH must be greater than zero".to_string(),
+            ));
+        }
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
             .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?
-            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing));
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing)?);
         info!(
             genesis_time = genesis_time,
             slot_duration_ms,
@@ -943,30 +1147,34 @@ impl ServiceBuilder {
         Ok(root)
     }
 
+    /// Fork schedule from one beacon node. The offline exit CLI uses this.
     pub async fn build_fork_schedule(
         &self,
         beacon: &dyn BeaconNodeClient,
     ) -> Result<Arc<ForkSchedule>, ConfigError> {
         info!("Fetching fork schedule from beacon node");
         let schedule = beacon.get_fork_schedule().await?;
-        info!(
-            genesis_version = %format_version(schedule.genesis_fork_version),
-            altair_epoch = schedule.altair_fork_epoch,
-            altair_version = %format_version(schedule.altair_fork_version),
-            bellatrix_epoch = schedule.bellatrix_fork_epoch,
-            bellatrix_version = %format_version(schedule.bellatrix_fork_version),
-            capella_epoch = schedule.capella_fork_epoch,
-            capella_version = %format_version(schedule.capella_fork_version),
-            deneb_epoch = schedule.deneb_fork_epoch,
-            deneb_version = %format_version(schedule.deneb_fork_version),
-            electra_epoch = schedule.electra_fork_epoch,
-            electra_version = %format_version(schedule.electra_fork_version),
-            fulu_epoch = schedule.fulu_fork_epoch,
-            fulu_version = %format_version(schedule.fulu_fork_version),
-            gloas_epoch = schedule.gloas_fork_epoch,
-            gloas_version = %format_version(schedule.gloas_fork_version),
-            "Loaded fork schedule from beacon node"
-        );
+        log_fork_schedule(&schedule);
+        Ok(Arc::new(schedule))
+    }
+
+    /// Fork schedule that the beacon nodes agreed at boot.
+    ///
+    /// This is the value that BN admission compares against, so rvc signs
+    /// with the same schedule that each admitted node reports. Fails when
+    /// [`BnManager::agreed_spec_and_genesis`] has not stored an identity.
+    pub async fn build_agreed_fork_schedule(
+        &self,
+        beacon: &BnManager,
+    ) -> Result<Arc<ForkSchedule>, ConfigError> {
+        let schedule = beacon
+            .agreed_chain_identity()
+            .await
+            .map(|identity| identity.fork_schedule)
+            .ok_or_else(|| {
+                beacon::BeaconError::HttpError("beacon chain identity is not established".into())
+            })?;
+        log_fork_schedule(&schedule);
         Ok(Arc::new(schedule))
     }
 
@@ -980,6 +1188,11 @@ impl ServiceBuilder {
     /// effective default fee recipient is the zero address. Operators must set
     /// a non-zero address in the validators config file passed via
     /// `--validators-config`.
+    ///
+    /// `--block-selection-mode` and the top-level TOML key `block_selection_mode`
+    /// become the store's global default after builder settings apply. A
+    /// per-validator mode still wins. A builder-settings error returns before
+    /// that default is published. The mode does not read the fork schedule.
     pub fn build_validator_store(
         &self,
         validators_config: Option<&std::path::Path>,
@@ -992,7 +1205,7 @@ impl ServiceBuilder {
                     return Err(ConfigError::EmptyValidatorsConfig);
                 }
                 ValidatorStore::load_from_config(path)
-                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?
+                    .map_err(|e| validator_store_config_error(e, &raw, path))?
             }
             None => ValidatorStore::new([0u8; 20], 30_000_000),
         };
@@ -1002,6 +1215,9 @@ impl ServiceBuilder {
         }
 
         crate::startup::apply_builder_settings(&store, &self.config.builder)?;
+        store.set_global_block_selection_mode(self.config.block_selection_mode);
+        let tracked = store.tracked_pubkeys();
+        warn_builder_only_without_builder(&store, &tracked);
 
         if let Some(raw) = self.config.graffiti.as_deref() {
             let applied = validator_store::parse_graffiti(raw);
@@ -1032,12 +1248,14 @@ impl ServiceBuilder {
     /// keep a freshly-imported key disabled is preserved.
     pub fn register_loaded_validators(&self, store: &ValidatorStore, pubkey_map: &PubkeyMap) {
         let mut registered = 0usize;
+        let mut added = Vec::new();
         for pubkey in pubkey_map.read().values() {
             let pk_bytes = pubkey.to_bytes();
             if !store.has_validator(&pk_bytes) {
                 store
                     .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
                     .expect("ValidatorConfig::new has no builder URLs");
+                added.push(pk_bytes);
                 registered += 1;
             }
         }
@@ -1046,6 +1264,7 @@ impl ServiceBuilder {
             enabled_total = store.list_enabled_pubkeys().len(),
             "Registered loaded validators in the validator store (D-3 fail-closed)"
         );
+        warn_builder_only_without_builder(store, &added);
     }
 
     pub fn build_builder_service(
@@ -1059,11 +1278,13 @@ impl ServiceBuilder {
         // Bridge full trait objects onto the narrow builder seams
         // (`RegistrationSigner` / `BuilderBeaconClient`).
         let signer: Arc<dyn ValidatorSigner> = signer;
-        let service = BuilderService::new(
+        let service = BuilderService::with_batching(
             Arc::new(signer),
             Arc::new(beacon),
             validator_store,
             genesis_fork_version,
+            self.config.validator_registration_batch_size,
+            self.config.validator_registration_batch_delay,
             fork_schedule,
         );
         info!("Created builder service");
@@ -1132,42 +1353,98 @@ impl ServiceBuilder {
         &self,
         genesis_validators_root: Root,
         fork_schedule: Arc<ForkSchedule>,
-    ) -> OrchestratorConfig {
+    ) -> Result<OrchestratorConfig, ConfigError> {
         let limits = DispatchLimits::validated(
             self.config.duties.duty_dispatch_concurrency,
             self.config.duties.duty_publish_concurrency,
         )
         .expect("Config::validate rejects zero duty concurrency");
-        OrchestratorConfig::new(genesis_validators_root, fork_schedule)
+        let schedule = deadline_schedule_from_timing(&self.config.timing)?;
+        Ok(OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
-            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing))
-            .with_dispatch_limits(limits)
+            .with_deadline_schedule(schedule)
+            .with_dispatch_limits(limits))
     }
 }
 
-/// Build both deadline sets from `[timing]`. Gloas members are listed in full so
-/// omitting one is a compile error; 1.7 serde defaults already fill missing TOML
-/// keys, so runtime "missing" cannot occur.
-fn deadline_schedule_from_timing(timing: &TimingConfig) -> DeadlineSchedule {
-    DeadlineSchedule {
+fn checked_bps(field: &'static str, value: u64) -> Result<u64, ConfigError> {
+    if (1..=timing::BASIS_POINTS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::Invalid {
+            field,
+            message: format!("must be 1..={}, got {value}", timing::BASIS_POINTS),
+            source_layer: rvc_config::ConfigSource::Default,
+        })
+    }
+}
+
+/// Build both deadline sets from `[timing]`.
+///
+/// Every pre-Gloas and Gloas basis-point field must be in `1..=10000`.
+/// Attestation must not land after aggregate, and the Gloas aggregate must
+/// not land after the payload attestation. A zero or oversized field fails
+/// closed instead of building a deadline at the start of the slot.
+fn deadline_schedule_from_timing(timing: &TimingConfig) -> Result<DeadlineSchedule, ConfigError> {
+    let attestation = checked_bps("timing.attestation_due_bps", timing.attestation_due_bps)?;
+    let aggregate = checked_bps("timing.aggregate_due_bps", timing.aggregate_due_bps)?;
+    let attestation_gloas =
+        checked_bps("timing.attestation_due_bps_gloas", timing.attestation_due_bps_gloas)?;
+    let aggregate_gloas =
+        checked_bps("timing.aggregate_due_bps_gloas", timing.aggregate_due_bps_gloas)?;
+    let sync_message =
+        checked_bps("timing.sync_message_due_bps_gloas", timing.sync_message_due_bps_gloas)?;
+    let contribution =
+        checked_bps("timing.contribution_due_bps_gloas", timing.contribution_due_bps_gloas)?;
+    let payload = checked_bps("timing.payload_due_bps", timing.payload_due_bps)?;
+    let payload_attestation =
+        checked_bps("timing.payload_attestation_due_bps", timing.payload_attestation_due_bps)?;
+    if attestation > aggregate {
+        return Err(ConfigError::Invalid {
+            field: "timing.aggregate_due_bps",
+            message: format!(
+                "must be >= timing.attestation_due_bps ({attestation}), got {aggregate}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    if attestation_gloas > aggregate_gloas {
+        return Err(ConfigError::Invalid {
+            field: "timing.aggregate_due_bps_gloas",
+            message: format!(
+                "must be >= timing.attestation_due_bps_gloas ({attestation_gloas}), got {aggregate_gloas}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    if aggregate_gloas > payload_attestation {
+        return Err(ConfigError::Invalid {
+            field: "timing.payload_attestation_due_bps",
+            message: format!(
+                "must be >= timing.aggregate_due_bps_gloas ({aggregate_gloas}), got {payload_attestation}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    Ok(DeadlineSchedule {
         pre_gloas: DeadlineBps {
-            attestation: timing.attestation_due_bps,
-            aggregate: timing.aggregate_due_bps,
+            attestation,
+            aggregate,
             // Pre-Gloas waits: sync messages share attestation, contributions share aggregate.
-            sync_message: timing.attestation_due_bps,
-            contribution: timing.aggregate_due_bps,
-            payload: timing.aggregate_due_bps,
-            payload_attestation: timing.aggregate_due_bps,
+            sync_message: attestation,
+            contribution: aggregate,
+            payload: aggregate,
+            payload_attestation: aggregate,
         },
         gloas: DeadlineBps {
-            attestation: timing.attestation_due_bps_gloas,
-            aggregate: timing.aggregate_due_bps_gloas,
-            sync_message: timing.sync_message_due_bps_gloas,
-            contribution: timing.contribution_due_bps_gloas,
-            payload: timing.payload_due_bps,
-            payload_attestation: timing.payload_attestation_due_bps,
+            attestation: attestation_gloas,
+            aggregate: aggregate_gloas,
+            sync_message,
+            contribution,
+            payload,
+            payload_attestation,
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1201,6 +1478,37 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let result = builder.build_beacon();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_beacon_url_logs_are_redacted() {
+        let config = Config {
+            beacon_url: "http://alice:BNSECRET@bn0:5052".to_string(),
+            beacon_nodes: vec!["http://bn1:5052/?apikey=BNSECRET".to_string()],
+            proposer_nodes: vec!["http://bn2:5052/?apikey=BNSECRET".to_string()],
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        builder.build_beacon().expect("beacon client");
+        builder.build_bn_manager().expect("main BnManager");
+        builder.build_proposer_bn_manager().expect("proposer BnManager").expect("proposer pool");
+        assert!(logs_contain("bn0:5052"));
+        assert!(logs_contain("bn1:5052"));
+        assert!(logs_contain("bn2:5052"));
+        assert!(!logs_contain("BNSECRET"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_effective_config_log_redacts_an_ambiguous_beacon_url() {
+        let config = Config {
+            beacon_nodes: vec!["http://bob:BN/SECRET@bn1:5052".to_string()],
+            ..create_minimal_config()
+        };
+        ServiceBuilder::new(config).log_effective_config();
+        assert!(logs_contain("http://***"));
+        assert!(!logs_contain("SECRET"));
     }
 
     #[test]
@@ -1402,6 +1710,553 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::KeystorePathNotFound(_))));
     }
 
+    #[cfg(unix)]
+    fn write_import_secret(keystore: &std::path::Path, pubkey: &[u8; 48], password: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = keystore.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.join(format!("0x{}", hex::encode(pubkey))))
+            .unwrap();
+        file.write_all(password.as_bytes()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_encrypted_keystore(dir: &std::path::Path, password: &str) -> [u8; 48] {
+        let sk = crypto::SecretKey::generate();
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
+        let pk = sk.public_key().to_bytes();
+        std::fs::write(
+            dir.join(format!("keystore-{}.json", hex::encode(pk))),
+            serde_json::to_string(&keystore).unwrap(),
+        )
+        .unwrap();
+        pk
+    }
+
+    #[cfg(unix)]
+    fn password_file(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("passwords.txt");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The persisted secret decrypts the key when the password file is wrong.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_secret_wins_over_password_file() {
+        let dir = TempDir::new().unwrap();
+        let secret = "secret-wins-password";
+        let file_pw = "file-entry-password";
+        let wildcard = "wildcard-entry-password";
+        let pk = write_encrypted_keystore(dir.path(), secret);
+        write_import_secret(dir.path(), &pk, secret);
+        let bare = hex::encode(pk);
+        let passwords = password_file(dir.path(), &format!("{bare}={file_pw}\n*={wildcard}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("secret decrypts the keystore");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// An uppercase keystore pubkey still selects the lowercase secret.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_loads_an_uppercase_pubkey_with_its_secret() {
+        let dir = TempDir::new().unwrap();
+        let secret = "uppercase-field-secret";
+        let wildcard = "wrong-wildcard-password";
+        let pk = write_encrypted_keystore(dir.path(), secret);
+        let json_path = dir.path().join(format!("keystore-{}.json", hex::encode(pk)));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        let field = value["pubkey"].as_str().unwrap().to_ascii_uppercase();
+        assert!(field.bytes().any(|b| b.is_ascii_uppercase()), "{field}");
+        value["pubkey"] = serde_json::Value::String(field);
+        std::fs::write(&json_path, value.to_string()).unwrap();
+        write_import_secret(dir.path(), &pk, secret);
+        let passwords = password_file(dir.path(), &format!("*={wildcard}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("the lowercase secret decrypts an uppercase pubkey field");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// A secret that does not decrypt its keystore aborts, even when the file is right.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_rejects_a_secret_that_does_not_decrypt() {
+        let dir = TempDir::new().unwrap();
+        let real = "real-keystore-password";
+        let wrong = "wrong-secret-password";
+        let pk = write_encrypted_keystore(dir.path(), real);
+        write_import_secret(dir.path(), &pk, wrong);
+        let bare = hex::encode(pk);
+        let passwords = password_file(dir.path(), &format!("{bare}={real}\n*={real}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a secret that does not decrypt must abort startup"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("password did not decrypt the keystore"), "{msg}");
+        assert!(msg.contains(&format!("0x{bare}")), "{msg}");
+        assert!(!msg.contains(real), "{msg}");
+        assert!(!msg.contains(wrong), "{msg}");
+        assert!(!logs_contain(real), "password file value was logged");
+        assert!(!logs_contain(wrong), "import secret was logged");
+    }
+
+    /// A keystore that does not parse is an error when its secret is present.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_on_a_corrupt_keystore_with_a_secret() {
+        let dir = TempDir::new().unwrap();
+        let pk = [0xabu8; 48];
+        let bare = hex::encode(pk);
+        let secret = "corrupt-keystore-secret";
+        std::fs::write(
+            dir.path().join("bad.json"),
+            format!(
+                r#"{{"crypto":{{"kdf":{{"function":"scrypt","params":{{"dklen":32,"n":2,"p":1,"r":1,"salt":"aa"}},"message":""}},"checksum":{{"function":"sha256","params":{{}},"message":"bb"}},"cipher":{{"function":"aes-128-ctr","params":{{"iv":"cc"}},"message":"dd"}}}},"pubkey":"{bare}","path":"m/12381/3600/0/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":3}}"#
+            ),
+        )
+        .unwrap();
+        write_import_secret(dir.path(), &pk, secret);
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a corrupt keystore must not be an orphan warning"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("keystore is corrupt"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!msg.contains("password did not decrypt"), "{msg}");
+    }
+
+    /// A missing `version` or a `crypto` value that is not an object is corrupt.
+    ///
+    /// A pubkey plus only `version` is corrupt on the canonical name. The same
+    /// document under another name is not a keystore.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_when_version_is_missing_or_crypto_is_not_an_object() {
+        let secret = "malformed-keystore-secret";
+        let cases = [
+            (r#"{"crypto":{"kdf":{"function":"scrypt"}},"pubkey":"{bare}"}"#, false),
+            (r#"{"crypto":"not-an-object","pubkey":"{bare}","version":4}"#, false),
+            (r#"{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}"#, true),
+        ];
+        for (body, canonical) in cases {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            let name = if canonical { format!("0x{bare}.json") } else { "bad.json".to_string() };
+            std::fs::write(dir.path().join(name), body.replace("{bare}", &bare)).unwrap();
+            write_import_secret(dir.path(), &pk, secret);
+            let config =
+                Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+            let err = match ServiceBuilder::new(config).build_key_manager() {
+                Err(err) => err,
+                Ok(_) => panic!("a malformed keystore must not be an orphan warning"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("keystore is corrupt"), "{msg}");
+            assert!(!msg.contains("has no keystore"), "{msg}");
+            assert!(!msg.contains(secret), "{msg}");
+        }
+    }
+
+    /// A non-canonical file that only names the secret's pubkey does not abort.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_warns_when_only_an_unrelated_json_names_the_secret_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let unrelated_pw = "unrelated-json-secret";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        write_import_secret(dir.path(), &pk, kept_pw);
+        let unrelated = [0xabu8; 48];
+        let bare = hex::encode(unrelated);
+        write_import_secret(dir.path(), &unrelated, unrelated_pw);
+        let names = [
+            format!("0x{}.json", bare.to_ascii_uppercase()),
+            format!("0X{bare}.json"),
+            format!("0x{bare}\u{200d}.json"),
+            format!("0x{bare}Z.json"),
+            "notes.json".to_string(),
+        ];
+        let body = format!(r#"{{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}}"#);
+        for name in &names {
+            std::fs::write(dir.path().join(name), &body).unwrap();
+        }
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("a non-canonical version field is not a corrupt keystore");
+        assert!(loaded.contains(&pk), "a renamed keystore still loads");
+        assert!(!loaded.contains(&unrelated));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain("keystore is corrupt"));
+        assert!(!logs_contain(kept_pw));
+        assert!(!logs_contain(unrelated_pw));
+    }
+
+    /// A valid keystore under another name still loads when `0x<pk>.json` is empty.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_loads_a_renamed_keystore_when_the_canonical_file_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let password = "renamed-keystore-password";
+        let pk = write_encrypted_keystore(dir.path(), password);
+        write_import_secret(dir.path(), &pk, password);
+        std::fs::write(dir.path().join(format!("0x{}.json", hex::encode(pk))), b"").unwrap();
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("a valid non-canonical keystore still loads");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// An empty, truncated, or unreadable canonical keystore fails boot.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_on_an_empty_truncated_or_unreadable_canonical_keystore_with_a_secret(
+    ) {
+        let secret = "canonical-keystore-secret";
+        let cases: &[(&str, Option<&[u8]>)] =
+            &[("empty", Some(b"")), ("truncated", Some(br#"{"pubkey":"#)), ("unreadable", None)];
+        for (label, body) in cases {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            let name = format!("0x{bare}.json");
+            let path = dir.path().join(&name);
+            match body {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::os::unix::fs::symlink("/no/such/keystore.json", &path).unwrap(),
+            }
+            write_import_secret(dir.path(), &pk, secret);
+            let config =
+                Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+            let err = match ServiceBuilder::new(config).build_key_manager() {
+                Err(err) => err,
+                Ok(_) => panic!("{label} canonical keystore must not be an orphan warning"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("keystore is corrupt"), "{label}: {msg}");
+            assert!(msg.contains(&format!("0x{bare}")), "{label}: {msg}");
+            assert!(!msg.contains("has no keystore"), "{label}: {msg}");
+            assert!(!msg.contains(secret), "{label}: {msg}");
+        }
+    }
+
+    /// `0x<other>.json` whose body validates as a different pubkey is corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_when_a_canonical_file_validates_as_another_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let password = "mismatched-canonical-name";
+        let body = write_encrypted_keystore(dir.path(), password);
+        let named = [0xcdu8; 48];
+        assert_ne!(body, named);
+        let json = std::fs::read_to_string(
+            dir.path().join(format!("keystore-{}.json", hex::encode(body))),
+        )
+        .unwrap();
+        let named_hex = hex::encode(named);
+        std::fs::write(dir.path().join(format!("0x{named_hex}.json")), json).unwrap();
+        write_import_secret(dir.path(), &named, password);
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a mismatched canonical name must not be an orphan warning"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("keystore is corrupt"), "{msg}");
+        assert!(msg.contains(&format!("0x{named_hex}")), "{msg}");
+        assert!(!msg.contains("has no keystore"), "{msg}");
+        assert!(!msg.contains(password), "{msg}");
+    }
+
+    /// Deposit data and an interchange file that contain the pubkey do not abort.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_ignores_deposit_data_and_interchange_json() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        write_import_secret(dir.path(), &pk, kept_pw);
+        let bare = hex::encode(pk);
+        std::fs::write(
+            dir.path().join("deposit_data.json"),
+            format!(
+                r#"[{{"pubkey":"{bare}","withdrawal_credentials":"00","amount":32000000000,"signature":"aa","deposit_data_root":"bb"}}]"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("slashing_protection.json"),
+            format!(
+                r#"{{"metadata":{{"interchange_format_version":"5"}},"data":[{{"pubkey":"0x{bare}","signed_blocks":[],"signed_attestations":[]}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.json"), format!("not-json {bare}")).unwrap();
+        let notes_pk = [0x22u8; 48];
+        let notes_secret = "notes-object-secret";
+        write_import_secret(dir.path(), &notes_pk, notes_secret);
+        std::fs::write(
+            dir.path().join("notes_object.json"),
+            format!(r#"{{"pubkey":"{}","note":"not a keystore"}}"#, hex::encode(notes_pk)),
+        )
+        .unwrap();
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("deposit data and interchange must not abort boot");
+        assert!(loaded.contains(&pk));
+        assert!(!logs_contain("keystore is corrupt"));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain(kept_pw));
+        assert!(!logs_contain(notes_secret));
+    }
+
+    /// An orphan secret warns and does not abort a keystore that still loads.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_warns_on_an_orphan_import_secret() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let orphan_pw = "orphan-secret-value";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        let orphan = [0x11u8; 48];
+        write_import_secret(dir.path(), &orphan, orphan_pw);
+        let passwords = password_file(dir.path(), &format!("*={kept_pw}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded =
+            ServiceBuilder::new(config).build_key_manager().expect("an orphan secret is a warning");
+        assert!(loaded.contains(&pk));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain(orphan_pw));
+        assert!(!logs_contain(kept_pw));
+    }
+
+    /// A denylisted keystore is not a startup error when its secret is wrong.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_skips_a_denylisted_keystore_with_a_bad_secret() {
+        let dir = TempDir::new().unwrap();
+        let real = "real-keystore-password";
+        let wrong = "wrong-secret-password";
+        let pk = write_encrypted_keystore(dir.path(), real);
+        write_import_secret(dir.path(), &pk, wrong);
+        let passwords = password_file(dir.path(), &format!("*={real}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let mut denylist = std::collections::HashSet::new();
+        denylist.insert(pk);
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(Some(&denylist))
+            .expect("denylisted keystore is skipped");
+        assert!(!loaded.contains(&pk));
+    }
+
+    struct ClearAfterLoad;
+    impl Drop for ClearAfterLoad {
+        fn drop(&mut self) {
+            super::AFTER_LOAD_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    fn arm_after_load(
+        hook: impl FnOnce(&mut Result<KeyManager, crypto::KeyManagerError>) + 'static,
+    ) -> ClearAfterLoad {
+        super::AFTER_LOAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        ClearAfterLoad
+    }
+
+    /// A corrupt import keystore beats any loader failure of another keystore.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_reports_a_corrupt_import_keystore_when_another_keystore_fails() {
+        let secret = "corrupt-import-secret";
+        // "reported": the loader records the unrelated decrypt failure and
+        // returns Ok. The other cases make the loader return that error.
+        for kind in [
+            "reported",
+            "decryption",
+            "load-failed",
+            "traversal",
+            "io",
+            "directory",
+            "thread-pool",
+            "no-files",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            std::fs::write(dir.path().join(format!("0x{bare}.json")), br#"{"pubkey":"#).unwrap();
+            write_import_secret(dir.path(), &pk, secret);
+            let other = write_encrypted_keystore(dir.path(), "unrelated-keystore-password");
+            let other_path = dir.path().join(format!("keystore-{}.json", hex::encode(other)));
+            let passwords = password_file(dir.path(), "*=not-the-unrelated-password\n");
+            let injected = match kind {
+                "reported" => None,
+                "decryption" => Some(crypto::KeyManagerError::DecryptionFailed {
+                    path: other_path,
+                    source: crypto::KeystoreError::ChecksumMismatch,
+                }),
+                "load-failed" => Some(crypto::KeyManagerError::KeystoreLoadFailed {
+                    path: other_path,
+                    source: crypto::KeystoreError::ChecksumMismatch,
+                }),
+                "traversal" => Some(crypto::KeyManagerError::PathTraversal {
+                    path: other_path,
+                    base: dir.path().to_path_buf(),
+                }),
+                "io" => Some(crypto::KeyManagerError::Io(std::io::Error::other("injected"))),
+                "directory" => {
+                    Some(crypto::KeyManagerError::DirectoryNotFound(dir.path().to_path_buf()))
+                }
+                "thread-pool" => Some(crypto::KeyManagerError::ThreadPoolError("injected".into())),
+                "no-files" => Some(crypto::KeyManagerError::NoKeystoreFiles),
+                other => panic!("unknown case {other}"),
+            };
+            let _guard = injected.map(|err| arm_after_load(move |loaded| *loaded = Err(err)));
+            let config = Config {
+                keystore_path: dir.path().to_path_buf(),
+                password_file: Some(passwords),
+                ..create_minimal_config()
+            };
+            let err = match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+                Err(err) => err,
+                Ok(_) => panic!("{kind}: a corrupt import keystore must fail boot"),
+            };
+            let msg = err.to_string();
+            match err {
+                ConfigError::ImportSecret { path, reason } => {
+                    assert_eq!(reason, "keystore is corrupt", "{kind}");
+                    assert!(path.ends_with(format!("0x{bare}")), "{kind}: {}", path.display());
+                }
+                other => panic!("{kind}: the loader error was returned: {other}"),
+            }
+            assert!(!msg.contains(secret), "{kind}: {msg}");
+        }
+
+        // A loader error with nothing to reject is still the loader error.
+        let dir = TempDir::new().unwrap();
+        write_import_secret(dir.path(), &[0x11u8; 48], secret);
+        let _guard = arm_after_load(|loaded| {
+            *loaded = Err(crypto::KeyManagerError::Io(std::io::Error::other("injected")))
+        });
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+            Err(ConfigError::KeyManagerError(crypto::KeyManagerError::Io(_))) => {}
+            Err(other) => panic!("an orphan secret is not a startup error: {other}"),
+            Ok(_) => panic!("the loader error is returned"),
+        }
+    }
+
+    /// A keystore change between the load and the classification fails closed.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn boot_fails_closed_when_a_keystore_changes_between_load_and_classification() {
+        let changed = |case: &str, dir: &std::path::Path, bare: &str| {
+            let config = Config { keystore_path: dir.to_path_buf(), ..create_minimal_config() };
+            match ServiceBuilder::new(config).build_key_manager_owned_filtered(None) {
+                Err(ConfigError::ImportSecret { path, reason }) => {
+                    assert_eq!(reason, "keystore directory changed during boot", "{case}");
+                    assert!(path.ends_with(format!("0x{bare}")), "{case}: {}", path.display());
+                }
+                Err(other) => panic!("{case}: wrong error: {other}"),
+                Ok(_) => panic!("{case}: boot continued after the directory changed"),
+            }
+        };
+
+        // The secret-bearing canonical keystore is moved away after the load.
+        let dir = TempDir::new().unwrap();
+        let pk = [0xabu8; 48];
+        let bare = hex::encode(pk);
+        let canonical = dir.path().join(format!("0x{bare}.json"));
+        std::fs::write(&canonical, br#"{"pubkey":"#).unwrap();
+        write_import_secret(dir.path(), &pk, "changed-during-boot-secret");
+        let moved = canonical.with_extension("moved");
+        let guard = arm_after_load(move |_| std::fs::rename(&canonical, &moved).unwrap());
+        changed("moved", dir.path(), &bare);
+        drop(guard);
+
+        // The secrets directory appears after the load.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.json"), b"{}").unwrap();
+        let keystore = dir.path().to_path_buf();
+        let guard = arm_after_load(move |_| write_import_secret(&keystore, &pk, "late-secret"));
+        changed("secrets-dir-appeared", dir.path(), &bare);
+        drop(guard);
+
+        // A keystore with no import secret moves. The orphan secret only warns.
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "unrelated-keystore-password";
+        let kept = write_encrypted_keystore(dir.path(), kept_pw);
+        let kept_path = dir.path().join(format!("keystore-{}.json", hex::encode(kept)));
+        write_import_secret(dir.path(), &pk, "orphan-secret");
+        let passwords = password_file(dir.path(), &format!("*={kept_pw}\n"));
+        let _guard = arm_after_load(move |_| {
+            std::fs::rename(&kept_path, kept_path.with_extension("moved")).unwrap()
+        });
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("a change to a keystore with no secret does not fail boot");
+        assert!(loaded.contains(&kept));
+        assert!(logs_contain("import password secret has no keystore"));
+    }
+
     #[test]
     fn test_build_slot_clock() {
         let config = create_minimal_config();
@@ -1429,6 +2284,50 @@ mod tests {
         let clock = ServiceBuilder::new(config).build_slot_clock(12_000).unwrap();
         assert_eq!(clock.deadlines().attestation, 2500);
         assert_eq!(clock.deadlines().aggregate, 4000);
+    }
+
+    #[test]
+    fn test_build_slot_clock_rejects_zero_and_huge_duration() {
+        let builder = ServiceBuilder::new(create_minimal_config());
+        for bad in [0, 86_400_000] {
+            let err = match builder.build_slot_clock(bad) {
+                Ok(_) => panic!("out of range duration must fail"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_gloas_aggregate_deadline_cannot_follow_payload_attestation() {
+        let config = Config {
+            timing: TimingConfig {
+                aggregate_due_bps_gloas: 8000,
+                payload_attestation_due_bps: 7500,
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_slot_clock(12_000) {
+            Ok(_) => panic!("Gloas aggregate after payload attestation must fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("payload_attestation_due_bps"), "{msg}");
+        assert!(msg.contains("aggregate_due_bps_gloas"), "{msg}");
+    }
+
+    #[test]
+    fn test_build_slot_clock_rejects_zero_gloas_payload_bps() {
+        let config = Config {
+            timing: TimingConfig { payload_due_bps: 0, ..Default::default() },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_slot_clock(12_000) {
+            Ok(_) => panic!("zero payload bps must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("payload_due_bps"), "{err}");
     }
 
     #[test]
@@ -1549,7 +2448,8 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let root = [0xaa; 32];
-        let orch_config = builder.build_orchestrator_config(root, sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config(root, sample_fork_schedule()).expect("timing");
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
@@ -1579,7 +2479,8 @@ mod tests {
             ..create_minimal_config()
         };
         let builder = ServiceBuilder::new(config);
-        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 2500);
         assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 4000);
     }
@@ -1591,7 +2492,8 @@ mod tests {
             ..create_minimal_config()
         };
         let builder = ServiceBuilder::new(config);
-        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(orch_config.deadline_schedule.gloas.payload, 1234);
         assert_eq!(
             timing::due_ms(orch_config.deadline_schedule.gloas.payload, 12_000),
@@ -1616,7 +2518,8 @@ mod tests {
         };
         let builder = ServiceBuilder::new(config);
         let clock = builder.build_slot_clock(12_000).unwrap();
-        let orch = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(clock.deadlines().attestation, 3333);
         assert_eq!(clock.deadlines().aggregate, 6667);
         assert_eq!(orch.deadline_schedule.pre_gloas.attestation, 3333);
@@ -1633,7 +2536,8 @@ mod tests {
         let root = [0xaau8; 32];
         let schedule = sample_fork_schedule();
         let defaulted = ServiceBuilder::new(create_minimal_config())
-            .build_orchestrator_config(root, schedule.clone());
+            .build_orchestrator_config(root, schedule.clone())
+            .expect("timing");
         assert_eq!(defaulted.deadline_schedule.gloas.aggregate, 5000);
         assert_eq!(timing::due_ms(defaulted.deadline_schedule.gloas.aggregate, 12_000), 6000);
 
@@ -1641,7 +2545,8 @@ mod tests {
             toml::from_str("aggregate_due_bps_gloas = 6667").expect("TOML-only override");
         let mut config = create_minimal_config();
         config.timing = timing;
-        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, schedule);
+        let orch =
+            ServiceBuilder::new(config).build_orchestrator_config(root, schedule).expect("timing");
         assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
         assert_eq!(timing::due_ms(orch.deadline_schedule.gloas.aggregate, 12_000), 8000);
         assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
@@ -1675,7 +2580,8 @@ mod tests {
         );
 
         let defaulted = ServiceBuilder::new(create_minimal_config())
-            .build_orchestrator_config(root, fork_schedule.clone());
+            .build_orchestrator_config(root, fork_schedule.clone())
+            .expect("timing");
         let default_deadline = defaulted.attestation_deadline_ms(gloas_slot, slot_duration_ms);
         let default_pre = defaulted.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms);
 
@@ -1683,7 +2589,9 @@ mod tests {
             toml::from_str("attestation_due_bps_gloas = 4000").expect("TOML-only override");
         let mut config = create_minimal_config();
         config.timing = timing;
-        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, fork_schedule);
+        let orch = ServiceBuilder::new(config)
+            .build_orchestrator_config(root, fork_schedule)
+            .expect("timing");
         let moved = orch.attestation_deadline_ms(gloas_slot, slot_duration_ms);
 
         assert_ne!(moved, default_deadline);
@@ -1745,6 +2653,22 @@ mod tests {
 
         let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
         assert_eq!(proposer_cfg.broadcast_topics, expected);
+    }
+
+    /// Both pools sign or reject a readable fee mismatch together.
+    #[test]
+    fn test_pool_bn_manager_config_forwards_fee_recipient_policy() {
+        let config = Config {
+            fee_recipient_policy: bn_manager::FeeRecipientPolicy::Reject,
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.fee_recipient_policy, bn_manager::FeeRecipientPolicy::Reject);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.fee_recipient_policy, bn_manager::FeeRecipientPolicy::Reject);
     }
 
     /// End-to-end: `build_bn_manager` applies the operator body cap to clients.
@@ -1838,6 +2762,54 @@ mod tests {
         );
     }
 
+    async fn mount_mainnet_identity(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let spec = format!(
+            r#"{{"data":{{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32",{}}}}}"#,
+            bn_manager::MAINNET_FORK_SPEC_FIELDS
+        );
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(spec))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_build_agreed_fork_schedule_is_the_agreed_schedule() {
+        let server = wiremock::MockServer::start().await;
+        mount_mainnet_identity(&server).await;
+        let config = Config { beacon_url: server.uri(), ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let manager = builder.build_bn_manager().expect("main BnManager");
+        manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("boot agreement");
+        server.reset().await;
+
+        let schedule = builder.build_agreed_fork_schedule(&manager).await.expect("agreed schedule");
+        assert_eq!(*schedule, bn_manager::mainnet_fork_schedule());
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty(), "the schedule is not read again: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn test_build_agreed_fork_schedule_without_identity_fails() {
+        let builder = ServiceBuilder::new(create_minimal_config());
+        let manager = builder.build_bn_manager().expect("main BnManager");
+        let err = builder.build_agreed_fork_schedule(&manager).await.expect_err("no identity");
+        assert!(err.to_string().contains("chain identity is not established"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_build_secret_providers_empty() {
         let config = create_minimal_config();
@@ -1912,6 +2884,93 @@ mod tests {
         );
     }
 
+    /// Production builder service over `keys` signable builder keys and the two batch knobs.
+    fn builder_service_with_knobs(
+        keys: usize,
+        batch_size: usize,
+        batch_delay_ms: u64,
+    ) -> (Arc<BuilderService>, Arc<bn_manager::MockBeaconNodeClient>) {
+        let builder = ServiceBuilder::new(Config {
+            validator_registration_batch_size: batch_size,
+            validator_registration_batch_delay: batch_delay_ms,
+            ..create_minimal_config()
+        });
+        let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
+        let mut key_manager = KeyManager::new();
+        for _ in 0..keys {
+            let sk = crypto::SecretKey::generate();
+            let mut config = validator_store::ValidatorConfig::new(sk.public_key().to_bytes());
+            config.builder_proposals = true;
+            store.add_validator(config).unwrap();
+            key_manager.insert(sk);
+        }
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
+        let bn =
+            Arc::new(bn_manager::MockBeaconNodeClient::new().with_register_validators(|_| Ok(())));
+        let service = builder.build_builder_service(
+            signer,
+            bn.clone(),
+            store,
+            [0, 0, 0, 0],
+            Arc::new(ForkSchedule::unscheduled_gloas()),
+        );
+        (service, bn)
+    }
+
+    fn register_validators_offsets(bn: &bn_manager::MockBeaconNodeClient) -> Vec<Duration> {
+        let stamps: Vec<tokio::time::Instant> = bn
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == bn_manager::MockMethod::RegisterValidators)
+            .map(|stamp| stamp.at)
+            .collect();
+        stamps.iter().map(|at| *at - stamps[0]).collect()
+    }
+
+    /// 654-AC4: `validator_registration_batch_size` / `_delay` reach the production path.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_build_builder_service_applies_batch_knobs() {
+        let (service, bn) = builder_service_with_knobs(5, 2, 10);
+
+        service.submit_epoch_registrations(0).await.unwrap();
+
+        let sizes: Vec<usize> = bn.register_validators_calls().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 2, 1], "5 keys in batches of 2");
+        assert_eq!(
+            register_validators_offsets(&bn),
+            vec![Duration::ZERO, Duration::from_millis(10), Duration::from_millis(20)],
+            "10 ms between batches"
+        );
+    }
+
+    /// 654-AC5 pair: 3 batches 6 s apart land under `registration_step_timeout()`
+    /// (22 s); a fixed 10 s cuts the third.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_batched_send_fits_inside_the_step_timeout() {
+        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
+        assert_eq!(service.registration_step_timeout(), Duration::from_secs(22));
+
+        let sent = tokio::time::timeout(
+            service.registration_step_timeout(),
+            service.submit_epoch_registrations(0),
+        )
+        .await;
+
+        assert!(matches!(sent, Ok(Ok(()))), "{sent:?}");
+        assert_eq!(bn.register_validators_calls().len(), 3);
+
+        let (service, bn) = builder_service_with_knobs(3, 1, 6_000);
+        let cut =
+            tokio::time::timeout(Duration::from_secs(10), service.submit_epoch_registrations(0))
+                .await;
+
+        assert!(cut.is_err(), "a fixed 10 s cuts the round: {cut:?}");
+        assert_eq!(bn.register_validators_calls().len(), 2);
+    }
+
     #[test]
     fn test_log_effective_config_does_not_panic() {
         let config = create_minimal_config();
@@ -1978,6 +3037,66 @@ mod tests {
             matches!(result, Err(ConfigError::ZeroFeeRecipient)),
             "expected ZeroFeeRecipient, got: {:?}",
             result.err()
+        );
+    }
+
+    /// `enable = false` is an unknown key. Boot names that key and the validators path.
+    #[test]
+    fn build_validator_store_names_the_validators_file_on_an_unknown_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let pk = "0x".to_string() + &"11".repeat(48);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"{pk}\"\nenable = false\n"
+            ),
+        )
+        .unwrap();
+        let err = match ServiceBuilder::new(create_minimal_config())
+            .build_validator_store(Some(&config_path))
+        {
+            Err(err) => err,
+            Ok(_) => panic!("unknown key"),
+        };
+        assert!(
+            matches!(
+                &err,
+                ConfigError::UnknownKey { key, file: Some(path) }
+                    if key == "enable" && path == &config_path
+            ),
+            "{err:?}"
+        );
+        let display = err.to_string();
+        assert!(display.contains("enable"), "{display}");
+        assert!(display.contains(&config_path.display().to_string()), "{display}");
+    }
+
+    /// A file that parses on the second read is "changed while loading".
+    ///
+    /// The first read is a `ValidatorStoreError::TomlParse`. `raw` is valid,
+    /// so boot does not classify that first error.
+    #[test]
+    fn validators_file_changed_while_loading_names_the_path() {
+        let path = Path::new("/var/lib/rvc/validators.toml");
+        let valid = "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n";
+        let err = validator_store_config_error(
+            ValidatorStoreError::TomlParse(validator_store::ClassifiedToml {
+                unknown_key: Some("enable".to_string()),
+                line: Some(4),
+                column: Some(1),
+                kind: validator_store::ParseKind::Other,
+            }),
+            valid,
+            path,
+        );
+        let shown = err.to_string();
+        assert_eq!(
+            shown,
+            format!(
+                "validator store error: {}: validators file changed while loading",
+                path.display()
+            )
         );
     }
 
@@ -2219,7 +3338,7 @@ mod tests {
         let (_, pubkey_map) = loaded_key_manager(&builder, 1);
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map, false);
 
         let machine = machine.expect("doppelganger on must construct ForwardWindowMachine");
         // Same object is both the enablement and the machine handle.
@@ -2251,18 +3370,43 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map, false);
         let machine = machine.expect("machine present");
 
         assert!(!enablement.is_signing_enabled(&pk));
 
         // Tick well past the boundary WITHOUT observe_liveness → still closed.
         let end_epoch = 50 + DEFAULT_MONITORING_EPOCHS;
-        machine.tick(end_epoch + 5, 0);
+        machine.statuses(end_epoch + 5, 0);
         assert!(
             !enablement.is_signing_enabled(&pk),
             "without complete liveness observation the gate must stay closed (D-2 fail-closed)"
         );
+    }
+
+    /// A detection marker in the keystore directory blocks the epoch-0 bypass.
+    #[test]
+    fn test_detection_marker_blocks_epoch0_bypass() {
+        let dir = tempfile::tempdir().expect("temp");
+        crate::detection_marker::write_marker(
+            dir.path(),
+            &crate::detection_marker::DetectionMarker {
+                epoch: 3,
+                unix_secs: 4,
+                pubkeys: vec!["0x".to_string() + &"ab".repeat(48)],
+            },
+        )
+        .expect("marker");
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (_, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = pubkey_map.read().values().next().unwrap().clone();
+        let (_, machine) =
+            builder.build_signing_enablement(slashing_db, [0x44; 32], 0, &pubkey_map, true);
+        let machine = machine.expect("machine");
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
     }
 
     /// Epoch-0 (pre-genesis) bypass: registered keys are immediately Safe.
@@ -2276,12 +3420,27 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map, true);
 
         assert!(machine.is_some());
         assert!(
             enablement.is_signing_enabled(&pk),
             "epoch-0 register must immediately enable signing (pre-genesis bypass)"
+        );
+    }
+
+    #[test]
+    fn test_epoch0_without_genesis_confirmation_stays_closed() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+        let (enablement, _) =
+            builder.build_signing_enablement(slashing_db, [0x33u8; 32], 0, &pubkey_map, false);
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "epoch 0 without a confirmed genesis must not mark keys Safe"
         );
     }
 
@@ -2296,7 +3455,7 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map, false);
 
         assert!(machine.is_none(), "opt-out must not construct ForwardWindowMachine");
         assert!(
@@ -2380,9 +3539,11 @@ mod tests {
     #[test]
     fn doppelganger_import_window_is_two_spec_epochs() {
         assert_eq!(
-            doppelganger_import_window().as_secs(),
+            doppelganger_import_window(SLOT_DURATION_MS).as_secs(),
             DEFAULT_MONITORING_EPOCHS * SLOTS_PER_EPOCH * SLOT_DURATION_MS / 1000
         );
+        assert_eq!(doppelganger_import_window(6_000).as_secs(), 384);
+        assert_eq!(doppelganger_import_window(12_000).as_secs(), 768);
     }
 
     // ── #626: unfinished import must not take the boot bypass ──────────────
@@ -2441,17 +3602,27 @@ mod tests {
     }
 
     fn satisfy_window_from(machine: &ForwardWindowMachine, pk: &crypto::PublicKey, start: u64) {
-        let end = start + DEFAULT_MONITORING_EPOCHS;
         let sample = doppelganger::ValidatorLivenessData {
             index: hex::encode(pk.to_bytes()),
             is_live: false,
         };
-        for epoch in start..=end {
-            machine
-                .observe_liveness(epoch, std::slice::from_ref(&sample))
-                .expect("liveness sample");
+        // Import sets next_check to start + 1 and needs monitoring_epochs + 1
+        // closed not-live epochs. The registration epoch itself does not count.
+        let remaining = DEFAULT_MONITORING_EPOCHS + 1;
+        for offset in 0..remaining {
+            let epoch = start + 1 + offset;
+            assert!(
+                machine
+                    .observe_liveness(
+                        epoch,
+                        std::slice::from_ref(&sample),
+                        epoch + 1,
+                        doppelganger::CLOSED_EPOCH_SLOT,
+                    )
+                    .is_empty(),
+                "liveness sample"
+            );
         }
-        machine.tick(end, SLOTS_PER_EPOCH - 1);
     }
 
     struct RestartPaths {
@@ -2507,6 +3678,79 @@ mod tests {
             .unwrap();
     }
 
+    /// A validators file that does not parse fails the hold pre-read closed.
+    ///
+    /// Both keys have recent attestation history, which would mark them Safe
+    /// on a normal `register`. `enable = false` is an unknown key, so every
+    /// loaded key stays Pending. The credential is on that failing line.
+    /// `doppelganger_pre_read_error_is_value_free` asserts the returned error
+    /// string. This test asserts the log does not contain the credential.
+    #[test]
+    #[tracing_test::traced_test]
+    fn enable_typo_in_the_validators_file_keeps_every_loaded_key_pending() {
+        const SECRET: &str = "https://alice:SECRET@host";
+        let gvr = [0x62u8; 32];
+        let (_sk_a, pk_a) = restart_keypair();
+        let (_sk_b, pk_b) = restart_keypair();
+        let paths = restart_paths();
+        std::fs::write(
+            &paths.validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false # {SECRET}\n",
+                hex::encode(pk_a.to_bytes()),
+            ),
+        )
+        .unwrap();
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        for pk in [&pk_a, &pk_b] {
+            seed_recent_attestation(&db, pk, &gvr);
+        }
+        let pubkey_map = map_of(&[pk_a.clone(), pk_b.clone()]);
+        let builder = builder_for(&paths, true);
+        let (_enablement, machine) =
+            builder.build_signing_enablement(db, gvr, RESTART_EPOCH, &pubkey_map, false);
+        let machine = machine.expect("doppelganger on");
+        assert_eq!(
+            machine.status(&pk_a),
+            doppelganger::ForwardWindowStatus::Pending,
+            "a key in the unreadable file stays Pending"
+        );
+        assert_eq!(
+            machine.status(&pk_b),
+            doppelganger::ForwardWindowStatus::Pending,
+            "a key absent from the unreadable file stays Pending"
+        );
+        assert!(logs_contain("cannot read validators file"));
+        assert!(!logs_contain("SECRET"), "hold pre-read log quotes the validators file");
+        assert!(!logs_contain(SECRET));
+        // `logs_contain` keeps only lines that carry this test's scope. A raw
+        // toml snippet is a later line, so the captured buffer is checked too.
+        let captured =
+            String::from_utf8(tracing_test::internal::global_buf().lock().unwrap().clone())
+                .unwrap();
+        assert!(!captured.contains("SECRET"), "hold pre-read log quotes the file:\n{captured}");
+    }
+
+    /// The pre-read error string names the unknown key and does not quote the file.
+    #[test]
+    fn doppelganger_pre_read_error_is_value_free() {
+        const SECRET: &str = "https://alice:SECRET@host";
+        let (_sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        std::fs::write(
+            &paths.validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n[[validators]]\npubkey = \"0x{}\"\nenable = false # {SECRET}\n",
+                hex::encode(pk.to_bytes()),
+            ),
+        )
+        .unwrap();
+        let err = open_doppelganger_holds(&paths.validators, &map_of(std::slice::from_ref(&pk)), 0)
+            .unwrap_err();
+        assert!(!err.contains("SECRET"), "pre-read error quotes the file: {err}");
+        assert!(!err.contains('\n'), "pre-read error spans lines: {err}");
+    }
+
     /// Restart of an interrupted import: open hold, recent slashing history.
     ///
     /// The imported key must start Pending and refuse a voluntary exit. A
@@ -2537,8 +3781,13 @@ mod tests {
         }
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone(), pk_disabled.clone()]);
         let builder = builder_for(&paths, true);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let composite = composite_with(vec![sk_import, sk_normal, sk_disabled]);
         let (signer, _quiesce) = builder.build_signer(composite, db, enablement);
@@ -2599,8 +3848,13 @@ mod tests {
         seed_recent_attestation(&db, &pk_normal, &gvr);
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) =
             builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
@@ -2626,7 +3880,8 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
-        let (_enablement, machine) = builder.build_signing_enablement(db, gvr, 0, &pubkey_map);
+        let (_enablement, machine) =
+            builder.build_signing_enablement(db, gvr, 0, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         assert_eq!(
             machine.status(&pk),
@@ -2649,7 +3904,7 @@ mod tests {
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, 0, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, 0, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -2675,8 +3930,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -2699,8 +3959,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -2736,7 +4001,7 @@ mod tests {
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
         let builder = builder_for(&paths, true);
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) =
             builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
@@ -2865,8 +4130,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -2907,7 +4177,7 @@ mod tests {
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
         let (_enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
 
@@ -2920,7 +4190,7 @@ mod tests {
         assert!(!sidecar.exists(), "Safe observation must remove the unfinished marker");
 
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -2942,8 +4212,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -2968,8 +4243,13 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);

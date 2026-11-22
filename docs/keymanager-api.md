@@ -112,9 +112,9 @@ Import one or more keystores. Slashing protection data is imported first, before
 
 | Status | Meaning |
 |--------|---------|
-| `imported` | Key successfully imported and activated |
-| `duplicate` | Key already exists |
-| `error` | Import failed |
+| `imported` | Key successfully imported and activated. The password is stored mode `0600` in `<keystore_dir>/.rvc.keymanager-secrets/` (directory mode `0700`) and is loaded on the next start, ahead of `--password-file`. The keystore file is `0x` plus the lowercase pubkey hex plus `.json`. |
+| `duplicate` | Key already exists: the pubkey is already a local key, or is already loaded in another key backend (an HTTP or gRPC remote signer). |
+| `error` | Import failed. A missing, non-lowercase, `0x`-prefixed, or mismatched `pubkey` field is reported by name and writes nothing. |
 
 ---
 
@@ -145,10 +145,14 @@ Delete one or more local keystores. Slashing protection is exported before delet
 
 | Status | Meaning |
 |--------|---------|
-| `deleted` | Key deleted and deactivated |
-| `not_active` | Key exists but is not active |
-| `not_found` | Key not found |
-| `error` | Deletion failed |
+| `deleted` | This call removed a loaded key, an on-disk keystore, or the validators row. The persisted import password is removed with the keystore, and the pubkey is written to the deletion denylist. The keystore unlink and the denylist entry are fsynced before DELETE reports `deleted`: the keystore directory is fsynced on every DELETE. When the entry creates the denylist file, its directory is fsynced too, and so is every directory created for it and the existing directory that holds the first of them. A restart skips a denylisted key. |
+| `not_active` | No loaded keystore and no remote registration remain. No matching keystore was found in the directory; skipped files (unreadable, or a symlink resolving outside the directory) are left in place. Slashing history was exported under the node's genesis validators root. |
+| `not_found` | No matching keystore was found in the directory, and there is no slashing history. Skipped files (unreadable, or a symlink resolving outside the directory) are left in place. The interchange still carries an empty record for the key under the node's real genesis validators root. |
+| `error` | Deletion failed, or the pubkey is registered only as a remote key (`error`). A remote-only key is refused with no denylist write, no enable-token cancel, and no export entry; delete it through `DELETE /eth/v1/remotekeys`. A loaded key stays in the signing registry until secret removal, the keystore-directory fsync, and the denylist write all succeed, so the DELETE can be retried. The denylist may already contain the pubkey when import-secret removal or the keystore-directory fsync failed. A failure to remove the keystore JSON returns before the denylist write. |
+
+Slashing protection is exported per requested key before anything is removed. The export set is the loaded members plus every other parsed pubkey that, after the signing drain, is neither loaded nor registered as a remote key. The export is admitted in the free slot window. When an import holds that window past the wait bound, DELETE returns HTTP 503 with a `Retry-After` header and removes nothing. Every response, including an all-`not_found` body and an empty pubkey list, carries the node's genesis validators root. A key that is not loaded but still has a readable keystore file inside the directory is removed by the pubkey inside that file. A file that cannot be read, or a symlink that resolves outside the directory, is left in place and counts as no matching keystore.
+
+On startup, only `0x<lowercase pubkey>.json` is that key's keystore. An empty, truncated, or unreadable file at that name fails startup when its import secret is present and the key did not load. Any other `*.json` name counts as a keystore only when it validates, or when it has a pubkey and a `crypto` field and validation fails. A document that only shares the pubkey and a `version` does not. Startup also fails with `keystore directory changed during boot` when the keystore for a key with an import secret changes while startup loads the directory (for example, a copy into the directory still running). A restart after the change finishes runs the usual startup check.
 
 ---
 
@@ -203,6 +207,8 @@ Import remote keys with their Web3Signer URLs.
   ]
 }
 ```
+
+- `duplicate`: the pubkey is already a remote key, or is already loaded in another key backend (a local key or a gRPC remote signer).
 
 ---
 
@@ -438,7 +444,7 @@ All numeric fields (`epoch`, `validator_index`) are string-encoded per spec. The
 
 ## Config Persistence
 
-All POST and DELETE operations on fee recipient, gas limit, and graffiti endpoints persist changes to the TOML config file atomically (temp file + rename). Changes survive process restarts without re-applying.
+All POST and DELETE operations on fee recipient, gas limit, and graffiti endpoints persist changes to the TOML config file atomically (temp file + rename). Changes survive process restarts without re-applying. A later proposer-config URL document that names fee recipient or gas limit takes that field back from the value set here.
 
 Concurrent API requests are safe — writes are serialized through a lock, and atomic file operations prevent corruption on crash.
 

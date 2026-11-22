@@ -1,0 +1,59 @@
+# AGENTS.md
+
+Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.md` holds project commands and code conventions; this file adds the workflow. Both apply.
+
+## Workflow (hard rules)
+- One issue = one branch, created from **current `develop`** (never `main`, never another feature branch).
+- Scope = that issue only. Adjacent problems go in a new issue, not this branch.
+- Exactly **one commit ahead of `develop`** when the PR opens. Squash first. Review fixes amend that commit and force-push the same branch; never open a superseding branch/PR.
+- Commit author: `Joonkyo Kim <rootwarp@gmail.com>`.
+- PR base = `develop`, linked to the issue. Body states acceptance criteria and how tests cover them, plus the pre-PR self-check below.
+- Merge into `develop` is fast-forward/rebase only, done by the lead. Agents do not merge.
+- **No self-review.** Do not run a code-review or review pass on your own PR. Reviews are done only by Harper (Codex code reviewer) and the Rust Security Auditor.
+
+## Before opening the PR
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run --workspace --all-features` (or `-p` for touched crates plus dependents)
+- `python3 scripts/gitleaks_strict_config.py --out-dir target/gitleaks` writes the strict configs that CI scans with. `useDefault` alone merges default allowlist entries that hide real secrets, so do not scan with `.gitleaks.toml` directly.
+- `gitleaks detect --no-git --source . --config target/gitleaks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
+- History scan: `./scripts/gitleaks_range_scan.sh "$PWD/target/gitleaks/gitleaks.toml" --history`. Run it in a full clone, not a shallow or `blob:none` clone. CI runs it weekly in `secret-history-scan.yml`.
+- Canary scripts: set `RVC_GITLEAKS_CONFIG="$PWD/target/gitleaks/gitleaks.toml"`. They refuse a config that is not strict.
+- `git diff --shortstat develop...HEAD` = N gross lines; cap 2,000 including tests and generated content; stop at 1,800 and report.
+- Self-check (paste into PR body):
+  - [ ] Red check: each new acceptance test shown failing on base or with the fix removed.
+  - [ ] Measurement claims ("no regression") come from a scenario where unfixed code scores worse.
+  - [ ] Repo-wide grep for every changed symbol/pattern the issue targets.
+  - [ ] Signing-root / `hash_tree_root` tests are KAT-anchored or `kat_exempt` with a reason.
+
+## Tests
+`cargo nextest run --workspace --all-features` is the gate, and the pre-PR line above names it. Plain `cargo test` is best-effort: it shares one process per test binary, so process-global metrics can race. Timing tests use paused tokio time. Do not synchronize a test on a wall-clock sleep.
+
+## Coding
+Follow `.cursor/rules/rust-code.mdc` (TDD, idiomatic Rust, conventions) and `CLAUDE.md`.
+
+## Spawn census
+`plan/tracing-2026-08-06/spawn-census.md` is checked by `census_anchors_match_sources`. Classify new spawn sites; anchors follow the code. A new executor or bn-manager spawn needs a content row (file, enclosing item, and task or call). A line number is not a key.
+
+## Runtime images
+The `rvc`, `rvc-signer` and `rvc-keygen` stages of `Dockerfile` start from one pinned `alpine:<version>@sha256:<digest>` image. The `chef` stage starts from a pinned `lukemathwalker/cargo-chef:<tag>@sha256:<digest>` image. Use the digest of the multi-platform image index, not the digest of one platform manifest. Change the three runtime `FROM` lines together. If you change a pinned image, update `RUNTIME_BASE` or `BUILDER_BASE` in the test, and give registry evidence for `linux/amd64` and `linux/arm64` in the pull request. For the builder, also record the Rust and cargo-chef versions.
+A runtime stage installs only `ca-certificates`. On arm64, it also installs `libgcc`.
+The `chef` stage maps `TARGETARCH` (`amd64` or `arm64`) to `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` in `/rust-target`. Each `cargo chef cook` and `cargo build` sets `--target "$rust_target"`. The amd64 binaries are static PIE. rustc has no static PIE for `aarch64-unknown-linux-musl`, thus the arm64 binaries link musl and `libgcc_s` dynamically. They are PIE too.
+`.cargo/config.toml` sets `target-cpu=native` for developer builds. One `ENV` in the `chef` stage sets `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the two musl targets (`target-cpu=x86-64` and `target-cpu=generic`). Cargo then ignores `build.rustflags`. Do not set `RUSTFLAGS` or `target-cpu=native` in `Dockerfile`: an image binary must run on each CPU of its platform.
+The binaries use the musl allocator. Do not add jemalloc or mimalloc without the approval of the lead.
+`scripts/tests/test_dockerfile_runtime_base.py` checks these rules.
+
+## CI action pins
+Each `uses:` in `.github/workflows` is a full commit SHA with a `# vX.Y.Z` comment on the same line. First-party `actions/*` and `github/*` actions are not exempt. No action keeps a tag. `test_every_action_is_sha_pinned` (`scripts/tests/test_workflow_hardening.py`) fails on a tag ref such as `@v4`.
+Tagging and releases are lead-only. Do not retag or re-run a release whose workflow still names a missing action ref. Publish images from a tag that contains the corrected workflow.
+Resolve a pin with `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`. If `object.type` is `tag`, dereference `git/tags/<object.sha>` and pin the commit, not the tag object. Confirm the ref exists before pushing. Confirm the commit is on the upstream default branch: `gh api repos/<owner>/<repo>/compare/<default>...<sha>` must report `status` `behind` or `identical`. Reject an annotated tag whose `tagger.date` is within 7 days, and treat a lightweight tag whose commit is only a few days old as not yet reviewed.
+`dtolnay/rust-toolchain` SHAs must be in `master` history (tag `v1` today); set `with: toolchain: stable`. `taiki-e/install-action` is the `v2` release commit; set `with: tool:`.
+`docker-scan.yml` runs only on a pull request into `main`, a push of a `v*` tag, and `workflow_dispatch`. It does not run on a pull request into `develop`, and it has no schedule.
+`aquasecurity/trivy-action` is pinned in both `docker.yml` and `docker-scan.yml`. Keep those `uses:` lines identical. SARIF output ignores `severity` unless `limit-severities-for-sarif: true`, so each Trivy step sets that flag. The `docker-scan.yml` job (`pr-scan`) has two gates and a table report:
+- Gate A sets `severity: CRITICAL`, `exit-code: '1'` and `ignore-unfixed: false`. Each CRITICAL finding fails the job. This includes a finding without a fix.
+- Gate B sets `severity: HIGH`, `exit-code: '1'` and `ignore-unfixed: true`. A HIGH finding fails the job only when a fixed version exists.
+- The table report sets `severity: HIGH,CRITICAL`, `exit-code: '0'` and `ignore-unfixed: false`. The job summary shows each HIGH and CRITICAL finding. This includes a HIGH finding without a fix.
+
+The `docker.yml` scan job has one gate. It sets `severity: HIGH,CRITICAL` and `exit-code: '1'`, and it does not set `ignore-unfixed`. Each HIGH and CRITICAL finding fails that job. `TRIVY_STEP_PLAN` in `scripts/tests/test_workflow_hardening.py` gives the reviewed policy of each Trivy step. `.trivyignore.yaml` is the only ignore file. It allows only CVE-2023-45853 in the Debian `zlib1g` package (`purls: [pkg:deb/debian/zlib1g]`), with `expired_at: 2027-01-18`. Debian marks the bug `will_not_fix`: the bug is in minizip, which `zlib1g` does not contain. The same CVE in a different package remains visible. The Alpine runtime images contain no Debian package, thus this entry matches no finding in them. On the `expired_at` date, Trivy reports the CVE again, and the scan fails until a new review changes the date. Set `ignore-unfixed: true` only on Gate B.
+The Trivy gate in `scripts/tests/test_workflow_hardening.py` is an allow-list: only the listed Trivy inputs, `image-ref: ${{ matrix.target }}:scan`, and the listed checkout, Docker setup and build actions may come before the last SARIF gate. No `run:` step goes before that gate, and no `run:` step in a Trivy job touches the ignore file, a Trivy config, `GITHUB_ENV` or `GITHUB_PATH`, or runs `trivy`.
+Dependabot waits 7 days after a release before it proposes an action update (`cooldown.default-days: 7`).

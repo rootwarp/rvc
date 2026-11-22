@@ -91,22 +91,32 @@ def test_jobs_are_build_then_soak():
     assert "continue-on-error" not in text
 
 
+def _sha_pin(body: str, action: str) -> str:
+    match = re.search(rf"{re.escape(action)}@[0-9a-f]{{40}}\s+#\s+v\S+", body)
+    assert match, f"missing sha pin for {action}"
+    return match.group(0)
+
+
 def test_build_matches_ci_check_cache_and_pins():
     nightly = NIGHTLY.read_text(encoding="utf-8")
     ci = CI_YML.read_text(encoding="utf-8")
     build = _jobs(nightly)["build"]
     check = _jobs(ci)["check"]
-    cache_key = "${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}"
-    assert cache_key in check
-    assert cache_key in build
-    assert "~/.cargo/registry" in build
-    assert "~/.cargo/git" in build
-    assert "target" in build
-    assert "dtolnay/rust-toolchain@stable" in build
-    assert "arduino/setup-protoc@v3" in build
+    # Nightly build shares the Check job's rust-cache key (not a full target/ dump).
+    assert _sha_pin(check, "Swatinem/rust-cache") == _sha_pin(build, "Swatinem/rust-cache")
+    assert 'shared-key: check' in check
+    assert 'shared-key: check' in build
+    assert 'cache-all-crates: "false"' in check
+    assert 'cache-all-crates: "false"' in build
+    assert _sha_pin(check, "dtolnay/rust-toolchain") == _sha_pin(build, "dtolnay/rust-toolchain")
+    assert "toolchain: stable" in build
+    assert _sha_pin(check, "arduino/setup-protoc") == _sha_pin(build, "arduino/setup-protoc")
     assert 'version: "27.x"' in build
     assert "cargo build --release --locked -p rvc-bin" in build
-    assert "actions/upload-artifact@v4" in build
+    upload = _sha_pin(build, "actions/upload-artifact")
+    assert upload.split("#")[-1].strip().startswith("v4."), (
+        f"The build job must pin a v4 release of actions/upload-artifact, not {upload!r}."
+    )
     assert "path: target/release/rvc" in build
     assert "name: rvc-bin" in build
     assert "rustfmt" not in build
@@ -115,7 +125,10 @@ def test_build_matches_ci_check_cache_and_pins():
 
 def test_soak_downloads_to_run_sh_path_and_chmod():
     soak = _jobs(NIGHTLY.read_text(encoding="utf-8"))["soak"]
-    assert "actions/download-artifact@v4" in soak
+    download = _sha_pin(soak, "actions/download-artifact")
+    assert download.split("#")[-1].strip().startswith("v4."), (
+        f"The soak job must pin a v4 release of actions/download-artifact, not {download!r}."
+    )
     assert "name: rvc-bin" in soak
     assert "path: target/release" in soak
     assert "chmod +x target/release/rvc" in soak

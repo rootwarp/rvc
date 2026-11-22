@@ -58,10 +58,11 @@ pub struct SafetyArgs {
     /// Disable doppelganger / forward-window protection (enabled by default).
     ///
     /// When enabled (default), newly loaded and imported keys are withheld from
-    /// signing for ~2 epochs (~12.8 min on mainnet) while network liveness is
-    /// observed, mitigating double-signing if another live instance holds the
-    /// same keys. Opting out removes that safety cost but exposes the process
-    /// to the Staked 2021 / SSV-Ankr class of mass-slashing incidents.
+    /// signing until three closed not-live epochs are observed (a missed epoch
+    /// delays that, with no timeout), mitigating double-signing if another live
+    /// instance holds the same keys. Opting out removes that safety cost but
+    /// exposes the process to the Staked 2021 / SSV-Ankr class of mass-slashing
+    /// incidents.
     #[arg(long = "no-doppelganger-detection")]
     #[serde(skip)]
     pub no_doppelganger_detection: bool,
@@ -100,7 +101,7 @@ impl SafetyArgs {
 
 /// `[safety]` table (section-relative names only; no flat aliases).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SafetyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_unsupported_fork: Option<bool>,

@@ -1,9 +1,8 @@
 //! Coordinator tests: fork-resolution gauge lifecycle.
 //!
 //! The gauges are process-global. Each test removes every `ForkName` series
-//! first, so a sequential `cargo test` of this module does not observe a
-//! sibling label. Tests that overlap in one process still race on these
-//! gauges; nextest's process-per-test isolation is what keeps them apart.
+//! first and holds `m2_metric_lock`, which every slot-loop test also holds,
+//! so a shared-process `cargo test` does not observe another writer's label.
 
 use super::*;
 
@@ -16,6 +15,7 @@ fn clear_next_activation_series() {
 
 #[tokio::test]
 async fn current_fork_gauge_is_set_on_resolution() {
+    let _metrics = m2_metric_lock().await;
     clear_next_activation_series();
     let schedule = create_test_fork_schedule();
     let mut orchestrator = orchestrator_with(schedule.clone()).await;
@@ -30,6 +30,7 @@ async fn current_fork_gauge_is_set_on_resolution() {
 
 #[tokio::test]
 async fn next_activation_label_is_set_from_the_schedule() {
+    let _metrics = m2_metric_lock().await;
     clear_next_activation_series();
     let schedule = create_test_fork_schedule();
     let mut orchestrator = orchestrator_with(schedule.clone()).await;
@@ -45,6 +46,7 @@ async fn next_activation_label_is_set_from_the_schedule() {
 
 #[tokio::test]
 async fn stale_next_activation_label_is_removed_not_overwritten() {
+    let _metrics = m2_metric_lock().await;
     clear_next_activation_series();
     let schedule = create_test_fork_schedule();
     let mut orchestrator = orchestrator_with(schedule.clone()).await;
@@ -69,6 +71,7 @@ async fn stale_next_activation_label_is_removed_not_overwritten() {
 
 #[tokio::test]
 async fn label_is_cleared_when_no_activation_remains() {
+    let _metrics = m2_metric_lock().await;
     clear_next_activation_series();
     let schedule = create_test_fork_schedule();
     let mut orchestrator = orchestrator_with(schedule.clone()).await;

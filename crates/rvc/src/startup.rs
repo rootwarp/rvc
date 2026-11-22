@@ -26,8 +26,11 @@ use crate::config::ConfigError;
 /// Distinct exit codes for startup failures.
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
-// EXIT 12 reserved historically for one-shot doppelganger detection (retired with
-// run_doppelganger_detection; production uses ForwardWindowMachine + Detected gate).
+/// Doppelganger detected. The liveness loop requests this through the executor
+/// drain after a write of the detection record or a marker and its fsync
+/// returned `Ok` in this process. The next start reads that record or marker
+/// and exits 12 again.
+pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
 /// Required metrics or keymanager listener failed to bind.
@@ -117,26 +120,26 @@ pub async fn validate_genesis_root(
 ) -> Result<(), StartupError> {
     info!("Validating genesis validators root against beacon node");
 
-    let genesis_response = beacon.get_genesis().await?;
-    let beacon_root = &genesis_response.data.genesis_validators_root;
-
-    let local_normalized = normalize_hex(local_root_hex)?;
-    let beacon_normalized = normalize_hex(beacon_root)?;
-
-    if local_normalized != beacon_normalized {
-        error!(
-            local = %local_root_hex,
-            beacon = %beacon_root,
-            "Genesis validators root mismatch"
-        );
-        return Err(StartupError::GenesisRootMismatch {
-            local: local_root_hex.to_string(),
-            beacon: beacon_root.clone(),
-        });
+    // Every responder, not the first `get_genesis` success. A pooled client
+    // rejects a node whose root differs and still accepts a later match.
+    if let Err(err) = beacon.confirm_genesis_validators_root(local_root_hex).await {
+        if let beacon::BeaconError::GenesisValidatorsRootMismatch { root } = &err {
+            error!(
+                local = %local_root_hex,
+                beacon = %root,
+                "Genesis validators root mismatch"
+            );
+            return Err(StartupError::GenesisRootMismatch {
+                local: local_root_hex.to_string(),
+                beacon: root.clone(),
+            });
+        }
+        return Err(err.into());
     }
 
     // SlashingDb takes a typed Root, compares by bytes, and stores canonical
     // `0x` + lowercase hex. Bare or mixed-case legacy metadata remains compatible.
+    let local_normalized = normalize_hex(local_root_hex)?;
     let local_root = eth_types::canonical::gvr_hex::parse_gvr_hex(&local_normalized)
         .map_err(|e| StartupError::InvalidHexInput(format!("genesis_validators_root: {e}")))?;
     slashing_db.set_genesis_validators_root(&local_root)?;
@@ -953,7 +956,11 @@ builder_boost_factor = 80
     fn test_gloas_scheduled_missing_bn_version_fails() {
         let mut spec = spec_without_gloas();
         spec.insert("GLOAS_FORK_EPOCH".into(), json!("600000"));
-        let bn = parse_fork_schedule(&spec).unwrap();
+        let err = parse_fork_schedule(&spec).expect_err("a scheduled fork needs a version");
+        assert!(err.to_string().contains("GLOAS_FORK_VERSION"), "{err}");
+        // Reconciliation still rejects the sentinel version if it is given directly.
+        let mut bn = parse_fork_schedule(&spec_without_gloas()).unwrap();
+        bn.gloas_fork_epoch = 600_000;
         let local = local_gloas(Some(600_000), Some("0x07000000"));
         let msg = mismatch_msg(&local, &bn);
         assert!(msg.contains("rvc-config"), "{msg}");

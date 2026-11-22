@@ -109,7 +109,7 @@ impl GcpSecretArgs {
 /// No flat-legacy `#[serde(alias)]` here: those bind inside `[secret_provider]`
 /// (4f SEC).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecretProviderConfig {
     #[serde(default)]
     pub providers: Vec<String>,
@@ -131,7 +131,7 @@ pub struct SecretProviderConfig {
 
 /// GCP project / prefix (resolved / `SecretProviderConfig.gcp` field).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GcpSecretConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,

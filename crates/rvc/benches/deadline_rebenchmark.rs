@@ -70,7 +70,9 @@ fn main() {
     let slot_duration_ms = config.network.slot_duration_ms();
     assert_eq!(slot_duration_ms, SLOT_DURATION_MS);
 
-    let orch = ServiceBuilder::new(config).build_orchestrator_config([0u8; 32], fork_schedule);
+    let orch = ServiceBuilder::new(config)
+        .build_orchestrator_config([0u8; 32], fork_schedule)
+        .expect("timing");
     let (fork, deadline_ms) = resolve_attestation_deadline(&orch, slot, slot_duration_ms);
     assert!(fork >= ForkName::Gloas, "6.14 must resolve a Gloas-epoch slot; got {}", fork.as_ref());
 

@@ -28,7 +28,7 @@ if sys.version_info < (3, 12):
         f"error: python >= 3.12 required, got {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     )
 
-from ssz import Boolean, ByteVector, Container, Root, Uint64, hash_tree_root
+from ssz import BitVector, Boolean, ByteVector, Container, Root, Uint64, hash_tree_root
 
 SPEC_TAG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SPEC_REL_RE = re.compile(r"^specs/[A-Za-z0-9._/-]+\.md$")
@@ -525,9 +525,123 @@ def emit_island_yaml(
     return "\n".join(lines) + "\n"
 
 
+# Fixed ContributionAndProof. Subcommittee aggregation bits are Bitvector[128]
+# (16 bytes), the mainnet sync subcommittee width. Selection proof is fixed
+# so the signing root does not depend on a random key.
+CONTRIB_AGGREGATOR_INDEX = 1
+CONTRIB_BEACON_BLOCK_ROOT = bytes.fromhex("cd" * 32)
+CONTRIB_SUBCOMMITTEE_INDEX = 0
+CONTRIB_AGGREGATION_BITS = bytes.fromhex("ff" * 16)
+CONTRIB_SIGNATURE = bytes.fromhex("01" * 96)
+CONTRIB_SELECTION_PROOF = bytes.fromhex("22" * 96)
+CONTRIB_FORK_RE = re.compile(r"^([A-Za-z0-9_-]+)=0x([0-9A-Fa-f]{8})@(\d+)$")
+
+
+class SubcommitteeBits(BitVector):
+    LENGTH = 128
+
+
+class SyncCommitteeContribution(Container):
+    slot: Uint64
+    beacon_block_root: Root
+    subcommittee_index: Uint64
+    aggregation_bits: SubcommitteeBits
+    signature: BLSSignature
+
+
+class ContributionAndProof(Container):
+    aggregator_index: Uint64
+    contribution: SyncCommitteeContribution
+    selection_proof: BLSSignature
+
+
+def contribution_and_proof(slot: int) -> ContributionAndProof:
+    return ContributionAndProof(
+        aggregator_index=Uint64(CONTRIB_AGGREGATOR_INDEX),
+        contribution=SyncCommitteeContribution(
+            slot=Uint64(slot),
+            beacon_block_root=Root(CONTRIB_BEACON_BLOCK_ROOT),
+            subcommittee_index=Uint64(CONTRIB_SUBCOMMITTEE_INDEX),
+            aggregation_bits=SubcommitteeBits.decode_bytes(CONTRIB_AGGREGATION_BITS),
+            signature=BLSSignature(CONTRIB_SIGNATURE),
+        ),
+        selection_proof=BLSSignature(CONTRIB_SELECTION_PROOF),
+    )
+
+
+def parse_contribution_forks(raw: str) -> list[tuple[str, Version, int]]:
+    rows: list[tuple[str, Version, int]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        match = CONTRIB_FORK_RE.fullmatch(part)
+        if match is None:
+            raise SystemExit(
+                f"error: contribution fork {part!r} is not name=0xVERSION@slot"
+            )
+        rows.append(
+            (match.group(1), Version(bytes.fromhex(match.group(2))), int(match.group(3)))
+        )
+    if not rows:
+        raise SystemExit("error: --contribution-forks is empty")
+    return rows
+
+
+def emit_contribution_yaml(
+    spec_tag: str,
+    genesis_validators_root: Root,
+    domain_type: bytes,
+    forks: list[tuple[str, Version, int]],
+) -> str:
+    lines = [
+        "# ContributionAndProof signing roots from eth-ssz-specs==0.1.0.",
+        "# DOMAIN_CONTRIBUTION_AND_PROOF parsed from altair beacon-chain.md.",
+        "# compute_domain / get_domain / compute_signing_root match pyspec phase0.",
+        "package: eth-ssz-specs==0.1.0",
+        f"spec_tag: {spec_tag}",
+        f"domain_contribution_and_proof: '{hex_bytes(domain_type)}'",
+        f"genesis_validators_root: '{hex32(genesis_validators_root)}'",
+        f"aggregator_index: {CONTRIB_AGGREGATOR_INDEX}",
+        f"beacon_block_root: '{hex_bytes(CONTRIB_BEACON_BLOCK_ROOT)}'",
+        f"subcommittee_index: {CONTRIB_SUBCOMMITTEE_INDEX}",
+        f"aggregation_bits: '{hex_bytes(CONTRIB_AGGREGATION_BITS)}'",
+        f"signature: '{hex_bytes(CONTRIB_SIGNATURE)}'",
+        f"selection_proof: '{hex_bytes(CONTRIB_SELECTION_PROOF)}'",
+        "forks:",
+    ]
+    for name, fork_version, slot in forks:
+        proof = contribution_and_proof(slot)
+        domain = get_domain(
+            DomainType(domain_type),
+            fork_version,
+            genesis_validators_root,
+        )
+        signing = compute_signing_root(proof, domain)
+        lines.extend(
+            [
+                f"  - name: {name}",
+                f"    fork_version: '{hex_bytes(fork_version)}'",
+                f"    slot: {slot}",
+                f"    object_root: '{hex32(hash_tree_root(proof))}'",
+                f"    signing_root: '{hex32(signing)}'",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Gloas signing-root vectors.")
     parser.add_argument("--out", required=True, help="Destination YAML path")
+    parser.add_argument(
+        "--contribution-out",
+        help="Optional ContributionAndProof signing-root YAML. Absent: not written.",
+    )
+    parser.add_argument(
+        "--contribution-forks",
+        default="",
+        help="Comma-separated name=0xVERSION@slot rows. Required with --contribution-out.",
+    )
     parser.add_argument(
         "--gloas-out",
         help="Island L3 signing-root YAML path (block, aggregate, envelope, AttestationData)",
@@ -587,6 +701,24 @@ def main() -> int:
             input_digest,
         )
         write_yaml(gloas_path, island)
+
+    if args.contribution_out:
+        forks = parse_contribution_forks(args.contribution_forks)
+        altair_md = load_consensus_spec(args.spec_tag, "specs/altair/beacon-chain.md")
+        contribution_domain = parse_domain_types(
+            altair_md, ("DOMAIN_CONTRIBUTION_AND_PROOF",)
+        )["DOMAIN_CONTRIBUTION_AND_PROOF"]
+        write_yaml(
+            Path(args.contribution_out),
+            emit_contribution_yaml(
+                args.spec_tag,
+                genesis_validators_root,
+                contribution_domain,
+                forks,
+            ),
+        )
+    elif args.contribution_forks.strip():
+        raise SystemExit("error: --contribution-forks requires --contribution-out")
     return 0
 
 

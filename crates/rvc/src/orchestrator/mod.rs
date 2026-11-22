@@ -9,6 +9,7 @@ pub(crate) mod block_proposal;
 mod coordinator;
 pub(crate) mod dispatch;
 pub(crate) mod duty_management;
+pub(crate) mod epoch_boundary;
 mod error;
 pub mod head_events;
 pub(crate) mod payload_attestation;

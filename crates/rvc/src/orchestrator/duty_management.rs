@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use builder::legacy_proposer_ops_retired;
+use crypto::Signature;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
 use observability::logging::TruncatedPubkey;
@@ -16,14 +18,46 @@ use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
+use super::error::OrchestratorError;
 use super::utils::{self, TimedOutcome};
-use crate::pubkey_index::{parse_pubkey_bytes, SharedPubkeyIndexRegistry};
+use crate::pubkey_index::{parse_pubkey_bytes, RegistryFreshness, SharedPubkeyIndexRegistry};
 
 /// Number of epochs in a single sync committee period.
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 
 /// How many epochs before the end of a period to start prefetching next-period duties.
 const PREFETCH_LOOKAHEAD: u64 = 2;
+
+/// The prepare POST, as timed and as named by a timeout.
+const PROPOSER_PREPARATION: &str = "proposer_preparation";
+
+/// The committee-subscription POST, as timed and as named by a timeout.
+const COMMITTEE_SUBSCRIPTION: &str = "committee_subscription";
+
+/// How a [`DutyManagementService::prepare_proposers`] call that met no error ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrepareOutcome {
+    /// The epoch needs no further send: Gloas, no local key, or a POST that
+    /// covered every local key.
+    Complete,
+    /// The keys with a validator index were POSTed; `unresolved` have none yet.
+    Partial { unresolved: usize },
+    /// No local key has a validator index yet, so nothing was sent.
+    NoIndices,
+    /// The registry was stale, or its token moved while preparing; no POST
+    /// was made, or the POST may have carried indices from before a
+    /// revocation.
+    Stale,
+}
+
+/// [`PrepareOutcome::Stale`] with no POST: the indices wait for a re-check.
+fn deferred_preparation(epoch: u64) -> PrepareOutcome {
+    info!(
+        epoch,
+        "Deferring proposer preparation: validator indices are being re-checked after a beacon-node revocation"
+    );
+    PrepareOutcome::Stale
+}
 
 pub(crate) struct DutyManagementService {
     signer: Arc<SignerService>,
@@ -37,6 +71,9 @@ pub(crate) struct DutyManagementService {
     /// Tracks which sync committee periods have been prefetched to ensure idempotency.
     prefetched_periods: RwLock<HashSet<u64>>,
 }
+
+/// Selection proofs already signed, by duty slot and validator pubkey.
+pub(crate) type SelectionProofs = parking_lot::Mutex<HashMap<(Slot, [u8; 48]), Signature>>;
 
 impl DutyManagementService {
     pub(crate) fn new(
@@ -256,10 +293,16 @@ impl DutyManagementService {
         }
     }
 
-    /// Returns `true` when a previously cached proposer `dependent_root` changed.
+    /// Sets `proposer_root_changed` as soon as a previously cached proposer
+    /// `dependent_root` changes, before the next await after the cache
+    /// write, so a caller that drops the check part way still sees a change
+    /// it cached.
     #[tracing::instrument(name = "orchestrator.check_reorg", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) -> bool {
-        let mut proposer_root_changed = false;
+    pub(crate) async fn check_reorg_at_epoch_boundary(
+        &self,
+        current_epoch: u64,
+        proposer_root_changed: &AtomicBool,
+    ) {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
@@ -307,6 +350,7 @@ impl DutyManagementService {
             .await
             {
                 TimedOutcome::Ok(true) if proposer_cached => {
+                    proposer_root_changed.store(true, Ordering::Release);
                     let new_root =
                         self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
                     warn!(
@@ -316,7 +360,6 @@ impl DutyManagementService {
                         "Reorg detected: proposer duties refetched"
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
-                    proposer_root_changed = true;
                 }
                 TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
@@ -373,23 +416,48 @@ impl DutyManagementService {
                 }
             }
         }
-        proposer_root_changed
     }
 
+    /// POSTs `prepare_beacon_proposer` for the local keys whose validator
+    /// index is known.
+    ///
+    /// [`PrepareOutcome::Complete`] at Gloas (the call is retired), with no
+    /// local key, or after a POST that covered every local key. `Partial`
+    /// after a POST of the keys with an index while others have none yet,
+    /// and `NoIndices`, with no POST, while no key has one. A failed POST is
+    /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
+    /// is [`OrchestratorError::OperationTimedOut`].
+    ///
+    /// The registry token is captured under the read lock the indices are
+    /// read under. [`PrepareOutcome::Stale`], with no POST, while the
+    /// registry is stale or once the token moved before the POST, and
+    /// `Stale` after a POST during which it moved: that POST may carry an
+    /// index from before a revocation.
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
-    pub(crate) async fn prepare_proposers(&self, epoch: u64) {
+    pub(crate) async fn prepare_proposers(
+        &self,
+        epoch: u64,
+    ) -> Result<PrepareOutcome, OrchestratorError> {
         let fork = ForkName::from_epoch(epoch, &self.config.fork_schedule);
         if legacy_proposer_ops_retired(fork) {
             info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
-            return;
+            return Ok(PrepareOutcome::Complete);
         }
 
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
-        let preparations: Vec<ProposerPreparation> = {
+        let (token, preparations, unresolved) = {
+            #[cfg(test)]
+            reach_prepare_point(PreparePoint::BeforeSnapshot);
             let pubkey_snapshot = self.pubkey_map.read().clone();
             let index_registry = self.pubkey_index.read();
+            let token = index_registry.freshness();
+            if token == RegistryFreshness::Stale {
+                drop(index_registry);
+                return Ok(deferred_preparation(epoch));
+            }
             let mut out = Vec::with_capacity(pubkey_snapshot.len());
+            let mut unresolved = 0;
             for (pubkey_bytes, pubkey) in &pubkey_snapshot {
                 let fee_recipient =
                     self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
@@ -403,6 +471,7 @@ impl DutyManagementService {
                         });
                     }
                     None => {
+                        unresolved += 1;
                         debug!(
                             pubkey = %format!("0x{}", hex::encode(pubkey_bytes)),
                             "No validator index found for proposer preparation"
@@ -410,34 +479,101 @@ impl DutyManagementService {
                     }
                 }
             }
-            out
+            drop(index_registry);
+            #[cfg(test)]
+            reach_prepare_point(PreparePoint::AfterSnapshot);
+            (token, out, unresolved)
         };
 
         if preparations.is_empty() {
-            return;
+            return Ok(if unresolved == 0 {
+                PrepareOutcome::Complete
+            } else {
+                PrepareOutcome::NoIndices
+            });
         }
 
+        if self.index_freshness() != token {
+            return Ok(deferred_preparation(epoch));
+        }
         let count = preparations.len();
         match utils::timed(
-            "proposer_preparation",
+            PROPOSER_PREPARATION,
             self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
         {
-            TimedOutcome::Ok(_) => info!(count, "Sent proposer preparations"),
-            TimedOutcome::Err(e) => warn!(error = %e, "Failed to send proposer preparations"),
+            TimedOutcome::Ok(()) => {
+                if self.index_freshness() != token {
+                    info!(
+                        epoch,
+                        count,
+                        "Proposer preparations sent while a beacon-node revocation moved the validator indices; sending again once they are re-checked"
+                    );
+                    return Ok(PrepareOutcome::Stale);
+                }
+                #[cfg(test)]
+                reach_prepare_point(PreparePoint::AfterPostCheck);
+                info!(count, "Sent proposer preparations");
+                Ok(if unresolved == 0 {
+                    PrepareOutcome::Complete
+                } else {
+                    PrepareOutcome::Partial { unresolved }
+                })
+            }
+            TimedOutcome::Err(e) => {
+                warn!(error = %e, "Failed to send proposer preparations");
+                Err(OrchestratorError::Beacon(e))
+            }
             TimedOutcome::Timeout => {
                 warn!(
                     "Proposer preparation timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
-                )
+                );
+                Err(OrchestratorError::OperationTimedOut { operation: PROPOSER_PREPARATION })
             }
         }
     }
 
+    /// The registry token [`Self::prepare_proposers`] captures. The read
+    /// lock is held only for this call.
+    pub(crate) fn index_freshness(&self) -> RegistryFreshness {
+        self.pubkey_index.read().freshness()
+    }
+
+    /// The local keys whose validator index is known: the size of the POST
+    /// a [`Self::prepare_proposers`] call would make now.
+    pub(crate) fn resolved_proposer_count(&self) -> usize {
+        let pubkeys: Vec<[u8; 48]> = self.pubkey_map.read().keys().copied().collect();
+        let index_registry = self.pubkey_index.read();
+        pubkeys.iter().filter(|pubkey| index_registry.index_of(pubkey).is_some()).count()
+    }
+
+    /// [`Self::submit_committee_subscriptions_with`], keeping no proof.
+    pub(crate) async fn submit_committee_subscriptions(
+        &self,
+        epoch: u64,
+    ) -> Result<(), OrchestratorError> {
+        self.submit_committee_subscriptions_with(epoch, &SelectionProofs::default()).await
+    }
+
+    /// Signs a selection proof for each local attester duty of `epoch` that
+    /// `proofs` does not hold yet, keeping it there, and POSTs the epoch's
+    /// committee subscriptions.
+    ///
+    /// `Ok` when the epoch needs no further send: the POST went out, or there
+    /// is nothing to send (no own duty, or the store gate closed or the
+    /// admission revoked for each one). A selection proof that fails to sign
+    /// is a warn, and skips its duty. A failed POST is
+    /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
+    /// is [`OrchestratorError::OperationTimedOut`].
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
-    pub(crate) async fn submit_committee_subscriptions(&self, epoch: u64) {
+    pub(crate) async fn submit_committee_subscriptions_with(
+        &self,
+        epoch: u64,
+        proofs: &SelectionProofs,
+    ) -> Result<(), OrchestratorError> {
         let mut subscriptions = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
@@ -470,17 +606,40 @@ impl DutyManagementService {
                 let committee_length = duty.committee_length;
                 let wire = &duty.raw;
 
-                // Compute selection proof and determine if aggregator
-                let selection_proof = match self
-                    .signer
-                    .sign_selection_proof(
-                        slot,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
+                let fence = match self.beacon.duty_fence() {
+                    Ok(fence)
+                        if !super::slot_context::admission_blocks(
+                            signer::SigningDuty::SelectionProof,
+                            &[&fence],
+                        ) =>
+                    {
+                        fence
+                    }
+                    _ => {
+                        warn!(
+                            slot,
+                            "skipping committee subscription: beacon node admission revoked"
+                        );
+                        continue;
+                    }
+                };
+                let kept = proofs.lock().get(&(slot, duty_bytes)).cloned();
+                let signed = match kept {
+                    Some(proof) => Ok(proof),
+                    None => {
+                        super::slot_context::under_admission(
+                            &fence,
+                            self.signer.sign_selection_proof(
+                                slot,
+                                &pubkey,
+                                &self.config.fork_schedule,
+                                &self.config.genesis_validators_root,
+                            ),
+                        )
+                        .await
+                    }
+                };
+                let selection_proof = match signed {
                     Ok(sig) => sig,
                     Err(e) => {
                         warn!(
@@ -494,6 +653,7 @@ impl DutyManagementService {
                 };
 
                 let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
+                proofs.lock().insert((slot, duty_bytes), selection_proof);
 
                 subscriptions.push(BeaconCommitteeSubscription {
                     validator_index: wire.validator_index.clone(),
@@ -506,43 +666,34 @@ impl DutyManagementService {
         }
 
         if subscriptions.is_empty() {
-            return;
+            return Ok(());
         }
 
         let count = subscriptions.len();
         match utils::timed(
-            "committee_subscription",
+            COMMITTEE_SUBSCRIPTION,
             self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
         {
-            TimedOutcome::Ok(_) => info!(count, epoch, "Sent committee subscriptions"),
-            TimedOutcome::Err(e) => {
-                warn!(epoch, error = %e, "Failed to send committee subscriptions")
+            TimedOutcome::Ok(()) => {
+                info!(count, epoch, "Sent committee subscriptions");
+                Ok(())
             }
-            TimedOutcome::Timeout => warn!(
-                epoch,
-                "Committee subscription timed out after {}s",
-                self.config.timeouts.preparation.as_secs()
-            ),
+            TimedOutcome::Err(e) => {
+                warn!(epoch, error = %e, "Failed to send committee subscriptions");
+                Err(OrchestratorError::Beacon(e))
+            }
+            TimedOutcome::Timeout => {
+                warn!(
+                    epoch,
+                    "Committee subscription timed out after {}s",
+                    self.config.timeouts.preparation.as_secs()
+                );
+                Err(OrchestratorError::OperationTimedOut { operation: COMMITTEE_SUBSCRIPTION })
+            }
         }
-    }
-
-    /// Epoch-boundary work: reorg checks, proposer preparation, committee
-    /// subscriptions for the current and next epoch, then a duty summary.
-    ///
-    /// Extracted from the coordinator slot loop so the run path stays a pure
-    /// phase dispatcher. Circuit-breaker reset stays in the coordinator (it
-    /// owns that state).
-    #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) -> bool {
-        let proposer_root_changed = self.check_reorg_at_epoch_boundary(current_epoch).await;
-        self.prepare_proposers(current_epoch).await;
-        self.submit_committee_subscriptions(current_epoch).await;
-        self.submit_committee_subscriptions(current_epoch + 1).await;
-        self.log_epoch_boundary_summary(current_epoch, current_slot).await;
-        proposer_root_changed
     }
 
     /// Count attester/proposer/sync duties for the epoch and emit the
@@ -579,6 +730,56 @@ impl DutyManagementService {
         }
         let sync_count = self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
         (attester_count, proposer_count, sync_count)
+    }
+}
+
+/// A point in [`DutyManagementService::prepare_proposers`] where a test can
+/// change the index registry.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparePoint {
+    /// Before the read lock that captures the token and the indices.
+    BeforeSnapshot,
+    /// After that read lock ends, before the token check before the POST.
+    AfterSnapshot,
+    /// After the token check that follows a successful POST.
+    AfterPostCheck,
+}
+
+#[cfg(test)]
+type PrepareHook = Box<dyn FnMut(PreparePoint)>;
+
+#[cfg(test)]
+thread_local! {
+    static PREPARE_HOOK: std::cell::RefCell<Option<PrepareHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the hook that [`arm_prepare_hook`] set on this thread, if one is set.
+#[cfg(test)]
+fn reach_prepare_point(point: PreparePoint) {
+    PREPARE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
+/// Runs `hook` at each [`PreparePoint`] on this thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn arm_prepare_hook(hook: impl FnMut(PreparePoint) + 'static) -> PrepareHookGuard {
+    PREPARE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    PrepareHookGuard
+}
+
+/// Removes the prepare hook when it drops, also after a failed assertion.
+#[cfg(test)]
+pub(crate) struct PrepareHookGuard;
+
+#[cfg(test)]
+impl Drop for PrepareHookGuard {
+    fn drop(&mut self) {
+        PREPARE_HOOK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -1175,7 +1376,7 @@ mod tests {
         let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
 
         // Epoch boundary at gloas-2 checks epochs gloas-2 and gloas-1 (both pre-Gloas).
-        service.check_reorg_at_epoch_boundary(gloas_epoch - 2).await;
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 2, &AtomicBool::default()).await;
 
         assert!(
             mock.post_ptc_duties_calls().is_empty(),
@@ -1184,7 +1385,7 @@ mod tests {
         );
 
         // Boundary into Gloas: current pre-Gloas skipped, next (Gloas) fetched.
-        service.check_reorg_at_epoch_boundary(gloas_epoch - 1).await;
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 1, &AtomicBool::default()).await;
         let ptc_epochs: Vec<u64> =
             mock.post_ptc_duties_calls().into_iter().map(|(epoch, _)| epoch).collect();
         assert_eq!(
@@ -1229,13 +1430,129 @@ mod tests {
         let service = build_service_with_mock(mock.clone(), make_config_with_gloas(u64::MAX));
         assert_eq!(service.config.fork_schedule.gloas_fork_epoch, u64::MAX);
 
-        service.check_reorg_at_epoch_boundary(10).await;
-        service.check_reorg_at_epoch_boundary(1_000_000).await;
+        service.check_reorg_at_epoch_boundary(10, &AtomicBool::default()).await;
+        service.check_reorg_at_epoch_boundary(1_000_000, &AtomicBool::default()).await;
 
         assert!(
             mock.post_ptc_duties_calls().is_empty(),
             "unscheduled Gloas reorg check must issue zero post_ptc_duties calls, got {:?}",
             mock.post_ptc_duties_calls()
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // W4-E3c R1 (Harper B5): no admitted beacon node is nothing to send
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// [`build_service_with_mock`] with `local` as an enabled local key that
+    /// the signer holds, and an attester duty for it at slot 1 of each epoch.
+    async fn build_subscribing_service(
+        local: crypto::SecretKey,
+    ) -> (DutyManagementService, Arc<bn_manager::MockBeaconNodeClient>) {
+        let pubkey = local.public_key();
+        let pk_bytes = pubkey.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let mock = Arc::new(
+            bn_manager::MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |epoch, _indices| {
+                    Ok(beacon::DependentRootResponse {
+                        dependent_root: "0xdeproot".into(),
+                        execution_optimistic: false,
+                        data: vec![beacon::AttesterDuty {
+                            pubkey: pk_hex.clone(),
+                            validator_index: "1".to_string(),
+                            committee_index: "0".to_string(),
+                            committee_length: "8".to_string(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: "0".to_string(),
+                            slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
+                        }],
+                    })
+                })
+                .with_submit_beacon_committee_subscriptions(|_subscriptions| Ok(())),
+        );
+        mock.track_admission();
+        let beacon = mock.clone() as Arc<dyn BeaconNodeClient>;
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(1).await.expect("seed attester duties");
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(local);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::from([(pk_bytes, pubkey)])));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        validator_store
+            .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
+            .expect("add validator");
+        let service = DutyManagementService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            validator_store,
+            pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            make_config(),
+        );
+        (service, mock)
+    }
+
+    /// With the admission of every beacon node revoked, the cached duty of an
+    /// enabled local key is skipped before its selection proof: the call is
+    /// `Ok`, with no subscription POST. Control: the same service over an
+    /// admitting beacon node POSTs that duty.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_subscriptions_with_admission_revoked_send_nothing() {
+        let local = crypto::SecretKey::generate();
+        let pk_bytes = local.public_key().to_bytes();
+        let (mut service, mock) = build_subscribing_service(local).await;
+        assert!(service.validator_store.is_signing_enabled(&pk_bytes), "the key is enabled");
+        assert_eq!(service.duty_tracker.get_duties_for_slot(33).await.len(), 1, "duty cached");
+
+        let manager = bn_manager::BnManager::new(bn_manager::BnManagerConfig::new(vec![
+            "http://127.0.0.1:9".to_string(),
+        ]))
+        .expect("bn manager");
+        assert!(BeaconNodeClient::duty_fence(&manager).is_ok(), "a new manager starts admitted");
+        manager.testing_revoke_admission(0);
+        assert!(
+            matches!(
+                BeaconNodeClient::duty_fence(&manager),
+                Err(bn_manager::BeaconError::NoAdmittedNode)
+            ),
+            "its only node is revoked"
+        );
+        let revoked = Arc::new(manager) as Arc<dyn BeaconNodeClient>;
+        let admitting = std::mem::replace(&mut service.beacon, revoked);
+
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(matches!(outcome, Ok(())), "nothing to send is Ok: {outcome:?}");
+        logs_assert(|lines: &[&str]| {
+            let count = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+            let skipped = count("skipping committee subscription: beacon node admission revoked");
+            let posted = count("Sent committee subscriptions")
+                + count("Failed to send committee subscriptions")
+                + count("Committee subscription timed out");
+            match (skipped, posted) {
+                (1, 0) => Ok(()),
+                other => Err(format!("(skipped, posted) = {other:?}, want (1, 0)")),
+            }
+        });
+
+        service.beacon = admitting;
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(matches!(outcome, Ok(())), "control: {outcome:?}");
+        let posts = mock
+            .call_stamps()
+            .iter()
+            .filter(|stamp| {
+                stamp.method == bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions
+            })
+            .count();
+        assert_eq!(posts, 1, "control: an admitting beacon node gets the duty's POST");
     }
 }

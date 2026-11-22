@@ -17,7 +17,9 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use signer::SignerService;
 
 #[cfg(test)]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex as StdMutex};
 
 /// Import/delete/sidecar-cleanup lock shared with the keystore adapter.
 ///
@@ -30,7 +32,9 @@ pub struct TrackedKeys {
     #[cfg(test)]
     contended: AtomicU64,
     #[cfg(test)]
-    stall_ms: AtomicU64,
+    contended_mu: StdMutex<()>,
+    #[cfg(test)]
+    contended_cv: Condvar,
 }
 
 impl TrackedKeys {
@@ -41,20 +45,14 @@ impl TrackedKeys {
             #[cfg(test)]
             contended: AtomicU64::new(0),
             #[cfg(test)]
-            stall_ms: AtomicU64::new(0),
+            contended_mu: StdMutex::new(()),
+            #[cfg(test)]
+            contended_cv: Condvar::new(),
         }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Vec<Pubkey>> {
-        let guard = self.lock_inner();
-        #[cfg(test)]
-        {
-            let ms = self.stall_ms.load(Ordering::Relaxed);
-            if ms > 0 {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
-        }
-        guard
+        self.lock_inner()
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Vec<Pubkey>> {
@@ -63,7 +61,10 @@ impl TrackedKeys {
             if let Some(guard) = self.keys.try_lock() {
                 guard
             } else {
+                let guard = self.contended_mu.lock().expect("contended");
                 self.contended.fetch_add(1, Ordering::SeqCst);
+                self.contended_cv.notify_all();
+                drop(guard);
                 self.keys.lock()
             }
         }
@@ -78,9 +79,23 @@ impl TrackedKeys {
         self.contended.load(Ordering::SeqCst)
     }
 
+    /// Block until [`Self::contended`] is greater than `before`.
     #[cfg(test)]
-    pub(crate) fn set_stall_ms(&self, ms: u64) {
-        self.stall_ms.store(ms, Ordering::Relaxed);
+    pub(crate) fn wait_until_contended(&self, before: u64) {
+        let mut guard = self.contended_mu.lock().expect("contended");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.contended.load(Ordering::SeqCst) <= before {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("tracked_keys was not contended within 5s (before {before})");
+            }
+            let (next, timed) =
+                self.contended_cv.wait_timeout(guard, remaining).expect("contended");
+            guard = next;
+            if timed.timed_out() && self.contended.load(Ordering::SeqCst) <= before {
+                panic!("tracked_keys was not contended within 5s (before {before})");
+            }
+        }
     }
 }
 
@@ -166,6 +181,16 @@ impl SigningEnablement for QuiescingEnablement {
         }
         self.inner.is_signing_enabled(pubkey)
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        self.inner.voluntary_exit_only()
+    }
+
+    fn blocked_by_doppelganger(&self, pubkey: &PublicKey) -> bool {
+        // Quiesce closes new admissions. It does not turn an already-admitted
+        // slashable sign into a doppelganger refusal.
+        self.inner.blocked_by_doppelganger(pubkey)
+    }
 }
 
 /// [`SigningQuiesce`] for the VC: insert into the registry the signer's
@@ -214,6 +239,11 @@ impl SigningQuiesceAdapter {
         self.tracked_keys = tracked_keys;
         self.membership = Some(composite);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_keys(&self) -> &Arc<TrackedKeys> {
+        &self.tracked_keys
     }
 
     #[cfg(test)]
@@ -273,7 +303,7 @@ impl SigningQuiesce for SigningQuiesceAdapter {
 #[cfg(test)]
 use signer::ValidatorSigner;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use validator_store::{ValidatorConfig, ValidatorStore};
 
@@ -287,6 +317,14 @@ struct AllowOne([u8; 48]);
 impl SigningEnablement for AllowOne {
     fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
         pubkey.to_bytes() == self.0
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
     }
 }
 
@@ -518,4 +556,19 @@ async fn non_quiesced_pubkeys_are_unaffected() {
         !matches!(result, Err(signer::SignerError::BlockedByDoppelganger)),
         "non-quiesced pubkey must pass ensure_signing_enabled, got {result:?}"
     );
+}
+
+/// The quiesce wrapper must not drop an exit-only inner back to every duty.
+#[test]
+fn quiescing_enablement_forwards_voluntary_exit_only() {
+    let pubkey = crypto::SecretKey::generate().public_key();
+    let registry = Arc::new(QuiesceRegistry::new());
+    let exit_only = QuiescingEnablement::new(
+        Arc::new(signer::OfflineExitEnablement::new(&pubkey)),
+        Arc::clone(&registry),
+    );
+    let every_duty =
+        QuiescingEnablement::new(Arc::new(doppelganger::DoppelgangerDisabledByOperator), registry);
+    assert!(exit_only.voluntary_exit_only());
+    assert!(!every_duty.voluntary_exit_only());
 }

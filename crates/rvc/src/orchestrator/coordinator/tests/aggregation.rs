@@ -108,7 +108,7 @@ async fn test_aggregation_full_flow_with_mock_beacon() {
         .and(query_param("slot", slot.to_string()))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "1",
@@ -431,7 +431,7 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
                 .set_body_json(serde_json::json!({
             "version": "electra",
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "0",
@@ -534,7 +534,7 @@ async fn test_aggregation_pre_electra_unchanged() {
         .and(query_param("slot", slot.to_string()))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "1",
@@ -642,7 +642,7 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
                 .set_body_json(serde_json::json!({
             "version": "fulu",
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "0",
@@ -754,7 +754,7 @@ async fn test_aggregation_gloas_dispatches_as_gloas() {
                 .set_body_json(serde_json::json!({
             "version": "gloas",
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "1",

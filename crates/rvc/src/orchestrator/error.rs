@@ -38,6 +38,10 @@ pub enum OrchestratorError {
 
     #[error("Failed to parse attestation data: {0}")]
     ParseError(String),
+
+    /// A beacon-node call outlasted its own bound.
+    #[error("{operation} timed out")]
+    OperationTimedOut { operation: &'static str },
 }
 
 #[cfg(test)]
@@ -67,6 +71,12 @@ mod tests {
     fn test_orchestrator_error_display_parse_error() {
         let err = OrchestratorError::ParseError("invalid format".to_string());
         assert_eq!(err.to_string(), "Failed to parse attestation data: invalid format");
+    }
+
+    #[test]
+    fn test_orchestrator_error_display_operation_timed_out() {
+        let err = OrchestratorError::OperationTimedOut { operation: "committee_subscription" };
+        assert_eq!(err.to_string(), "committee_subscription timed out");
     }
 
     #[test]

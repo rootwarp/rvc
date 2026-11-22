@@ -12,21 +12,28 @@ categories = ["cryptography::cryptocurrencies"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Test-only surface: latch hooks and `observe_liveness`. Production binaries do not enable it.
+test-utils = []
+
 [dependencies]
 crypto = { workspace = true }
 observability = { workspace = true }
 eth-types = { workspace = true }
 slashing = { workspace = true }
-async-trait = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 parking_lot = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Integration tests call `observe_liveness`, which is test-utils only.
+rvc-doppelganger = { path = ".", features = ["test-utils"] }
 crypto = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }
+proptest.workspace = true
 tokio = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

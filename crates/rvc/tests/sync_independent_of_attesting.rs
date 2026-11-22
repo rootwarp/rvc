@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -180,6 +180,54 @@ impl BeaconBlockClient for NoopBlockBeacon {
     ) -> Result<(), BlockServiceError> {
         Ok(())
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<block_service::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
 }
 
 // ── NoopSubmitter ─────────────────────────────────────────────────────────────
@@ -268,6 +316,13 @@ async fn build_integration_orchestrator(
 
 // ── test cases ────────────────────────────────────────────────────────────────
 
+/// Phase spans are cached for the process. A sibling that emits them with no
+/// subscriber disables the callsite for the span test that follows.
+fn phase_span_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// H-7 integration test — `test_sync_runs_with_attesting_disabled`:
 ///
 /// With `attesting_enabled = false` and `sync_enabled = true` (default),
@@ -282,6 +337,7 @@ async fn build_integration_orchestrator(
 /// (project-plan RP6).
 #[tokio::test]
 async fn test_sync_runs_with_attesting_disabled() {
+    let _phase_spans = phase_span_lock().lock().await;
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
@@ -335,6 +391,7 @@ async fn test_sync_runs_with_attesting_disabled() {
 /// GREEN (after fix): `sync_enabled = false` guard prevents the call.
 #[tokio::test]
 async fn test_sync_disabled_attesting_enabled() {
+    let _phase_spans = phase_span_lock().lock().await;
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
@@ -599,6 +656,7 @@ async fn build_span_race_orchestrator(
 /// with the attestation span, cannot satisfy the bound.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_phase_span_opens_within_50ms_of_attestation_phase_span() {
+    let _phase_spans = phase_span_lock().lock().await;
     tokio::time::pause();
 
     let sk = SecretKey::generate();
@@ -609,6 +667,7 @@ async fn sync_phase_span_opens_within_50ms_of_attestation_phase_span() {
     let layer = HierarchyCapture { spans: spans.clone() };
     let subscriber = tracing_subscriber::registry().with(layer);
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
 
     let run_task = tokio::spawn(async move { orchestrator.run().await });
 

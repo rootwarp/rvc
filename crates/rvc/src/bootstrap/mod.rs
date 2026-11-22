@@ -23,13 +23,19 @@ pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 pub use keys::{load_signing_keys, LoadedKeys};
+#[cfg(any(test, feature = "test-utils"))]
+pub use run::run_with_slot_clock;
+#[cfg(test)]
+pub(crate) use run::{await_shutdown_and_drain_with_signal, DetectionShutdown, ShutdownInputs};
 pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 pub use tasks::{
-    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks, spawn_sse_subscriber,
-    spawn_sync_monitor, RequiredListeners, METRICS_ALLOW_NON_LOOPBACK_ENV, SSE_CANCEL_TASK_NAME,
-    SSE_TASK_NAME, SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
+    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks,
+    spawn_proposer_sync_monitor, spawn_sse_subscriber, spawn_sync_monitor, RequiredListeners,
+    METRICS_ALLOW_NON_LOOPBACK_ENV, PROPOSER_SYNC_MONITOR_CANCEL_TASK_NAME,
+    PROPOSER_SYNC_MONITOR_TASK_NAME, SSE_CANCEL_TASK_NAME, SSE_TASK_NAME,
+    SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
 };
 
 use std::sync::Arc;
@@ -117,6 +123,17 @@ pub enum BootstrapError {
     /// A registered task panicked. The executor drain has already finished.
     #[error("critical task '{task}' failed; process exiting")]
     CriticalTaskFailed { task: &'static str },
+
+    /// Doppelganger detection requested a drain. Exit 12.
+    #[error("doppelganger detected; process exiting")]
+    DoppelgangerDetected,
+
+    /// The orchestrator had no epoch boundary runner task to spawn.
+    #[error(
+        "duty orchestrator has no `{}` task to spawn",
+        crate::orchestrator::epoch_boundary::TASK_NAME
+    )]
+    EpochBoundaryRunnerMissing,
 }
 
 impl BootstrapError {
@@ -126,6 +143,7 @@ impl BootstrapError {
             Self::Startup(e) => e.exit_code(),
             Self::CriticalTaskFailed { .. } => EXIT_CRITICAL_TASK_FAILED,
             Self::ListenerBind { .. } => EXIT_LISTENER_BIND,
+            Self::DoppelgangerDetected => crate::startup::EXIT_DOPPELGANGER_DETECTED,
             _ => 1,
         }
     }

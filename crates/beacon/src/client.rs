@@ -1,14 +1,19 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use metrics::{define_int_gauge_vec, IntGaugeVec};
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::{
+    DeserializeOwned, DeserializeSeed, Deserializer, Error as DeError, IgnoredAny, MapAccess,
+    SeqAccess, Visitor,
+};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace, warn, Instrument};
 
 use observability::logging::RedactedUrl;
+use tree_hash::TreeHash;
 
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBlockContentsJson,
@@ -20,14 +25,15 @@ use crate::retry::RetryPolicy;
 use crate::ssz_deser;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
-    GenesisResponse, IndexedAttestationError, IndexedErrorMessage, NodeVersionResponse,
-    NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    BeaconCommitteeSubscription, BlockHeaderSummary, BlockRootResponse, ConfigSpecResponse,
+    DataResponse, GenesisResponse, IndexedAttestationError, IndexedErrorMessage,
+    NodeVersionResponse, NodeVersionV2Response, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use crate::v4_wire::{
     BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, FIELD_BLOBS,
@@ -121,7 +127,7 @@ enum ProduceBlockApi {
     V4,
 }
 
-/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_defaults`].
+/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_from`].
 #[derive(Debug)]
 struct ProduceV4Headers {
     payload_included: bool,
@@ -130,9 +136,20 @@ struct ProduceV4Headers {
 }
 
 impl ProduceV4Headers {
-    /// Pre-Gloas V3 does not send these headers; do not fail closed on their absence.
-    fn v3_defaults() -> Self {
-        Self { payload_included: false, builder_url: None, consensus_block_value: None }
+    /// Pre-Gloas V3 has no payload-included or builder-url header.
+    ///
+    /// `Eth-Consensus-Block-Value` is optional. A missing header ranks as 0.
+    /// A non-UTF-8 header is ignored the same way as `Eth-Execution-Payload-Value`,
+    /// so the block still ranks and the unreadable value contributes 0.
+    fn v3_from(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: headers
+                .get(HEADER_ETH_CONSENSUS_BLOCK_VALUE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        }
     }
 }
 
@@ -209,10 +226,9 @@ pub fn ensure_genesis_validators_root(
     if hex_ids_equal(&genesis.data.genesis_validators_root, expected_root_hex) {
         Ok(genesis)
     } else {
-        Err(BeaconError::HttpError(format!(
-            "genesis_validators_root {} does not match configured root",
-            genesis.data.genesis_validators_root
-        )))
+        Err(BeaconError::GenesisValidatorsRootMismatch {
+            root: genesis.data.genesis_validators_root,
+        })
     }
 }
 
@@ -223,6 +239,8 @@ pub struct BeaconClient {
     config: BeaconClientConfig,
     /// Logs the node-version v1 fallback once per BN (D25).
     node_version_v1_fallback_logged: Arc<AtomicBool>,
+    /// Set by [`Self::hold_admission`]. Unset means `duty_fence` stays open.
+    admission_generation: Arc<Mutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl BeaconClient {
@@ -251,7 +269,24 @@ impl BeaconClient {
             client,
             config,
             node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
+            admission_generation: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install a holding duty-fence generation on this client.
+    ///
+    /// `BnManager` owns admission. A raw client stays open until a test calls
+    /// this, so builder preferences do not sign against an open fence.
+    #[doc(hidden)]
+    pub fn hold_admission(&self) -> Arc<AtomicU64> {
+        let mut slot = self.admission_generation.lock().unwrap_or_else(|err| err.into_inner());
+        slot.get_or_insert_with(|| Arc::new(AtomicU64::new(0))).clone()
+    }
+
+    /// Generation installed by [`Self::hold_admission`], if any.
+    #[doc(hidden)]
+    pub fn admission_generation(&self) -> Option<Arc<AtomicU64>> {
+        self.admission_generation.lock().unwrap_or_else(|err| err.into_inner()).clone()
     }
 
     /// Returns the configured endpoint URL.
@@ -494,6 +529,14 @@ impl BeaconClient {
         ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
     }
 
+    /// One client is the only responder. A different validators root is an error.
+    pub async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError> {
+        self.get_genesis_matching_validators_root(expected_root_hex).await.map(|_| ())
+    }
+
     /// Fetches fork information for the given state.
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
@@ -511,6 +554,26 @@ impl BeaconClient {
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = Self::build_path(&["eth", "v1", "beacon", "blocks", block_id, "root"], &[]);
         self.get(&path).await
+    }
+
+    /// Fetches one beacon header (`GET /eth/v1/beacon/headers/{block_id}`).
+    ///
+    /// The returned root is `hash_tree_root` of the header message. A root that
+    /// does not match is a parse error. `execution_optimistic` must be `false`.
+    /// A missing flag, `true`, or a non-boolean flag is a parse error. That
+    /// parse error is a health error for the beacon node on every slot whose
+    /// header is fetched. A non-boolean flag is not copied into the error.
+    /// The signature is not checked. The header container is the same from
+    /// phase0 through Gloas. Slot and proposer index must be decimal integers.
+    /// Roots must be 32 bytes.
+    #[tracing::instrument(name = "beacon.get_block_header", skip_all)]
+    pub async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<BlockHeaderSummary, BeaconError> {
+        let path = Self::build_path(&["eth", "v1", "beacon", "headers", block_id], &[]);
+        let response: BlockHeaderWire = self.get(&path).await?;
+        parse_block_header(response)
     }
 
     /// Path for proposer duties: v1 pre-Gloas, v2 at Gloas.
@@ -546,6 +609,13 @@ impl BeaconClient {
     /// The full SSZ pipeline (header extraction, block-service SSZ path,
     /// JSON fallback on failure) is in place.
     const SSZ_ACCEPT_HEADER: &'static str = "application/octet-stream;q=1.0,application/json;q=0.9";
+
+    /// Duty-aware production needs ranking and the fee, fork, and parent checks.
+    ///
+    /// This client has one node and does not apply a duty. The pool does.
+    pub fn unsupported_duty_aware_production() -> BeaconError {
+        BeaconError::Unsupported("duty-aware production requires BnManager")
+    }
 
     /// Produces a block for the given slot using the v3 endpoint.
     ///
@@ -617,13 +687,14 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
+            let v3_headers = ProduceV4Headers::v3_from(response.headers());
             match Self::try_process_ssz_body(
                 response,
                 slot,
                 is_blinded,
                 &consensus_version,
                 &execution_payload_value,
-                ProduceV4Headers::v3_defaults(),
+                v3_headers,
             )
             .await
             {
@@ -819,6 +890,7 @@ impl BeaconClient {
             payload_included: v4.payload_included,
             builder_url: v4.builder_url,
             consensus_block_value: v4.consensus_block_value,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         })
     }
 
@@ -853,13 +925,15 @@ impl BeaconClient {
 
         let v4_headers = match api {
             ProduceBlockApi::V4 => parse_v4_produce_headers(response.headers())?,
-            ProduceBlockApi::V3 => ProduceV4Headers::v3_defaults(),
+            ProduceBlockApi::V3 => ProduceV4Headers::v3_from(response.headers()),
         };
 
         // H-12: cap the body before deserialising.
         let bytes = read_body_capped(response, max_body_bytes).await?;
-        let body: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| BeaconError::ParseError(e.to_string()))?;
+        // One pass. `serde_json::Value` would keep the last duplicate key, so
+        // `deny_unknown_fields` would never see it.
+        let body = parse_json_rejecting_duplicate_keys(&bytes)
+            .map_err(|err| BeaconError::ParseError(err.to_string()))?;
 
         let data = body.get("data").cloned().ok_or_else(|| {
             BeaconError::ParseError("missing 'data' field in produce block response".into())
@@ -875,6 +949,7 @@ impl BeaconClient {
             payload_included: v4_headers.payload_included,
             builder_url: v4_headers.builder_url,
             consensus_block_value: v4_headers.consensus_block_value,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         })
     }
 
@@ -1607,6 +1682,17 @@ impl BeaconClient {
             .await
     }
 
+    /// Subscribes validators to sync-committee subnets ahead of their period
+    /// (`POST /eth/v1/validator/sync_committee_subscriptions`).
+    pub async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/sync_committee_subscriptions", &subscriptions)
+            .instrument(tracing::info_span!("beacon.submit_sync_committee_subscriptions"))
+            .await
+    }
+
     // Builder
 
     pub async fn register_validators(
@@ -1902,6 +1988,10 @@ impl BeaconClient {
                     let status = response.status();
                     span.record("http.status_code", status.as_u16());
 
+                    // 429 is proxy backpressure, same class as 502/503/504 below.
+                    // The final error stays `ApiError` so callers can match the
+                    // status. BnManager treats that status as unreachable at boot.
+                    // Block production does not fail over on 429.
                     if status.as_u16() == 429 {
                         last_error = Some(BeaconError::ApiError {
                             status: 429,
@@ -1920,6 +2010,21 @@ impl BeaconClient {
                         continue;
                     }
 
+                    // 502/503/504 are proxy-unavailable, grouped with 429: retried,
+                    // returned as `ApiError`, and treated as unreachable at boot.
+                    if matches!(status.as_u16(), 502..=504) {
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
+                        last_error =
+                            Some(BeaconError::ApiError { status: status.as_u16(), message });
+                        warn!(
+                            attempt = attempt,
+                            status = status.as_u16(),
+                            "Proxy unavailable, will retry"
+                        );
+                        continue;
+                    }
+
+                    // 500 and other 5xx are retried here and stay boot-fatal.
                     if status.is_server_error() {
                         let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =
@@ -1929,6 +2034,18 @@ impl BeaconClient {
                             status = status.as_u16(),
                             "Server error, will retry"
                         );
+                        continue;
+                    }
+
+                    // A later 404 must not erase a 5xx, 429, timeout, or connect error.
+                    if status.as_u16() == 404 && prior_failure_hidden_by_not_found(&last_error) {
+                        warn!(
+                            attempt,
+                            "HTTP 404 after a retryable failure; keeping the earlier error"
+                        );
+                        if attempt >= policy.max_retries {
+                            break;
+                        }
                         continue;
                     }
 
@@ -1997,6 +2114,15 @@ impl BeaconClient {
         } else {
             Err(Self::api_error_from_response(response).await)
         }
+    }
+}
+
+/// `true` when `last_error` is a failure a following 404 must not replace.
+fn prior_failure_hidden_by_not_found(last_error: &Option<BeaconError>) -> bool {
+    match last_error {
+        Some(BeaconError::ApiError { status, .. }) if *status == 429 || *status >= 500 => true,
+        Some(BeaconError::Timeout | BeaconError::HttpError(_)) => true,
+        _ => false,
     }
 }
 
@@ -2112,11 +2238,326 @@ fn decode_aggregate_data<T: DeserializeOwned>(data: serde_json::Value) -> Result
         .map_err(|e| BeaconError::ParseError(format!("error decoding response body: {e}")))
 }
 
+fn deserialize_execution_optimistic<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Flag;
+
+    impl serde::de::Visitor<'_> for Flag {
+        type Value = Option<bool>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(Some(value))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Err(E::custom("execution_optimistic must be a boolean"))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, _value: String) -> Result<Self::Value, E> {
+            Err(E::custom("execution_optimistic must be a boolean"))
+        }
+    }
+
+    deserializer.deserialize_any(Flag)
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockHeaderWire {
+    #[serde(default, deserialize_with = "deserialize_execution_optimistic")]
+    execution_optimistic: Option<bool>,
+    data: BlockHeaderDataWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockHeaderDataWire {
+    root: String,
+    header: SignedBeaconHeaderWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignedBeaconHeaderWire {
+    message: BeaconHeaderMessageWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct BeaconHeaderMessageWire {
+    slot: String,
+    proposer_index: String,
+    parent_root: String,
+    state_root: String,
+    body_root: String,
+}
+
+fn parse_block_header(wire: BlockHeaderWire) -> Result<BlockHeaderSummary, BeaconError> {
+    if wire.execution_optimistic != Some(false) {
+        return Err(BeaconError::ParseError("execution_optimistic header is unchecked".into()));
+    }
+    let message = wire.data.header.message;
+    let header = eth_types::BeaconBlockHeader {
+        slot: parse_u64_decimal(&message.slot, "slot")?,
+        proposer_index: parse_u64_decimal(&message.proposer_index, "proposer_index")?,
+        parent_root: parse_root_hex(&message.parent_root, "parent_root")?,
+        state_root: parse_root_hex(&message.state_root, "state_root")?,
+        body_root: parse_root_hex(&message.body_root, "body_root")?,
+    };
+    let root = parse_root_hex(&wire.data.root, "root")?;
+    let computed = header.tree_hash_root();
+    if computed.as_slice() != root {
+        return Err(BeaconError::ParseError(
+            "beacon header root does not match hash_tree_root(message)".into(),
+        ));
+    }
+    Ok(BlockHeaderSummary {
+        root,
+        slot: header.slot,
+        proposer_index: header.proposer_index,
+        parent_root: header.parent_root,
+    })
+}
+
+fn parse_u64_decimal(text: &str, field: &str) -> Result<u64, BeaconError> {
+    text.parse::<u64>()
+        .map_err(|_| BeaconError::ParseError(format!("beacon header {field} is not a u64")))
+}
+
+fn parse_root_hex(text: &str, field: &str) -> Result<[u8; 32], BeaconError> {
+    let hex_str = text.strip_prefix("0x").unwrap_or(text);
+    if hex_str.len() != 64 {
+        return Err(BeaconError::ParseError(format!("beacon header {field} must be 32 bytes")));
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index.checked_mul(2).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        let end = start.checked_add(2).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        let digits = hex_str.get(start..end).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        *byte = u8::from_str_radix(digits, 16)
+            .map_err(|_| BeaconError::ParseError(format!("beacon header {field} is not hex")))?;
+    }
+    Ok(out)
+}
+
+/// Parse JSON and reject a repeated object key.
+///
+/// One serde pass builds the value. A key is the string JSON defines: UTF-8,
+/// with `\u` escapes and surrogate pairs decoded. A second key that decodes to
+/// the same string is `duplicate JSON key`. Invalid UTF-8 and a lone surrogate
+/// are serde errors. Nesting stops at serde_json's recursion limit. `bytes` is
+/// the produce body, already capped by `read_body_capped`.
+fn parse_json_rejecting_duplicate_keys(
+    bytes: &[u8],
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = DeserializeSeed::deserialize(DuplicateKeySeed, &mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+#[cfg(test)]
+fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), BeaconError> {
+    parse_json_rejecting_duplicate_keys(bytes)
+        .map(|_| ())
+        .map_err(|err| BeaconError::ParseError(err.to_string()))
+}
+
+/// serde visitor that builds a [`serde_json::Value`] and errors on a duplicate key.
+struct DuplicateKeySeed;
+
+impl<'de> DeserializeSeed<'de> for DuplicateKeySeed {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyVisitor)
+    }
+}
+
+struct DuplicateKeyVisitor;
+
+impl<'de> Visitor<'de> for DuplicateKeyVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: DeError>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E: DeError>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E: DeError>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E: DeError>(self, value: f64) -> Result<Self::Value, E> {
+        // Same as `serde_json::Value`: a non-finite number becomes null.
+        // JSON itself does not produce one.
+        Ok(serde_json::Number::from_f64(value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number))
+    }
+
+    fn visit_str<E: DeError>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: DeError>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E: DeError>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        // `size_hint` is not a trust boundary. serde_json does not set one;
+        // a lying hint must not reserve an unbounded buffer.
+        let hint = seq.size_hint().unwrap_or(0).min(1024);
+        let mut out = Vec::with_capacity(hint);
+        while let Some(value) = seq.next_element_seed(DuplicateKeySeed)? {
+            out.push(value);
+        }
+        Ok(serde_json::Value::Array(out))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if out.contains_key(&key) {
+                // Consume the repeated value without retaining it.
+                map.next_value::<IgnoredAny>()?;
+                return Err(DeError::custom("duplicate JSON key"));
+            }
+            let value = map.next_value_seed(DuplicateKeySeed)?;
+            out.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn duplicate_json_keys_are_rejected_before_serde_collapses_them() {
+        let err = reject_duplicate_json_keys(br#"{"a":1,"a":2}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate JSON key"), "{err}");
+        assert!(reject_duplicate_json_keys(br#"{"a":1,"b":2}"#).is_ok());
+        let nested = reject_duplicate_json_keys(br#"{"a":{"b":1,"b":2}}"#).unwrap_err();
+        assert!(nested.to_string().contains("duplicate JSON key"), "{nested}");
+        assert!(reject_duplicate_json_keys(br#"{"a":[1,1]}"#).is_ok());
+        let escaped = reject_duplicate_json_keys(br#"{"a":"q\"","a":1}"#).unwrap_err();
+        assert!(escaped.to_string().contains("duplicate JSON key"), "{escaped}");
+        assert!(reject_duplicate_json_keys(br#"{"\u0061":1,"a":2}"#).is_err());
+        let fixture = include_str!(
+            "../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json"
+        );
+        let wrapped = format!(r#"{{"data":{fixture}}}"#);
+        assert!(reject_duplicate_json_keys(wrapped.as_bytes()).is_ok(), "fixture keys are unique");
+    }
+
+    #[test]
+    fn duplicate_json_key_scan_treats_raw_and_escaped_utf8_as_one_key() {
+        let doc = "{\"\u{00e9}\":1,\"\\u00e9\":2}";
+        let err = reject_duplicate_json_keys(doc.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("duplicate JSON key"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_json_key_scan_keeps_distinct_surrogate_pair_keys() {
+        let doc = r#"{"\uD83D\uDE00":1,"\uD83D\uDE01":2}"#;
+        let value = parse_json_rejecting_duplicate_keys(doc.as_bytes()).expect("distinct emoji");
+        assert_eq!(value.as_object().expect("object").len(), 2);
+
+        // U+00E9 versus the two characters U+00C3 U+00A9. The Latin-1 scan
+        // collapsed the raw UTF-8 key into the second string.
+        let distinct = "{\"\u{00e9}\":1,\"\u{00c3}\u{00a9}\":2}";
+        let value =
+            parse_json_rejecting_duplicate_keys(distinct.as_bytes()).expect("distinct keys");
+        assert_eq!(value.as_object().expect("object").len(), 2);
+    }
+
+    #[test]
+    fn duplicate_json_key_scan_rejects_non_utf8_and_a_lone_surrogate() {
+        let non_utf8 = reject_duplicate_json_keys(b"{\"\xff\":1}").unwrap_err();
+        assert!(
+            !non_utf8.to_string().contains("duplicate JSON key"),
+            "invalid UTF-8 is a decode error, {non_utf8}"
+        );
+        let lone = reject_duplicate_json_keys(br#"{"\uD800":1}"#).unwrap_err();
+        assert!(
+            !lone.to_string().contains("duplicate JSON key"),
+            "a lone surrogate is a decode error, {lone}"
+        );
+    }
+
+    #[test]
+    fn json_control_escapes_match_their_unicode_form_and_stay_distinct() {
+        for (escaped, unicode) in [
+            (r"\b", r"\u0008"),
+            (r"\f", r"\u000c"),
+            (r"\n", r"\u000a"),
+            (r"\r", r"\u000d"),
+            (r"\t", r"\u0009"),
+        ] {
+            let doc = format!(r#"{{"{escaped}":1,"{unicode}":2}}"#);
+            let err = reject_duplicate_json_keys(doc.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("duplicate JSON key"), "{escaped}: {err}");
+        }
+        let distinct = r#"{"\b":1,"\f":2,"\n":3,"\r":4,"\t":5}"#;
+        let value = parse_json_rejecting_duplicate_keys(distinct.as_bytes()).expect("five keys");
+        assert_eq!(value.as_object().expect("object").len(), 5);
+    }
+
+    #[test]
+    fn json_nesting_follows_serde_recursion_limit() {
+        let accepted = nested_json_objects(80);
+        assert!(
+            parse_json_rejecting_duplicate_keys(&accepted).is_ok(),
+            "80 objects is under serde_json's recursion limit"
+        );
+        let err = parse_json_rejecting_duplicate_keys(&nested_json_objects(200)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("recursion limit exceeded"), "{text}");
+        assert!(!text.contains("duplicate JSON key scan exceeded depth"), "{text}");
+    }
+
+    fn nested_json_objects(depth: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(depth * 6 + 1);
+        for _ in 0..depth {
+            out.extend_from_slice(br#"{"k":"#);
+        }
+        out.push(b'0');
+        out.extend(std::iter::repeat_n(b'}', depth));
+        out
+    }
 
     #[test]
     fn test_config_default_values() {
@@ -2292,6 +2733,26 @@ mod tests {
         assert!(!parsed.payload_included);
         assert_eq!(parsed.builder_url, None);
         assert_eq!(parsed.consensus_block_value, None);
+    }
+
+    #[test]
+    fn test_v3_from_non_utf8_consensus_block_value_is_absent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let parsed = ProduceV4Headers::v3_from(&headers);
+        assert_eq!(parsed.consensus_block_value, None);
+        assert!(!parsed.payload_included);
+        assert_eq!(parsed.builder_url, None);
+
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_static("10"),
+        );
+        let parsed = ProduceV4Headers::v3_from(&headers);
+        assert_eq!(parsed.consensus_block_value.as_deref(), Some("10"));
     }
 
     #[test]
@@ -2555,5 +3016,164 @@ mod tests {
             "encoded segment must stay on configured origin: {abs}"
         );
         assert!(!abs.starts_with("http://evil.com"), "must not takeover origin: {abs}");
+    }
+
+    fn external_slot() -> String {
+        eth_types::EXTERNAL_BEACON_BLOCK_HEADER_SLOT.to_string()
+    }
+
+    /// JSON header. `optimistic == None` omits the flag. `body_root` is omitted
+    /// when `include_body_root` is false.
+    fn external_header_json(
+        optimistic: Option<bool>,
+        root_hex: &str,
+        slot: &str,
+        include_body_root: bool,
+    ) -> String {
+        let flag = match optimistic {
+            Some(value) => format!(r#""execution_optimistic":{value},"#),
+            None => String::new(),
+        };
+        let body_field = if include_body_root {
+            format!(r#","body_root":"0x{}""#, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX)
+        } else {
+            String::new()
+        };
+        format!(
+            r#"{{{flag}"finalized":false,"data":{{"root":"0x{root_hex}","canonical":true,"header":{{"message":{{"slot":"{slot}","proposer_index":"{}","parent_root":"0x{}","state_root":"0x{}"{body_field}}},"signature":"0x00"}}}}}}"#,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
+        )
+    }
+
+    async fn fetch_header(body: &str, block_id: &str) -> Result<BlockHeaderSummary, BeaconError> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/headers/{block_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(server.uri()).with_max_retries(0))
+            .expect("client");
+        client.get_block_header(block_id).await
+    }
+
+    #[tokio::test]
+    async fn get_block_header_rejects_a_header_whose_hash_differs() {
+        let slot = external_slot();
+        let mut wrong = eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX.to_string();
+        let last = wrong.pop().expect("root hex");
+        wrong.push(if last == '2' { '3' } else { '2' });
+        assert_ne!(wrong, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX);
+        let body = external_header_json(Some(false), &wrong, &slot, true);
+        let err = fetch_header(&body, &slot).await.expect_err("root must be hash_tree_root");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("hash_tree_root"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_header_treats_an_optimistic_header_as_unchecked() {
+        let slot = external_slot();
+        let body = external_header_json(
+            Some(true),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let err = fetch_header(&body, &slot).await.expect_err("optimistic header is unchecked");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("execution_optimistic"), "{message}");
+                assert!(message.contains("unchecked"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_header_accepts_the_external_vector_when_the_flag_is_false() {
+        let slot = external_slot();
+        let body = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let header = fetch_header(&body, &slot).await.expect("consistent header");
+        assert_eq!(hex::encode(header.root), eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX);
+        assert_eq!(header.slot, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_SLOT);
+        assert_eq!(header.proposer_index, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX);
+        assert_eq!(
+            hex::encode(header.parent_root),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        );
+    }
+
+    #[tokio::test]
+    async fn get_block_header_rejects_an_absent_optimistic_flag_and_a_malformed_message() {
+        let slot = external_slot();
+        let absent = external_header_json(
+            None,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let absent_err = fetch_header(&absent, &slot).await.expect_err("missing flag");
+        match absent_err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("execution_optimistic"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+
+        let malformed = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            false,
+        );
+        let malformed_err = fetch_header(&malformed, &slot).await.expect_err("missing body_root");
+        assert!(matches!(malformed_err, BeaconError::ParseError(_)), "{malformed_err:?}");
+
+        let bad_slot = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            "nope",
+            true,
+        );
+        let bad_slot_err = fetch_header(&bad_slot, "nope").await.expect_err("slot");
+        assert!(matches!(bad_slot_err, BeaconError::ParseError(_)), "{bad_slot_err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_block_header_drops_a_string_optimistic_flag_from_the_error() {
+        let slot = external_slot();
+        let marker = "SENTINEL_OPTIMISTIC_VALUE_MUST_NOT_LEAK";
+        let leaked = marker.repeat(40);
+        let body = format!(
+            r#"{{"execution_optimistic":"{leaked}","finalized":false,"data":{{"root":"0x{}","canonical":true,"header":{{"message":{{"slot":"{slot}","proposer_index":"{}","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX,
+        );
+        let err = fetch_header(&body, &slot).await.expect_err("string flag");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(!message.contains(marker), "{message}");
+                assert!(message.len() < 240, "{message}");
+                assert!(message.contains("execution_optimistic"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
     }
 }

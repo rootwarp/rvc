@@ -11,6 +11,14 @@
 //! cargo run -p rvc-architecture-tests --bin generate-architecture-md
 //! ```
 
+mod rust_source;
+
+pub use rust_source::{
+    byte_in_code, enclosing_item, ident_boundary_before, is_rust_ws, mask_comments_and_strings,
+    mask_cooked_string, non_code_spans, try_mask_char_literal, try_mask_raw_string, ItemId,
+    ItemSpan, ResolveError, SourceItems,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;

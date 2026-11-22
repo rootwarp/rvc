@@ -105,7 +105,6 @@ fn disabled_per_slot_logging_is_zero_alloc() {
         tracing::debug!(slot = 1000u64, "No duties for slot");
         tracing::debug!(slot = 1000u64, wait_ms = 4000u128, "Waiting for attestation time");
         tracing::debug!(slot = 1000u64, wait_ms = 8000u128, "Waiting for 2/3 slot time");
-        tracing::debug!(jitter_secs = 3u64, "Delaying builder registration with jitter");
         tracing::debug!(
             slot = 1000u64,
             epoch = 31u64,

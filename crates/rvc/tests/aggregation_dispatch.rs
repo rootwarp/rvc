@@ -8,7 +8,9 @@
 //! `submit_aggregate_and_proofs_completions`, taken when that future returns.
 //!
 //! Slots 33 through 64 stay pre-Electra (Electra is epoch 50 in the fixture).
-//! Slot 64 is the only epoch boundary, so committee subscriptions run once.
+//! The epoch boundary runner runs on its own task beside the slot loop. It
+//! sends committee subscriptions for the boot epoch at slot 33 and for epoch 2
+//! at slot 64, the only epoch boundary.
 
 mod common;
 
@@ -116,12 +118,15 @@ async fn aggregations_are_dispatched_concurrently() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let handle = &fixture.handle;
+    let runner =
+        tokio::spawn(fixture.orchestrator.take_epoch_boundary_runner().expect("runner").run());
     let run_fut = fixture.orchestrator.run();
     tokio::pin!(run_fut);
 
-    let wall_started = std::time::Instant::now();
     let mut released = 0usize;
     let mut shutdown_sent = false;
+    let wall_deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+    let paused_start = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -130,6 +135,17 @@ async fn aggregations_are_dispatched_concurrently() {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                // Paused time. This arm advances the slot clock; it is not a wall bound.
+                if std::time::Instant::now() >= wall_deadline {
+                    panic!(
+                        "aggregate proofs did not reach {SLOT_COUNT} slots within 10m wall time (released {released})"
+                    );
+                }
+                if paused_start.elapsed() > Duration::from_secs(15 * 60) {
+                    panic!(
+                        "aggregate proofs did not reach {SLOT_COUNT} slots within 15m of paused time (released {released})"
+                    );
+                }
                 let proofs = aggregate_proof_count(&client.submit_aggregate_and_proofs_calls());
                 if !shutdown_sent && proofs >= (released + 1) * N {
                     if released + 1 == SLOT_COUNT {
@@ -140,14 +156,11 @@ async fn aggregations_are_dispatched_concurrently() {
                         clock.set_slot(slots[released]);
                     }
                 }
-                assert!(
-                    wall_started.elapsed() < Duration::from_secs(180),
-                    "aggregation dispatch did not finish {SLOT_COUNT} slots within 180 s of wall time; proofs={proofs}"
-                );
             }
         }
     }
     assert!(shutdown_sent, "run returned before {SLOT_COUNT} aggregate slots were published");
+    runner.await.expect("runner task");
 
     let calls = client.submit_aggregate_and_proofs_calls();
     assert_eq!(

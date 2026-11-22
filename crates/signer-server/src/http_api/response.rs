@@ -322,6 +322,7 @@ mod tests {
     fn every_gate_error() -> Vec<SigningGateError> {
         vec![
             SigningGateError::BlockedByDoppelganger,
+            SigningGateError::BeaconAdmissionRevoked,
             SigningGateError::SlashingBlocked(SlashingError::SlashableBlock(
                 BlockSlashingViolation::DoubleBlockProposal { slot: 42 },
             )),
@@ -372,6 +373,7 @@ mod tests {
     fn clone_gate_err(err: &SigningGateError) -> SigningGateError {
         match err {
             SigningGateError::BlockedByDoppelganger => SigningGateError::BlockedByDoppelganger,
+            SigningGateError::BeaconAdmissionRevoked => SigningGateError::BeaconAdmissionRevoked,
             SigningGateError::SlashingBlocked(inner) => {
                 SigningGateError::SlashingBlocked(match inner {
                     SlashingError::SlashableBlock(

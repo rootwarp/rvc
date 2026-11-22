@@ -38,6 +38,11 @@ keystore_path = "./keystores"
 # Block graffiti included in proposed blocks (optional, max 32 bytes)
 # graffiti = "rvc"
 
+# Readable fee-recipient mismatch on produceBlockV3. `sign` (default) still
+# signs the best remaining block and logs a warning. `reject` drops it. A
+# missing or unreadable fee on a full Bellatrix+ block is always rejected.
+# fee_recipient_policy = "sign"
+
 # ---------------------------------------------------------------------------
 # Slashing Protection
 # ---------------------------------------------------------------------------
@@ -137,5 +142,8 @@ log_level = "info"
 # tracing_service_name = "rvc"
 
 # GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
-# Uses Application Default Credentials (ADC) — no endpoint needed.
+# Sends OTLP to the Telemetry API (https://telemetry.googleapis.com/v1/traces)
+# with Application Default Credentials (ADC). tracing_endpoint is ignored.
+# Enable telemetry.googleapis.com and keep cloudtrace.googleapis.com enabled.
+# For the IAM roles and the quota project, see docs/running-guide.md.
 # On shutdown, pending spans are flushed with a 5-second timeout.

@@ -28,9 +28,9 @@ use beacon::{
     ProposerDutiesResponse, ProposerDuty, ProposerPreparation, PtcDutiesResponse,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    SyncCommitteeMessage, SyncCommitteeSubscription, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
@@ -155,6 +155,13 @@ impl NodeStatusApi for DutyStallBeacon {
     ) -> Result<beacon::GenesisResponse, BeaconError> {
         beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
     }
+    async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError> {
+        beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+            .map(|_| ())
+    }
     async fn get_config_spec(&self) -> Result<beacon::ConfigSpecResponse, BeaconError> {
         self.inner.get_config_spec().await
     }
@@ -172,6 +179,20 @@ impl NodeStatusApi for DutyStallBeacon {
         block_id: &str,
     ) -> Result<beacon::BlockRootResponse, BeaconError> {
         self.inner.get_block_root(block_id).await
+    }
+    async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<beacon::BlockHeaderSummary, BeaconError> {
+        self.inner.get_block_header(block_id).await
+    }
+    async fn get_block_header_checked(
+        &self,
+        block_id: &str,
+        proposal_slot: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<bn_manager::CheckedHeader, BeaconError> {
+        self.inner.get_block_header_checked(block_id, proposal_slot, deadline).await
     }
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.inner.get_node_syncing().await
@@ -314,6 +335,54 @@ impl BlockProducer for DutyStallBeacon {
     ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
         self.inner.submit_builder_preferences(entries).await
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: bn_manager::ProduceDuty,
+    ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<bn_manager::ProduceDuty>,
+    ) -> Result<Vec<beacon::RankedBlock>, beacon::BeaconError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![beacon::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<bn_manager::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<beacon::RankedBlock>, beacon::BeaconError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &beacon::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
 }
 
 #[async_trait]
@@ -353,6 +422,12 @@ impl AttestationApi for DutyStallBeacon {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.inner.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+    async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.inner.submit_sync_committee_subscriptions(subscriptions).await
     }
 }
 
@@ -462,6 +537,7 @@ impl BeaconBlockClient for TrackingBlockBeacon {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         })
     }
 
@@ -519,6 +595,54 @@ impl BeaconBlockClient for TrackingBlockBeacon {
         _broadcast_validation: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         Ok(())
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<block_service::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
 }
 
@@ -588,7 +712,8 @@ fn build_duty_stall_beacon(
         })
         .with_post_sync_committee_duties(move |_epoch, _indices| Ok(empty_sync_response()))
         .with_prepare_beacon_proposer(|_p| Ok(()))
-        .with_submit_beacon_committee_subscriptions(|_s| Ok(()));
+        .with_submit_beacon_committee_subscriptions(|_s| Ok(()))
+        .with_submit_sync_committee_subscriptions(|_s| Ok(()));
 
     DutyStallBeacon { inner, stalls }
 }
@@ -602,7 +727,7 @@ fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         bellatrix_fork_version: [0, 0, 0, 3],
         capella_fork_epoch: 30,
         capella_fork_version: [0, 0, 0, 4],
-        deneb_fork_epoch: 40,
+        deneb_fork_epoch: 0,
         deneb_fork_version: [0, 0, 0, 5],
         electra_fork_epoch: 50,
         electra_fork_version: [0, 0, 0, 6],

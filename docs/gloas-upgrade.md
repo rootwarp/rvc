@@ -27,8 +27,13 @@ under the table fail startup and name the key.
 The BN half is `/eth/v1/config/spec` keys `GLOAS_FORK_EPOCH` /
 `GLOAS_FORK_VERSION`, parsed by `parse_fork_schedule`
 (`crates/beacon/src/types.rs`). A missing BN key uses the unscheduled sentinels
-`u64::MAX` / `[0xFF; 4]`. A present but malformed value is a parse error that
-names that key.
+`u64::MAX` / `[0xFF; 4]`. A scheduled `GLOAS_FORK_EPOCH` with no
+`GLOAS_FORK_VERSION` is a parse error. A present but malformed value is a parse
+error that names that key.
+
+rvc loads the BN fork schedule one time, at boot. When the BNs start to
+schedule Gloas, a running rvc revokes them. Upgrade all the BNs, set this
+table, and then restart rvc.
 
 Startup reconciles the two sources (`crates/rvc/src/startup.rs`
 `reconcile_gloas_fork_schedule`, applied from `crates/rvc/src/bootstrap/services.rs`):

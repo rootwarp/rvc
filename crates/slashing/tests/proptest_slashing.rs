@@ -11,7 +11,7 @@ mod common;
 
 use common::{stage_and_commit_attestation, stage_and_commit_block};
 use proptest::prelude::*;
-use rvc_slashing::{SlashingDb, SlashingError};
+use rvc_slashing::{AttestationSlashingViolation, SlashingDb, SlashingError};
 
 /// Zero GVR for signing-path checks (matches the historical harness).
 const SIGN_GVR: &[u8; 32] = &[0u8; 32];
@@ -96,11 +96,13 @@ proptest! {
 proptest! {
     #![proptest_config(config())]
 
+    // Targets stay above both sources: source > target is refused before
+    // the double-vote rule runs (W4-S2).
     #[test]
     fn proptest_no_double_votes(
         source_a in 0u64..50_000,
         source_b in 0u64..50_000,
-        target in 1u64..100_000,
+        target in 50_000u64..100_000,
         root_a in signing_root_strategy(),
         root_b in signing_root_strategy(),
     ) {
@@ -439,6 +441,189 @@ proptest! {
                     "att target T={t} <= W={w} must be BelowAttestationWatermark, got {result:?}",
                 );
             }
+        }
+    }
+}
+
+fn near_i64_max() -> impl Strategy<Value = u64> {
+    (i64::MAX as u64 - 64)..=(i64::MAX as u64 + 64)
+}
+
+fn no_surround(rows: &[(u64, u64)]) {
+    for (s_i, t_i) in rows {
+        for (s_j, t_j) in rows {
+            assert!(
+                !(*s_i < *s_j && *t_i > *t_j),
+                "surround detected: ({s_i}, {t_i}) surrounds ({s_j}, {t_j})"
+            );
+        }
+    }
+}
+
+// Values within 64 of `i64::MAX` keep no-double and no-surround.
+// Values above `i64::MAX` are refused and write no row. An in-range source
+// above its target is refused and writes no row (W4-S2).
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn proptest_near_i64_max_keeps_no_double_no_surround_and_refuses_above(
+        slot in near_i64_max(),
+        source in near_i64_max(),
+        target in near_i64_max(),
+        root_a in signing_root_strategy(),
+        root_b in signing_root_strategy(),
+    ) {
+        let limit = i64::MAX as u64;
+        let db = SlashingDb::open_in_memory().unwrap();
+        let pk = pubkey(1);
+
+        if slot > limit {
+            let err = db.reserve_block(&pk, slot, root_a.clone(), SIGN_GVR).unwrap_err();
+            prop_assert!(
+                matches!(err, SlashingError::OutOfRange { field: "slot", value } if value == slot),
+                "slot {slot} must be OutOfRange, got {err:?}"
+            );
+            prop_assert!(db.get_blocks(&pk).unwrap().is_empty(), "refused slot must write no row");
+        } else {
+            let first = db.reserve_block(&pk, slot, root_a.clone(), SIGN_GVR);
+            prop_assert!(
+                first.is_ok(),
+                "in-range slot {slot} must be accepted: {:?}",
+                first.as_ref().err()
+            );
+            let blocks = db.get_blocks(&pk).unwrap();
+            prop_assert_eq!(blocks.len(), 1);
+            prop_assert_eq!(blocks[0].slot, slot);
+            let second = db.reserve_block(&pk, slot, root_b.clone(), SIGN_GVR);
+            if root_a == root_b {
+                prop_assert!(second.is_ok(), "same root must re-sign: {:?}", second.as_ref().err());
+            } else {
+                prop_assert!(second.is_err(), "different root at slot {slot} must be refused");
+            }
+            prop_assert_eq!(db.get_blocks(&pk).unwrap().len(), 1, "no double proposal row");
+        }
+
+        let db = SlashingDb::open_in_memory().unwrap();
+        if source > limit {
+            let err = db
+                .reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR)
+                .unwrap_err();
+            prop_assert!(
+                matches!(
+                    err,
+                    SlashingError::OutOfRange { field: "source_epoch", value } if value == source
+                ),
+                "source {source} must be OutOfRange before target, got {err:?}"
+            );
+            prop_assert!(db.get_attestations(&pk).unwrap().is_empty());
+        } else if target > limit {
+            let err = db
+                .reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR)
+                .unwrap_err();
+            prop_assert!(
+                matches!(
+                    err,
+                    SlashingError::OutOfRange { field: "target_epoch", value } if value == target
+                ),
+                "target {target} must be OutOfRange, got {err:?}"
+            );
+            prop_assert!(db.get_attestations(&pk).unwrap().is_empty());
+        } else if source > target {
+            let err = db
+                .reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR)
+                .unwrap_err();
+            prop_assert!(
+                matches!(
+                    err,
+                    SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::SourceExceedsTarget {
+                            source_epoch,
+                            target_epoch,
+                        }
+                    ) if source_epoch == source && target_epoch == target
+                ),
+                "({source}, {target}) must be SourceExceedsTarget, got {err:?}"
+            );
+            prop_assert!(db.get_attestations(&pk).unwrap().is_empty());
+        } else {
+            let first = db.reserve_attestation(&pk, source, target, root_a.clone(), SIGN_GVR);
+            prop_assert!(
+                first.is_ok(),
+                "in-range ({source}, {target}) must be accepted: {:?}",
+                first.as_ref().err()
+            );
+            let rows = db.get_attestations(&pk).unwrap();
+            prop_assert_eq!(rows.len(), 1);
+            prop_assert_eq!(rows[0].source_epoch, source);
+            prop_assert_eq!(rows[0].target_epoch, target);
+
+            let second = db.reserve_attestation(&pk, source, target, root_b.clone(), SIGN_GVR);
+            if root_a == root_b {
+                prop_assert!(second.is_ok(), "same root must re-sign: {:?}", second.as_ref().err());
+            } else {
+                prop_assert!(second.is_err(), "different root at target {target} must be refused");
+            }
+            prop_assert_eq!(db.get_attestations(&pk).unwrap().len(), 1, "no double vote row");
+
+            if source > 0 {
+                let surround_target = target.saturating_add(1);
+                let before = db.get_attestations(&pk).unwrap().len();
+                let surround = db.reserve_attestation(
+                    &pk,
+                    source - 1,
+                    surround_target,
+                    Some(hex_root(0)),
+                    SIGN_GVR,
+                );
+                if surround_target > limit {
+                    prop_assert!(
+                        matches!(
+                            surround,
+                            Err(SlashingError::OutOfRange { field: "target_epoch", .. })
+                        ),
+                        "surround target above i64::MAX must be refused, got {surround:?}"
+                    );
+                } else {
+                    prop_assert!(
+                        surround.is_err(),
+                        "({} , {surround_target}) must not surround ({source}, {target})",
+                        source - 1
+                    );
+                    prop_assert!(
+                        !matches!(surround, Err(SlashingError::OutOfRange { .. })),
+                        "in-range surround must be a rule refusal, got {surround:?}"
+                    );
+                }
+                prop_assert_eq!(db.get_attestations(&pk).unwrap().len(), before);
+            }
+
+            // A second target below the stored minimum is `TargetEpochBelowMinimum`,
+            // so the extra in-range row takes the next target above the row already
+            // stored, sourced at the stored target (neither surrounds the other).
+            if target < limit {
+                let extra = db.reserve_attestation(
+                    &pk,
+                    target,
+                    target + 1,
+                    Some("0xnear-extra".into()),
+                    SIGN_GVR,
+                );
+                prop_assert!(
+                    extra.is_ok(),
+                    "non-surrounding ({target}, {}) must be accepted: {:?}",
+                    target + 1,
+                    extra.as_ref().err()
+                );
+            }
+            let stored: Vec<(u64, u64)> = db
+                .get_attestations(&pk)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.source_epoch, row.target_epoch))
+                .collect();
+            prop_assert!(!stored.is_empty(), "an in-range attestation must be stored");
+            no_surround(&stored);
         }
     }
 }

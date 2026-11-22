@@ -60,6 +60,7 @@ async fn test_every_background_task_is_registered_by_name() {
         Arc::new(ValidatorStore::new([0u8; 20], 100)),
         SlashedAction::DisableOnly,
         &executor,
+        12_000,
     );
 
     let names = executor.registered_names();
@@ -101,6 +102,7 @@ async fn test_disabled_slashing_monitor_registers_no_task() {
         Arc::new(ValidatorStore::new([0u8; 20], 100)),
         SlashedAction::None,
         &executor,
+        12_000,
     );
 
     assert!(executor.registered_names().is_empty(), "disabled slashing must register no task");

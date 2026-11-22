@@ -1,25 +1,52 @@
 //! Top-level `--graffiti` applied by [`rvc::config::ServiceBuilder::build_validator_store`].
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, ProduceBlockResponse};
 use crypto::SecretKey;
 use eth_types::{decode_beacon_block_body_electra, BeaconBlock, ForkSchedule, SignedBeaconBlock};
 use keymanager_api::traits::ValidatorConfigManager;
 use rvc::beacon_adapter::BeaconBlockAdapter;
-use rvc::config::{Config, ServiceBuilder};
+use rvc::config::{BlockSelectionMode, Config, ServiceBuilder};
 use rvc::keymanager_adapters::ValidatorConfigManagerAdapter;
 use signer::StubValidatorSigner;
 use tempfile::TempDir;
 use validator_store::{parse_graffiti, DefaultUpdate, ValidatorStore};
+
+fn store_log_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn fee_recipient_toml(extra: &str) -> String {
     let fr = format!("0x{}", hex::encode([0xaau8; 20]));
     format!("[defaults]\nfee_recipient = \"{fr}\"\n{extra}")
 }
 
+fn build_store_with(
+    graffiti: Option<&str>,
+    toml_body: &str,
+    mode: BlockSelectionMode,
+    builders: Vec<String>,
+) -> (TempDir, Arc<ValidatorStore>) {
+    tracing::callsite::rebuild_interest_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("validators.toml");
+    std::fs::write(&path, toml_body).expect("write validators.toml");
+    let mut config = Config { graffiti: graffiti.map(str::to_string), ..Config::default() };
+    config.block_selection_mode = mode;
+    config.builder.builders = builders;
+    let store =
+        ServiceBuilder::new(config).build_validator_store(Some(&path)).expect("validator store");
+    (dir, store)
+}
+
 fn build_store(graffiti: Option<&str>, toml_body: &str) -> (TempDir, Arc<ValidatorStore>) {
+    // The "Created validator store" callsite is cached for the process. A
+    // sibling test that logs it with no subscriber disables it for everyone.
+    let _log = store_log_lock().lock().expect("store log");
+    tracing::callsite::rebuild_interest_cache();
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("validators.toml");
     std::fs::write(&path, toml_body).expect("write validators.toml");
@@ -67,6 +94,7 @@ fn echoing_beacon() -> (MockBeaconNodeClient, Arc<Mutex<Vec<SignedBeaconBlock>>>
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         })
         .with_publish_block(move |block, _version, _url| {
@@ -125,7 +153,7 @@ async fn top_level_graffiti_reaches_a_produced_block() {
     let beacon: Arc<dyn BeaconNodeClient> = Arc::new(client);
     let service = block_service::BlockService::new(
         Arc::new(StubValidatorSigner::new()),
-        Arc::new(BeaconBlockAdapter(beacon)),
+        Arc::new(BeaconBlockAdapter::new(beacon)),
         store,
         Arc::new(ForkSchedule::unscheduled_gloas()),
         [0xaa; 32],
@@ -200,4 +228,113 @@ fn absent_graffiti_leaves_defaults_untouched() {
 
     let (_dir, without) = build_store(None, &fee_recipient_toml(""));
     assert!(without.effective_graffiti(&pk).is_none());
+}
+
+fn validator_row(byte: u8, extra: &str) -> String {
+    let pk = format!("0x{}", hex::encode([byte; 48]));
+    format!("[[validators]]\npubkey = \"{pk}\"\n{extra}\n")
+}
+
+fn capture_startup(body: impl FnOnce()) -> String {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = Arc::clone(&buf);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || LogBuf(Arc::clone(&writer)))
+        .finish();
+    let _log = store_log_lock().lock().expect("store log");
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        body();
+    });
+    let logged = String::from_utf8(buf.lock().expect("log buf").clone()).expect("utf8 log");
+    logged
+}
+
+fn builder_only_warns(logged: &str) -> Vec<&str> {
+    logged.lines().filter(|line| line.contains("builder_only_without_builder")).collect()
+}
+
+/// Builder-only without `builder_proposals` warns once per key and does not boot-fail.
+#[test]
+fn startup_warns_for_a_builder_only_key_that_is_not_builder_enabled() {
+    let toml = fee_recipient_toml(&format!(
+        "{}\n{}\n{}",
+        validator_row(0x11, "block_selection_mode = \"builder-only\"\nbuilder_proposals = false"),
+        validator_row(0x22, "block_selection_mode = \"builder-only\""),
+        validator_row(0x33, "block_selection_mode = \"max-profit\"\nbuilder_proposals = true"),
+    ));
+    let logged = capture_startup(|| {
+        let (_dir, store) =
+            build_store_with(None, &toml, BlockSelectionMode::MaxProfit, Vec::new());
+        assert!(store.is_builder_enabled(&[0x33; 48]));
+        assert!(!store.is_builder_enabled(&[0x11; 48]));
+        assert_eq!(
+            store.effective_block_selection_mode(&[0x11; 48]),
+            BlockSelectionMode::BuilderOnly
+        );
+    });
+    let warns = builder_only_warns(&logged);
+    assert_eq!(warns.len(), 2, "one WARN per BuilderOnly key that is not enabled: {logged}");
+    assert!(warns.iter().all(|line| line.contains("WARN")), "{logged}");
+    assert!(warns.iter().all(|line| line.contains("builder_enabled=false")), "{logged}");
+    assert!(!logged.contains("0x3333333333"), "max-profit key must not be warned: {logged}");
+    assert!(!logged.contains(&hex::encode([0x11u8; 48])), "full pubkey: {logged}");
+    assert!(!logged.contains(&hex::encode([0x22u8; 48])), "full pubkey: {logged}");
+    assert!(!logged.contains(&hex::encode([0xaau8; 20])), "fee recipient: {logged}");
+}
+
+/// Builder-only with an empty Gloas builder list warns, even when the flag is on.
+#[test]
+fn startup_warns_for_builder_only_with_no_gloas_builders() {
+    let toml = fee_recipient_toml(&validator_row(0x44, "builder_proposals = true"));
+    let logged = capture_startup(|| {
+        let (_dir, store) =
+            build_store_with(None, &toml, BlockSelectionMode::BuilderOnly, Vec::new());
+        assert!(store.is_builder_enabled(&[0x44; 48]));
+        assert!(store.builders(&[0x44; 48]).is_empty());
+        let (_dir, ready) = build_store_with(
+            None,
+            &toml,
+            BlockSelectionMode::BuilderOnly,
+            vec!["https://relay.example".to_string()],
+        );
+        assert_eq!(ready.builders(&[0x44; 48]), vec!["https://relay.example".to_string()]);
+    });
+    let warns = builder_only_warns(&logged);
+    assert_eq!(warns.len(), 1, "{logged}");
+    assert!(warns[0].contains("WARN"), "{logged}");
+    assert!(warns[0].contains("builder_enabled=true"), "{logged}");
+    assert!(warns[0].contains("gloas_builders=0"), "{logged}");
+    assert!(!logged.contains("https://relay.example"), "relay URL: {logged}");
+    assert!(!logged.contains(&hex::encode([0x44u8; 48])), "full pubkey: {logged}");
+    assert!(!logged.contains(&hex::encode([0xaau8; 20])), "fee recipient: {logged}");
+}
+
+/// Flag off still warns when a Gloas builder URL is configured.
+///
+/// Warning only on an empty builder list would miss this key.
+#[test]
+fn startup_warns_for_builder_only_with_the_flag_off_and_gloas_builders_present() {
+    let toml = fee_recipient_toml(&validator_row(
+        0x55,
+        "block_selection_mode = \"builder-only\"\nbuilder_proposals = false",
+    ));
+    let logged = capture_startup(|| {
+        let (_dir, store) = build_store_with(
+            None,
+            &toml,
+            BlockSelectionMode::MaxProfit,
+            vec!["https://relay.example".to_string()],
+        );
+        assert!(!store.is_builder_enabled(&[0x55; 48]));
+        assert_eq!(store.builders(&[0x55; 48]), vec!["https://relay.example".to_string()]);
+    });
+    let warns = builder_only_warns(&logged);
+    assert_eq!(warns.len(), 1, "{logged}");
+    assert!(warns[0].contains("builder_enabled=false"), "{logged}");
+    assert!(warns[0].contains("gloas_builders=1"), "{logged}");
+    assert!(!logged.contains("https://relay.example"), "relay URL: {logged}");
+    assert!(!logged.contains(&hex::encode([0x55u8; 48])), "full pubkey: {logged}");
 }

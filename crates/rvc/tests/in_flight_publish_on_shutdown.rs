@@ -28,7 +28,8 @@ use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
 };
 use bn_manager::{
-    AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, OperationTimeouts, Propagator,
+    AttestationSubmitter, BeaconNodeClient, BlockProducer, MockBeaconNodeClient, OperationTimeouts,
+    Propagator,
 };
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use duty_tracker::DutyTracker;
@@ -101,6 +102,7 @@ impl BeaconBlockClient for BarrierBlockBeacon {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         })
     }
 
@@ -178,6 +180,54 @@ impl BeaconBlockClient for BarrierBlockBeacon {
     ) -> Result<(), BlockServiceError> {
         Ok(())
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: block_service::ProduceDuty,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<block_service::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &block_service::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
 }
 
 // ── noop submitter ───────────────────────────────────────────────────────────
@@ -205,7 +255,7 @@ fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         bellatrix_fork_version: [0, 0, 0, 3],
         capella_fork_epoch: 30,
         capella_fork_version: [0, 0, 0, 4],
-        deneb_fork_epoch: 40,
+        deneb_fork_epoch: 0,
         deneb_fork_version: [0, 0, 0, 5],
         electra_fork_epoch: 50,
         electra_fork_version: [0, 0, 0, 6],
@@ -501,4 +551,165 @@ async fn test_second_sigint_during_drain_does_not_bypass_tier_order() {
     };
 
     tokio::time::timeout(Duration::from_secs(5), body).await.expect("tier-order test timed out");
+}
+
+/// Read one HTTP/1.1 request, including a Content-Length body.
+async fn read_http_request(sock: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if buf.len() > 65_536 {
+                break;
+            }
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let mut len = 0usize;
+        for line in headers.lines() {
+            let Some((name, value)) = line.split_once(':') else { continue };
+            if name.eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let need = header_end + 4 + len;
+        while buf.len() < need {
+            let n = sock.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// One-shot HTTP server. `hold` waits after the request is read and before 200.
+async fn serve_once(
+    hold: Option<Arc<Notify>>,
+    release: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        if read_http_request(&mut sock).await.is_err() {
+            return;
+        }
+        entered.store(true, Ordering::SeqCst);
+        if let Some(hold) = hold {
+            loop {
+                let notified = hold.notified();
+                tokio::pin!(notified);
+                if release.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        if tokio::io::AsyncWriteExt::write_all(&mut sock, response).await.is_ok() {
+            finished.store(true, Ordering::SeqCst);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A detached publish to a slow beacon node finishes before shutdown returns.
+///
+/// The fast node returns first-OK. The slow node is still in the detached
+/// drain. The waiter registered after the orchestrator tier joins that drain,
+/// bounded by `block_publication`.
+#[tokio::test]
+async fn test_detached_broadcast_to_slow_bn_finishes_before_shutdown() {
+    let body = async {
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+        let fast_entered = Arc::new(AtomicBool::new(false));
+        let fast_finished = Arc::new(AtomicBool::new(false));
+        let slow_entered = Arc::new(AtomicBool::new(false));
+        let slow_finished = Arc::new(AtomicBool::new(false));
+        let fast = serve_once(
+            None,
+            Arc::clone(&release),
+            Arc::clone(&fast_entered),
+            Arc::clone(&fast_finished),
+        )
+        .await;
+        let slow = serve_once(
+            Some(Arc::clone(&wake)),
+            Arc::clone(&release),
+            Arc::clone(&slow_entered),
+            Arc::clone(&slow_finished),
+        )
+        .await;
+
+        let timeouts = OperationTimeouts {
+            preparation: Duration::from_secs(8),
+            ..OperationTimeouts::default()
+        };
+        let manager = Arc::new(
+            bn_manager::BnManager::new(bn_manager::BnManagerConfig::new(vec![fast, slow]))
+                .expect("manager")
+                .with_operation_timeouts(timeouts),
+        );
+
+        let block_publication = Duration::from_secs(3);
+        let token = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(token);
+        let drains = Arc::clone(&manager);
+        executor.set_after_orchestrator_waiter(async move {
+            drains.wait_for_broadcast_drains(block_publication).await;
+        });
+
+        BlockProducer::prepare_beacon_proposer(manager.as_ref(), &[])
+            .await
+            .expect("fast beacon node accepts the broadcast");
+        let wall = std::time::Instant::now() + Duration::from_secs(5);
+        while !slow_entered.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < wall, "the slow beacon node never saw the publish");
+            tokio::task::yield_now().await;
+        }
+        assert!(fast_finished.load(Ordering::SeqCst), "the fast beacon node returned 200");
+        assert!(!slow_finished.load(Ordering::SeqCst), "the slow publish is still detached");
+
+        let shutdown = tokio::spawn(async move {
+            executor
+                .shutdown(TierBudget::new([
+                    Duration::from_millis(200),
+                    Duration::from_millis(200),
+                    Duration::from_millis(200),
+                    Duration::from_millis(200),
+                ]))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!shutdown.is_finished(), "shutdown must wait for the detached publish");
+        assert!(!slow_finished.load(Ordering::SeqCst));
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("shutdown exceeded block_publication")
+            .expect("shutdown task");
+        assert!(
+            slow_finished.load(Ordering::SeqCst),
+            "the slow publish must finish before shutdown returns"
+        );
+        assert!(outcome.aborted.is_empty(), "no tier task was aborted: {:?}", outcome.aborted);
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), body)
+        .await
+        .expect("detached broadcast shutdown test timed out");
 }

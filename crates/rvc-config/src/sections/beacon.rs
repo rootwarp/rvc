@@ -91,7 +91,7 @@ impl BeaconArgs {
 /// `bn_sync_tolerances` is TOML-only. `beacon_nodes_config` stays on the rvc
 /// wire wrapper because it names `BnRole`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BeaconConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

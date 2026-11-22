@@ -23,7 +23,7 @@
 //! | `OrchestratorConfig` timeouts | produce+publish timeout envelope |
 //!
 //! Call site today is a single phase in the slot loop
-//! (`maybe_propose_block(slot, epoch, &ctx)`). A service would expose that same
+//! (`maybe_propose_block(slot, epoch, &ctx, proposal_deadline)`). A service would expose that same
 //! entry point; the orchestrator would hold `block_proposal: BlockProposalService`
 //! instead of calling an inherent method. Do **not** introduce the service until
 //! a second caller or a test-double seam justifies the plumbing cost.
@@ -38,6 +38,7 @@ use metrics::definitions::{
     RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL, RVC_BUILDER_CONSECUTIVE_MISSES,
     RVC_BUILDER_EPOCH_MISSES,
 };
+use signer::CircuitBreakerState;
 use timing::SlotClock;
 
 use super::coordinator::DutyOrchestrator;
@@ -87,19 +88,26 @@ mod proposal_counter_lock {
     }
 }
 
+/// Sets the builder miss gauges from `breaker`.
+pub(crate) fn publish_circuit_breaker_metrics(breaker: &CircuitBreakerState) {
+    RVC_BUILDER_CONSECUTIVE_MISSES.set(breaker.consecutive_misses() as i64);
+    RVC_BUILDER_EPOCH_MISSES.set(breaker.epoch_misses() as i64);
+}
+
 impl<C, S, B> DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
     B: BeaconBlockClient + 'static,
 {
-    pub(crate) fn update_circuit_breaker_metrics(&self) {
-        RVC_BUILDER_CONSECUTIVE_MISSES.set(self.circuit_breaker.consecutive_misses() as i64);
-        RVC_BUILDER_EPOCH_MISSES.set(self.circuit_breaker.epoch_misses() as i64);
-    }
-
     #[tracing::instrument(name = "orchestrator.maybe_propose_block", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
-    pub(crate) async fn maybe_propose_block(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+    pub(crate) async fn maybe_propose_block(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        proposal_deadline: Option<tokio::time::Instant>,
+    ) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
             None => return,
@@ -130,26 +138,62 @@ where
         // H-4: validator_index was parsed when the proposer duty entered the cache.
         let expected_proposer_index = proposer_duty.validator_index;
 
+        let proposal_closed = self
+            .beacon
+            .duty_fence()
+            .map(|fence| {
+                super::slot_context::admission_blocks(
+                    signer::SigningDuty::RandaoReveal,
+                    &[&fence, &ctx.fence],
+                )
+            })
+            .unwrap_or(true);
+        if proposal_closed {
+            warn!(slot, "skipping block proposal: beacon node admission revoked");
+            return;
+        }
+
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
-        // Wrap with combined produce + publish timeout
+        // The outer timeout is the block-production allowance, and also the
+        // time left in the slot when that is shorter. `proposal_deadline` is
+        // forwarded only into proposer-pool block production. The coordinator
+        // arms it at the slot end before parent capture; this function does
+        // not recompute it. Publication inside the proposal uses its own
+        // budget. Attestation, sync, and aggregate publication are not capped
+        // here; they keep slot end plus 500 ms. When `proposal_deadline` is
+        // set, V3 produce arms its 250 ms backstop at that instant. The cap
+        // is a tokio timeout, with the same poll order as the timeout below:
+        // when the runtime is responsive the wait ends at that instant, and
+        // under scheduler lag a result that is already ready can still be
+        // returned.
+        let remaining =
+            self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(std::time::Duration::ZERO);
+        let allowance = block_proposal_allowance(&self.config.timeouts).min(remaining);
         match tokio::time::timeout(
-            self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block(
+            allowance,
+            self.block_service.propose_block_until(
                 slot,
                 &pubkey,
                 expected_proposer_index,
-                ctx.parent_root,
+                ctx.expected_parents,
+                proposal_deadline,
+                &ctx.fence,
             ),
         )
         .await
         {
             Ok(Ok(result)) => {
-                let was_tripped = self.circuit_breaker.is_tripped();
-                self.circuit_breaker.record_success();
-                self.update_circuit_breaker_metrics();
-                if was_tripped && !self.circuit_breaker.is_tripped() {
-                    info!(slot, "Builder circuit breaker reset after successful proposal");
+                // Only a builder-path publish resets the breaker. A local
+                // success, including a fallback after a blinded failure, says
+                // nothing about the relay.
+                if result.builder_path {
+                    let was_tripped = self.circuit_breaker.is_tripped();
+                    self.circuit_breaker.record_success();
+                    publish_circuit_breaker_metrics(&self.circuit_breaker);
+                    if was_tripped && !self.circuit_breaker.is_tripped() {
+                        info!(slot, "Builder circuit breaker reset after successful proposal");
+                    }
                 }
                 inc_proposal_outcome(proposal_outcome::SUCCESS);
                 info!(
@@ -172,7 +216,7 @@ where
                 if is_builder_failure {
                     let was_tripped = self.circuit_breaker.is_tripped();
                     self.circuit_breaker.record_miss();
-                    self.update_circuit_breaker_metrics();
+                    publish_circuit_breaker_metrics(&self.circuit_breaker);
                     if !was_tripped && self.circuit_breaker.is_tripped() {
                         RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
                         warn!(slot, "Builder circuit breaker tripped");
@@ -195,13 +239,42 @@ where
                 error!(
                     slot,
                     epoch,
-                    "Block proposal timed out after {}s",
-                    (self.config.timeouts.block_production
-                        + self.config.timeouts.block_publication)
-                        .as_secs()
+                    timeout_ms = allowance.as_millis() as u64,
+                    "Block proposal timed out after {}ms",
+                    allowance.as_millis()
                 );
             }
         }
+    }
+}
+
+/// Produce budget, plus the beacon-node backstop, plus publish.
+///
+/// The backstop is the same 250 ms [`bn_manager::BACKSTOP_MARGIN`] that
+/// `produce_block_v3` adds so a block already in hand is not cancelled.
+/// Publication is not asked to absorb that margin.
+fn block_proposal_allowance(timeouts: &bn_manager::OperationTimeouts) -> std::time::Duration {
+    timeouts
+        .block_production
+        .saturating_add(bn_manager::BACKSTOP_MARGIN)
+        .saturating_add(timeouts.block_publication)
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::block_proposal_allowance;
+    use bn_manager::OperationTimeouts;
+
+    #[test]
+    fn proposal_timeout_includes_the_backstop_margin() {
+        let timeouts = OperationTimeouts::default();
+        let allowance = block_proposal_allowance(&timeouts);
+        assert_eq!(bn_manager::BACKSTOP_MARGIN, std::time::Duration::from_millis(250));
+        assert_eq!(
+            allowance,
+            timeouts.block_production + bn_manager::BACKSTOP_MARGIN + timeouts.block_publication
+        );
+        assert!(allowance > timeouts.block_production + timeouts.block_publication);
     }
 }
 

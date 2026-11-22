@@ -34,6 +34,26 @@ pub enum SigningGateError {
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
 
+    /// The caller task's beacon admission refused the duty: a generation in
+    /// its scope moved, or no scope is installed and the missing-scope rule
+    /// refuses (always, in production builds). `VoluntaryExit` is never
+    /// refused for admission.
+    ///
+    /// Returned by the gate's entry check for every other duty, slashable and
+    /// non-slashable, and by the slashable core's checks under the
+    /// per-validator lock and after the slashing reservation, which
+    /// `SignerService` also runs and maps to
+    /// [`crate::SignerError::BeaconAdmissionRevoked`]. Doppelganger is checked
+    /// first at each of these points.
+    ///
+    /// No signature was produced. The entry and under-lock checks run before
+    /// the reservation, so they write no slashing-DB row. The check after the
+    /// reservation is the last check before BLS for a slashable sign; it
+    /// deletes the row this call inserted, and if that delete fails, the row
+    /// is kept.
+    #[error("beacon node admission revoked")]
+    BeaconAdmissionRevoked,
+
     /// The slashing-protection database rejected the sign request at the *stage*
     /// step — a potential double-vote or double-block-proposal was detected.
     ///
@@ -240,6 +260,9 @@ impl GateErrClass {
 pub fn classify(err: &SigningGateError) -> GateErrClass {
     match err {
         SigningGateError::BlockedByDoppelganger => GateErrClass::BlockedByDoppelganger,
+        SigningGateError::BeaconAdmissionRevoked => {
+            GateErrClass::Internal { log_detail: "beacon node admission revoked".into() }
+        }
         SigningGateError::SlashingBlocked(inner) => match inner {
             // Slot/epoch violation detail is safe to surface on the wire.
             SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
@@ -274,6 +297,7 @@ mod tests {
     fn all_gate_errors() -> Vec<SigningGateError> {
         vec![
             SigningGateError::BlockedByDoppelganger,
+            SigningGateError::BeaconAdmissionRevoked,
             SigningGateError::SlashingBlocked(SlashingError::SlashableBlock(
                 BlockSlashingViolation::DoubleBlockProposal { slot: 1 },
             )),
@@ -303,6 +327,10 @@ mod tests {
             assert!(!class.client_message().is_empty());
             assert!(!class.metrics_label().is_empty());
         }
+
+        let admission = classify(&SigningGateError::BeaconAdmissionRevoked);
+        assert_eq!(admission.metrics_label(), "internal", "{admission:?}");
+        assert_eq!(admission.client_message(), "internal signing error");
     }
 
     #[test]

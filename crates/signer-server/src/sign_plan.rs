@@ -152,7 +152,6 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
         PlanInput::AggregationSlot { slot, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_SELECTION_PROOF, *fork_version, *gvr);
             let root = compute_signing_root(slot, domain);
-            // Same gate method as sync selection; domain is already in the root.
             (root, Slashing::NonSlashable, Some(NonSlashableOp::SelectionProof))
         }
         PlanInput::AggregateAndProof { object_root, fork_version, gvr } => {
@@ -170,7 +169,7 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
         PlanInput::SyncCommitteeSelection { data, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, *fork_version, *gvr);
             let root = compute_signing_root(data, domain);
-            (root, Slashing::NonSlashable, Some(NonSlashableOp::SelectionProof))
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::SyncCommitteeSelectionProof))
         }
         PlanInput::ContributionAndProof { object_root, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, *fork_version, *gvr);
@@ -257,6 +256,7 @@ pub struct RequestCtx {
 pub enum NonSlashableOp {
     RandaoReveal,
     SelectionProof,
+    SyncCommitteeSelectionProof,
     AggregateAndProof,
     SyncCommitteeMessage,
     ContributionAndProof,
@@ -295,26 +295,32 @@ pub async fn dispatch_slashable(
     ctx: &RequestCtx,
     plan: &SignPlan,
 ) -> Result<Vec<u8>, DispatchError> {
+    if matches!(plan.slashing, Slashing::NonSlashable) {
+        return Err(DispatchError::PlanMismatch);
+    }
     let started = Instant::now();
-    let result = match plan.slashing {
-        Slashing::Block { slot, gvr } => {
-            gate.sign_block(&ctx.pubkey, slot, plan.signing_root, gvr, &ctx.client_cn).await
+    // The remote signer has no beacon node. An unbound scope keeps the
+    // library check fail-closed for callers that set nothing.
+    let result = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+        match plan.slashing {
+            Slashing::Block { slot, gvr } => {
+                gate.sign_block(&ctx.pubkey, slot, plan.signing_root, gvr, &ctx.client_cn).await
+            }
+            Slashing::Attestation { source_epoch, target_epoch, gvr } => {
+                gate.sign_attestation(
+                    &ctx.pubkey,
+                    source_epoch,
+                    target_epoch,
+                    plan.signing_root,
+                    gvr,
+                    &ctx.client_cn,
+                )
+                .await
+            }
+            Slashing::NonSlashable => unreachable!("rejected above"),
         }
-        // Recording site for metrics is this function — not the gRPC handler.
-        Slashing::Attestation { source_epoch, target_epoch, gvr } => {
-            gate.sign_attestation(
-                &ctx.pubkey,
-                source_epoch,
-                target_epoch,
-                plan.signing_root,
-                gvr,
-                &ctx.client_cn,
-            )
-            .await
-        }
-        // Slashable dispatch must not be called for non-slashable plans.
-        Slashing::NonSlashable => return Err(DispatchError::PlanMismatch),
-    };
+    })
+    .await;
     finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
 }
 
@@ -337,35 +343,43 @@ pub async fn dispatch_non_slashable(
     let started = Instant::now();
     let root = plan.signing_root;
     if let Some(gate) = gate {
-        let result = match op {
-            NonSlashableOp::RandaoReveal => gate.sign_randao_reveal(&ctx.pubkey, root).await,
-            NonSlashableOp::SelectionProof => gate.sign_selection_proof(&ctx.pubkey, root).await,
-            NonSlashableOp::AggregateAndProof => {
-                gate.sign_aggregate_and_proof(&ctx.pubkey, root).await
+        let result = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+            match op {
+                NonSlashableOp::RandaoReveal => gate.sign_randao_reveal(&ctx.pubkey, root).await,
+                NonSlashableOp::SelectionProof => {
+                    gate.sign_selection_proof(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::SyncCommitteeSelectionProof => {
+                    gate.sign_sync_committee_selection_proof(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::AggregateAndProof => {
+                    gate.sign_aggregate_and_proof(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::SyncCommitteeMessage => {
+                    gate.sign_sync_committee_message(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::ContributionAndProof => {
+                    gate.sign_contribution_and_proof(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::BuilderRegistration => {
+                    gate.sign_builder_registration(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::VoluntaryExit => gate.sign_voluntary_exit(&ctx.pubkey, root).await,
+                NonSlashableOp::PayloadAttestation => {
+                    gate.sign_payload_attestation(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::ProposerPreferences => {
+                    gate.sign_proposer_preferences(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::BuilderRequestAuth => {
+                    gate.sign_builder_request_auth(&ctx.pubkey, root).await
+                }
+                NonSlashableOp::ExecutionPayloadEnvelope => {
+                    gate.sign_execution_payload_envelope(&ctx.pubkey, root).await
+                }
             }
-            NonSlashableOp::SyncCommitteeMessage => {
-                gate.sign_sync_committee_message(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::ContributionAndProof => {
-                gate.sign_contribution_and_proof(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::BuilderRegistration => {
-                gate.sign_builder_registration(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::VoluntaryExit => gate.sign_voluntary_exit(&ctx.pubkey, root).await,
-            NonSlashableOp::PayloadAttestation => {
-                gate.sign_payload_attestation(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::ProposerPreferences => {
-                gate.sign_proposer_preferences(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::BuilderRequestAuth => {
-                gate.sign_builder_request_auth(&ctx.pubkey, root).await
-            }
-            NonSlashableOp::ExecutionPayloadEnvelope => {
-                gate.sign_execution_payload_envelope(&ctx.pubkey, root).await
-            }
-        };
+        })
+        .await;
         finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
     } else {
         let result = backend.sign(&root, &ctx.pubkey_bytes).await;
@@ -717,6 +731,19 @@ mod tests {
         assert_eq!(sync_plan, plan_sign(&dvt_sync));
         assert_eq!(sync_plan.non_slashable_op, Some(NonSlashableOp::SyncCommitteeMessage));
 
+        let sync_selection = plan_sign(&PlanInput::SyncCommitteeSelection {
+            data: SyncAggregatorSelectionData { slot: 1, subcommittee_index: 2 },
+            fork_version: FORK,
+            gvr: GVR,
+        });
+        assert_eq!(
+            sync_selection.non_slashable_op,
+            Some(NonSlashableOp::SyncCommitteeSelectionProof)
+        );
+        let aggregation =
+            plan_sign(&PlanInput::AggregationSlot { slot: 77, fork_version: FORK, gvr: GVR });
+        assert_eq!(aggregation.non_slashable_op, Some(NonSlashableOp::SelectionProof));
+
         // Block: when the HTTP header's body_root equals the body HTR of the full
         // gRPC/DVT block, object roots (and therefore SignPlans) match.
         use eth_types::{BeaconBlock, BeaconBlockHeader};
@@ -950,10 +977,11 @@ mod tests {
         let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
             .await
             .expect("dispatch_sign payload attestation");
-        let direct = gate
-            .sign_payload_attestation(&ctx.pubkey, plan.signing_root)
-            .await
-            .expect("direct gate payload attestation");
+        let direct = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+            gate.sign_payload_attestation(&ctx.pubkey, plan.signing_root).await
+        })
+        .await
+        .expect("direct gate payload attestation");
         assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_payload_attestation");
         assert!(crypto::Signature::from_bytes(&sig)
             .expect("bls sig")
@@ -1035,10 +1063,11 @@ mod tests {
         let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
             .await
             .expect("dispatch_sign proposer preferences");
-        let direct = gate
-            .sign_proposer_preferences(&ctx.pubkey, plan.signing_root)
-            .await
-            .expect("direct gate proposer preferences");
+        let direct = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+            gate.sign_proposer_preferences(&ctx.pubkey, plan.signing_root).await
+        })
+        .await
+        .expect("direct gate proposer preferences");
         assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_proposer_preferences");
         assert!(crypto::Signature::from_bytes(&sig)
             .expect("bls sig")
@@ -1121,10 +1150,11 @@ mod tests {
         let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
             .await
             .expect("dispatch_sign builder request auth");
-        let direct = gate
-            .sign_builder_request_auth(&ctx.pubkey, plan.signing_root)
-            .await
-            .expect("direct gate builder request auth");
+        let direct = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+            gate.sign_builder_request_auth(&ctx.pubkey, plan.signing_root).await
+        })
+        .await
+        .expect("direct gate builder request auth");
         assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_builder_request_auth");
         assert!(crypto::Signature::from_bytes(&sig)
             .expect("bls sig")
@@ -1208,10 +1238,11 @@ mod tests {
         let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
             .await
             .expect("dispatch_sign execution payload envelope");
-        let direct = gate
-            .sign_execution_payload_envelope(&ctx.pubkey, plan.signing_root)
-            .await
-            .expect("direct gate execution payload envelope");
+        let direct = signer::with_beacon_admission(signer::BeaconAdmission::unbound(), async {
+            gate.sign_execution_payload_envelope(&ctx.pubkey, plan.signing_root).await
+        })
+        .await
+        .expect("direct gate execution payload envelope");
         assert_eq!(
             sig, direct,
             "dispatch_sign must use SigningGate::sign_execution_payload_envelope"

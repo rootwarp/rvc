@@ -142,7 +142,6 @@ pub fn record_expected_sse_drop() {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::OnceLock;
     use std::time::Instant;
 
     use metrics::definitions::RVC_MONITORING_PUSH_FAILURES_TOTAL;
@@ -151,15 +150,15 @@ mod tests {
         attestation_status, attestation_trigger_source, RVC_ATTESTATIONS_TOTAL,
         RVC_ATTESTATION_TRIGGER_TOTAL,
     };
-    use tokio::sync::{Mutex, MutexGuard};
+    use tokio::sync::MutexGuard;
     use tracing_test::traced_test;
 
     const ATT_TIMER: Duration = Duration::from_secs(4);
 
     /// Process-wide trigger vec; serialize every wait / delta assertion.
+    /// Slot-loop tests write it too, so this is their lock.
     async fn trigger_metric_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().await
+        crate::orchestrator::coordinator::tests::m2_metric_lock().await
     }
 
     fn trigger_count(source: &str) -> u64 {

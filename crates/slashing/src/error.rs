@@ -40,9 +40,9 @@ pub enum SlashingError {
 
     /// Attestation floor cannot be encoded as one interchange record.
     ///
-    /// The derived bounds have `source_bound > target_bound`, or only one of
-    /// the source and target watermarks is set (the missing side is `0`).
-    /// The whole export fails; no partial interchange is returned.
+    /// Only one of the two attestation watermarks is set (the missing side is
+    /// `0`). The whole export fails; no partial interchange is returned. A
+    /// two-sided floor with `S* > T*` is clamped on export instead.
     #[error(
         "attestation floor for {pubkey} cannot be represented \
          (source_bound={source_bound}, target_bound={target_bound})"
@@ -131,6 +131,12 @@ pub enum SlashingError {
     /// failure off a signing path.
     #[error("slashing-protection compensating delete failed (row retained): {0}")]
     ReconcileFailed(String),
+
+    /// Slot or epoch above [`i64::MAX`]. SQLite binds these columns as signed
+    /// integers; a wider value would wrap negative and weaken a surround or
+    /// double-proposal check. Refused, never saturated.
+    #[error("out of range: {field}={value} exceeds i64::MAX (9223372036854775807)")]
+    OutOfRange { field: &'static str, value: u64 },
 }
 
 impl SlashingError {
@@ -183,6 +189,12 @@ pub enum AttestationSlashingViolation {
 
     #[error("target epoch {target_epoch} is below minimum existing target epoch {min_target}")]
     TargetEpochBelowMinimum { target_epoch: Epoch, min_target: Epoch },
+
+    /// Source checkpoint after the target checkpoint. Refused on every
+    /// signing path before any history read; seeding and interchange import
+    /// still accept such a row.
+    #[error("source epoch {source_epoch} is above target epoch {target_epoch}")]
+    SourceExceedsTarget { source_epoch: Epoch, target_epoch: Epoch },
 }
 
 /// Specific types of block slashing violations per EIP-3076.

@@ -41,6 +41,7 @@ secret-provider.workspace = true
 signer.workspace = true
 slashing.workspace = true
 serde.workspace = true
+serde_path_to_error.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 timing.workspace = true
@@ -58,9 +59,16 @@ validator-store.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 axum.workspace = true
+# test-utils: produce-return hook for the proposer fence tests. The production
+# dependency line above does not enable this feature.
+block-service = { workspace = true, features = ["test-utils"] }
 # test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
 bn-manager = { workspace = true, features = ["test-utils"] }
+# test-utils: `DutyTracker::cache_proposer_duties` for the preference re-broadcast
+# tests. The production dependency line above does not enable this feature.
+duty-tracker = { workspace = true, features = ["test-utils"] }
 crypto = { workspace = true, features = ["test-utils"] }
 # ARCH-7b: valid Deneb body fixtures for proposal success path in M1 harness.
 eth-types = { workspace = true, features = ["test-fixtures"] }
@@ -73,6 +81,8 @@ secrecy.workspace = true
 serde_json.workspace = true
 # test-utils: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
 signer = { workspace = true, features = ["test-utils"] }
+# test-utils: detection-latch rendezvous hooks (FU-A2a). Not a production feature.
+doppelganger = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
@@ -85,6 +95,17 @@ opentelemetry_sdk.workspace = true
 # ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
+rvc-test-support.workspace = true
+rcgen.workspace = true
+# The run.rs tests parse the source with syn to find calls. `span-locations`
+# gives the byte range of a token. Cargo.lock already has these versions.
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+syn = { version = "=2.0.117", features = ["full", "visit"] }
+# ring only: rustls auto-resolution panics when aws-lc and ring are both
+# unified on, which `--workspace --all-features` does. The HTTPS redirect
+# test installs this provider before `ServerConfig::builder()`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
 criterion.workspace = true
 # Feature-unify `test-utils` onto the crate-under-test so integration tests
 # can enable the feature. Production dependents do not get this line.

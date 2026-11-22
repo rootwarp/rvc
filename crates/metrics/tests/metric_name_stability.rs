@@ -81,6 +81,77 @@
 //! `committee_index`, `validator_index`, `committee_length`,
 //! `validator_committee_index`). The rest of the epoch stays cached. Dashboards
 //! that alert on malformed beacon duties should bind this name (RR3-04 / #533).
+//! RV-1.1 / #639 adds `rvc_bn_broadcast_drain_health_skipped_total` (family
+//! delta +1): one increment when a broadcast success health sample is skipped
+//! because the health-sample cap is full, or when any sample does not fit on
+//! the health-recorder queue. When that queue is full, an error or a timeout
+//! sample can be dropped, and that drop is counted. The enqueue does not
+//! block the publish. A full pool still records an
+//! error or a timeout when the queue has room. The cap limits health
+//! recording, not sends. The publish still runs. It has no labels. Dashboards
+//! that watch missed beacon-node health samples should bind this name.
+//! #721 adds `rvc_bn_broadcast_inflight_waits_total` (family delta +1): one
+//! increment when a broadcast waits for a per-beacon-node in-flight permit.
+//! Label `endpoint` is the redacted beacon endpoint. A free permit does not
+//! increment it. The cap is 4 (2 × the default publish concurrency of 2).
+//! The HTTP call starts after the permit is acquired. Dashboards that watch
+//! a saturated beacon node should bind this counter. The overflow gauge is
+//! unchanged.
+//! RV-1.1 / #639 adds `rvc_bn_broadcast_overflow_drains` (family delta +1):
+//! in-flight broadcast publishes past the health-sample cap. Label `endpoint`
+//! is the redacted beacon endpoint (`scheme://host:port`, userinfo and path
+//! stripped) so a slow beacon node's backlog is visible. The gauge drops when
+//! that HTTP call finishes, or when that attempt is cancelled or panics,
+//! before the health sample is queued. Each publish
+//! still runs and ends at the attempt budget, or at the HTTP client timeout
+//! when no budget is set, so the series tracks publish rate times that timeout.
+//! Dashboards that watch overflow publishes should bind this gauge.
+//! #679 adds `rvc_produce_block_fee_recipient_penalty_total` (family delta +1):
+//! one increment when a block is signed despite a readable fee-recipient
+//! mismatch. A higher-ranked candidate that is skipped before signing, and a
+//! drop under `fee_recipient_policy = reject`, are not counted. It has no
+//! labels. Dashboards that watch signed fee mismatches should bind this name.
+//! #647 adds `rvc_block_shape_rejections_total` (family delta +1): one
+//! increment when a produced block is rejected because the selection mode
+//! does not allow that shape. Labels are `mode` and `shape`. A Gloas response
+//! flagged blinded is not counted. Dashboards that watch mode mismatches
+//! should bind this name.
+//! #705 adds `rvc_doppelganger_detection_latch` (family delta +1): 0 when the
+//! liveness loop starts, 1 after this process stores the doppelganger latch.
+//! A boot that exits 12 because the marker file is already present can exit
+//! before the loop is scraped. It has no labels. Dashboards that watch an
+//! in-process detection should bind this gauge; the marker file is the
+//! durable signal.
+//! #705 also adds `rvc_doppelganger_marker_write_failures_total` (family delta
+//! +1): one increment each time the detection marker write fails. The process
+//! stays up and retries. It has no labels. Dashboards that watch a latched
+//! process that has not yet exited should bind this counter.
+//! #719 adds `rvc_bn_produce_candidates_rejected_total` (family delta +1):
+//! one increment per hard-rejected produce candidate, and per fallback body
+//! that passes the hard checks and misses the primary parent. Label `reason`
+//! is `fork`, `unreadable`, `slot`, `proposer`, `parent`, `fee`, `shape`, or
+//! `fallback_parent`. A fee-only penalty is not counted. Health does not move.
+//! Dashboards that watch unusable produce bodies should bind this name.
+//! #719 adds `rvc_bn_produce_soft_deadline_returns_total` (family delta +1):
+//! one increment when a best-of produce round returns because a block is in
+//! hand at the soft deadline, or because the first in-hand block arrives
+//! after it. A round that finishes every attempt before that deadline is not
+//! counted. It has no labels.
+//! #719 adds `rvc_bn_produce_fallback_total` (family delta +1): one increment
+//! when an unsynced proposal fallback starts an attempt. No candidate above
+//! the health floor, and a deadline already closed before that attempt, are
+//! not counted. It has no labels.
+//! #719 splits best-of drain skips onto
+//! `rvc_bn_best_of_drain_health_skipped_total` (family delta +1). Broadcast
+//! skips stay on `rvc_bn_broadcast_drain_health_skipped_total`. A dashboard
+//! that summed the broadcast counter for best-of skips must add this series.
+//! The 16-permit pool is still shared.
+//! #774 adds `reason` values to `rvc_slot_context_parent_fallback_total` (no
+//! family delta): `unchecked_parse`, `unchecked_error`, `unconfirmed`, and
+//! `capture_timeout`, next to `walk_back_exhausted`. Each new reason turns the
+//! parent check off for one slot. A slot whose walk-back is exhausted can also
+//! count a reason for the `head` fallback. Dashboards that watch an unchecked
+//! parent should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -127,11 +198,22 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestations_total",
     "rvc_attesting_enabled",
     "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
+    "rvc_block_shape_rejections_total", // operator-facing: produced blocks rejected by selection mode; labels mode, shape (#647)
+    "rvc_bn_admitted", // operator-facing: 1 while the beacon node may serve duties (#707)
+    "rvc_bn_best_of_drain_health_skipped_total", // operator-facing: best-of drain health samples not recorded; broadcast skips stay on the broadcast counter (#719)
+    "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
+    "rvc_bn_broadcast_inflight_waits_total", // operator-facing: waits for a per-beacon-node in-flight permit; the send is not skipped (#721)
+    "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
+    "rvc_bn_produce_candidates_rejected_total", // operator-facing: dropped produce candidates by reason, including fallback_parent; fee-only penalty is not counted (#719)
+    "rvc_bn_produce_fallback_total", // operator-facing: unsynced proposal fallback rounds that started an attempt (#719)
+    "rvc_bn_produce_soft_deadline_returns_total", // operator-facing: best-of produce rounds that returned at the soft deadline (#719)
     "rvc_builder_circuit_breaker_trips_total",
     "rvc_builder_consecutive_misses",
     "rvc_builder_epoch_misses",
+    "rvc_doppelganger_detection_latch", // operator-facing: 1 after this process stores the detection latch (#705)
+    "rvc_doppelganger_marker_write_failures_total", // operator-facing: failed durable marker writes while the latch stays set (#705)
     "rvc_duties_fetched_total",
     "rvc_duty_index_set_size", // operator-facing: pubkey-index registry size (RR-2.2)
     "rvc_duty_rejected_total", // operator-facing: per-duty malformed numeric field (RR3-04 / #533)
@@ -149,6 +231,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_payload_attestation_skipped_total",
     "rvc_pre_proposal_cold_fetch_duration_seconds",
     "rvc_pre_proposal_cold_fetch_total",
+    "rvc_produce_block_fee_recipient_penalty_total", // operator-facing: signed blocks whose readable fee recipient did not match (#679)
     "rvc_proposals_total", // operator-facing: proposal outcomes success/failed/envelope_late (issue 6.20 / #377)
     "rvc_proposer_bn_health_score",
     "rvc_proposer_bn_latency_ms",
@@ -172,7 +255,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
     "rvc_slashing_reconcile_total",
     "rvc_slashing_reserve_tx_hold_duration_ms",
-    "rvc_slot_context_parent_fallback_total",
+    "rvc_slot_context_parent_fallback_total", // operator-facing: reason walk_back_exhausted, unchecked_parse, unchecked_error, unconfirmed, capture_timeout (#774)
     "rvc_slot_phase_block_start_offset_ms", // deprecated: use rvc_slot_phase_offset_ms{phase="block"}; retained for dashboards (AQ-7 / #611)
     "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
     "rvc_slot_phase_offset_ms", // operator-facing: true offset into the slot when a phase fires (RR1-05 / #508)
@@ -283,11 +366,7 @@ fn expected_metric_names_is_sorted_and_unique() {
         sorted.as_slice(),
         "EXPECTED_METRIC_NAMES must be sorted and unique (edit-only list)"
     );
-    assert_eq!(
-        EXPECTED_METRIC_NAMES.len(),
-        60,
-        "RR3-02 adds rvc_slashing_import_deferred_ms; count is the list length"
-    );
+    assert_eq!(EXPECTED_METRIC_NAMES.len(), 72, "#721 adds rvc_bn_broadcast_inflight_waits_total");
 }
 
 #[test]

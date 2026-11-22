@@ -2,8 +2,13 @@
 //!
 //! Provides async HTTP client with retry logic for beacon node communication.
 
+mod admission;
 mod client;
 mod error;
+pub mod prepare_check;
+mod shape;
+
+pub use admission::DutyFence;
 pub(crate) mod http_caps;
 mod retry;
 pub mod ssz_deser;
@@ -11,25 +16,29 @@ mod types;
 mod v4_wire;
 
 pub use client::{ensure_genesis_validators_root, hex_ids_equal, BeaconClient, BeaconClientConfig};
-pub use error::BeaconError;
+pub use error::{BeaconError, ProduceError};
 pub use http_caps::ResponseCaps;
+pub use prepare_check::{check_preparable, CandidateMemo, PrepareReject, Prepared, PreparedKind};
 pub use retry::RetryPolicy;
+pub use shape::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};
 pub use types::{
-    parse_fork_schedule, parse_slot_duration_ms, AttestationData, AttestationDataResponse,
+    block_value, compare_fork_schedule, display_value_parse, parse_fork_schedule,
+    parse_slot_duration_ms, parse_slots_per_epoch, AttestationData, AttestationDataResponse,
     AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader, BeaconCommitteeSubscription,
-    BlockRootData, BlockRootResponse, Checkpoint, ClientVersionV1, ConfigSpecResponse,
-    DataResponse, DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
-    GloasBlockContents, IndexedAttestationError, IndexedErrorMessage, IndexedFailure,
-    LegacyAttestation, NodeVersionData, NodeVersionResponse, NodeVersionV2Data,
-    NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
-    ProduceBlockV4Body, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
-    PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedContributionAndProof,
-    SingleAttestation, StateFork, StateForkResponse, StateResponse, SubmitAttestationResult,
-    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorData, ValidatorInfo,
+    BlockHeaderSummary, BlockRootData, BlockRootResponse, Checkpoint, ClientVersionV1,
+    ConfigSpecResponse, DataResponse, DependentRootResponse, ExecutionOptimisticResponse,
+    ForkScheduleAgreement, GenesisData, GenesisResponse, GloasBlockContents,
+    IndexedAttestationError, IndexedErrorMessage, IndexedFailure, LegacyAttestation,
+    NodeVersionData, NodeVersionResponse, NodeVersionV2Data, NodeVersionV2Response,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProduceBlockV4Body,
+    ProposerDutiesResponse, ProposerDuty, ProposerPreparation, PtcDutiesResponse, PtcDuty,
+    RankedBlock, SignedAggregateAndProof, SignedContributionAndProof, SingleAttestation, StateFork,
+    StateForkResponse, StateResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncCommitteeSubscription, SyncingData, SyncingResponse, ValidatorData, ValidatorInfo,
     ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    WireBody, MAX_PLAUSIBLE_BLOCK_VALUE_WEI,
 };
 pub use v4_wire::{
     BuilderConfig, BuilderEntry, BuilderPreferencesEntry, BuilderRequestAuth,

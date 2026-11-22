@@ -3,10 +3,16 @@
 use std::sync::LazyLock;
 
 use metrics::{
-    define_gauge_vec, define_histogram_vec, define_int_counter_vec, define_int_gauge_vec, GaugeVec,
-    HistogramVec, IntCounterVec, IntGaugeVec,
+    define_gauge_vec, define_histogram_vec, define_int_counter, define_int_counter_vec,
+    define_int_gauge_vec, GaugeVec, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
 };
 use url::Url;
+
+/// `pool` label for the main beacon-node manager.
+pub const METRIC_POOL_MAIN: &str = "main";
+
+/// `pool` label for the proposer beacon-node manager.
+pub const METRIC_POOL_PROPOSER: &str = "proposer";
 
 /// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
 /// not credentials or request path (issue 8.3 label hygiene).
@@ -109,11 +115,137 @@ pub static RVC_BN_CAPABILITY_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
 });
 
+/// Health samples not applied because a success was skipped while the
+/// health-sample cap was full, or because the recorder queue did not accept
+/// the sample.
+///
+/// The publish itself still runs. A full pool still records an error or a
+/// timeout when the queue has room. A full queue drops the sample, including
+/// an error or a timeout, and does not block the attempt. The cap limits
+/// health recording, not sends.
+pub static RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(
+    || {
+        define_int_counter(
+        "rvc_bn_broadcast_drain_health_skipped_total",
+        "Broadcast health samples not recorded because the health-sample cap skipped a success, or because the recorder queue was full for a broadcast sample. When the queue is full, an error or a timeout sample can be dropped, and that drop is counted. The enqueue does not block the publish. A full pool still records an error or a timeout when the queue has room. The publish still runs. Best-of and fallback skips are rvc_bn_best_of_drain_health_skipped_total",
+    )
+    },
+);
+
+/// Best-of and fallback health samples that were not recorded.
+///
+/// A success is skipped when the shared 16-permit drain pool is full. A
+/// sample that does not fit on the shared recorder queue is also counted
+/// here, including an error or a hard reject. Broadcast skips stay on
+/// [`RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL`]. The pool is shared, so
+/// a full broadcast drain can cause a best-of success to land on this
+/// counter. The enqueue does not block the round.
+pub static RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_bn_best_of_drain_health_skipped_total",
+        "Best-of and fallback health samples not recorded because the shared drain pool skipped a success, or because the recorder queue was full. A hard reject is still offered to the queue. Broadcast skips stay on rvc_bn_broadcast_drain_health_skipped_total. The pool is shared. The enqueue does not block the round",
+    )
+});
+
+/// Produce candidates dropped before they are returned.
+///
+/// One increment per hard reject on best-of, its drain, and the unsynced
+/// fallback, and per fallback body that passes `accept` and misses the
+/// primary parent. A fee-only penalty is not counted. Health does not move.
+/// Label `reason` is `fork`, `unreadable`, `slot`, `proposer`, `parent`,
+/// `fee`, `shape`, or `fallback_parent`.
+pub static RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        define_int_counter_vec(
+            "rvc_bn_produce_candidates_rejected_total",
+            "Produce candidates dropped before return. A fee-only penalty is not counted. Health does not move. Label reason is fork, unreadable, slot, proposer, parent, fee, shape, or fallback_parent. fallback_parent passed the hard checks and missed the primary parent on fallback",
+            &["reason"],
+        )
+    },
+);
+
+/// Best-of produce rounds that returned at the soft deadline.
+///
+/// One increment when a block is in hand at the soft deadline, or when the
+/// first in-hand block arrives after it. A round that finishes every attempt
+/// before the soft deadline is not counted. A round with no budget is not
+/// counted.
+pub static RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+            "rvc_bn_produce_soft_deadline_returns_total",
+            "Best-of produce rounds that returned because a block was in hand at the soft deadline, or because the first in-hand block arrived after it. A round that finishes every attempt before the soft deadline is not counted",
+        )
+});
+
+/// Unsynced proposal fallback rounds that started an attempt.
+///
+/// One increment when the synced round left nothing in hand and the fallback
+/// starts its first attempt. No candidate above the floor does not count. A
+/// deadline that is already closed before that attempt does not count.
+pub static RVC_BN_PRODUCE_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_bn_produce_fallback_total",
+        "Unsynced proposal fallback rounds that started an attempt. A round with no candidate above the health floor is not counted. A deadline already closed before the first attempt is not counted",
+    )
+});
+
+/// Blocks signed even though the readable fee recipient did not match.
+///
+/// Incremented once for the candidate that is signed, not for a higher-ranked
+/// candidate that was skipped before signing. A [`crate::FeeRecipientPolicy::Reject`]
+/// drop is not counted here. Block proposal records the increment.
+pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_produce_block_fee_recipient_penalty_total",
+        "Blocks signed despite a readable fee-recipient mismatch",
+    )
+});
+
+/// Broadcast attempts that waited because the beacon node was already at
+/// [`crate::MAX_INFLIGHT_PER_BN`].
+///
+/// One increment per wait, labelled by [`endpoint_label`]. A free permit
+/// does not increment this. The send still runs once a permit is free, or
+/// the attempt times out at its budget without starting the HTTP call.
+/// The overflow gauge stays [`RVC_BN_BROADCAST_OVERFLOW_DRAINS`].
+pub static RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_bn_broadcast_inflight_waits_total",
+        "Broadcast attempts that waited for a per-beacon-node in-flight permit. Label endpoint is the redacted beacon endpoint. The cap is 2 times the default publish concurrency (4). A wait is not a skip. The HTTP call starts after a permit is acquired, or the attempt times out at its budget without starting",
+        &["endpoint"],
+    )
+});
+
+/// In-flight overflow publishes, one series per redacted beacon endpoint.
+///
+/// The 16-permit health-sample cap limits health recording, not sends. A
+/// publish past that cap still runs. The gauge drops when that HTTP call
+/// finishes, before the health sample is queued. The `endpoint` label is
+/// [`endpoint_label`] (`scheme://host:port`, userinfo and path stripped) so
+/// a slow beacon node's backlog is visible. Each publish ends at that
+/// attempt's budget, or at the beacon client's HTTP timeout when no budget
+/// is set. Sends are also capped by [`crate::MAX_INFLIGHT_PER_BN`].
+pub static RVC_BN_BROADCAST_OVERFLOW_DRAINS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_bn_broadcast_overflow_drains",
+        "In-flight broadcast publishes past the health-sample cap, by redacted endpoint. The gauge drops when the HTTP call finishes, or when that attempt is cancelled or panics. The cap limits health recording, not sends. Each publish ends at the attempt budget, or at the HTTP client timeout when no budget is set",
+        &["endpoint"],
+    )
+});
+
 pub fn init() {
     LazyLock::force(&RVC_ATTESTATIONS_TOTAL);
     LazyLock::force(&RVC_PROPOSER_BN_HEALTH_SCORE);
     LazyLock::force(&RVC_PROPOSER_BN_LATENCY_MS);
     LazyLock::force(&RVC_BN_CAPABILITY_STATE);
+    LazyLock::force(&RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_FALLBACK_TOTAL);
+    LazyLock::force(&RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL);
+    LazyLock::force(&RVC_BN_BROADCAST_OVERFLOW_DRAINS);
+    LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
 }
 
 #[cfg(test)]
@@ -160,7 +292,7 @@ pub(crate) fn gather_health_tier_series() -> Vec<(String, i64)> {
 mod tests {
     use super::{
         endpoint_label, is_proposer_block_production_op, observe_proposer_bn_latency,
-        RVC_PROPOSER_BN_LATENCY_MS,
+        RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL, RVC_PROPOSER_BN_LATENCY_MS,
     };
     use std::time::Duration;
 
@@ -211,5 +343,12 @@ mod tests {
             after > before,
             "observe must bump histogram count; before={before}, after={after}"
         );
+    }
+
+    #[test]
+    fn penalized_fee_counter_increments_once_per_win() {
+        let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
+        assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
     }
 }

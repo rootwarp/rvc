@@ -18,9 +18,9 @@ use rvc_keymanager_api::handlers::{
     import_keystores, import_remote_keys, list_keystores, AppState,
 };
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
-    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
+    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ExportedInterchange,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
+    SlashingProtection, SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Verbose error string that must never reach the client ──────────────────
@@ -73,8 +73,14 @@ impl SlashingProtection for SimpleSlashingProtection {
     async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        Ok(r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#.to_string())
+    async fn export_interchange(
+        &self,
+        _: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        Ok(ExportedInterchange {
+            json: r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#.to_string(),
+            with_history: Vec::new(),
+        })
     }
 }
 
@@ -86,7 +92,10 @@ impl SlashingProtection for VerboseFailingSlashingProtection {
     async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+    async fn export_interchange(
+        &self,
+        _: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
         Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
 }

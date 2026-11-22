@@ -17,8 +17,8 @@ use common::{
 };
 use rvc_keymanager_api::handlers::{import_keystores, AppState};
 use rvc_keymanager_api::traits::{
-    DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey, SlashingProtection,
-    SlashingProtectionError, ValidatorManager,
+    DeleteKeystoreError, ExportedInterchange, ImportKeystoreError, KeystoreManager, Pubkey,
+    SlashingProtection, SlashingProtectionError, ValidatorManager,
 };
 use rvc_keymanager_api::types::{ImportKeystoresRequest, ImportStatus};
 use rvc_keymanager_api::DoppelgangerLifecycle;
@@ -69,8 +69,11 @@ impl SlashingProtection for OrderProbe {
         Ok(())
     }
 
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
-        Ok("{}".into())
+    async fn export_interchange(
+        &self,
+        _: &[Pubkey],
+    ) -> Result<ExportedInterchange, SlashingProtectionError> {
+        Ok(ExportedInterchange { json: "{}".into(), with_history: Vec::new() })
     }
 }
 

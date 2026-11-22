@@ -45,7 +45,7 @@ fn spawn_test_deps(
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
     let deletion_denylist =
         Arc::new(DeletionDenylist::empty_at(keystore_dir.join(".rvc.deleted_keys")));
-    let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+    let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
     let admissions = Arc::new(KeyAdmissionService::new(
         Arc::clone(&pubkey_map),
         key_gen_tx.clone(),
@@ -176,6 +176,18 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
         // Machine registered the key as Pending (import-strict)
         assert_eq!(machine.status(&crypto_pk), doppelganger::ForwardWindowStatus::Pending);
     }
+}
+
+/// Two epochs at a 6 s slot is 384 s. A 12 s clock would hold for 768 s.
+#[test]
+fn test_spawn_keymanager_api_six_second_slots_hold_for_two_epochs() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let mut deps = spawn_test_deps(dir.path(), None);
+    deps.slot_clock =
+        Arc::new(timing::MockSlotClock::new(1_606_824_023, std::time::Duration::from_secs(6), 32));
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    assert_eq!(built.doppelganger_window, std::time::Duration::from_secs(384));
 }
 
 /// Opt-out (`forward_window_machine: None`) selects the always-safe monitor.
@@ -388,5 +400,96 @@ async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
     assert!(
         outcome.joined.contains(&"keymanager_api") || outcome.aborted.contains(&"keymanager_api"),
         "keymanager_api must be drained"
+    );
+}
+
+/// The monitor `build_keymanager_api` returns skips a late cancel while a key
+/// backend holds the key, and cancels once none does.
+#[test]
+fn built_monitor_skips_cancel_while_a_backend_holds_the_key() {
+    use doppelganger::ForwardWindowStatus;
+
+    let dir = TempDir::new().unwrap();
+    let reader: Arc<dyn slashing::SlashingDbReader> =
+        Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+    let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xab; 32]));
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), Some(Arc::clone(&machine)));
+    let composite = Arc::clone(&deps.composite_signer);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    let monitor = &built.doppelganger_monitor;
+    let secret = SecretKey::generate();
+    let public = secret.public_key();
+    let pk = public.to_bytes();
+    machine.register_for_import(&public, 5);
+    let mut seen = Vec::new();
+
+    composite.add_local_key(secret);
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    assert!(composite.remove_local_key(&pk));
+    composite.add_remote_key(pk, Arc::new(LocalSigner::new(KeyManager::new())));
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    assert!(composite.remove_remote_key(&pk));
+    monitor.cancel_monitoring(&pk);
+    seen.push(machine.status(&public));
+    let grpc = add_grpc_remote_key(&composite).public_key();
+    machine.register_for_import(&grpc, 5);
+    monitor.cancel_monitoring(&grpc.to_bytes());
+    seen.push(machine.status(&grpc));
+
+    assert_eq!(
+        seen,
+        [
+            ForwardWindowStatus::Pending,
+            ForwardWindowStatus::Pending,
+            ForwardWindowStatus::Unmonitored,
+            ForwardWindowStatus::Pending,
+        ],
+        "[K local, K remote, K in no backend, gRPC key]"
+    );
+}
+
+/// 628-4: the keystore, remote and signing-quiesce adapters hold the one
+/// `TrackedKeys` the caller passes in, so every keymanager key-set writer
+/// serialises on it.
+#[test]
+fn adapters_share_one_tracked_keys() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), None);
+    let shared = Arc::clone(&deps.tracked_keys);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    let held = &built.adapter_tracked_keys;
+
+    assert_eq!(
+        [
+            Arc::ptr_eq(&shared, &held.keystore),
+            Arc::ptr_eq(&shared, &held.remote),
+            Arc::ptr_eq(&shared, &held.signing_quiesce),
+        ],
+        [true; 3],
+        "[keystore, remote, signing quiesce] adapter on deps.tracked_keys"
+    );
+}
+
+/// The keystore adapter admits, and the remote DELETE cancels windows,
+/// through the one `deps.admissions` the secret-provider refresh also uses.
+#[test]
+fn adapters_admit_and_cancel_through_deps_admissions() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let deps = spawn_test_deps(dir.path(), None);
+    let admissions = Arc::clone(&deps.admissions);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert_eq!(
+        [
+            Arc::ptr_eq(&built.keystore_admissions, &admissions),
+            built.remote_window_cancel.as_ref().is_some_and(|held| Arc::ptr_eq(held, &admissions)),
+        ],
+        [true; 2],
+        "[keystore admits, remote cancels] through deps.admissions"
     );
 }

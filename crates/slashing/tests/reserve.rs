@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use rvc_slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
-    BlockSlashingViolation, CommittedReservation, InterchangeAttestation, InterchangeBlock,
-    InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
-    SlashingDb, SlashingError, ValidatorRecord,
+    AttestationSlashingViolation, BlockSlashingViolation, CommittedReservation, GroupCommitConfig,
+    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
+    PubkeyScopedDb, ReconcileOutcome, ReservationKind, SlashingDb, SlashingError, ValidatorRecord,
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -661,4 +661,379 @@ fn test_scoped_reserve_pins_client_cn_and_gvr() {
         .query_row("SELECT COUNT(*) FROM blocks WHERE pubkey = ?1", [PUBKEY2], |row| row.get(0))
         .expect("count");
     assert_eq!(leftover, 0, "GVR-rejected reserve must write no row");
+}
+
+fn assert_out_of_range(err: SlashingError, field: &str, value: u64) {
+    match &err {
+        SlashingError::OutOfRange { field: got, value: got_value } => {
+            assert_eq!(*got, field, "{err}");
+            assert_eq!(*got_value, value, "{err}");
+        }
+        other => panic!("expected OutOfRange {{ field: {field}, value: {value} }}, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(msg.contains(field), "{msg}");
+    assert!(msg.contains(&value.to_string()), "{msg}");
+    assert!(msg.contains("i64::MAX"), "{msg}");
+    assert!(msg.contains(&i64::MAX.to_string()), "{msg}");
+    assert!(!err.is_reserve_commit_failure(), "{err:?}");
+}
+
+/// With (100, 101) stored, a target of 2^63 used to bind as `i64::MIN` and miss the surround.
+#[test]
+fn reserve_attestation_rejects_a_target_at_2_pow_63_and_writes_no_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.reserve_attestation(PUBKEY, 100, 101, Some("0xstored".into()), GVR)
+        .expect("store (100, 101)");
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1);
+
+    let err = db
+        .reserve_attestation(PUBKEY, 99, 1 << 63, Some("0xwrap".into()), GVR)
+        .expect_err("target 2^63");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1, "no wrapped row");
+
+    let err = db
+        .reserve_attestation(PUBKEY, 1 << 63, (1 << 63) + 1, Some("0xsrc".into()), GVR)
+        .expect_err("source 2^63");
+    assert_out_of_range(err, "source_epoch", 1 << 63);
+    assert_eq!(
+        db.get_attestations(PUBKEY).expect("rows").len(),
+        1,
+        "source refusal writes nothing"
+    );
+}
+
+#[test]
+fn reserve_block_rejects_a_slot_at_2_pow_63() {
+    for slot in [1_u64 << 63, u64::MAX] {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let err = db
+            .reserve_block(PUBKEY, slot, Some("0xslot".into()), GVR)
+            .expect_err("slot above i64::MAX");
+        assert_out_of_range(err, "slot", slot);
+        assert!(db.get_blocks(PUBKEY).expect("rows").is_empty(), "slot {slot} must write no row");
+    }
+}
+
+/// `i64::MAX` is a real signed SQLite value and must be stored as itself.
+#[test]
+fn reserve_accepts_i64_max_exactly() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let limit = i64::MAX as u64;
+
+    let block = db.reserve_block(PUBKEY, limit, Some("0xblock".into()), GVR).expect("slot");
+    assert!(block.inserted);
+    let blocks = db.get_blocks(PUBKEY).expect("blocks");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].slot, limit);
+
+    let by_target =
+        db.reserve_attestation(PUBKEY, 1, limit, Some("0xtarget".into()), GVR).expect("target");
+    assert!(by_target.inserted);
+    let by_source = db
+        .reserve_attestation(PUBKEY2, limit, limit, Some("0xsource".into()), GVR)
+        .expect("source");
+    assert!(by_source.inserted);
+
+    let target_row = db
+        .get_attestations(PUBKEY)
+        .expect("target rows")
+        .into_iter()
+        .find(|row| row.target_epoch == limit)
+        .expect("target row");
+    assert_eq!(target_row.target_epoch, limit);
+    let source_row = db
+        .get_attestations(PUBKEY2)
+        .expect("source rows")
+        .into_iter()
+        .find(|row| row.source_epoch == limit)
+        .expect("source row");
+    assert_eq!(source_row.source_epoch, limit);
+    assert_eq!(source_row.target_epoch, limit);
+}
+
+#[test]
+fn set_block_and_attestation_watermarks_reject_2_pow_63() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let above = 1_u64 << 63;
+
+    let err = db.set_block_watermark(PUBKEY, above).expect_err("block watermark");
+    assert_out_of_range(err, "slot", above);
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("block wm"), None);
+
+    db.set_block_watermark(PUBKEY, 10).expect("in-range block watermark");
+    let err = db.set_block_watermark(PUBKEY, u64::MAX).expect_err("block watermark max");
+    assert_out_of_range(err, "slot", u64::MAX);
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("block wm"), Some(10));
+
+    let err = db.set_attestation_watermark(PUBKEY, above, 5).expect_err("source watermark");
+    assert_out_of_range(err, "source_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), None);
+
+    let err = db.set_attestation_watermark(PUBKEY, 5, above).expect_err("target watermark");
+    assert_out_of_range(err, "target_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), None);
+
+    db.set_attestation_watermark(PUBKEY, 3, 4).expect("in-range attestation watermark");
+    let err =
+        db.set_attestation_watermark(PUBKEY, above, above + 1).expect_err("both out of range");
+    assert_out_of_range(err, "source_epoch", above);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("att wm"), Some((3, 4)));
+}
+
+/// The out-of-range member is refused before enqueue. A sibling already queued
+/// with `wait_to_fill == 0` and `batch_size == 2` still commits. If the range
+/// check ran only inside `insert_spec`, that sibling would share the batch and
+/// come back as `ReserveCommitFailed`.
+#[test]
+fn out_of_range_member_does_not_roll_back_its_group_commit_sibling() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the in-range sibling without a leader");
+    sibling.arm();
+
+    let err = db
+        .reserve_attestation(PUBKEY2, 99, 1 << 63, Some("0xbad".into()), GVR)
+        .expect_err("out of range member");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+
+    let leader =
+        db.reserve_block(PUBKEY, 8, Some("0xleader".into()), GVR).expect("in-range leader");
+    assert!(leader.inserted, "valid sibling's batch must commit");
+    let queued = sibling.recv().expect("pre-queued sibling commits");
+    assert!(queued.inserted);
+
+    let blocks = db.get_blocks(PUBKEY).expect("blocks");
+    assert_eq!(blocks.len(), 2, "no batch rollback, got {blocks:?}");
+    assert!(blocks.iter().any(|block| block.slot == 7));
+    assert!(blocks.iter().any(|block| block.slot == 8));
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+}
+
+#[test]
+fn enqueue_helpers_reject_a_slot_above_i64_max_before_queueing() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let err = db
+        .enqueue_and_abandon_block(PUBKEY, 1 << 63, Some("0xabandon".into()), GVR)
+        .expect_err("abandon");
+    assert_out_of_range(err, "slot", 1 << 63);
+
+    let cancellable = db.enqueue_block_cancellable(PUBKEY, u64::MAX, Some("0xcancel".into()), GVR);
+    let err = match cancellable {
+        Err(err) => err,
+        Ok(_) => panic!("cancellable enqueue of u64::MAX must be OutOfRange"),
+    };
+    assert_out_of_range(err, "slot", u64::MAX);
+    assert!(db.get_blocks(PUBKEY).expect("rows").is_empty());
+}
+
+#[test]
+fn scoped_reserve_delegates_the_range_check() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), *GVR);
+    let err = scoped
+        .reserve_attestation(PUBKEY, 99, 1 << 63, Some("0xscoped".into()))
+        .expect_err("scoped attestation");
+    assert_out_of_range(err, "target_epoch", 1 << 63);
+    let err =
+        scoped.reserve_block(PUBKEY, 1 << 63, Some("0xscoped".into())).expect_err("scoped block");
+    assert_out_of_range(err, "slot", 1 << 63);
+    assert!(db.get_attestations(PUBKEY).expect("atts").is_empty());
+    assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty());
+}
+
+fn assert_source_exceeds_target(result: Result<impl std::fmt::Debug, SlashingError>, path: &str) {
+    match result {
+        Err(SlashingError::SlashableAttestation(
+            AttestationSlashingViolation::SourceExceedsTarget { source_epoch, target_epoch },
+        )) => {
+            assert_eq!((source_epoch, target_epoch), (20, 9), "{path}");
+        }
+        other => panic!("{path}: expected SourceExceedsTarget {{ 20, 9 }}, got {other:?}"),
+    }
+}
+
+/// The signer-server reserve and stage paths have no caller-side filter, so
+/// the evaluator itself refuses source > target. Source == target is not that
+/// case and is accepted.
+#[test]
+fn reserve_and_stage_refuse_an_attestation_whose_source_exceeds_its_target() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), SCOPED_CN.to_string(), *GVR);
+
+    assert_source_exceeds_target(
+        db.reserve_attestation(PUBKEY, 20, 9, Some("0xreserve".into()), GVR),
+        "reserve_attestation",
+    );
+    assert_source_exceeds_target(
+        db.stage_attestation(PUBKEY, 20, 9, Some("0xstage".into()), GVR),
+        "stage_attestation",
+    );
+    assert_source_exceeds_target(
+        scoped.reserve_attestation(PUBKEY, 20, 9, Some("0xscoped-reserve".into())),
+        "PubkeyScopedDb::reserve_attestation",
+    );
+    assert_source_exceeds_target(
+        scoped.stage_attestation(PUBKEY, 20, 9, Some("0xscoped-stage".into())).map(|(s, _)| s),
+        "PubkeyScopedDb::stage_attestation",
+    );
+    assert!(db.get_attestations(PUBKEY).expect("rows").is_empty(), "no refused row written");
+
+    // The stage refusal rolled back: the connection takes the next write.
+    let equal = db
+        .reserve_attestation(PUBKEY, 9, 9, Some("0xequal".into()), GVR)
+        .expect("source == target is not source > target");
+    assert!(equal.inserted);
+    let staged = db
+        .stage_attestation(PUBKEY2, 9, 9, Some("0xequal-stage".into()), GVR)
+        .expect("stage source == target");
+    staged.commit().expect("commit source == target");
+    for pubkey in [PUBKEY, PUBKEY2] {
+        let rows = db.get_attestations(pubkey).expect("rows");
+        assert_eq!(rows.len(), 1, "{pubkey}: {rows:?}");
+        assert_eq!((rows[0].source_epoch, rows[0].target_epoch), (9, 9));
+    }
+}
+
+/// A source > target member is evaluated inside the batch and rejected alone.
+/// The queued sibling still commits; a batch abort would return
+/// `ReserveCommitFailed` to both.
+#[test]
+fn source_exceeds_target_member_does_not_roll_back_its_group_commit_sibling() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the sibling without a leader");
+    sibling.arm();
+
+    assert_source_exceeds_target(
+        db.reserve_attestation(PUBKEY2, 20, 9, Some("0xbad".into()), GVR),
+        "batched reserve_attestation",
+    );
+    let queued = sibling.recv().expect("sibling in the same batch commits");
+    assert!(queued.inserted);
+    assert_eq!(db.get_blocks(PUBKEY).expect("blocks").len(), 1);
+    assert!(db.get_attestations(PUBKEY2).expect("bad rows").is_empty());
+}
+
+/// `wait_eval_gate` runs before the evaluator. The connection mutex is held
+/// across the gate, so only lock-free state can tell the order apart: a strict
+/// flag set while the member is parked must be the one its decision uses.
+#[test]
+fn group_commit_evaluates_after_the_eval_gate() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.seed_block(PUBKEY, 50, None, GVR).expect("seed NULL-root block");
+    let (entered, release) = db.block_next_eval();
+
+    let db_w = Arc::clone(&db);
+    let worker = thread::spawn(move || db_w.reserve_block(PUBKEY, 50, None, GVR));
+    entered.recv().expect("member parked at the eval gate");
+    db.set_strict_semantics(true);
+    release.send(()).expect("release the gate");
+
+    match worker.join().expect("worker") {
+        Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+            slot: 50,
+        })) => {}
+        other => panic!("strict NULL == NULL must be refused after the gate, got {other:?}"),
+    }
+}
+
+/// File DB whose `table` is dropped from a second connection after `open`, so
+/// the evaluator's history read on that table fails with a SQL error inside
+/// the caller's transaction. Every other table, and the other kind's paths,
+/// keep working.
+fn open_with_dropped_history_table(table: &str) -> (tempfile::TempDir, SlashingDb) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slashing.db");
+    let db = SlashingDb::open(&path).expect("open");
+    rusqlite::Connection::open(&path)
+        .expect("second connection")
+        .execute_batch(&format!("DROP TABLE {table};"))
+        .expect("drop history table");
+    (dir, db)
+}
+
+fn assert_missing_table(err: SlashingError, table: &str, path: &str) {
+    match &err {
+        SlashingError::DatabaseError(e) => {
+            assert_eq!(e.to_string(), format!("no such table: {table}"), "{path}");
+        }
+        other => panic!("{path}: expected DatabaseError (evaluator read), got {other:?}"),
+    }
+}
+
+/// A SQL error inside `evaluate_block` goes through the one ROLLBACK, so the
+/// same connection takes the next write. Without it the next `BEGIN
+/// IMMEDIATE` fails with "cannot start a transaction within a transaction".
+#[test]
+fn stage_block_rolls_back_an_evaluator_sql_error_and_takes_the_next_write() {
+    let (_dir, db) = open_with_dropped_history_table("blocks");
+
+    let err = db
+        .stage_block(PUBKEY, 7, Some("0xblock".into()), GVR)
+        .expect_err("the blocks history read must fail");
+    assert_missing_table(err, "blocks", "stage_block");
+
+    db.stage_attestation(PUBKEY, 8, 9, Some("0xnext".into()), GVR)
+        .expect("next stage on the same connection")
+        .commit()
+        .expect("next commit");
+    assert_eq!(db.get_attestations(PUBKEY).expect("rows").len(), 1);
+}
+
+/// Attestation counterpart of
+/// `stage_block_rolls_back_an_evaluator_sql_error_and_takes_the_next_write`.
+#[test]
+fn stage_attestation_rolls_back_an_evaluator_sql_error_and_takes_the_next_write() {
+    let (_dir, db) = open_with_dropped_history_table("attestations");
+
+    let err = db
+        .stage_attestation(PUBKEY, 8, 9, Some("0xatt".into()), GVR)
+        .expect_err("the attestations history read must fail");
+    assert_missing_table(err, "attestations", "stage_attestation");
+
+    db.stage_block(PUBKEY, 7, Some("0xnext".into()), GVR)
+        .expect("next stage on the same connection")
+        .commit()
+        .expect("next commit");
+    assert_eq!(db.get_blocks(PUBKEY).expect("rows").len(), 1);
+}
+
+/// A SQL error inside a member's evaluator is not a member rejection: it
+/// aborts the batch, so the sibling accepted (and inserted) before it is
+/// rolled back and every member gets the commit-failure error.
+#[test]
+fn group_commit_evaluator_sql_error_rolls_back_the_accepted_sibling() {
+    let (_dir, db) = open_with_dropped_history_table("attestations");
+    db.set_group_commit(GroupCommitConfig { batch_size: 2, wait_to_fill: Duration::ZERO });
+
+    let sibling = db
+        .enqueue_block_cancellable(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("queue the sibling without a leader");
+    sibling.arm();
+
+    let member = db.reserve_attestation(PUBKEY2, 8, 9, Some("0xbroken".into()), GVR);
+    let sibling = sibling.recv();
+    for (path, result) in [("member", member), ("sibling", sibling)] {
+        match result {
+            Err(SlashingError::ReserveCommitFailed(msg)) => {
+                assert_eq!(msg, "database error: no such table: attestations", "{path}");
+            }
+            other => panic!("{path}: expected the batch commit failure, got {other:?}"),
+        }
+    }
+    assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty(), "sibling row rolled back");
+
+    let again = db
+        .reserve_block(PUBKEY, 7, Some("0xsibling".into()), GVR)
+        .expect("the connection takes the next batch");
+    assert!(again.inserted, "no sibling row survived the abort");
 }

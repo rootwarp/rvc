@@ -29,7 +29,8 @@ pub fn prompt_password() -> Result<Zeroizing<String>> {
     Ok(password)
 }
 
-/// Resolves a password from a file or interactive prompt.
+/// Resolves a new keystore's password from a file or interactive prompt, and
+/// checks its minimum length.
 ///
 /// If `password_file` is `Some`, reads the password from the file.
 /// Otherwise, prompts the user interactively with double-prompt confirmation.
@@ -40,23 +41,43 @@ pub fn resolve_password(password_file: Option<&Path>) -> Result<Zeroizing<String
     }
 }
 
-/// Reads a password from a file, trims trailing newlines.
+/// Resolves an existing keystore's password from a file or one interactive
+/// prompt. No minimum length applies: EIP-2335 sets none for decryption.
+pub fn resolve_existing_password(password_file: Option<&Path>) -> Result<Zeroizing<String>> {
+    match password_file {
+        Some(path) => read_password_text(path),
+        None => Ok(Zeroizing::new(
+            rpassword::prompt_password_stderr("Enter keystore password: ")
+                .context("Failed to read password")?,
+        )),
+    }
+}
+
+/// Reads a password from a file, trims trailing newlines, and checks its
+/// minimum length.
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    let password = read_password_text(path)?;
+    validate_password(&password)?;
+    Ok(password)
+}
+
+fn read_password_text(path: &Path) -> Result<Zeroizing<String>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read password file: {}", path.display()))?;
 
     let password = content.trim_end_matches('\n').trim_end_matches('\r');
-    validate_password(password)?;
     Ok(Zeroizing::new(password.to_string()))
 }
 
-/// Validates that a password meets minimum length requirements.
+/// Validates the minimum length of the password the keystore is encrypted
+/// with: its [`crypto::process_password`] form, in UTF-8 bytes.
 pub fn validate_password(password: &str) -> Result<()> {
-    if password.len() < MIN_PASSWORD_LENGTH {
+    let processed_len = crypto::process_password(password).len();
+    if processed_len < MIN_PASSWORD_LENGTH {
         bail!(
-            "Password too short: minimum {} characters, got {}",
+            "Password too short after EIP-2335 processing: minimum {} characters, got {}",
             MIN_PASSWORD_LENGTH,
-            password.len()
+            processed_len
         );
     }
     Ok(())
@@ -136,6 +157,26 @@ mod tests {
         let err = validate_password("short").unwrap_err();
         assert!(err.to_string().contains("minimum 8 characters"));
         assert!(err.to_string().contains("got 5"));
+    }
+
+    #[test]
+    fn a_password_shorter_than_the_minimum_after_processing_is_rejected() {
+        let password = "short\r\n\t\t";
+        assert_eq!(password.len(), 9);
+        let err = validate_password(password).expect_err("5 bytes after processing");
+        assert_eq!(
+            err.to_string(),
+            "Password too short after EIP-2335 processing: minimum 8 characters, got 5"
+        );
+        let fullwidth = "\u{FF50}\u{FF41}\u{FF53}\u{FF53}";
+        assert_eq!(fullwidth.len(), 12);
+        let err = validate_password(fullwidth).expect_err("NFKD maps it to 4 bytes");
+        assert!(err.to_string().ends_with("got 4"), "{err}");
+    }
+
+    #[test]
+    fn the_minimum_counts_utf8_bytes_not_characters() {
+        assert!(validate_password("\u{1F511}\u{1F511}").is_ok());
     }
 
     #[test]

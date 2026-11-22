@@ -1,6 +1,6 @@
-//! G-8 / ARCH-3g: mock-fidelity scan of `with_get_block_root` stubs.
+//! G-8 / ARCH-3g: mock-fidelity scan of block-id stubs.
 //!
-//! No `with_get_block_root` closure in `crates/**` may:
+//! No `with_get_block_root` or `with_get_block_header` closure in `crates/**` may:
 //!
 //! * **(i)** return `Ok(` on every path (`Ok` present, `Err` absent) — an
 //!   unconditional-success stub, including head-vs-else that still `Ok`s every
@@ -11,14 +11,16 @@
 //! `use MockBeaconNodeClient::with_slot_aware_block_root`.
 //!
 //! After ARCH-3f the original seven fixtures are slot-aware (`with_slot_aware_block_root`).
-//! Remaining `with_get_block_root` sites either branch on the slot id or inject a **transport**
+//! Remaining block-id sites either branch on the slot id or inject a **transport**
 //! `HttpError` (ARCH-3f site 2 + two empty-slot harnesses). Those transport injectors are not
 //! 404 stand-ins and must stay green (3f: do not treat the transport helper as a 404).
+//! RV-1.4 moved parent capture onto `with_get_block_header`. Those closures are held to the
+//! same two rules. Four `with_get_block_root` sites remain.
 //!
 //! The builder definition lives in [`MOCK_BUILDER_PATH`] and is excluded by exact path.
 //!
-//! Non-vacuity: the walk must observe at least [`MIN_SITES`] `with_get_block_root(` call
-//! sites, or a rename of the builder silently turns the gate into a no-op.
+//! Non-vacuity: the walk must observe at least [`MIN_SITES`] call sites across both
+//! builders, or a rename of either builder silently turns the gate into a no-op.
 //!
 //! RED is demonstrated on **synthetic** strings (ADR-012: do not merge a failing workspace
 //! scan). No external dependency (Phase-1 rule P6): brace-aware extraction in the
@@ -38,11 +40,11 @@ const MOCK_BUILDER_PATH: &str = "crates/bn-manager/src/mock.rs";
 /// This gate's own sources mention the needle inside synthetic fixtures.
 const THIS_GATE: &str = "crates/architecture-tests/tests/mock_fidelity.rs";
 
-/// Floor at ARCH-3g land (seven remaining `with_get_block_root` call sites after 3f,
-/// excluding [`MOCK_BUILDER_PATH`]). A future rename of the builder must not go silent.
-const MIN_SITES: usize = 7;
+/// Floor after RV-1.4: four `with_get_block_root` sites plus eight `with_get_block_header`
+/// sites, excluding [`MOCK_BUILDER_PATH`]. A future rename of either builder must not go silent.
+const MIN_SITES: usize = 12;
 
-const NEEDLE: &str = "with_get_block_root(";
+const NEEDLES: &[&str] = &["with_get_block_root(", "with_get_block_header("];
 
 const REMEDY: &str = "use `MockBeaconNodeClient::with_slot_aware_block_root`";
 
@@ -373,37 +375,40 @@ fn ident_boundary_before(src: &str, at: usize) -> bool {
     at == 0 || !is_ident_char(src.as_bytes()[at - 1])
 }
 
-/// All `with_get_block_root(` closures in `src` (synthetic or real).
+/// All block-id stub closures in `src` (synthetic or real).
 fn scan_source(rel: &str, src: &str) -> Vec<FoundStub> {
     let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(rel_off) = src[from..].find(NEEDLE) {
-        let at = from + rel_off;
-        from = at + NEEDLE.len();
-        if !ident_boundary_before(src, at) {
-            continue;
+    for needle in NEEDLES {
+        let mut from = 0;
+        while let Some(rel_off) = src[from..].find(needle) {
+            let at = from + rel_off;
+            from = at + needle.len();
+            if !ident_boundary_before(src, at) {
+                continue;
+            }
+            let ls = line_start(src, at);
+            let le = line_end(src, at);
+            let line_text = &src[ls..le];
+            if is_comment_only_line(line_text) {
+                continue;
+            }
+            // Needle after `//` on this line is a comment mention, not a call.
+            let code = code_portion(line_text);
+            if at - ls >= code.len() {
+                continue;
+            }
+            let name_len = needle.len() - 1;
+            let Some(closure) = extract_call_closure(src, at + name_len) else {
+                continue;
+            };
+            let class = classify(&closure.param, &closure.body);
+            out.push(FoundStub {
+                rel_path: rel.to_string(),
+                line: line_at(src, at),
+                site: line_text.trim().to_string(),
+                class,
+            });
         }
-        let ls = line_start(src, at);
-        let le = line_end(src, at);
-        let line_text = &src[ls..le];
-        if is_comment_only_line(line_text) {
-            continue;
-        }
-        // Needle after `//` on this line is a comment mention, not a call.
-        let code = code_portion(line_text);
-        if at - ls >= code.len() {
-            continue;
-        }
-        let Some(closure) = extract_call_closure(src, at + "with_get_block_root".len()) else {
-            continue;
-        };
-        let class = classify(&closure.param, &closure.body);
-        out.push(FoundStub {
-            rel_path: rel.to_string(),
-            line: line_at(src, at),
-            site: line_text.trim().to_string(),
-            class,
-        });
     }
     out
 }
@@ -442,7 +447,7 @@ fn g8_no_dishonest_block_root_stubs() {
     );
     assert!(
         scan.sites.len() >= MIN_SITES,
-        "found only {} with_get_block_root site(s); matcher or walk likely broke (need >= {MIN_SITES})",
+        "found only {} block-id stub site(s); matcher or walk likely broke (need >= {MIN_SITES})",
         scan.sites.len()
     );
     assert!(
@@ -455,7 +460,7 @@ fn g8_no_dishonest_block_root_stubs() {
     violations.sort();
     assert!(
         violations.is_empty(),
-        "G-8 mock-fidelity (ARCH-3g / VD-36): with_get_block_root stubs must not Ok \
+        "G-8 mock-fidelity (ARCH-3g / VD-36): block-id stubs must not Ok \
          unconditionally and must not Err on every path as a 404 stand-in. {REMEDY}.\n\
          Offenders:\n  {}",
         violations.join("\n  ")
@@ -594,7 +599,7 @@ fn test_scanner_is_non_vacuous() {
     );
     assert!(
         scan.sites.len() >= MIN_SITES,
-        "found only {} with_get_block_root site(s); need >= {MIN_SITES}",
+        "found only {} block-id stub site(s); need >= {MIN_SITES}",
         scan.sites.len()
     );
     assert!(

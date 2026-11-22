@@ -204,6 +204,14 @@ impl SigningEnablement for LoadEnablement {
     fn is_signing_enabled(&self, _pubkey: &crypto::PublicKey) -> bool {
         true
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &crypto::PublicKey) -> bool {
+        false
+    }
 }
 
 /// signer-server load-profile fixture: N keys, [`SlowSigner`], real `SlashingDb::open`.

@@ -2,6 +2,9 @@
 
 use super::*;
 use beacon::WireBody;
+use eth_types::BeaconBlock;
+use signer::SignerError;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use timing::{DeadlineBps, DeadlineSchedule};
@@ -28,27 +31,37 @@ fn tight_payload_schedule() -> DeadlineSchedule {
 async fn test_self_build_json_signs_block_then_envelope() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let envelope_ssz = gloas_envelope_ssz();
-    let expected_root = rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)
-        .expect("valid envelope SSZ");
+    let spec_root = rvc_gloas::gloas_execution_payload_envelope_root(&gloas_envelope_ssz())
+        .expect("spec envelope SSZ");
     assert_eq!(
-        hex::encode(expected_root),
+        hex::encode(spec_root),
         rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT
     );
+    let response = self_build_json_response(slot);
+    let envelope_hex = response.data["execution_payload_envelope"]
+        .as_str()
+        .expect("bound envelope hex")
+        .to_string();
+    let envelope_ssz = hex::decode(envelope_hex.strip_prefix("0x").expect("0x prefix"))
+        .expect("bound envelope hex");
+    let expected_root =
+        rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).expect("bound envelope");
 
     let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let signer = Arc::new(MockSigner::new().with_trace(trace.clone()));
-    let beacon = Arc::new(
-        MockBeaconClient::from_response(self_build_json_response(slot)).with_trace(trace.clone()),
-    );
+    let beacon = Arc::new(MockBeaconClient::from_response(response).with_trace(trace.clone()));
     let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "self-build JSON must succeed: {result:?}");
 
     assert_eq!(signer.header_calls.lock().unwrap().len(), 1);
+    let header = signer.header_calls.lock().unwrap()[0].header.clone();
+    assert_eq!(hex::encode(header.body_root), rvc_gloas::KAT_GLOAS_SELF_BUILD_BODY_ROOT);
+    assert_eq!(hex::encode(header.object_root()), rvc_gloas::KAT_GLOAS_SELF_BUILD_BLOCK_ROOT);
     assert_eq!(signer.envelope_calls.lock().unwrap().len(), 1);
     assert_eq!(signer.envelope_calls.lock().unwrap()[0].object_root, expected_root);
+    assert_eq!(hex::encode(expected_root), rvc_gloas::KAT_GLOAS_BOUND_ENVELOPE_ROOT);
     assert_eq!(signer.envelope_calls.lock().unwrap()[0].slot, slot);
     assert_eq!(beacon.publish_full_calls.lock().unwrap().len(), 1);
     assert!(beacon.publish_full_calls.lock().unwrap()[0].builder_url.is_none());
@@ -59,7 +72,7 @@ async fn test_self_build_json_signs_block_then_envelope() {
     assert_eq!(envelopes[0].consensus_version, "gloas");
     match &envelopes[0].signed_envelope {
         WireBody::Json(value) => {
-            assert_eq!(value["message"], serde_json::json!(gloas_envelope_hex()));
+            assert_eq!(value["message"], serde_json::json!(envelope_hex));
             assert_eq!(
                 value["signature"],
                 serde_json::json!(format!("0x{}", hex::encode(mock_envelope_sig().to_bytes())))
@@ -77,15 +90,20 @@ async fn test_self_build_json_signs_block_then_envelope() {
 async fn test_self_build_ssz_signs_block_then_envelope() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let envelope_ssz = gloas_envelope_ssz();
-    let expected_root = rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)
-        .expect("valid envelope SSZ");
+    let response = self_build_ssz_response(slot);
+    let envelope_ssz = bound_self_build_envelope(&BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: self_build_body(slot, [0x11; 32]),
+    });
+    let expected_root =
+        rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).expect("bound envelope");
 
     let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let signer = Arc::new(MockSigner::new().with_trace(trace.clone()));
-    let beacon = Arc::new(
-        MockBeaconClient::from_response(self_build_ssz_response(slot)).with_trace(trace.clone()),
-    );
+    let beacon = Arc::new(MockBeaconClient::from_response(response).with_trace(trace.clone()));
     let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
@@ -162,7 +180,7 @@ async fn test_builder_win_ssz_echoes_url_and_skips_envelope() {
 }
 
 fn gloas_ssz_builder_win(slot: Slot) -> MockBeaconClient {
-    let body = gloas_body_ssz();
+    let body = external_bid_body(slot, [0x11; 32]);
     let ssz_bytes = build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &body);
     MockBeaconClient::from_response(ProduceBlockResponse {
         data: serde_json::Value::Null,
@@ -174,6 +192,7 @@ fn gloas_ssz_builder_win(slot: Slot) -> MockBeaconClient {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     })
 }
 
@@ -199,8 +218,13 @@ async fn test_json_envelope_object_drops_duty_before_sign() {
 async fn test_invalid_envelope_ssz_drops_duty_before_sign() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let block_ssz =
-        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
+    let block_ssz = build_gloas_beacon_block_ssz(
+        slot,
+        42,
+        [0x11; 32],
+        [0x22; 32],
+        &self_build_body(slot, [0x11; 32]),
+    );
     let ssz_bytes = build_gloas_block_contents_ssz(&block_ssz, &[0xde, 0xad], &[0xaa], &[0xbb]);
     let response = ProduceBlockResponse {
         data: serde_json::Value::Null,
@@ -212,6 +236,7 @@ async fn test_invalid_envelope_ssz_drops_duty_before_sign() {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
     let signer = Arc::new(MockSigner::new());
     let beacon = Arc::new(MockBeaconClient::from_response(response));
@@ -349,4 +374,153 @@ fn test_v4_envelope_deadline_is_injected_schedule_not_literal() {
     let body = &rest[..end];
     assert!(body.contains("first_overrun_stage"), "{body}");
     assert!(!body.contains("5000"), "{body}");
+}
+
+fn signer_service_for(secret: crypto::SecretKey) -> Arc<signer::SignerService> {
+    let mut keys = crypto::KeyManager::new();
+    keys.insert(secret);
+    let composite = Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(keys)));
+    let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("memory slashing db"));
+    Arc::new(signer::SignerService::new(composite, db).with_enablement(signer::always_enabled()))
+}
+
+/// The envelope signs under the produce fence. A capture fence that no longer
+/// holds is discarded before that sign, so dropping `capture_fence` from the
+/// re-check (or deleting the re-check) publishes the envelope. A call with no
+/// scope is `BeaconAdmissionRevoked`.
+#[tokio::test]
+async fn gloas_envelope_signs_under_its_scope_and_is_refused_without_one() {
+    let secret = crypto::SecretKey::generate();
+    let pubkey = secret.public_key();
+    let signer = signer_service_for(secret);
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(MockBeaconClient::from_response(self_build_json_response(slot)));
+    let schedule = Arc::new(test_fork_schedule_with_near_gloas());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        schedule.clone(),
+        [0xaa; 32],
+    );
+    let response = self_build_json_response(slot);
+    let envelope = WireBody::Json(serde_json::json!("0x01"));
+    let blobs = WireBody::Json(serde_json::json!([]));
+    let proofs = WireBody::Json(serde_json::json!([]));
+    let root = [0x11; 32];
+    let fork = eth_types::ForkName::Gloas;
+    let generation = Arc::new(AtomicU64::new(0));
+    let fence = beacon::DutyFence::at(0, Arc::clone(&generation));
+    let capture = beacon::DutyFence::at(0, generation);
+
+    let published = signer::require_beacon_admission_scope(service.sign_and_publish_envelope(
+        &response,
+        &envelope,
+        &blobs,
+        &proofs,
+        root,
+        slot,
+        &pubkey,
+        fork,
+        &mut PayloadDeadline::for_test(60_000),
+        &fence,
+        &capture,
+    ))
+    .await;
+    assert!(published.is_ok(), "{published:?}");
+    assert_eq!(beacon.envelope_publish_calls.lock().unwrap().len(), 1);
+
+    let refused =
+        signer::require_beacon_admission_scope(signer.sign_execution_payload_envelope_root(
+            &root,
+            slot + 2,
+            &pubkey,
+            schedule.as_ref(),
+            &[0xaa; 32],
+        ))
+        .await;
+    assert!(matches!(refused, Err(SignerError::BeaconAdmissionRevoked)), "{refused:?}");
+
+    let held = beacon::DutyFence::at(0, Arc::new(AtomicU64::new(0)));
+    let closed = beacon::DutyFence::closed();
+    let blocked = signer::require_beacon_admission_scope(service.sign_and_publish_envelope(
+        &response,
+        &envelope,
+        &blobs,
+        &proofs,
+        root,
+        slot + 1,
+        &pubkey,
+        fork,
+        &mut PayloadDeadline::for_test(60_000),
+        &held,
+        &closed,
+    ))
+    .await;
+    let err = blocked.expect_err("revoked capture fence");
+    assert!(err.to_string().contains("admission revoked in flight"), "{err}");
+    assert_eq!(beacon.envelope_publish_calls.lock().unwrap().len(), 1);
+}
+
+/// The discard inside `sign_and_publish_v4` must refuse the header.
+///
+/// An external bid has no envelope, so the second `discard_revoked_fences`
+/// call is that header check. Removing it leaves the generation unmoved and
+/// the mock signer completes the header.
+#[tokio::test]
+async fn v4_header_discard_refuses_the_header_when_admission_moves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(
+        MockBeaconClient::unblinded(external_bid_block(slot)).with_consensus_version("gloas"),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
+    let revocation = Arc::clone(&beacon.revocation);
+    let calls = AtomicUsize::new(0);
+    service.set_before_discard(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            revocation.fetch_add(1, Ordering::Release);
+        }
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("discarded");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert!(
+        signer.header_calls.lock().unwrap().is_empty(),
+        "sign_and_publish_v4 must drop the candidate before the header"
+    );
+    assert!(signer.envelope_calls.lock().unwrap().is_empty());
+}
+
+/// The discard inside `sign_and_publish_envelope` must refuse the envelope
+/// after the header was signed.
+///
+/// Self-build calls discard after produce, before the header, and before the
+/// envelope. The third call is the envelope check. Removing it leaves the
+/// generation unmoved and the mock signer completes the envelope.
+#[tokio::test]
+async fn envelope_discard_refuses_the_envelope_when_admission_moves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(MockBeaconClient::from_response(self_build_json_response(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
+    let revocation = Arc::clone(&beacon.revocation);
+    let calls = AtomicUsize::new(0);
+    service.set_before_discard(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+            revocation.fetch_add(1, Ordering::Release);
+        }
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("discarded");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert_eq!(signer.header_calls.lock().unwrap().len(), 1, "the header was already signed");
+    assert!(
+        signer.envelope_calls.lock().unwrap().is_empty(),
+        "sign_and_publish_envelope must drop the envelope before it is signed"
+    );
 }

@@ -12,6 +12,8 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +47,8 @@ pub enum ShutdownReason {
     Success(&'static str),
     /// A registered task panicked or otherwise failed fatally.
     Failure(&'static str),
+    /// The doppelganger latch was stored. Drain, then exit 12.
+    DoppelgangerDetected,
 }
 
 impl ShutdownReason {
@@ -52,6 +56,7 @@ impl ShutdownReason {
     pub fn message(&self) -> &'static str {
         match self {
             Self::Success(msg) | Self::Failure(msg) => msg,
+            Self::DoppelgangerDetected => "doppelganger detected",
         }
     }
 }
@@ -127,13 +132,50 @@ struct Registered {
 /// DSR-2.1 likewise registers `BnManager::start_sync_monitor` as
 /// `"bn.sync_monitor"` (+ `"bn.sync_monitor.cancel"`). `keymanager-api`
 /// lifecycle is per-pubkey/C5-owned.
+/// Cloneable request for a process drain.
+///
+/// [`Self::request_exit`] accepts only doppelganger exit 12. The flag is stored
+/// before the channel send, so a full channel still exits 12 once the drain wakes.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    tx: mpsc::Sender<ShutdownReason>,
+    doppelganger_exit: Arc<AtomicBool>,
+}
+
+impl ShutdownHandle {
+    /// Request a drain that exits `exit_code`.
+    ///
+    /// Only [`crate::startup::EXIT_DOPPELGANGER_DETECTED`] is accepted. Any other
+    /// code is logged and ignored so a caller cannot invent a process status.
+    pub fn request_exit(&self, exit_code: i32) {
+        if exit_code != crate::startup::EXIT_DOPPELGANGER_DETECTED {
+            error!(exit_code, "shutdown handle refused an unexpected exit code");
+            return;
+        }
+        self.doppelganger_exit.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(ShutdownReason::DoppelgangerDetected);
+    }
+}
+
 pub struct TaskExecutor {
     token: CancellationToken,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
+    doppelganger_exit: Arc<AtomicBool>,
     registry: Arc<Mutex<Vec<Registered>>>,
     /// Exit classifications (`ok` / `error` / `panic` / `cancelled`) in completion order.
     /// Written by every monitor; read by unit tests (ARCH-2f will also drive metrics).
     exits: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+    /// Bumps after a monitor records an exit. Tests wait on this instead of the
+    /// process-global running gauge. The counter is always updated: a
+    /// `#[cfg(test)]` above the production `tokio::spawn` sites would hide
+    /// those sites from the raw-spawn scan.
+    finished: tokio::sync::watch::Sender<u64>,
+    /// Polled after the Orchestrator tier and before Background.
+    ///
+    /// Bootstrap registers [`bn_manager::BnManager::wait_for_broadcast_drains`]
+    /// here. The future is not started until that point. It is not an
+    /// executor task, so it is not in the spawn census.
+    after_orchestrator: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
 }
 
 impl TaskExecutor {
@@ -149,10 +191,48 @@ impl TaskExecutor {
         let executor = Self {
             token,
             shutdown_tx,
+            doppelganger_exit: Arc::new(AtomicBool::new(false)),
             registry: Arc::new(Mutex::new(Vec::new())),
             exits: Arc::new(Mutex::new(Vec::new())),
+            finished: tokio::sync::watch::channel(0).0,
+            after_orchestrator: Mutex::new(None),
         };
         (executor, shutdown_rx)
+    }
+
+    /// Run `fut` after the Orchestrator tier has drained and before Background.
+    ///
+    /// The future is polled only then, so its deadline starts after in-flight
+    /// duties have stopped spawning drains. A second call replaces a waiter
+    /// that has not run. The waiter is awaited in full. It is not cut by the
+    /// Background tier budget. [`bn_manager::BnManager::wait_for_broadcast_drains`]
+    /// bounds itself by `block_publication`.
+    pub fn set_after_orchestrator_waiter<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        *self.after_orchestrator.lock() = Some(Box::pin(fut));
+    }
+
+    /// Handle the liveness loop uses to request exit 12.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            tx: self.shutdown_tx.clone(),
+            doppelganger_exit: Arc::clone(&self.doppelganger_exit),
+        }
+    }
+
+    /// Whether a doppelganger exit was requested. The drain prefers this over
+    /// whichever channel reason woke it.
+    pub fn doppelganger_exit_requested(&self) -> bool {
+        self.doppelganger_exit.load(Ordering::SeqCst)
+    }
+
+    /// Shared exit-12 flag. Clone it before [`Self::shutdown`] and load it
+    /// after the drain returns: `shutdown` consumes `self`, and a detection
+    /// can set the flag while a tier is still joining.
+    pub fn doppelganger_exit_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.doppelganger_exit)
     }
 
     /// Clone of the process cancellation token for cooperative tasks.
@@ -198,6 +278,7 @@ impl TaskExecutor {
         let work = handle.abort_handle();
         let tx = self.shutdown_tx.clone();
         let exits = Arc::clone(&self.exits);
+        let finished = self.finished.clone();
         RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
         let monitor = tokio::spawn(async move {
             let outcome = match handle.await {
@@ -211,6 +292,7 @@ impl TaskExecutor {
             RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
             RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
             exits.lock().push((name, outcome));
+            finished.send_modify(|count| *count = count.saturating_add(1));
         });
         self.registry.lock().push(Registered { name, tier, work, monitor });
     }
@@ -251,6 +333,7 @@ impl TaskExecutor {
         let work = handle.abort_handle();
         let tx = self.shutdown_tx.clone();
         let exits = Arc::clone(&self.exits);
+        let finished = self.finished.clone();
         RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
         let monitor = tokio::spawn(async move {
             let outcome = match handle.await {
@@ -269,6 +352,7 @@ impl TaskExecutor {
             RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
             RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
             exits.lock().push((name, outcome));
+            finished.send_modify(|count| *count = count.saturating_add(1));
         });
         self.registry.lock().push(Registered { name, tier, work, monitor });
     }
@@ -298,6 +382,7 @@ impl TaskExecutor {
     pub async fn shutdown(self, budget: TierBudget) -> ShutdownOutcome {
         // Exactly once — cooperative tasks across all tiers observe the same cancel.
         self.token.cancel();
+        let mut after_orchestrator = self.after_orchestrator.lock().take();
 
         let registered = {
             let mut guard = self.registry.lock();
@@ -321,10 +406,14 @@ impl TaskExecutor {
 
         for tier in TIERS {
             let tasks = std::mem::take(&mut by_tier[tier as usize]);
-            if tasks.is_empty() {
-                continue;
+            if !tasks.is_empty() {
+                Self::drain_tier(tasks, budget.for_tier(tier), &mut joined, &mut aborted).await;
             }
-            Self::drain_tier(tasks, budget.for_tier(tier), &mut joined, &mut aborted).await;
+            if tier == ShutdownTier::Orchestrator {
+                if let Some(waiter) = after_orchestrator.take() {
+                    waiter.await;
+                }
+            }
         }
 
         ShutdownOutcome { joined, aborted }
@@ -441,6 +530,29 @@ impl TaskExecutor {
     #[cfg(test)]
     fn recorded_outcomes(&self) -> Vec<(&'static str, &'static str)> {
         self.exits.lock().clone()
+    }
+
+    /// Whether the registered work task named `name` has finished.
+    #[cfg(test)]
+    pub(crate) fn work_finished(&self, name: &str) -> bool {
+        self.registry.lock().iter().any(|entry| entry.name == name && entry.work.is_finished())
+    }
+
+    /// Resolves when `name`'s work abort handle is finished.
+    ///
+    /// Subscribes before the check so a completion that lands between the
+    /// check and the wait is still observed.
+    #[cfg(test)]
+    pub(crate) async fn wait_until_work_finished(&self, name: &'static str) {
+        let mut finished = self.finished.subscribe();
+        loop {
+            if self.work_finished(name) {
+                return;
+            }
+            if finished.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -620,6 +732,59 @@ mod tests {
         assert!(ShutdownTier::Ingress < ShutdownTier::Orchestrator);
         assert!(ShutdownTier::Orchestrator < ShutdownTier::Background);
         assert!(ShutdownTier::Background < ShutdownTier::Telemetry);
+    }
+
+    /// The broadcast-drain waiter runs after Orchestrator has joined and
+    /// before the Background budget starts. A pending background task is
+    /// aborted only after the waiter returns, so the elapsed time is the
+    /// orchestrator sleep plus the waiter plus the background budget.
+    #[tokio::test]
+    async fn after_orchestrator_waiter_runs_before_background() {
+        let token = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(token);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let orch_order = Arc::clone(&order);
+        executor.spawn("orch_before_drains", ShutdownTier::Orchestrator, async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            orch_order.lock().push("orch");
+        });
+        executor.spawn("bg_after_drains", ShutdownTier::Background, std::future::pending::<()>());
+        let waiter_order = Arc::clone(&order);
+        executor.set_after_orchestrator_waiter(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            waiter_order.lock().push("waiter");
+        });
+        let started = std::time::Instant::now();
+        let outcome = executor
+            .shutdown(TierBudget::new([
+                Duration::from_millis(50),
+                Duration::from_millis(500),
+                Duration::from_millis(80),
+                Duration::from_millis(50),
+            ]))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(360),
+            "waiter must run after orchestrator and before background, elapsed {elapsed:?}"
+        );
+        assert!(
+            outcome.joined.contains(&"orch_before_drains"),
+            "orchestrator task must join before the waiter: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert!(
+            outcome.aborted.contains(&"bg_after_drains"),
+            "background straggler is aborted only after the waiter: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert_eq!(
+            order.lock().as_slice(),
+            ["orch", "waiter"],
+            "the waiter starts only after the orchestrator tier has joined"
+        );
     }
 
     /// Drop-guard records task name when the work future is dropped (abort or exit).

@@ -6,6 +6,7 @@
 //!   (M-12 wall-clock elapse ≠ cancel).
 //! * `cancel_monitoring` is the DELETE / hard-remove path
 //!   (`ForwardWindowMachine::cancel`) so a re-import starts a fresh window.
+//!   A `Detected` entry stays, and the process latch is not cleared.
 //! * The trait default `cancel_monitoring → stop_monitoring` is **correct** for
 //!   time-based / log-only / test-double implementors and **fatal** for
 //!   machine-backed ones. This gate is therefore a **classification**, not a ban.
@@ -52,6 +53,11 @@ const DEFAULT_IS_SAFE: &[(&str, &str, &str)] = &[
         "crates/keymanager-api/src/lifecycle.rs",
         "PendingSetMonitor",
         "test double; pending-set, cancel defaults to stop — lifecycle.rs:356",
+    ),
+    (
+        "crates/keymanager-api/src/lifecycle.rs",
+        "RaceMonitor",
+        "test double; detection-race monitor, cancel defaults to stop",
     ),
     ("crates/keymanager-api/src/server.rs", "StubDoppelganger", "test double"),
     (

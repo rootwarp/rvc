@@ -11,7 +11,13 @@ workspace = true
 
 [features]
 default = []
-gcp-trace = ["dep:opentelemetry-gcloud-trace"]
+gcp-trace = [
+    "dep:async-trait",
+    "dep:google-cloud-auth",
+    "dep:opentelemetry-http",
+    "dep:rustls",
+    "dep:serde_json",
+]
 grpc = ["dep:tonic"]
 
 [dependencies]
@@ -25,13 +31,22 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-logroller = { workspace = true }
+flate2 = { workspace = true }
+# Directory-handle file calls and the process UID for the rolling writer (Unix).
+rustix = { version = "1", features = ["fs", "process"] }
 
-# GCP (optional)
-opentelemetry-gcloud-trace = { version = "0.22", optional = true }
+# GCP (optional): OTLP export to the Telemetry API with Google auth.
+async-trait = { workspace = true, optional = true }
+google-cloud-auth = { version = "1.6", default-features = false, optional = true }
+opentelemetry-http = { version = "0.31", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+serde_json = { workspace = true, optional = true }
 # gRPC metadata propagation (optional; TRC-3a). Not pulled unless `grpc` is on.
 tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
+http = "1"
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
+wiremock.workspace = true

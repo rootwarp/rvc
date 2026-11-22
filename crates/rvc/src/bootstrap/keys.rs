@@ -14,7 +14,7 @@ use secret_provider::SecretProvider;
 use tracing::{info, warn};
 
 use super::BootstrapError;
-use crate::config::{redact_url, Config, ServiceBuilder};
+use crate::config::{redact_url, Config, ConfigError, ServiceBuilder};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::orchestrator::PubkeyMap;
 
@@ -73,6 +73,7 @@ pub async fn load_signing_keys(
             info!(count = validator_count, "Loaded validator keys");
             km
         }
+        Err(e @ ConfigError::ImportSecret { .. }) => return Err(e.into()),
         Err(e) => {
             warn!("Failed to load keys, continuing without validators: {}", e);
             KeyManager::new()
@@ -371,6 +372,111 @@ mod tests {
         assert!(!loaded.local_pubkeys.contains(&denied_pk));
         assert!(loaded.composite_signer.has_local_key(&kept_pk));
         assert!(!loaded.composite_signer.has_local_key(&denied_pk));
+    }
+
+    /// A mode `0644` import secret aborts startup. Other key-load errors stay non-fatal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_signing_keys_aborts_on_a_world_readable_import_secret() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let ks_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&ks_dir).unwrap();
+        let password_file = write_password_file(&dir);
+        let secrets = ks_dir.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        let mut dir_perms = std::fs::metadata(&secrets).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&secrets, dir_perms).unwrap();
+        let secret = "world-readable-import-secret";
+        let name = format!("0x{}", "ab".repeat(48));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(secrets.join(&name))
+            .unwrap();
+        write!(file, "{secret}").unwrap();
+        let config = base_config(ks_dir, password_file);
+        let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
+        let err = match load_signing_keys(&config, &denylist).await {
+            Err(err) => err,
+            Ok(_) => panic!("a 0644 import secret aborts startup"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("file permissions must be 0600"), "{msg}");
+        assert!(msg.contains(&name), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+    }
+
+    /// Canonical symlink or FIFO alone, plus a secret and no other json, fails boot.
+    ///
+    /// `in-dir-*` targets sit inside the keystore directory, so only the
+    /// regular-file rule refuses them. Each load runs on a helper thread, so a
+    /// regression that opens the FIFO hangs there and fails the hang guard.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_signing_keys_aborts_on_a_lone_canonical_symlink() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        for kind in ["outside", "dangling", "directory", "fifo", "in-dir-directory", "in-dir-fifo"]
+        {
+            let dir = TempDir::new().unwrap();
+            let ks = dir.path().join("k");
+            std::fs::create_dir(&ks).unwrap();
+            let outside_pk = kind == "outside";
+            let pk = if outside_pk {
+                write_keystore(dir.path(), &SecretKey::generate())
+            } else {
+                [0xcd; 48]
+            };
+            let secret = if outside_pk { PASSWORD } else { "lone-symlink-secret" };
+            let name = format!("0x{}", hex::encode(pk));
+            let link = ks.join(format!("{name}.json"));
+            let target = if outside_pk {
+                dir.path().join(format!("keystore-0x{}.json", hex::encode(pk)))
+            } else if let Some(in_dir) = kind.strip_prefix("in-dir-") {
+                ks.join(in_dir)
+            } else {
+                dir.path().join(kind)
+            };
+            if kind.ends_with("directory") {
+                std::fs::create_dir(&target).unwrap();
+            } else if kind.ends_with("fifo") {
+                let c_path = std::ffi::CString::new(target.to_str().unwrap()).unwrap();
+                // SAFETY: mkfifo only creates a named pipe at this temp path.
+                assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            }
+            let dest = if kind == "dangling" { "missing" } else { target.to_str().unwrap() };
+            std::os::unix::fs::symlink(dest, &link).unwrap();
+            let secrets = ks.join(Config::IMPORT_SECRETS_DIR);
+            std::fs::create_dir(&secrets).unwrap();
+            std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            write!(opts.open(secrets.join(&name)).unwrap(), "{secret}").unwrap();
+            let config = base_config(ks, write_password_file(&dir));
+            let denylist = DeletionDenylist::empty_at(dir.path().join("d"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let loaded = runtime.block_on(load_signing_keys(&config, &denylist));
+                let _ = tx.send(loaded.map(|_| ()).map_err(|e| e.to_string()));
+            });
+            let msg = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("{kind}: load_signing_keys did not return: {e}"))
+                .expect_err(kind);
+            assert!(msg.contains("keystore is corrupt") && msg.contains(&name), "{kind}: {msg}");
+            assert!(!msg.contains(secret), "{kind}: {msg}");
+            assert!(!msg.contains("No keystore files"), "{kind}: {msg}");
+            assert!(!msg.contains("has no keystore"), "{kind}: {msg}");
+        }
     }
 
     #[tokio::test]

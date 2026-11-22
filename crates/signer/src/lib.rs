@@ -26,18 +26,193 @@ pub use eth_types::is_aggregator;
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 #[cfg(any(test, feature = "test-utils"))]
 pub use core::PreReserveBarrier;
-#[allow(deprecated)]
+#[cfg(any(test, feature = "test-utils"))]
 pub use core::StagedRow;
 #[cfg(any(test, feature = "test-utils"))]
 pub use core::{
     block_reserve_interval_count, clear_block_reserve_intervals, take_block_reserve_intervals,
 };
 pub use core::{
-    sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
-    SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
-    TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
+    sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks, SignSlashableRequest,
+    SlashableKind, SlashableSignSession, StandardSlashableHooks, TimeoutPolicy,
+    TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
-pub use doppelganger::SigningEnablement;
+pub use doppelganger::{duty_requires_beacon_admission, SigningDuty, SigningEnablement};
+
+#[cfg(not(any(test, feature = "test-utils")))]
+use crate::core::sign_nonslashable_core;
+
+/// Revocation generation for [`with_beacon_admission`]. A missing scope fails closed.
+///
+/// [`Self::and_generation`] keeps every generation already attached.
+/// [`Self::holds`] is false when any of them has moved, so one block duty
+/// can fail closed on the main pool or the proposer pool.
+#[derive(Clone, Debug)]
+pub struct BeaconAdmission {
+    watches: Vec<(u64, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
+}
+
+impl BeaconAdmission {
+    pub fn new(seen: u64, current: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self { watches: vec![(seen, current)] }
+    }
+
+    /// Attach another pool's generation. Generations already stored stay.
+    pub fn and_generation(
+        mut self,
+        seen: u64,
+        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.watches.push((seen, current));
+        self
+    }
+
+    pub fn holds(&self) -> bool {
+        self.watches
+            .iter()
+            .all(|(seen, current)| current.load(std::sync::atomic::Ordering::Acquire) == *seen)
+    }
+
+    /// Scope for a process that has no beacon node. Stays public so
+    /// signer-server, a different crate, can install it. The VC must not use
+    /// this for a duty whose bytes came from a beacon node.
+    ///
+    /// The atomic is private to this value, so `holds` stays true. A missing
+    /// scope still fails closed.
+    pub fn unbound() -> Self {
+        Self { watches: vec![(0, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))] }
+    }
+}
+
+/// `Some` when this task installed an admission scope.
+///
+/// Tests read it from inside `sign_block_header` to prove both generations
+/// were installed. Production builds do not compile this.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn testing_beacon_admission_holds() -> Option<bool> {
+    BEACON_ADMISSION.try_with(|admission| admission.holds()).ok()
+}
+
+#[cfg(test)]
+mod beacon_admission_combined {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::BeaconAdmission;
+
+    #[test]
+    fn combined_admission_fails_when_either_generation_moves() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let also = Arc::new(AtomicU64::new(2));
+        let admission =
+            BeaconAdmission::new(0, Arc::clone(&primary)).and_generation(2, Arc::clone(&also));
+        assert!(admission.holds());
+        also.fetch_add(1, Ordering::Release);
+        assert!(!admission.holds(), "the second generation must drop the scope");
+        also.store(2, Ordering::Release);
+        primary.fetch_add(1, Ordering::Release);
+        assert!(!admission.holds(), "the primary generation must drop the scope");
+    }
+
+    #[test]
+    fn and_generation_keeps_a_generation_attached_before_the_last() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let middle = Arc::new(AtomicU64::new(1));
+        let third = Arc::new(AtomicU64::new(2));
+        let admission = BeaconAdmission::new(0, Arc::clone(&primary))
+            .and_generation(1, Arc::clone(&middle))
+            .and_generation(2, Arc::clone(&third));
+        middle.fetch_add(1, Ordering::Release);
+        assert!(
+            !admission.holds(),
+            "combining must keep a generation attached before the last one"
+        );
+    }
+}
+
+tokio::task_local! {
+    static BEACON_ADMISSION: BeaconAdmission;
+    #[cfg(any(test, feature = "test-utils"))]
+    static ADMISSION_SCOPE_REQUIRED: ();
+}
+
+pub async fn with_beacon_admission<R>(
+    admission: BeaconAdmission,
+    fut: impl std::future::Future<Output = R>,
+) -> R {
+    BEACON_ADMISSION.scope(admission, fut).await
+}
+
+/// Run `fut` as a production caller that forgot the admission scope.
+///
+/// `test-utils` otherwise leaves a missing scope open so existing signer
+/// fixtures keep signing. Production builds do not have that feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn require_beacon_admission_scope<R>(fut: impl std::future::Future<Output = R>) -> R {
+    ADMISSION_SCOPE_REQUIRED.scope((), fut).await
+}
+
+pub(crate) fn beacon_admission_revoked(duty: SigningDuty) -> bool {
+    admission_revoked_by(&capture_admission(), duty)
+}
+
+/// The caller task's admission, read once so a check on another thread
+/// (the slashable `spawn_blocking` body) applies the same rule.
+///
+/// A clone shares the live generation atomics, so a revoke after the
+/// capture is still seen.
+#[derive(Clone, Debug)]
+pub(crate) enum CapturedAdmission {
+    Scoped(BeaconAdmission),
+    /// No scope on the caller task; `revokes` is the missing-scope rule there.
+    Missing {
+        revokes: bool,
+    },
+}
+
+/// Read both admission task-locals. Call it on the task that owns them.
+pub(crate) fn capture_admission() -> CapturedAdmission {
+    match BEACON_ADMISSION.try_with(BeaconAdmission::clone) {
+        Ok(admission) => CapturedAdmission::Scoped(admission),
+        Err(_) => CapturedAdmission::Missing { revokes: missing_admission_scope_revokes() },
+    }
+}
+
+/// The one admission rule for the entry, under-lock and after-reserve checks.
+pub(crate) fn admission_revoked_by(captured: &CapturedAdmission, duty: SigningDuty) -> bool {
+    if !duty_requires_beacon_admission(duty) {
+        return false;
+    }
+    match captured {
+        CapturedAdmission::Scoped(admission) => !admission.holds(),
+        CapturedAdmission::Missing { revokes } => *revokes,
+    }
+}
+
+/// The missing-scope rule. `test_utils` is whether the build has the
+/// `test-utils` feature; `opted_in` is whether the caller runs under
+/// [`require_beacon_admission_scope`]. Only a `test-utils` build that did not
+/// opt in leaves a missing scope open.
+const fn missing_scope_revokes(test_utils: bool, opted_in: bool) -> bool {
+    !test_utils || opted_in
+}
+
+/// `test-utils` keeps existing fixtures signing unless the test opts in.
+#[cfg(feature = "test-utils")]
+fn missing_admission_scope_revokes() -> bool {
+    missing_scope_revokes(true, ADMISSION_SCOPE_REQUIRED.try_with(|_| ()).is_ok())
+}
+
+/// Production builds have no opt-in, so a missing scope always refuses.
+#[cfg(not(feature = "test-utils"))]
+const fn missing_admission_scope_revokes() -> bool {
+    missing_scope_revokes(false, false)
+}
+
+// Every build without `test-utils` evaluates the production arm here: release
+// binaries, `cargo check -p rvc-signer`, and the `rvc-signer-server` test build.
+#[cfg(not(feature = "test-utils"))]
+const _: () = assert!(missing_admission_scope_revokes(), "a missing admission scope must refuse");
 pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
@@ -66,9 +241,9 @@ use crypto::{
     DutyRef, PublicKey, SignContext, Signature, Signer, SigningCtx, SigningError, TypedSigner,
 };
 use eth_types::{
-    AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
-    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName,
-    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, BuilderRequestAuth,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName, ForkSchedule,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
     VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
@@ -118,6 +293,12 @@ pub enum SignerError {
     /// No slashing-DB row was staged or committed.
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
+
+    /// Beacon-node revocation after this duty captured chain data. No
+    /// signature. A refusal after the slashing reservation deletes the row
+    /// this call inserted; if that delete fails, the row is kept.
+    #[error("signing blocked: beacon node admission revoked")]
+    BeaconAdmissionRevoked,
 
     /// This signer cannot produce a signature for the named duty.
     ///
@@ -218,6 +399,40 @@ pub enum BackendKind {
     Unknown,
 }
 
+/// How `composite` routes `pk`. **Fail-closed:** only a local-only key is
+/// [`BackendKind::InProcess`].
+///
+/// The one classifier behind [`SignerService::backend_kind`] and the SEC-1
+/// policy closure. A free function, so the `'static` closure can call it
+/// without capturing the service.
+fn classify_backend(composite: &CompositeSigner, pk: &[u8; 48]) -> BackendKind {
+    let local = composite.has_local_key(pk);
+    let remote = composite.has_grpc_remote(pk) || composite.has_remote_key(pk);
+    match (local, remote) {
+        (true, false) => BackendKind::InProcess,
+        (false, true) => BackendKind::Remote,
+        // Dual-registered or unregistered: cannot prove in-process drop is safe.
+        _ => BackendKind::Unknown,
+    }
+}
+
+/// Per-method inputs of [`SignerService::sign_slashable_vc`].
+///
+/// Owned values only, so the `async_trait` futures stay `Send`.
+struct VcSlashable {
+    /// Taken after admission; the completion debug measures from here.
+    started: Instant,
+    pubkey_hex: String,
+    op_name: &'static str,
+    /// `signing_type` of the completion debug line.
+    signing_type: &'static str,
+    hooks: StandardSlashableHooks,
+    kind: SlashableKind,
+    fork_name: ForkName,
+    signing_root: Root,
+    typed: Option<TypedSignFactory>,
+}
+
 /// Service that combines signing through CompositeSigner with slashing protection.
 ///
 /// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
@@ -239,8 +454,8 @@ pub enum BackendKind {
 /// per per-pubkey [`TimeoutPolicy`] (fail-closed retain for remote/unknown).
 /// Metrics use [`StandardSlashableHooks`] (same families as the gate).
 ///
-/// Non-slashable paths: `ensure_signing_enabled` then
-/// [`sign_nonslashable_core`] (timeout + uniform classification). They take
+/// Non-slashable paths: `ensure_duty_enabled` then
+/// `sign_nonslashable_core` (timeout + uniform classification). They take
 /// no per-validator lock and write no slashing-DB row. VC-specific `debug!`
 /// timing stays in the wrapper.
 pub struct SignerService {
@@ -269,6 +484,12 @@ pub struct SignerService {
     /// Release `rvc-bin` does not enable that feature.
     #[cfg(any(test, feature = "test-utils"))]
     pre_reserve_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+    /// Test-only park before [`Self::ensure_duty_enabled`].
+    #[cfg(any(test, feature = "test-utils"))]
+    admission_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+    /// Test-only park after the non-slashable enablement check, before the backend.
+    #[cfg(any(test, feature = "test-utils"))]
+    nonslashable_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
 }
 
 /// Per-slot envelope reservation. In-flight is refused the same as signed so
@@ -325,6 +546,7 @@ fn envelope_slot_is_unambiguous_no_signature(err: &SignerError) -> bool {
         err,
         SignerError::KeyNotFound(_)
             | SignerError::BlockedByDoppelganger
+            | SignerError::BeaconAdmissionRevoked
             | SignerError::UnsupportedDuty { .. }
     )
 }
@@ -338,6 +560,155 @@ struct FailClosedEnablement;
 impl SigningEnablement for FailClosedEnablement {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         <bool as FailClosedDefault>::default_when_unknown()
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
+}
+
+/// Offline CLI exit enablement. Permits exactly one pubkey, and only a
+/// voluntary exit.
+///
+/// `rvc voluntary-exit` and `rvc prepare-exit` are offline tools. A voluntary
+/// exit is not slashable, so that path is not doppelganger-gated. The type is
+/// named so it cannot be confused with the test-only always-enabled helper
+/// or with `DoppelgangerDisabledByOperator` (every pubkey). Installing it does
+/// not unlock attestations, blocks, or other duties: [`voluntary_exit_only`]
+/// is true, and [`signing_allowed`] refuses those paths.
+///
+/// [`voluntary_exit_only`]: SigningEnablement::voluntary_exit_only
+/// [`signing_allowed`]: doppelganger::signing_allowed
+pub struct OfflineExitEnablement {
+    pubkey: PublicKey,
+}
+
+impl OfflineExitEnablement {
+    /// Permit a voluntary exit only for `pubkey`.
+    #[must_use]
+    pub fn new(pubkey: &PublicKey) -> Self {
+        Self { pubkey: pubkey.clone() }
+    }
+}
+
+impl SigningEnablement for OfflineExitEnablement {
+    fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
+        pubkey == &self.pubkey
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        true
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod offline_exit_enablement_tests {
+    use super::{OfflineExitEnablement, SigningEnablement};
+    use crypto::SecretKey;
+
+    #[test]
+    fn test_offline_exit_enablement_refuses_other_pubkeys() {
+        let allowed = SecretKey::generate().public_key();
+        let other = SecretKey::generate().public_key();
+        let third = SecretKey::generate().public_key();
+        let gate = OfflineExitEnablement::new(&allowed);
+
+        assert!(gate.is_signing_enabled(&allowed));
+        assert!(!gate.is_signing_enabled(&other));
+        assert!(!gate.is_signing_enabled(&third));
+        assert!(gate.voluntary_exit_only());
+        assert!(doppelganger::signing_allowed(
+            &gate,
+            &allowed,
+            doppelganger::SigningDuty::VoluntaryExit
+        ));
+        assert!(!doppelganger::signing_allowed(
+            &gate,
+            &allowed,
+            doppelganger::SigningDuty::RandaoReveal
+        ));
+        assert!(!doppelganger::signing_allowed(
+            &gate,
+            &other,
+            doppelganger::SigningDuty::VoluntaryExit
+        ));
+    }
+
+    /// The pubkey match must not open a slashable duty or another non-slashable duty.
+    #[tokio::test]
+    async fn test_offline_exit_enablement_signs_only_a_voluntary_exit() {
+        use crypto::{CompositeSigner, KeyManager, LocalSigner};
+        use eth_types::{AttestationData, Checkpoint, ForkSchedule, VoluntaryExit};
+        use slashing::SlashingDb;
+
+        use super::{OfflineExitEnablement, SignerError, SignerService, ValidatorSigner};
+
+        let secret_key = crypto::SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut manager = KeyManager::new();
+        manager.insert(secret_key);
+        let composite = std::sync::Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
+        let slashing_db = std::sync::Arc::new(SlashingDb::open_in_memory().expect("memory db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(std::sync::Arc::new(OfflineExitEnablement::new(&pubkey)));
+
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0x10, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [0x11, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [0x12, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [0x13, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [0x14, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [0x15, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0x16, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x17, 0, 0, 0],
+        };
+        let gvr = [0xbb_u8; 32];
+
+        let attestation = service
+            .sign_attestation(
+                &AttestationData {
+                    slot: 1,
+                    index: 0,
+                    beacon_block_root: [0; 32],
+                    source: Checkpoint { epoch: 0, root: [0; 32] },
+                    target: Checkpoint { epoch: 1, root: [0; 32] },
+                },
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(attestation, Err(SignerError::BlockedByDoppelganger)),
+            "attestation must stay gated, got {attestation:?}"
+        );
+
+        let randao = service.sign_randao_reveal(1, &pubkey, &schedule, &gvr).await;
+        assert!(
+            matches!(randao, Err(SignerError::BlockedByDoppelganger)),
+            "randao must stay gated, got {randao:?}"
+        );
+
+        let exit = VoluntaryExit { epoch: 55, validator_index: 1 };
+        service
+            .sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr)
+            .await
+            .expect("voluntary exit is the only duty this enablement unlocks");
     }
 }
 
@@ -356,6 +727,14 @@ pub struct AlwaysEnabled;
 impl SigningEnablement for AlwaysEnabled {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         true
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
     }
 }
 
@@ -437,18 +816,6 @@ fn sign_context_at_epoch(
     )
 }
 
-fn electra_aggregate_as_legacy(e: &ElectraAggregateAndProof) -> AggregateAndProof {
-    AggregateAndProof {
-        aggregator_index: e.aggregator_index,
-        aggregate: Attestation {
-            aggregation_bits: e.aggregate.aggregation_bits.clone(),
-            data: e.aggregate.data.clone(),
-            signature: e.aggregate.signature.clone(),
-        },
-        selection_proof: e.selection_proof.clone(),
-    }
-}
-
 fn sign_context_for_exit(
     pubkey: PublicKey,
     fork_schedule: &ForkSchedule,
@@ -487,6 +854,10 @@ impl SignerService {
             envelope_slots: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-utils"))]
             pre_reserve_barrier: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            admission_barrier: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            nonslashable_barrier: parking_lot::Mutex::new(None),
         }
     }
 
@@ -503,6 +874,33 @@ impl SignerService {
     #[cfg(any(test, feature = "test-utils"))]
     fn pre_reserve_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
         self.pre_reserve_barrier.lock().clone()
+    }
+
+    /// Park before the outer enablement check. `None` clears it.
+    ///
+    /// The barrier must not call back into the enablement gate.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_admission_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.admission_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn admission_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.admission_barrier.lock().clone()
+    }
+
+    /// Park after the non-slashable enablement check and before the backend.
+    ///
+    /// That is the accepted window: the check has admitted the sign, and the
+    /// backend has not run. `None` clears it.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_nonslashable_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.nonslashable_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn nonslashable_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.nonslashable_barrier.lock().clone()
     }
 
     /// Replace the signing enablement gate (builder style).
@@ -544,15 +942,7 @@ impl SignerService {
     /// Dual registration (local + remote) or missing registration is
     /// [`BackendKind::Unknown`].
     pub fn backend_kind(&self, pubkey: &PublicKey) -> BackendKind {
-        let pk = pubkey.to_bytes();
-        let local = self.signer.has_local_key(&pk);
-        let remote = self.signer.has_grpc_remote(&pk) || self.signer.has_remote_key(&pk);
-        match (local, remote) {
-            (true, false) => BackendKind::InProcess,
-            (false, true) => BackendKind::Remote,
-            // Dual-registered or unregistered: cannot prove in-process drop is safe.
-            _ => BackendKind::Unknown,
-        }
+        classify_backend(&self.signer, &pubkey.to_bytes())
     }
 
     /// Map [`BackendKind`] → [`TimeoutPolicy`]. **Default is fail-closed retain.**
@@ -581,34 +971,65 @@ impl SignerService {
         let composite = Arc::clone(&self.signer);
         let pk_bytes = pubkey.to_bytes();
         TimeoutPolicySource::ResolveUnderLock(Arc::new(move || {
-            let local = composite.has_local_key(&pk_bytes);
-            let remote =
-                composite.has_grpc_remote(&pk_bytes) || composite.has_remote_key(&pk_bytes);
-            let kind = match (local, remote) {
-                (true, false) => BackendKind::InProcess,
-                (false, true) => BackendKind::Remote,
-                _ => BackendKind::Unknown,
-            };
-            Self::timeout_policy_for_kind(kind)
+            Self::timeout_policy_for_kind(classify_backend(&composite, &pk_bytes))
         }))
     }
 
-    /// Refuse signing when the doppelganger enablement gate is closed.
+    /// Entry check: doppelganger enablement first, then beacon admission.
     ///
-    /// Called **before** any slashing stage or BLS sign so a closed gate never
-    /// stages a row or produces a signature.  On slashable paths the shared
-    /// core re-checks enablement **under** the per-validator lock (closes
-    /// Safe→Detected TOCTOU vs concurrent liveness).
-    fn ensure_signing_enabled(&self, pubkey: &PublicKey) -> Result<(), SignerError> {
-        if self.enablement.is_signing_enabled(pubkey) {
-            return Ok(());
+    /// Runs before any slashing reservation or BLS call, so a refusal here
+    /// writes no row and produces no signature. A closed enablement returns
+    /// [`SignerError::BlockedByDoppelganger`]. Otherwise a moved generation, or
+    /// a missing scope where the missing-scope rule refuses, returns
+    /// [`SignerError::BeaconAdmissionRevoked`] for every duty except
+    /// [`SigningDuty::VoluntaryExit`].
+    ///
+    /// The process detection latch is read inside `signing_allowed`. Once it
+    /// is stored, every later check point refuses with
+    /// [`SignerError::BlockedByDoppelganger`] before it reads admission, so a
+    /// detected key reports doppelganger even when its admission also moved.
+    ///
+    /// Slashable signs check both again, in the same order, under the
+    /// per-validator lock (after the lock wait) and after the slashing
+    /// reservation. A doppelganger refusal after the reservation keeps the
+    /// row; an admission refusal there deletes the row this call inserted.
+    /// The last check before BLS is the boundary: the after-reservation check
+    /// for a slashable sign, this entry check for a non-slashable one (its
+    /// core re-checks doppelganger only). It is not atomic with the backend:
+    /// a BLS call already started, including a remote request, finishes or
+    /// hits the sign timeout.
+    ///
+    /// `duty` is the typed operation. An exit-only enablement stays closed
+    /// for every variant except [`SigningDuty::VoluntaryExit`].
+    fn ensure_duty_enabled(
+        &self,
+        pubkey: &PublicKey,
+        duty: SigningDuty,
+    ) -> Result<(), SignerError> {
+        if !doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty) {
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            warn!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                "SignerService: signing blocked by doppelganger enablement gate"
+            );
+            return Err(SignerError::BlockedByDoppelganger);
         }
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        warn!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            "SignerService: signing blocked by doppelganger enablement gate"
-        );
-        Err(SignerError::BlockedByDoppelganger)
+        if beacon_admission_revoked(duty) {
+            warn!("SignerService: beacon node admission revoked");
+            return Err(SignerError::BeaconAdmissionRevoked);
+        }
+        Ok(())
+    }
+
+    /// Outer admission check, after an optional test rendezvous.
+    async fn admit(&self, pubkey: &PublicKey, duty: SigningDuty) -> Result<(), SignerError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(barrier) = self.admission_barrier() {
+            barrier.wait().await;
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        std::future::ready(()).await;
+        self.ensure_duty_enabled(pubkey, duty)
     }
 
     /// Raw-root [`Self::sign_backend`] for local/HTTP keys; typed adapter for gRPC.
@@ -644,6 +1065,7 @@ impl SignerService {
     fn map_gate_error(err: SigningGateError, pubkey_hex: &str) -> SignerError {
         match err {
             SigningGateError::BlockedByDoppelganger => SignerError::BlockedByDoppelganger,
+            SigningGateError::BeaconAdmissionRevoked => SignerError::BeaconAdmissionRevoked,
             SigningGateError::SlashingBlocked(e) => SignerError::SlashingBlocked(e),
             SigningGateError::CommitFailed { signing_root, source } => {
                 SignerError::CommitFailed { signing_root, source }
@@ -661,16 +1083,115 @@ impl SignerService {
         })
     }
 
+    /// The VC's one slashable sign through [`sign_slashable`]: policy source,
+    /// BLS backend, request, `slashing_result` record and error mapping.
+    ///
+    /// The caller has already admitted the duty and computed its root. This
+    /// helper opens no span, so `slashing_result` lands on the caller's
+    /// `sign.*` span.
+    async fn sign_slashable_vc(
+        &self,
+        pubkey: &PublicKey,
+        gvr: Root,
+        req: VcSlashable,
+    ) -> Result<Signature, SignerError> {
+        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
+        let policy = self.timeout_policy_source(pubkey);
+        let signer = self.bls_backend_for_duty(pubkey, req.signing_root, req.typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
+
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: Arc::clone(&self.enablement),
+            signer,
+            signing_root: req.signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(req.hooks),
+            op_name: req.op_name,
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: req.kind,
+            fork_name: Some(req.fork_name),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
+        })
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = req.started.elapsed().as_millis() as u64,
+                    signing_type = req.signing_type,
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &req.pubkey_hex))
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Non-slashable paths — all route through `sign_nonslashable`
     // -------------------------------------------------------------------------
     //
     // Pattern (mirrors SigningGate):
     //   1. Root derivation in the public wrapper
-    //   2. `ensure_signing_enabled` (Result) then `sign_nonslashable_core`
+    //   2. `ensure_duty_enabled` (Result) then `sign_nonslashable_core`
     // No per-validator lock, no slashing-DB staging. VC `debug!`/timing stay here.
 
-    /// Facade wrapper: `ensure_signing_enabled` then [`sign_nonslashable_core`].
+    async fn sign_nonslashable_checked(
+        &self,
+        backend: &dyn Signer,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        duty: SigningDuty,
+    ) -> Result<Signature, NonSlashableFailure> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            return core::sign_nonslashable_core_paused(
+                self.enablement.as_ref(),
+                backend,
+                pubkey,
+                signing_root,
+                self.sign_timeout,
+                duty,
+                self.nonslashable_barrier(),
+            )
+            .await;
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            sign_nonslashable_core(
+                self.enablement.as_ref(),
+                backend,
+                pubkey,
+                signing_root,
+                self.sign_timeout,
+                duty,
+            )
+            .await
+        }
+    }
+
+    /// Facade wrapper: `ensure_duty_enabled` then [`crate::core::sign_nonslashable_core`].
     ///
     /// VC-specific `debug!` / elapsed timing stay here (operator output, not
     /// core behaviour). `KeyNotFound` and other backend errors fold through
@@ -679,12 +1200,16 @@ impl SignerService {
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
+        duty: SigningDuty,
         op_name: &str,
         backend: Arc<dyn Signer>,
         fork_name: Option<ForkName>,
     ) -> Result<Signature, SignerError> {
-        // Same gate point as slashable early check (Result, not a bool).
-        self.ensure_signing_enabled(pubkey)?;
+        // Same gate point as the slashable early check. `op_name` is only the
+        // log and metrics label. The exit unlock is `duty`, matched exhaustively
+        // inside `signing_allowed`. The admission barrier, when set, parks
+        // before that check.
+        self.admit(pubkey, duty).await?;
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
@@ -695,15 +1220,7 @@ impl SignerService {
             "Signing non-slashable duty"
         );
 
-        match sign_nonslashable_core(
-            self.enablement.as_ref(),
-            backend.as_ref(),
-            pubkey,
-            signing_root,
-            self.sign_timeout,
-        )
-        .await
-        {
+        match self.sign_nonslashable_checked(backend.as_ref(), pubkey, signing_root, duty).await {
             Ok(sig) => {
                 debug!(
                     duration_ms = start.elapsed().as_millis() as u64,
@@ -748,6 +1265,10 @@ impl SignerService {
     }
 
     /// Returns a reference to the underlying composite signer.
+    ///
+    /// Test-only. Production signing goes through [`ValidatorSigner`], which
+    /// consults the doppelganger gate. A raw accessor would skip that gate.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn signer(&self) -> &CompositeSigner {
         &self.signer
     }
@@ -811,7 +1332,7 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         // Cheap outer enablement check (core re-checks under the lock).
-        self.ensure_signing_enabled(pubkey)?;
+        self.admit(pubkey, SigningDuty::Attestation).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -848,63 +1369,24 @@ impl ValidatorSigner for SignerService {
         drop(_slashing_span);
 
         let gvr = *genesis_validators_root;
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-
         let data_owned = data.clone();
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.target.epoch);
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_attestation(&data_owned, &sign_ctx).await
         });
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: self.enablement.as_ref(),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::attestation()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_attestation",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "attestation",
+            hooks: StandardSlashableHooks::attestation(),
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
-            fork_name: Some(ForkName::from_epoch(data.target.epoch, fork_schedule)),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "attestation",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name: ForkName::from_epoch(data.target.epoch, fork_schedule),
+            signing_root,
+            typed,
+        };
+        self.sign_slashable_vc(pubkey, gvr, req).await
     }
 
     /// Signs a block after checking slashing protection.
@@ -920,7 +1402,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey)?;
+        self.admit(pubkey, SigningDuty::Block).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -935,58 +1417,18 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
 
-        let gvr = *genesis_validators_root;
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, None);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
-
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: self.enablement.as_ref(),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::block()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_block",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "block",
+            hooks: StandardSlashableHooks::block(),
             kind: SlashableKind::Block { slot },
-            fork_name: Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "block",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name: ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule),
+            signing_root,
+            typed: None,
+        };
+        self.sign_slashable_vc(pubkey, *genesis_validators_root, req).await
     }
 
     /// Signs a block from five header leaves after slashing protection.
@@ -1002,7 +1444,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey)?;
+        self.admit(pubkey, SigningDuty::Block).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1020,8 +1462,6 @@ impl ValidatorSigner for SignerService {
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &ctx);
 
         let gvr = *genesis_validators_root;
-        let policy = self.timeout_policy_source(pubkey);
-
         let header_owned = header.clone();
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
@@ -1052,55 +1492,19 @@ impl ValidatorSigner for SignerService {
                 grpc.sign_block(&block, &sign_ctx).await
             }
         });
-        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        #[cfg(any(test, feature = "test-utils"))]
-        let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(SignSlashableRequest {
-            locks: &self.validator_locks,
-            pubkey,
-            enablement: self.enablement.as_ref(),
-            signer,
-            signing_root,
-            sign_timeout: self.sign_timeout,
-            policy,
-            hooks: Arc::new(StandardSlashableHooks::block()),
+        let req = VcSlashable {
+            started: start,
+            pubkey_hex,
             op_name: "sign_block_header",
-            slashing_db: Arc::clone(&self.slashing_db),
-            client_cn: AUDIT_CN_VC.to_string(),
-            gvr,
+            signing_type: "block",
+            hooks: StandardSlashableHooks::block(),
             kind: SlashableKind::Block { slot },
-            fork_name: Some(fork_name),
-            #[cfg(any(test, feature = "test-utils"))]
-            pre_reserve_barrier,
-        })
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "block",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
+            fork_name,
+            signing_root,
+            typed,
+        };
+        self.sign_slashable_vc(pubkey, gvr, req).await
     }
 
     /// Signs a RANDAO reveal for the given epoch.
@@ -1122,7 +1526,15 @@ impl ValidatorSigner for SignerService {
             grpc.sign_randao_reveal(epoch_c, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "randao", backend, Some(fork_name)).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::RandaoReveal,
+            "randao",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -1150,6 +1562,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SyncCommitteeMessage,
             "sync_committee_message",
             backend,
             Some(fork_name),
@@ -1183,6 +1596,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::PayloadAttestation,
             "payload_attestation",
             backend,
             Some(fork_name),
@@ -1224,6 +1638,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::ProposerPreferences,
             "proposer_preferences",
             backend,
             Some(fork_name),
@@ -1267,6 +1682,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::BuilderRequestAuth,
             "builder_request_auth",
             backend,
             Some(ForkName::Phase0),
@@ -1309,6 +1725,7 @@ impl ValidatorSigner for SignerService {
             .sign_nonslashable(
                 pubkey,
                 signing_root,
+                SigningDuty::ExecutionPayloadEnvelope,
                 "execution_payload_envelope",
                 backend,
                 Some(fork_name),
@@ -1337,6 +1754,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SelectionProof,
             "selection_proof",
             backend,
             Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
@@ -1365,6 +1783,11 @@ impl ValidatorSigner for SignerService {
             );
             return Err(SignerError::UnsupportedDuty { duty: "aggregate_and_proof" });
         }
+        if let Err(error) = aggregate_and_proof.try_tree_hash_root() {
+            return Err(SignerError::SigningFailed(format!(
+                "invalid aggregate and proof: {error}"
+            )));
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
         let gvr = *genesis_validators_root;
@@ -1378,6 +1801,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::AggregateAndProof,
             "aggregate_and_proof",
             backend,
             Some(fork_name),
@@ -1413,6 +1837,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::AggregateAndProofRoot,
             "aggregate_and_proof_root",
             backend,
             Some(fork_name),
@@ -1446,21 +1871,17 @@ impl ValidatorSigner for SignerService {
         let fork_name = sign_ctx.fork_name;
         let pk = pubkey.to_bytes();
         if self.signer.has_grpc_remote(&pk) {
-            // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
-            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
-            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
-            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
-            });
-            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-            self.sign_nonslashable(
-                pubkey,
-                signing_root,
-                "electra_aggregate_and_proof",
-                backend,
-                Some(fork_name),
-            )
-            .await
+            // SignAggregateAndProof is pre-Electra attestation SSZ and drops
+            // committee_bits. SignRoot would change the RPC a pre-Gloas remote
+            // signer receives. Fail closed before any legacy hash.
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(fork_name)),
+            );
+            return Err(SignerError::SigningFailed(
+                "legacy SignAggregateAndProof drops committee_bits; this client does not send Electra aggregates on SignRoot".to_string(),
+            ));
         } else {
             let signing_root =
                 signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
@@ -1468,6 +1889,7 @@ impl ValidatorSigner for SignerService {
             self.sign_nonslashable(
                 pubkey,
                 signing_root,
+                SigningDuty::ElectraAggregateAndProof,
                 "electra_aggregate_and_proof",
                 backend,
                 Some(fork_name),
@@ -1508,8 +1930,15 @@ impl ValidatorSigner for SignerService {
             grpc.sign_voluntary_exit(&exit, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend, Some(fork_name))
-            .await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::VoluntaryExit,
+            "voluntary_exit",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -1548,6 +1977,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::BuilderRegistration,
             "builder_registration",
             backend,
             Some(ForkName::Phase0),
@@ -1579,6 +2009,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SyncCommitteeSelectionProof,
             "sync_committee_selection_proof",
             backend,
             Some(fork_name),
@@ -1610,6 +2041,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::ContributionAndProof,
             "contribution_and_proof",
             backend,
             Some(fork_name),
@@ -2240,6 +2672,472 @@ mod tests {
         assert_eq!(err.to_string(), "unsupported duty: payload_attestation");
     }
 
+    /// W4-S4b: the one rule behind the entry, under-lock and after-reserve
+    /// admission checks. A duty without the admission requirement is never
+    /// refused.
+    #[test]
+    fn admission_revoked_by_table() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let scoped = CapturedAdmission::Scoped(BeaconAdmission::new(3, Arc::clone(&generation)));
+        let revokes = CapturedAdmission::Missing { revokes: true };
+        let open = CapturedAdmission::Missing { revokes: false };
+        let check = |case: &str, captured: &CapturedAdmission, duty: SigningDuty, want: bool| {
+            assert_eq!(admission_revoked_by(captured, duty), want, "{case} ({duty:?})");
+        };
+        check("scoped, holding", &scoped, SigningDuty::Block, false);
+        check("missing, revokes", &revokes, SigningDuty::Attestation, true);
+        check("missing, open", &open, SigningDuty::Block, false);
+        check("missing revokes, no admission duty", &revokes, SigningDuty::VoluntaryExit, false);
+        generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        check("scoped, moved", &scoped, SigningDuty::Attestation, true);
+        check("scoped moved, no admission duty", &scoped, SigningDuty::VoluntaryExit, false);
+    }
+
+    /// 751-6: the missing-scope rule for both builds. `(false, _)` is the
+    /// production arm, which no test build compiles as a `cfg` branch.
+    #[test]
+    fn missing_scope_revokes_table() {
+        let cases = [
+            ("production, no opt-in", false, false, true),
+            ("production, opt-in flag ignored", false, true, true),
+            ("test-utils fixture, no opt-in", true, false, false),
+            ("test-utils, opted in", true, true, true),
+        ];
+        for (case, test_utils, opted_in, revokes) in cases {
+            assert_eq!(missing_scope_revokes(test_utils, opted_in), revokes, "{case}");
+        }
+    }
+
+    /// A duty that requires beacon admission is refused when no task-local
+    /// admission scope is installed. Voluntary exit does not require that
+    /// scope. The keymanager may still read the validator index from a beacon
+    /// node. That read is not the fence.
+    #[tokio::test]
+    async fn signing_without_an_admission_scope_is_refused() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+        let attestation_data = create_test_attestation_data(100, 101);
+        let err = require_beacon_admission_scope(service.sign_attestation(
+            &attestation_data,
+            &pubkey,
+            &fork_schedule,
+            &genesis_root,
+        ))
+        .await
+        .expect_err("missing admission scope");
+        assert!(
+            matches!(err, SignerError::BeaconAdmissionRevoked),
+            "missing scope must fail closed, got {err:?}"
+        );
+        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 1 };
+        require_beacon_admission_scope(service.sign_voluntary_exit(
+            &exit,
+            &pubkey,
+            &fork_schedule,
+            &genesis_root,
+        ))
+        .await
+        .expect("voluntary exit does not require beacon admission");
+        let holding = BeaconAdmission::unbound();
+        with_beacon_admission(
+            holding,
+            service.sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root),
+        )
+        .await
+        .expect("a holding scope allows the attestation");
+    }
+
+    /// Every `SigningDuty` variant once, in [`duty_ordinal`] order.
+    const ALL_SIGNING_DUTIES: [SigningDuty; 16] = [
+        SigningDuty::Attestation,
+        SigningDuty::Block,
+        SigningDuty::RandaoReveal,
+        SigningDuty::SyncCommitteeMessage,
+        SigningDuty::SelectionProof,
+        SigningDuty::AggregateAndProof,
+        SigningDuty::ElectraAggregateAndProof,
+        SigningDuty::AggregateAndProofRoot,
+        SigningDuty::SyncCommitteeSelectionProof,
+        SigningDuty::ContributionAndProof,
+        SigningDuty::PayloadAttestation,
+        SigningDuty::ProposerPreferences,
+        SigningDuty::BuilderRegistration,
+        SigningDuty::BuilderRequestAuth,
+        SigningDuty::ExecutionPayloadEnvelope,
+        SigningDuty::VoluntaryExit,
+    ];
+
+    /// No wildcard: a new `SigningDuty` variant does not compile until it has
+    /// an ordinal here and a call in [`call_without_scope`]. Add it to
+    /// [`ALL_SIGNING_DUTIES`] in the same edit and raise the `16`s; nothing
+    /// else can enforce that.
+    fn duty_ordinal(duty: SigningDuty) -> usize {
+        match duty {
+            SigningDuty::Attestation => 0,
+            SigningDuty::Block => 1,
+            SigningDuty::RandaoReveal => 2,
+            SigningDuty::SyncCommitteeMessage => 3,
+            SigningDuty::SelectionProof => 4,
+            SigningDuty::AggregateAndProof => 5,
+            SigningDuty::ElectraAggregateAndProof => 6,
+            SigningDuty::AggregateAndProofRoot => 7,
+            SigningDuty::SyncCommitteeSelectionProof => 8,
+            SigningDuty::ContributionAndProof => 9,
+            SigningDuty::PayloadAttestation => 10,
+            SigningDuty::ProposerPreferences => 11,
+            SigningDuty::BuilderRegistration => 12,
+            SigningDuty::BuilderRequestAuth => 13,
+            SigningDuty::ExecutionPayloadEnvelope => 14,
+            SigningDuty::VoluntaryExit => 15,
+        }
+    }
+
+    struct NoScopeFixture {
+        service: SignerService,
+        pubkey: PublicKey,
+        schedule: ForkSchedule,
+    }
+
+    impl NoScopeFixture {
+        fn new() -> Self {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let signer = create_test_composite_signer_with_key(secret_key);
+            let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+            let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+            Self { service, pubkey, schedule: create_test_fork_schedule() }
+        }
+    }
+
+    /// Every `SignerService` method that signs `duty`, each run under
+    /// `require_beacon_admission_scope` with no admission scope. `Block` has
+    /// two (`sign_block`, `sign_block_header`). The payloads are the ones the
+    /// hand-written per-duty list used.
+    async fn call_without_scope(
+        fx: &NoScopeFixture,
+        duty: SigningDuty,
+    ) -> Vec<(&'static str, Result<(), SignerError>)> {
+        let NoScopeFixture { service, pubkey, schedule } = fx;
+        let genesis_root = [0xaa; 32];
+        let root = [0x11; 32];
+        let electra_slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+        match duty {
+            SigningDuty::Attestation => {
+                let attestation = create_test_attestation_data(1, 2);
+                vec![(
+                    "sign_attestation",
+                    require_beacon_admission_scope(service.sign_attestation(
+                        &attestation,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::Block => {
+                let header = BeaconBlockHeaderFields {
+                    slot: 1,
+                    proposer_index: 1,
+                    parent_root: root,
+                    state_root: root,
+                    body_root: root,
+                    body_ssz: Vec::new(),
+                    is_blinded: false,
+                };
+                vec![
+                    (
+                        "sign_block",
+                        require_beacon_admission_scope(service.sign_block(
+                            &root,
+                            1,
+                            pubkey,
+                            schedule,
+                            &genesis_root,
+                        ))
+                        .await
+                        .map(drop),
+                    ),
+                    (
+                        "sign_block_header",
+                        require_beacon_admission_scope(service.sign_block_header(
+                            &header,
+                            pubkey,
+                            schedule,
+                            &genesis_root,
+                        ))
+                        .await
+                        .map(drop),
+                    ),
+                ]
+            }
+            SigningDuty::RandaoReveal => vec![(
+                "sign_randao_reveal",
+                require_beacon_admission_scope(service.sign_randao_reveal(
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SyncCommitteeMessage => vec![(
+                "sign_sync_committee_message",
+                require_beacon_admission_scope(service.sign_sync_committee_message(
+                    &root,
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SelectionProof => vec![(
+                "sign_selection_proof",
+                require_beacon_admission_scope(service.sign_selection_proof(
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::AggregateAndProof => {
+                let aggregate = create_test_aggregate_and_proof(100);
+                vec![(
+                    "sign_aggregate_and_proof",
+                    require_beacon_admission_scope(service.sign_aggregate_and_proof(
+                        &aggregate,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ElectraAggregateAndProof => {
+                let electra = create_test_electra_aggregate_and_proof(electra_slot);
+                vec![(
+                    "sign_electra_aggregate_and_proof",
+                    require_beacon_admission_scope(service.sign_electra_aggregate_and_proof(
+                        &electra,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::AggregateAndProofRoot => vec![(
+                "sign_aggregate_and_proof_root",
+                require_beacon_admission_scope(service.sign_aggregate_and_proof_root(
+                    &root,
+                    electra_slot,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::SyncCommitteeSelectionProof => vec![(
+                "sign_sync_committee_selection_proof",
+                require_beacon_admission_scope(service.sign_sync_committee_selection_proof(
+                    1,
+                    0,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::ContributionAndProof => {
+                let contribution = eth_types::ContributionAndProof {
+                    aggregator_index: 1,
+                    contribution: eth_types::SyncCommitteeContribution {
+                        slot: 1,
+                        beacon_block_root: root,
+                        subcommittee_index: 0,
+                        aggregation_bits: vec![0xff],
+                        signature: vec![0xaa; 96],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                };
+                vec![(
+                    "sign_contribution_and_proof",
+                    require_beacon_admission_scope(service.sign_contribution_and_proof(
+                        &contribution,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::PayloadAttestation => {
+                let payload = eth_types::PayloadAttestationData {
+                    beacon_block_root: root,
+                    slot: 1,
+                    payload_present: true,
+                    blob_data_available: false,
+                };
+                vec![(
+                    "sign_payload_attestation",
+                    require_beacon_admission_scope(service.sign_payload_attestation(
+                        &payload,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ProposerPreferences => {
+                let prefs = eth_types::ProposerPreferences {
+                    dependent_root: root,
+                    proposal_slot: 1,
+                    validator_index: 1,
+                    fee_recipient: [0x22; 20],
+                    target_gas_limit: 30_000_000,
+                };
+                vec![(
+                    "sign_proposer_preferences",
+                    require_beacon_admission_scope(service.sign_proposer_preferences(
+                        &prefs,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::BuilderRegistration => {
+                let registration = eth_types::ValidatorRegistrationV1 {
+                    fee_recipient: [0x22; 20],
+                    gas_limit: 30_000_000,
+                    timestamp: 1,
+                    pubkey: pubkey.to_bytes(),
+                };
+                vec![(
+                    "sign_builder_registration",
+                    require_beacon_admission_scope(service.sign_builder_registration(
+                        &registration,
+                        pubkey,
+                        schedule.genesis_fork_version,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::BuilderRequestAuth => {
+                let auth =
+                    eth_types::BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1)
+                        .expect("auth");
+                vec![(
+                    "sign_builder_request_auth",
+                    require_beacon_admission_scope(service.sign_builder_request_auth(
+                        &auth,
+                        pubkey,
+                        schedule.genesis_fork_version,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+            SigningDuty::ExecutionPayloadEnvelope => vec![(
+                "sign_execution_payload_envelope_root",
+                require_beacon_admission_scope(service.sign_execution_payload_envelope_root(
+                    &root,
+                    1,
+                    pubkey,
+                    schedule,
+                    &genesis_root,
+                ))
+                .await
+                .map(drop),
+            )],
+            SigningDuty::VoluntaryExit => {
+                let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 1 };
+                vec![(
+                    "sign_voluntary_exit",
+                    require_beacon_admission_scope(service.sign_voluntary_exit(
+                        &exit,
+                        pubkey,
+                        schedule,
+                        &genesis_root,
+                    ))
+                    .await
+                    .map(drop),
+                )]
+            }
+        }
+    }
+
+    /// 751-6: every `SigningDuty` variant runs through the exhaustive
+    /// [`call_without_scope`] with the missing-scope rule opted in. Every
+    /// call of an admission duty is refused at the service entry: one entry
+    /// WARN per call, so the under-lock re-check is not the one that refused.
+    /// Voluntary exit signs. `ElectraAggregateAndProof` and
+    /// `AggregateAndProofRoot` have no `SigningGate` method, so this is their
+    /// only missing-scope test.
+    #[tokio::test]
+    async fn every_signing_duty_variant_has_a_missing_scope_case() {
+        let mut ordinals: Vec<usize> = ALL_SIGNING_DUTIES.into_iter().map(duty_ordinal).collect();
+        ordinals.sort_unstable();
+        assert_eq!(
+            ordinals,
+            (0..16).collect::<Vec<_>>(),
+            "ALL_SIGNING_DUTIES must list every variant exactly once"
+        );
+
+        let fx = NoScopeFixture::new();
+        for duty in ALL_SIGNING_DUTIES {
+            let (calls, warns) = with_warns(call_without_scope(&fx, duty)).await;
+            let lines: Vec<String> =
+                warns.iter().map(|w| format!("{} {}", w.message, w.fields_text)).collect();
+            if duty == SigningDuty::VoluntaryExit {
+                for (method, result) in &calls {
+                    assert!(result.is_ok(), "{method}: an exit needs no admission, got {result:?}");
+                }
+                assert!(warns.is_empty(), "{duty:?}: no WARN, got {lines:?}");
+                continue;
+            }
+            for (method, result) in &calls {
+                assert!(
+                    matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+                    "{method} ({duty:?}): a missing scope must fail closed, got {result:?}"
+                );
+            }
+            assert_eq!(
+                warns.len(),
+                calls.len(),
+                "{duty:?}: one entry WARN per call, got {lines:?}"
+            );
+            assert!(
+                warns.iter().all(|w| {
+                    w.message == "SignerService: beacon node admission revoked"
+                        && w.fields_text.is_empty()
+                }),
+                "{duty:?}: refused at the service entry, got {lines:?}"
+            );
+        }
+    }
+
     /// RF4-03 (M1): production `sign_block` commit arm returns `CommitFailed`
     /// with the real signing root — not a hand-built enum.
     #[tokio::test]
@@ -2700,6 +3598,255 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
+    /// The real signer refuses when a generation attached after the primary moves.
+    ///
+    /// A mock that returns false from its own hook does not exercise
+    /// [`SignerService::ensure_duty_enabled`].
+    #[tokio::test]
+    async fn signer_refuses_randao_when_the_second_generation_moves() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let primary = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(4));
+        let admission =
+            BeaconAdmission::new(0, Arc::clone(&primary)).and_generation(4, Arc::clone(&second));
+        second.fetch_add(1, Ordering::Release);
+
+        let err = with_beacon_admission(
+            admission,
+            service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root),
+        )
+        .await
+        .expect_err("the second generation must refuse the real signer");
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
+    }
+
+    /// Run `fut` under a thread-local [`Capture`] and return its WARN events.
+    ///
+    /// The default `#[tokio::test]` runtime is current-thread and the service
+    /// entry check runs on the caller's task, so the capture sees its WARN.
+    async fn with_warns<T>(fut: impl std::future::Future<Output = T>) -> (T, Vec<CapturedEvent>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry::Registry::default()
+            .with(Capture { events: Arc::clone(&events), spans: Spans::default() });
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = fut.await;
+        drop(guard);
+        let warns =
+            events.lock().iter().filter(|e| e.level == tracing::Level::WARN).cloned().collect();
+        (out, warns)
+    }
+
+    /// Exactly one WARN, the service entry refusal, with `message` and
+    /// `fields` verbatim and without the full pubkey hex.
+    fn assert_one_service_entry_warn(
+        warns: &[CapturedEvent],
+        message: &str,
+        fields: &str,
+        pubkey_hex: &str,
+    ) {
+        let lines: Vec<String> =
+            warns.iter().map(|w| format!("{} {}", w.message, w.fields_text)).collect();
+        assert_eq!(warns.len(), 1, "one service entry WARN, got {lines:?}");
+        assert_eq!(warns[0].message, message, "entry WARN text");
+        assert_eq!(warns[0].fields_text, fields, "entry WARN fields");
+        assert!(!lines[0].contains(pubkey_hex), "full pubkey in the entry WARN: {}", lines[0]);
+    }
+
+    /// W4-S4c (750-9, #736): a detected key reports `BlockedByDoppelganger`
+    /// at the service entry even when its admission also moved, writes no
+    /// row, and logs only the doppelganger WARN, with the pubkey truncated.
+    #[tokio::test]
+    async fn doppelganger_block_wins_over_revoked_admission() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Detected;
+        impl SigningEnablement for Detected {
+            fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+                false
+            }
+
+            fn voluntary_exit_only(&self) -> bool {
+                false
+            }
+
+            fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+                true
+            }
+        }
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, Arc::clone(&slashing_db))
+            .with_enablement(Arc::new(Detected));
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let attestation = create_test_attestation_data(3, 4);
+        let generation = Arc::new(AtomicU64::new(0));
+        let admission = BeaconAdmission::new(0, Arc::clone(&generation));
+        generation.fetch_add(1, Ordering::Release);
+
+        let (result, warns) = with_warns(with_beacon_admission(
+            admission,
+            service.sign_attestation(&attestation, &pubkey, &fork_schedule, &[0xaa; 32]),
+        ))
+        .await;
+        let err = result.expect_err("a detected key must not sign");
+
+        assert!(matches!(err, SignerError::BlockedByDoppelganger), "{err:?}");
+        let rows = slashing_db.get_attestations(&pubkey_hex).expect("attestation rows");
+        assert!(rows.is_empty(), "the entry refusal must not write a row: {rows:?}");
+        let truncated = TruncatedPubkey::new(&pubkey_hex).to_string();
+        assert_one_service_entry_warn(
+            &warns,
+            "SignerService: signing blocked by doppelganger enablement gate",
+            &format!("pubkey={truncated} "),
+            &pubkey_hex,
+        );
+    }
+
+    /// With enablement open, a moved admission is refused at the service
+    /// entry with only the admission WARN, which logs no pubkey.
+    #[tokio::test]
+    async fn revoked_admission_with_open_enablement_warns_once_at_service_entry() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let attestation = create_test_attestation_data(3, 4);
+        let generation = Arc::new(AtomicU64::new(0));
+        let admission = BeaconAdmission::new(0, Arc::clone(&generation));
+        generation.fetch_add(1, Ordering::Release);
+
+        let (result, warns) = with_warns(with_beacon_admission(
+            admission,
+            service.sign_attestation(&attestation, &pubkey, &fork_schedule, &[0xaa; 32]),
+        ))
+        .await;
+        let err = result.expect_err("a moved admission must not sign");
+
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
+        let rows = slashing_db.get_attestations(&pubkey_hex).expect("attestation rows");
+        assert!(rows.is_empty(), "the entry refusal must not write a row: {rows:?}");
+        assert_one_service_entry_warn(
+            &warns,
+            "SignerService: beacon node admission revoked",
+            "",
+            &pubkey_hex,
+        );
+    }
+
+    /// Always enabled; sends on `entered` from its first `is_signing_enabled`
+    /// call, which is the entry check (admission is read just after it).
+    struct EnteredOnce {
+        inner: Arc<dyn SigningEnablement>,
+        entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl SigningEnablement for EnteredOnce {
+        fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            self.inner.is_signing_enabled(pubkey)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            self.inner.voluntary_exit_only()
+        }
+
+        fn blocked_by_doppelganger(&self, pubkey: &PublicKey) -> bool {
+            self.inner.blocked_by_doppelganger(pubkey)
+        }
+    }
+
+    /// W4-S4a (766-2): the entry check passes, the sign waits for a held
+    /// per-validator lock, and the generation moves during that wait. The sign
+    /// is refused under the lock, before any reserve: no block row and no
+    /// signature.
+    ///
+    /// Current-thread: the sign task runs from its entry check to the lock
+    /// wait without yielding, so the test resumes only once it is parked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signer_service_refuses_block_header_after_lock_wait_when_admission_moves() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let enablement = EnteredOnce {
+            inner: always_enabled(),
+            entered: parking_lot::Mutex::new(Some(entered_tx)),
+        };
+        let service = Arc::new(
+            SignerService::new(signer, Arc::clone(&slashing_db))
+                .with_enablement(Arc::new(enablement)),
+        );
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let header = BeaconBlockHeaderFields {
+            slot: 64,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x12; 32],
+            body_root: [0x13; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        let generation = Arc::new(AtomicU64::new(0));
+        let lock_handles = || Arc::strong_count(&service.validator_locks.get(&pubkey_bytes));
+
+        let held = service.acquire_signing_lock_for_test(&pubkey_bytes).await;
+        let before = lock_handles();
+        let sign = tokio::spawn(with_beacon_admission(
+            BeaconAdmission::new(0, Arc::clone(&generation)),
+            {
+                let service = Arc::clone(&service);
+                let pubkey = pubkey.clone();
+                async move {
+                    service.sign_block_header(&header, &pubkey, &schedule, &genesis_root).await
+                }
+            },
+        ));
+        entered_rx.await.expect("the entry check must run");
+        assert_eq!(lock_handles(), before + 1, "the sign must be parked on the held lock");
+        generation.fetch_add(1, Ordering::Release);
+        // A reserve attempted after this point fails as `CommitFailed`.
+        slashing_db.fail_next_commits(1);
+        drop(held);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), sign)
+            .await
+            .expect("hang guard")
+            .expect("join");
+        let rows = slashing_db.get_blocks(&hex::encode(pubkey_bytes)).expect("rows");
+        assert!(rows.is_empty(), "no block row may be written: {rows:?}");
+        assert!(
+            matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+            "expected BeaconAdmissionRevoked before any reserve, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_sign_randao_reveal_key_not_found() {
         let signer = create_empty_composite_signer();
@@ -3118,6 +4265,14 @@ mod tests {
             fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
                 self.0.load(std::sync::atomic::Ordering::SeqCst)
             }
+
+            fn voluntary_exit_only(&self) -> bool {
+                false
+            }
+
+            fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+                false
+            }
         }
         let service = SignerService::new(signer, slashing_db)
             .with_enablement(Arc::new(FlipEnablement(Arc::clone(&gate))));
@@ -3424,6 +4579,30 @@ mod tests {
             compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
         let signing_root = compute_signing_root(&agg_and_proof, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn overlong_aggregate_bits_are_rejected_without_panic() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        let schedule = create_test_fork_schedule();
+        let mut agg = create_test_aggregate_and_proof(100);
+        // 258 bytes is past Bitlist[2048] (257). `try_tree_hash_root` fails;
+        // the panicking `tree_hash_root` wrapper must not run.
+        agg.aggregate.aggregation_bits = vec![0xff; 258];
+        let err = service
+            .sign_aggregate_and_proof(&agg, &pubkey, &schedule, &[0xaa; 32])
+            .await
+            .expect_err("an over-long bitlist must not reach the legacy hasher");
+        match err {
+            SignerError::SigningFailed(msg) => {
+                assert!(msg.contains("invalid aggregate"), "{msg}");
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3983,6 +5162,14 @@ mod tests {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
             false
         }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
@@ -4119,7 +5306,8 @@ mod tests {
     }
     impl SigningEnablement for AllowOnceThenDeny {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-            // try_update / swap: first caller sees 1 → true, subsequent → false.
+            // try_update: first caller sees 1 → true, subsequent → false.
+            // Stable since the 1.99 rename of `fetch_update` (CI's stable).
             self.remaining
                 .try_update(
                     std::sync::atomic::Ordering::SeqCst,
@@ -4128,6 +5316,14 @@ mod tests {
                 )
                 .map(|prev| prev > 0)
                 .unwrap_or(false)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            false
         }
     }
 

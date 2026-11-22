@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 from pytest_socket import disable_socket
 
+# A script that imports a sibling module finds it here, as it does when it
+# runs as `python3 scripts/<name>.py`.
+sys.path.insert(1, str(Path(__file__).resolve().parents[1]))
+
+
 def _script_path(name: str) -> Path:
     return Path(__file__).resolve().parents[1] / f"{name}.py"
 
@@ -142,3 +147,41 @@ class FakeTransport:
 
     def close(self):
         self.closed = True
+
+
+_FAKE_GITLEAKS = Path(__file__).resolve().parent / "fake_gitleaks.py"
+_MINI_GITLEAKS_DEFAULT = """title = "gitleaks config"
+
+[allowlist]
+regexes = [
+    '''(?i)^true|false|null$''',
+]
+paths = [
+    '''gitleaks\\.toml''',
+]
+
+[[rules]]
+id = "generic-api-key"
+regex = '''api_key'''
+"""
+
+
+@pytest.fixture
+def fake_gitleaks(tmp_path) -> Path:
+    """A ``gitleaks`` command that runs ``fake_gitleaks.py`` with this interpreter."""
+    wrapper = tmp_path / "fake-bin" / "gitleaks"
+    wrapper.parent.mkdir()
+    wrapper.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{_FAKE_GITLEAKS}' \"$@\"\n")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+@pytest.fixture
+def strict_gitleaks_config(tmp_path) -> Path:
+    """A strict copy of ``.gitleaks.toml`` built from a small default config."""
+    builder = load_script("gitleaks_strict_config")
+    root = Path(__file__).resolve().parents[2]
+    written = builder.write_strict_configs(
+        _MINI_GITLEAKS_DEFAULT, [root / ".gitleaks.toml"], tmp_path / "strict"
+    )
+    return written[0]

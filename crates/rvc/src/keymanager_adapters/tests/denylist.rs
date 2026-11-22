@@ -105,21 +105,33 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
     assert!(monitor.is_doppelganger_safe(&pk), "Disabled monitor stays safe after re-arm");
 }
 
-/// Leftover `.removing.*` set-asides must re-arm like a final sidecar.
+/// Leftover `.removing.*` set-asides must re-arm like a final sidecar: the
+/// re-arm reaches the forward-window machine.
 #[test]
-#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_rearms_leftover_removing_sidecar() {
-    let dir = TempDir::new().unwrap();
-    let pk: Pubkey = [0xAEu8; 48];
-    let now_unix =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let removing =
-        dir.path().join(format!("0x{}.import_meta.json.removing.{now_unix}", hex::encode(pk)));
-    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{now_unix}}}")).unwrap();
+    use doppelganger::ForwardWindowStatus;
 
-    let monitor = DoppelgangerDisabledMonitor::new();
+    let dir = TempDir::new().unwrap();
+    let public = SecretKey::generate().public_key();
+    let pk: Pubkey = public.to_bytes();
+    // A far-future import time saturates `elapsed` to 0 for any clock value.
+    let imported_unix = u64::MAX / 2;
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.{imported_unix}", hex::encode(pk)));
+    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{imported_unix}}}")).unwrap();
+    let reader: Arc<dyn slashing::SlashingDbReader> =
+        Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+    let machine = Arc::new(ForwardWindowMachine::new(reader, 1, [0x11; 32]));
+    let epoch: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 5);
+    let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch);
+
     scan_and_rearm_gate(dir.path(), &monitor, 768);
-    assert!(logs_contain("re-arming"), "leftover .removing.* must re-arm within the window");
+
+    assert_eq!(
+        machine.status(&public),
+        ForwardWindowStatus::Pending,
+        "leftover .removing.* must re-arm within the window"
+    );
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.
@@ -157,9 +169,11 @@ fn boot_load_keystore_dir_key() -> (TempDir, Arc<CompositeSigner>, Pubkey) {
     km.insert(sk);
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(km)));
     let dir = TempDir::new().unwrap();
-    // Optional on-disk keystore file (as `--keystore-path` would leave behind)
+    // On-disk keystore. DELETE matches the pubkey inside the JSON, so the
+    // placeholder has to carry this key. A filename alone is not a match.
     let filename = format!("{}.json", pubkey_hex(pk_bytes));
-    std::fs::write(dir.path().join(&filename), "{}").unwrap();
+    let body = format!(r#"{{"pubkey":"{}"}}"#, hex::encode(pk_bytes));
+    std::fs::write(dir.path().join(&filename), body).unwrap();
     (dir, composite, pk_bytes)
 }
 
@@ -213,9 +227,8 @@ async fn test_delete_boot_loaded_key_returns_ok_true_and_stops_signing() {
 
 #[test]
 fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
-    // Mirrors the DELETE handler: has_key gates export of existing keys, so a
-    // boot-loaded key with real slashing rows must yield a non-empty history
-    // in the interchange (not the empty interchange used for never-known keys).
+    // A loaded key with real slashing rows yields that history in the
+    // interchange. The handler exports it because the key is a member.
     let (dir, composite, pk) = boot_load_keystore_dir_key();
     let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
@@ -227,13 +240,10 @@ fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
 
     let slashing = SlashingProtectionAdapter::new_in_free_window(db, gvr_root);
 
-    assert!(
-        adapter.has_key(&pk),
-        "handler only exports interchange for keys where has_key is true"
-    );
+    assert!(adapter.has_key(&pk), "a boot-loaded key is present in the signing registry");
 
-    let export = slashing.export_interchange(&[pk]).expect("export");
-    let v: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let export = block_on(slashing.export_interchange(&[pk])).expect("export");
+    let v: serde_json::Value = serde_json::from_str(&export.json).unwrap();
     let data = v["data"].as_array().expect("data array");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0]["pubkey"], pk_hex);

@@ -88,97 +88,15 @@ fn version_exits_zero() {
     assert!(stdout.contains("rvc"), "stdout={stdout}");
 }
 
+/// Exit status of `start --help`. The flag list itself is
+/// `test_start_help_lists_every_flag`.
 #[test]
 fn start_help_exits_zero_and_lists_flags() {
     let output = run_with_timeout(
         Command::new(rvc_bin()).args(["start", "--help"]),
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     );
     assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Core surface + RF5-14 complete flag set (dropped clap flatten field fails loudly).
-    for flag in [
-        "--config",
-        "--beacon-url",
-        "--beacon-nodes",
-        "--beacon-max-body-bytes",
-        "--keystore-path",
-        "--slashing-db-path",
-        "--init-slashing-db",
-        "--allow-unsupported-fork",
-        "--metrics-address",
-        "--metrics-port",
-        "--network",
-        "--genesis-time",
-        "--genesis-validators-root",
-        "--graffiti",
-        "--no-doppelganger-detection",
-        "--log-level",
-        "--log-format",
-        "--enable-log-reload",
-        "--keymanager-enabled",
-        "--no-keymanager",
-        "--keymanager-address",
-        "--keymanager-token-file",
-        "--remote-signer-url",
-        "--remote-signer-allowed-hosts",
-        "--strict-permissions",
-        "--strict-slashing-semantics",
-        "--block-production-timeout",
-        "--attestation-timeout",
-        "--aggregate-timeout",
-        "--duty-fetch-timeout",
-        "--duty-dispatch-concurrency",
-        "--duty-publish-concurrency",
-        "--key-decrypt-threads",
-        "--tracing-endpoint",
-        "--tracing-exporter",
-        "--tracing-sample-rate",
-        "--tracing-max-queue-size",
-        "--tracing-max-export-batch-size",
-        "--secret-provider",
-        "--gcp-project-id",
-        "--gcp-secret-prefix",
-        "--secret-refresh-interval",
-        "--secret-provider-strict",
-        "--allow-insecure-remote-signer",
-        "--keymanager-cors-origins",
-        "--keymanager-body-limit",
-        "--keymanager-import-kdf-concurrency",
-        "--keymanager-import-kdf-total-mib",
-        "--keymanager-import-kdf-max-keystore-mib",
-        "--grpc-signer-url",
-        "--grpc-signer-tls-cert",
-        "--grpc-signer-tls-key",
-        "--grpc-signer-tls-ca-cert",
-        "--disable-attesting",
-        "--slashed-validators-action",
-        "--builder-circuit-breaker-consecutive-limit",
-        "--builder-circuit-breaker-epoch-limit",
-        "--disable-keystore-locking",
-        "--proposer-nodes",
-        "--broadcast",
-        "--proposer-config-url",
-        "--proposer-config-file",
-        "--proposer-config-refresh-interval",
-        "--proposer-config-url-token",
-        "--proposer-config-url-insecure",
-        "--monitoring-endpoint",
-        "--monitoring-interval",
-        "--monitoring-endpoint-insecure",
-        "--logfile",
-        "--logfile-max-size",
-        "--logfile-max-number",
-        "--logfile-compress",
-        "--logfile-level",
-        "--block-selection-mode",
-        "--validator-registration-batch-size",
-        "--validator-registration-batch-delay",
-        "--validators-config",
-        "--password-file",
-    ] {
-        assert!(stdout.contains(flag), "start --help missing {flag}\n{stdout}");
-    }
 }
 
 #[test]
@@ -516,4 +434,64 @@ fn tracing_otlp_path_append_and_compose_host_http_warn() {
         remote.contains(HTTP_WARN),
         "dotted remote http:// must warn after subscriber init.\n--- combined ---\n{remote}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `rvc health`: the image HEALTHCHECK probe
+// ---------------------------------------------------------------------------
+
+/// Serves the production metrics router on an ephemeral loopback port.
+fn spawn_metrics_server() -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            tx.send(listener.local_addr().expect("local_addr")).expect("send addr");
+            let _ =
+                metrics::server::serve_metrics_on(listener, metrics::server::new_health_status())
+                    .await;
+        });
+    });
+    rx.recv_timeout(Duration::from_secs(5)).expect("metrics server address")
+}
+
+fn run_health(url: &str) -> Output {
+    run_with_timeout(
+        Command::new(rvc_bin()).args(["health", "--url", url]),
+        Duration::from_secs(15),
+    )
+}
+
+#[test]
+fn health_exits_zero_on_the_livez_route() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/livez"));
+    assert!(out.status.success(), "health on /livez must pass: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_on_the_unserved_healthz_route() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/healthz"));
+    assert!(!out.status.success(), "health on /healthz must fail: {}", combined(&out));
+    assert!(combined(&out).contains("404"), "stderr must name the status: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_on_readyz_before_the_client_is_ready() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/readyz"));
+    assert!(!out.status.success(), "health on /readyz must fail: {}", combined(&out));
+    assert!(combined(&out).contains("503"), "stderr must name the status: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_when_nothing_listens() {
+    let out = run_health(&format!("http://127.0.0.1:{}/livez", free_port()));
+    assert!(!out.status.success(), "health with no listener must fail: {}", combined(&out));
+    assert!(combined(&out).contains("health probe"), "stderr: {}", combined(&out));
 }

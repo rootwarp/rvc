@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,10 +100,31 @@ pub fn new_shared_sync_statuses(count: usize) -> SharedSyncStatuses {
 ///
 /// Also updates [`metrics::definitions::RVC_BN_HEALTH_TIER`] per endpoint from the
 /// polled detail (DSR-2.2). Tier values follow [`BnSyncDetail::tier`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn check_all_sync_statuses(
     clients: &[BeaconClient],
     statuses: &SharedSyncStatuses,
     thresholds: &TierThresholds,
+) {
+    check_all_sync_statuses_publishing(
+        clients,
+        statuses,
+        thresholds,
+        true,
+        crate::metrics::METRIC_POOL_MAIN,
+    )
+    .await;
+}
+
+/// [`check_all_sync_statuses`]. `publish` writes the tier gauge and the synced log.
+///
+/// The manager re-check publishes those itself so an unadmitted node is omitted.
+pub async fn check_all_sync_statuses_publishing(
+    clients: &[BeaconClient],
+    statuses: &SharedSyncStatuses,
+    thresholds: &TierThresholds,
+    publish: bool,
+    pool: &str,
 ) {
     let futs: Vec<_> = clients
         .iter()
@@ -129,7 +152,9 @@ pub async fn check_all_sync_statuses(
         }
         match detail.status {
             BnSyncStatus::Synced => {
-                info!(bn_index = i, endpoint = %RedactedUrl(&endpoint), "BN is synced");
+                if publish {
+                    info!(bn_index = i, endpoint = %RedactedUrl(&endpoint), "BN is synced");
+                }
             }
             BnSyncStatus::Syncing => {
                 warn!(
@@ -150,12 +175,14 @@ pub async fn check_all_sync_statuses(
             }
             BnSyncStatus::Unknown => {}
         }
-        let tier = detail.tier(thresholds);
-        // Issue 8.3 label hygiene — never put userinfo/path/query on /metrics.
-        let endpoint_label = crate::metrics::endpoint_label(&endpoint);
-        metrics::definitions::RVC_BN_HEALTH_TIER
-            .with_label_values(&[endpoint_label.as_str()])
-            .set(tier.as_metric_value());
+        if publish {
+            let tier = detail.tier(thresholds);
+            // Issue 8.3 label hygiene — never put userinfo/path/query on /metrics.
+            let endpoint_label = crate::metrics::endpoint_label(&endpoint);
+            metrics::definitions::RVC_BN_HEALTH_TIER
+                .with_label_values(&[endpoint_label.as_str(), pool])
+                .set(tier.as_metric_value());
+        }
         new_statuses[i] = detail;
     }
 
@@ -195,20 +222,54 @@ async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
     }
 }
 
+/// Runs after each sync poll. Production uses it to admit a skipped beacon node.
+pub type AfterSyncPoll = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Starts a background task that periodically polls sync status of all BNs.
 ///
 /// The task runs until the shutdown signal fires. Each poll updates
-/// `rvc_bn_health_tier` via [`check_all_sync_statuses`].
+/// `rvc_bn_health_tier` via [`check_all_sync_statuses`]. `after_poll` runs
+/// after the status write and does not change those statuses.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn start_sync_monitor(
     clients: Vec<BeaconClient>,
     statuses: SharedSyncStatuses,
     thresholds: TierThresholds,
     interval: Duration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    after_poll: Option<AfterSyncPoll>,
 ) -> tokio::task::JoinHandle<()> {
+    start_sync_monitor_publishing(
+        clients, statuses, thresholds, interval, shutdown, after_poll, true,
+    )
+}
+
+/// [`start_sync_monitor`] with control over tier and synced-log publication.
+pub fn start_sync_monitor_publishing(
+    clients: Vec<BeaconClient>,
+    statuses: SharedSyncStatuses,
+    thresholds: TierThresholds,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    after_poll: Option<AfterSyncPoll>,
+    publish: bool,
+) -> tokio::task::JoinHandle<()> {
+    // detached: sync monitor; bootstrap registers the JoinHandle.
     tokio::spawn(async move {
         loop {
-            check_all_sync_statuses(&clients, &statuses, &thresholds).await;
+            // `publish` is the free-function path. `BnManager` passes false and
+            // writes `pool` from its own re-check.
+            check_all_sync_statuses_publishing(
+                &clients,
+                &statuses,
+                &thresholds,
+                publish,
+                crate::metrics::METRIC_POOL_MAIN,
+            )
+            .await;
+            if let Some(after_poll) = &after_poll {
+                after_poll().await;
+            }
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -691,6 +752,7 @@ mod tests {
             TierThresholds::default(),
             Duration::from_millis(50),
             shutdown_rx,
+            None,
         );
 
         // Wait a bit for at least one poll
@@ -728,6 +790,7 @@ mod tests {
             TierThresholds::default(),
             Duration::from_millis(50),
             shutdown_rx,
+            None,
         );
 
         // Wait for initial poll
@@ -970,7 +1033,9 @@ mod tests {
 
     fn health_tier_gauge(endpoint: &str) -> i64 {
         let label = crate::metrics::endpoint_label(endpoint);
-        metrics::definitions::RVC_BN_HEALTH_TIER.with_label_values(&[label.as_str()]).get()
+        metrics::definitions::RVC_BN_HEALTH_TIER
+            .with_label_values(&[label.as_str(), crate::metrics::METRIC_POOL_MAIN])
+            .get()
     }
 
     #[tokio::test]

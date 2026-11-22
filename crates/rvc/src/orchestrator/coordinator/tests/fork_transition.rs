@@ -93,7 +93,11 @@ async fn build_fork_transition_orchestrator_with(
     clock.set_slot(slot);
 
     let beacon_config = BeaconClientConfig::new(mock_server_uri);
-    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let client = BeaconClient::new(beacon_config).unwrap();
+    if attach_builder {
+        client.hold_admission();
+    }
+    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(client);
 
     let secret_key = SecretKey::generate();
     let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
@@ -377,6 +381,7 @@ async fn run_until_shutdown(
 
 #[tokio::test]
 async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
+    let _metrics = m2_metric_lock().await;
     let mock_server = wiremock::MockServer::start().await;
 
     // Slot 2240 = epoch 70 = gloas_fork_epoch
@@ -427,6 +432,7 @@ async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
 /// per validator without writing a slashing row.
 #[tokio::test]
 async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
+    let _metrics = m2_metric_lock().await;
     use timing::{due_ms, SlotClock};
 
     // Park at the pre-Gloas aggregate offset so att/agg remaining are zero and
@@ -548,6 +554,7 @@ async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
 /// attestation duty for the same Gloas slot still succeeds.
 #[tokio::test]
 async fn test_payload_attestation_204_skips_submission_attestation_still_succeeds() {
+    let _metrics = m2_metric_lock().await;
     let slot = 2240u64;
     let epoch = slot / SLOTS_PER_EPOCH;
     assert_eq!(epoch, 70, "Slot 2240 should be epoch 70");
@@ -2235,7 +2242,14 @@ async fn build_proposal_boundary_orchestrator(
 }
 
 fn proposal_ctx(slot: Slot) -> SlotContext {
-    SlotContext { slot, epoch: slot / SLOTS_PER_EPOCH, parent_root: None, head_root: None }
+    SlotContext {
+        slot,
+        epoch: slot / SLOTS_PER_EPOCH,
+        parent_root: None,
+        expected_parents: None,
+        head_root: None,
+        fence: beacon::DutyFence::open(),
+    }
 }
 
 fn gloas_beacon_block(slot: Slot) -> eth_types::BeaconBlock {
@@ -2243,28 +2257,67 @@ fn gloas_beacon_block(slot: Slot) -> eth_types::BeaconBlock {
 }
 
 fn gloas_beacon_block_with_state(slot: Slot, state_root: Root) -> eth_types::BeaconBlock {
-    eth_types::BeaconBlock {
-        slot,
-        proposer_index: PROPOSER_INDEX,
-        parent_root: [1u8; 32],
-        state_root,
-        body: hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap(),
-    }
+    let parent_root = [1u8; 32];
+    let spec = spec_body_ssz();
+    let index = rvc_gloas::gloas_bid_builder_index(&spec).expect("spec body");
+    let body = rvc_gloas::body_with_bid_binding(&spec, index, slot, parent_root)
+        .expect("spec body accepts a bid binding");
+    eth_types::BeaconBlock { slot, proposer_index: PROPOSER_INDEX, parent_root, state_root, body }
 }
 
-fn gloas_envelope_hex() -> String {
-    format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
+fn spec_body_ssz() -> Vec<u8> {
+    hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap()
+}
+
+fn spec_envelope_ssz() -> Vec<u8> {
+    hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap()
+}
+
+/// Spec body with `builder_index == BUILDER_INDEX_SELF_BUILD`. The unmodified
+/// spec bid is an external index, so a contents wrapper is not a self-build.
+fn self_build_block_with_state(slot: Slot, state_root: Root) -> eth_types::BeaconBlock {
+    let parent_root = [1u8; 32];
+    let body = rvc_gloas::body_with_bid_binding(
+        &spec_body_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        slot,
+        parent_root,
+    )
+    .expect("spec body accepts a self-build index");
+    eth_types::BeaconBlock { slot, proposer_index: PROPOSER_INDEX, parent_root, state_root, body }
+}
+
+fn bound_self_build_envelope_hex(block: &eth_types::BeaconBlock) -> String {
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    let bound = rvc_gloas::envelope_with_binding(
+        &spec_envelope_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding");
+    format!("0x{}", hex::encode(bound))
 }
 
 fn gloas_block_contents_response(slot: Slot) -> ProduceBlockResponse {
-    gloas_block_contents_response_for(gloas_beacon_block(slot))
+    gloas_block_contents_response_for(self_build_block_with_state(slot, [2u8; 32]))
 }
 
 fn gloas_block_contents_response_for(block: eth_types::BeaconBlock) -> ProduceBlockResponse {
+    let envelope = bound_self_build_envelope_hex(&block);
     ProduceBlockResponse {
         data: serde_json::json!({
             "block": block,
-            "execution_payload_envelope": gloas_envelope_hex(),
+            "execution_payload_envelope": envelope,
             "kzg_proofs": ["0xaa"],
             "blobs": ["0xbb"],
         }),
@@ -2278,6 +2331,7 @@ fn gloas_block_contents_response_for(block: eth_types::BeaconBlock) -> ProduceBl
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -2292,6 +2346,7 @@ fn gloas_builder_win_response(slot: Slot, builder_url: &str) -> ProduceBlockResp
         payload_included: false,
         builder_url: Some(builder_url.to_string()),
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -2373,6 +2428,7 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
             PRE_GLOAS_SLOT,
             PRE_GLOAS_SLOT / SLOTS_PER_EPOCH,
             &proposal_ctx(PRE_GLOAS_SLOT),
+            None,
         )
         .await;
 
@@ -2388,7 +2444,12 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
 
     clock.set_slot(GLOAS_SLOT);
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
 
     assert_eq!(
@@ -2441,13 +2502,16 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
             let WireBody::Json(value) = signed_envelope else {
                 panic!("expected JSON signed envelope, got {signed_envelope:?}");
             };
-            assert_eq!(value["message"], serde_json::json!(gloas_envelope_hex()));
+            let signed_block = self_build_block_with_state(GLOAS_SLOT, [2u8; 32]);
+            assert_eq!(
+                value["message"],
+                serde_json::json!(bound_self_build_envelope_hex(&signed_block))
+            );
             let sig_hex = value["signature"].as_str().expect("envelope signature hex");
             let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x")).expect("sig hex");
             let sig = Signature::from_bytes(&sig_bytes).expect("envelope signature");
-            let envelope_ssz =
-                hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
-                    .unwrap();
+            let message = value["message"].as_str().expect("envelope hex");
+            let envelope_ssz = hex::decode(message.trim_start_matches("0x")).expect("envelope ssz");
             let envelope_root =
                 rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).unwrap();
             let schedule = create_test_fork_schedule();
@@ -2473,7 +2537,7 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
         other => panic!("expected envelope publish, got {other:?}"),
     }
 
-    let block = gloas_beacon_block(GLOAS_SLOT);
+    let block = self_build_block_with_state(GLOAS_SLOT, [2u8; 32]);
     assert!(
         block.try_tree_hash_root().is_err(),
         "Gloas body must not merkleize through the Electra/Deneb tree_hash bridge"
@@ -2495,11 +2559,16 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
     let publish_before = block_beacon.publish_block_calls().len();
     let envelopes_before = block_beacon.envelope_publish_calls().len();
     // Same slot, different signing root — EIP-3076 double proposal, not a re-sign.
-    block_beacon.set_response(gloas_block_contents_response_for(gloas_beacon_block_with_state(
+    block_beacon.set_response(gloas_block_contents_response_for(self_build_block_with_state(
         GLOAS_SLOT, [3u8; 32],
     )));
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
     assert_eq!(
         block_beacon.publish_block_calls().len(),
@@ -2551,7 +2620,12 @@ async fn test_gloas_builder_win_skips_envelope_and_echoes_builder_url() {
     orchestrator.duty_tracker.fetch_proposer_duties(GLOAS_SLOT / SLOTS_PER_EPOCH).await.unwrap();
 
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
 
     assert!(block_beacon.produce_v3_slots().is_empty());
@@ -2652,6 +2726,19 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         "v2",
     )
     .await;
+    // The preferences step waits for the proposer duties of E and E+1.
+    // Epochs 69 and 71 have no proposal.
+    for (epoch, version) in [(fulu_epoch, "v1"), (gloas_epoch + 1, "v2")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/{version}/validator/duties/proposer/{epoch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+    }
 
     Mock::given(method("POST"))
         .and(path("/eth/v1/validator/prepare_beacon_proposer"))
@@ -2671,8 +2758,7 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
 
     orchestrator.duty_tracker.fetch_proposer_duties(gloas_epoch).await.unwrap();
 
-    orchestrator.duty_management.on_epoch_boundary(fulu_epoch, fulu_slot).await;
-    orchestrator.run_builder_epoch_boundary(fulu_epoch).await;
+    orchestrator.epoch_boundary.run_pending(fulu_slot).await;
 
     let after_69 = mock_server.received_requests().await.unwrap();
     let prefs_69 = signed_proposer_preferences(&after_69);
@@ -2727,8 +2813,7 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         .await;
 
     orchestrator.clock.set_slot(gloas_slot);
-    orchestrator.duty_management.on_epoch_boundary(gloas_epoch, gloas_slot).await;
-    orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
+    orchestrator.epoch_boundary.run_pending(gloas_slot).await;
 
     let after_70 = mock_server.received_requests().await.unwrap();
     let epoch_70 = &after_70[after_69.len()..];

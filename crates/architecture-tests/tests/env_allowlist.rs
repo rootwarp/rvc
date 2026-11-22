@@ -129,7 +129,16 @@ const GRANDFATHERED: &[(&str, &str)] = &[(
 /// figment's idiomatic `Env` layer (env-wins overlay). Adopting a figment-style
 /// `Env` layer would violate this gate; ADR-008 avoids it by not taking the
 /// dependency at all (C3).
+///
+/// The Google ADC names have no rvc config field. Only the `gcp` tracing
+/// exporter reads them (`telemetry/src/gcp.rs`), as the removed gcloud-sdk did.
 const ECOSYSTEM_CONFIG_WINS: &[(&str, &str)] = &[
+    ("GCE_METADATA_HOST", GCP_ADC),
+    ("GCP_PROJECT", GCP_ADC),
+    ("GCP_PROJECT_ID", GCP_ADC),
+    ("GOOGLE_APPLICATION_CREDENTIALS", GCP_ADC),
+    ("HOME", GCP_ADC),
+    ("PROJECT_ID", GCP_ADC),
     ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTLP endpoint; config-else-env (`tracing.rs:136` `or_else`)"),
     ("OTEL_TRACES_SAMPLER_ARG", "OTLP sampler; config-else-env (`tracing.rs:146` `None =>`)"),
     (
@@ -137,6 +146,9 @@ const ECOSYSTEM_CONFIG_WINS: &[(&str, &str)] = &[
         "tracing-subscriber filter; ecosystem default, env fills unset (`telemetry/src/init.rs`)",
     ),
 ];
+
+/// The constant gives the reason for each Google ADC name in class 3.
+const GCP_ADC: &str = "The `gcp` exporter reads Google ADC settings in `telemetry/src/gcp.rs`.";
 
 /// One shrinking-only row: file, 1-based line, allowed expr, constructor-arg
 /// idents that flow in, reason.

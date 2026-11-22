@@ -141,6 +141,7 @@ impl Harness {
             0,
             std::time::Instant::now(),
             SLOTS_PER_EPOCH * 12,
+            12_000,
         ));
 
         let (enablement, machine) = if doppelganger_enabled {
@@ -429,17 +430,23 @@ impl Harness {
     fn open_forward_window(&self, pubkey: &PublicKey) {
         let machine = self.machine.as_ref().expect("forward-window machine");
         let start = self.epoch_clock.current_epoch();
-        let end = start + DEFAULT_MONITORING_EPOCHS;
         let bare = hex::encode(pubkey.to_bytes());
-        for epoch in start..=end {
-            machine
-                .observe_liveness(
-                    epoch,
-                    &[ValidatorLivenessData { index: bare.clone(), is_live: false }],
-                )
-                .expect("observe liveness");
+        // Boot counts `start`. Import's next_check is the next epoch, so the
+        // extra observation covers that path. An already-Safe key ignores it.
+        for offset in 0..DEFAULT_MONITORING_EPOCHS + 2 {
+            let epoch = start + offset;
+            assert!(
+                machine
+                    .observe_liveness(
+                        epoch,
+                        &[ValidatorLivenessData { index: bare.clone(), is_live: false }],
+                        epoch + 1,
+                        doppelganger::CLOSED_EPOCH_SLOT,
+                    )
+                    .is_empty(),
+                "observe liveness"
+            );
         }
-        machine.tick(end + 1, 0);
         assert!(
             machine.is_signing_enabled(pubkey),
             "forward-window gate must be open after a clean not-live window"
@@ -514,7 +521,8 @@ impl Harness {
         deps.pubkey_index = Arc::clone(&self.registry);
         let (orchestrator, _handle) = rvc::orchestrator::DutyOrchestrator::new(deps);
         let mark = self.mark().await;
-        orchestrator.submit_committee_subscriptions(epoch).await;
+        let sent = orchestrator.submit_committee_subscriptions(epoch).await;
+        assert!(matches!(sent, Ok(())), "a closed store gate is nothing to send: {sent:?}");
         let signed = self.since(mark).await.into_iter().any(|r| {
             r.method.as_str() == "POST"
                 && r.url.path() == "/eth/v1/validator/beacon_committee_subscriptions"
@@ -657,6 +665,18 @@ async fn mount_bn(server: &MockServer, state: Arc<BnState>) {
         .mount(server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/genesis"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "genesis_time": "1606824023",
+                "genesis_validators_root": format!("0x{}", hex::encode(GVR)),
+                "genesis_fork_version": "0x00000000"
+            }
+        })))
+        .mount(server)
+        .await;
+
     let state_v = Arc::clone(&state);
     Mock::given(method("GET"))
         .and(path("/eth/v1/beacon/states/head/validators"))
@@ -730,12 +750,22 @@ async fn beacon_handles(config: &Config) -> BeaconHandles {
     let beacon_client = sb.build_beacon().expect("beacon client");
     let bn_manager =
         sb.build_bn_manager_with_timeouts(bn_manager::OperationTimeouts::default()).expect("bn");
+    // `connect_beacon` agrees the chain identity before `build_services`.
+    bn_manager
+        .agreed_spec_and_genesis(
+            bn_manager::SpecAgreement::Responding,
+            &format!("0x{}", hex::encode(GVR)),
+        )
+        .await
+        .expect("main pool agrees");
     BeaconHandles {
         beacon_client,
         bn_manager,
         genesis_validators_root: GVR,
         genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
         genesis_time: config.genesis_time.unwrap_or(1_606_824_023),
+        slot_duration_ms: 12_000,
+        genesis_confirmed: true,
     }
 }
 

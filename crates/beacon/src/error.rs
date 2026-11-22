@@ -31,6 +31,42 @@ pub enum BeaconError {
     /// No BN matched the requested role and no `All`-role fallback exists.
     #[error("no beacon nodes eligible for {operation} (role {role})")]
     NoEligibleBn { operation: String, role: String },
+
+    /// The beacon node returned a genesis validators root other than the configured one.
+    #[error("genesis validators root {root} does not match configured root")]
+    GenesisValidatorsRootMismatch { root: String },
+
+    /// No beacon node is admitted, so a duty must not be sent or signed.
+    #[error("no admitted beacon node; duties halted")]
+    NoAdmittedNode,
+
+    /// A response arrived after the node's admission generation changed.
+    #[error("beacon node response dropped: admission revoked in flight")]
+    RevokedInFlight,
+
+    /// This client does not implement the named operation.
+    ///
+    /// A raw [`crate::BeaconClient`] returns this when produce is asked to
+    /// apply a duty. Ranking and the fee, fork, and parent checks belong to
+    /// the beacon-node pool.
+    #[error("{0}")]
+    Unsupported(&'static str),
+
+    /// Produce round failed for a reason other than a transport error.
+    #[error(transparent)]
+    Produce(#[from] ProduceError),
+}
+
+/// A produce round that returned no block without a transport error.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ProduceError {
+    /// Dropped candidates, and no transport error was stored.
+    ///
+    /// `reasons` is `bn {index} {label}` in index order, joined by `, `.
+    /// Labels: `fork`, `unreadable`, `slot`, `proposer`, `parent`, `fee`,
+    /// `shape`, or `fallback_parent` (hard checks passed, primary parent missed). Fee-only is not an entry.
+    #[error("{operation}: all candidates rejected: {reasons}")]
+    AllCandidatesRejected { operation: String, reasons: String },
 }
 
 #[cfg(test)]
@@ -74,6 +110,36 @@ mod tests {
             timeout: Duration::from_secs(3),
         };
         assert_eq!(err.to_string(), "produce_block_v3 timed out after 3s");
+    }
+
+    #[test]
+    fn test_no_admitted_node_error_display() {
+        let err = BeaconError::NoAdmittedNode;
+        assert_eq!(err.to_string(), "no admitted beacon node; duties halted");
+    }
+
+    #[test]
+    fn test_revoked_in_flight_error_display() {
+        let err = BeaconError::RevokedInFlight;
+        assert_eq!(err.to_string(), "beacon node response dropped: admission revoked in flight");
+    }
+
+    #[test]
+    fn test_all_candidates_rejected_display() {
+        let err = BeaconError::from(ProduceError::AllCandidatesRejected {
+            operation: "produce_block_v3".to_string(),
+            reasons: "bn 0 parent, bn 1 slot".to_string(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "produce_block_v3: all candidates rejected: bn 0 parent, bn 1 slot"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_error_display() {
+        let err = BeaconError::Unsupported("duty-aware production requires BnManager");
+        assert_eq!(err.to_string(), "duty-aware production requires BnManager");
     }
 
     #[test]

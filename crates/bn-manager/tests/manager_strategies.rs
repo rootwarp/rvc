@@ -6,26 +6,29 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use beacon::{
     BeaconClient, BeaconClientConfig, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
     PRODUCE_BLOCK_V4_PATH_PREFIX,
 };
-use eth_types::ForkSchedule;
+use eth_types::{ForkName, ForkSchedule};
 use serde_json::json;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use rvc_bn_manager::metrics::{RVC_BN_CAPABILITY_STATE, RVC_PROPOSER_BN_LATENCY_MS};
+use rvc_bn_manager::metrics::{
+    RVC_BN_CAPABILITY_STATE, RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL, RVC_PROPOSER_BN_LATENCY_MS,
+};
 use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
-    AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
-    BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, DutiesProvider, LivenessApi, NodeStatusApi,
-    OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    AttestationApi, AttestationData, BeaconError, BeaconNodeClient, BlockProducer, BnManager,
+    BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
+    FeeRecipientPolicy, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
+    ProduceDuty, Propagator, ShapeConstraint, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SingleAttestation, SubmitAttestationResult, SyncCommitteeApi, SyncCommitteeSubscription,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -38,6 +41,48 @@ fn make_manager(endpoint: &str) -> BnManager {
 fn make_multi_manager(endpoints: &[&str]) -> BnManager {
     let config = BnManagerConfig::new(endpoints.iter().map(|e| e.to_string()).collect());
     BnManager::new(config).unwrap()
+}
+
+/// A peer's publish can arrive on the drain after the call returns.
+///
+/// Match method and path. A prior `GET /eth/v1/node/syncing` must not satisfy
+/// a wait for the publish.
+async fn poll_received(server: &MockServer, method: &str, path: &str, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let requests = server.received_requests().await.expect("received_requests");
+        let got = requests
+            .iter()
+            .filter(|req| req.method.as_str() == method && req.url.path() == path)
+            .count();
+        if got >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {n} {method} {path}, saw {got}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Broadcast health is recorded by the drain, which can finish after the call returns.
+async fn poll_broadcast_health(
+    manager: &BnManager,
+    pred: impl Fn(&[rvc_bn_manager::BnHealthScore]) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let scores = manager.health_scores().await;
+        if pred(&scores) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the broadcast drain to record health: {scores:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 const GENESIS_RESPONSE: &str = r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#;
@@ -337,6 +382,46 @@ async fn test_submit_beacon_committee_subscriptions_delegates() {
     let manager = make_manager(&mock_server.uri());
     let result = manager.submit_beacon_committee_subscriptions(&[]).await;
     assert!(result.is_ok());
+}
+
+const SYNC_COMMITTEE_SUBSCRIPTIONS_PATH: &str = "/eth/v1/validator/sync_committee_subscriptions";
+
+fn sync_committee_subscription() -> SyncCommitteeSubscription {
+    SyncCommitteeSubscription {
+        validator_index: 7,
+        sync_committee_indices: vec![1, 300],
+        until_epoch: 512,
+    }
+}
+
+async fn sync_committee_subscription_posts(server: &MockServer) -> usize {
+    let requests = server.received_requests().await.expect("received_requests");
+    requests
+        .iter()
+        .filter(|req| {
+            req.method.as_str() == "POST" && req.url.path() == SYNC_COMMITTEE_SUBSCRIPTIONS_PATH
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .and(body_json(json!([
+            {"validator_index": "7", "sync_committee_indices": ["1", "300"], "until_epoch": "512"}
+        ])))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Ok(())), "{result:?}");
 }
 
 #[tokio::test]
@@ -703,6 +788,8 @@ async fn test_submit_payload_attestations_failover() {
     let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
     let result = manager.submit_payload_attestations(&[]).await;
     assert!(result.is_ok(), "broadcast any-success must succeed: {result:?}");
+    poll_received(&primary, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
+    poll_received(&secondary, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
 }
 
 /// ARCH-P1-13 / ARCH-3n: fail-safe OR-merge — any BN reporting live wins.
@@ -747,6 +834,47 @@ async fn test_merged_liveness_reports_live_when_any_bn_says_live_fail_safe() {
     assert!(entry.is_live, "fail-safe: any BN reporting live must win over a not-live peer");
 }
 
+/// A later BN that reports live after another BN's 200 still wins the merge.
+/// `first_ok` would return the fast not-live answer and drop this report.
+#[tokio::test]
+async fn merged_liveness_waits_for_a_bn_that_reports_live_after_a_200() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":false}]}"#),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":true}]}"#)
+                .set_delay(Duration::from_millis(150)),
+        )
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let indices = vec!["1".to_string()];
+    let result = manager.post_validator_liveness_merged(42, &indices).await;
+    assert!(result.is_ok(), "merge must wait for every BN: {result:?}");
+    let entry = result
+        .unwrap()
+        .data
+        .into_iter()
+        .find(|v| v.index == "1")
+        .expect("merged response must include index 1");
+    assert!(entry.is_live, "a late is_live=true must still win the OR-merge");
+}
+
 /// An erroring BN contributes nothing (not live, not not-live).
 #[tokio::test]
 async fn test_merged_liveness_ignores_a_failing_bn() {
@@ -771,6 +899,15 @@ async fn test_merged_liveness_ignores_a_failing_bn() {
         .await;
 
     let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    // Not-live counts only from a synced witness. The secondary is the sole
+    // success, so it has to be that witness. The assertion is unchanged.
+    manager.sync_statuses().write().await[1] = BnSyncDetail {
+        status: BnSyncStatus::Synced,
+        sync_distance: Some(0),
+        head_slot: Some(32),
+        is_optimistic: false,
+        el_offline: false,
+    };
     let indices = vec!["1".to_string()];
     let result = manager.post_validator_liveness_merged(42, &indices).await;
     assert!(result.is_ok(), "partial failure must not fail the merge: {result:?}");
@@ -934,35 +1071,97 @@ async fn test_multi_best_picks_higher_value_block() {
     let bn1 = MockServer::start().await;
     let bn2 = MockServer::start().await;
 
-    // BN1 returns block with lower value
+    // Execution 10 + consensus 0 loses to execution 5 + consensus 10.
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(200)
             .insert_header("Eth-Consensus-Version", "deneb")
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "1000")
+            .insert_header("Eth-Execution-Payload-Value", "10")
+            .insert_header("Eth-Consensus-Block-Value", "0")
             .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
         .expect(1)
         .mount(&bn1)
         .await;
 
-    // BN2 returns block with higher value
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(200)
             .insert_header("Eth-Consensus-Version", "deneb")
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "5000")
+            .insert_header("Eth-Execution-Payload-Value", "5")
+            .insert_header("Eth-Consensus-Block-Value", "10")
             .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
         .expect(1)
         .mount(&bn2)
         .await;
 
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
-    let block = result.unwrap();
-    assert_eq!(block.execution_payload_value, Some("5000".to_string()));
+    let block = manager.produce_block_v3(1, "0xrandao", None, None).await.expect("ranked head");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("5"));
+    assert_eq!(block.consensus_block_value.as_deref(), Some("10"));
+}
+
+#[tokio::test]
+async fn test_multi_best_missing_headers_rank_as_zero() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    // Missing headers are 0. Equal to an explicit 0, so the lower index wins.
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .insert_header("Eth-Execution-Payload-Value", "0")
+            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"1","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn2)
+        .await;
+
+    let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+    let tied =
+        manager.produce_block_v3(1, "0xrandao", None, None).await.expect("tie keeps index 0");
+    assert_eq!(tied.execution_payload_value, None);
+    assert_eq!(tied.consensus_block_value, None);
+
+    let bn3 = MockServer::start().await;
+    let bn4 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/2"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .set_body_string(r#"{"data":{"slot":"2","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn3)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/2"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .insert_header("Eth-Execution-Payload-Value", "1")
+            .set_body_string(r#"{"data":{"slot":"2","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn4)
+        .await;
+
+    let manager = make_multi_manager(&[&bn3.uri(), &bn4.uri()]);
+    let positive =
+        manager.produce_block_v3(2, "0xrandao", None, None).await.expect("1 beats missing");
+    assert_eq!(positive.execution_payload_value.as_deref(), Some("1"));
+    assert_eq!(positive.consensus_block_value, None);
 }
 
 #[tokio::test]
@@ -1038,6 +1237,445 @@ async fn test_multi_best_single_bn_falls_back_to_first() {
     let manager = make_manager(&bn.uri());
     let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
     assert!(result.is_ok());
+}
+
+fn produce_block_v3_ok(value: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", value)
+        .set_body_string(
+            r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+        )
+}
+
+fn manager_with_block_budget(endpoints: &[&str], budget: Duration) -> BnManager {
+    let config = BnManagerConfig::new(endpoints.iter().map(|e| e.to_string()).collect());
+    BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+        block_production: budget,
+        ..OperationTimeouts::default()
+    })
+}
+
+/// B-002: a block already in hand is returned at the soft deadline. The slow
+/// peer's timeout is recorded as an error instead of discarding the block.
+///
+/// Budget 3 s, so the soft deadline is 1.5 s. BN-A answers in 300 ms. BN-B
+/// answers in 4 s with a higher payload value. The call must keep BN-A.
+#[tokio::test]
+async fn test_best_of_returns_ready_block_at_soft_deadline_when_peer_is_slow() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .and(query_param("randao_reveal", "0xrandao"))
+        .respond_with(produce_block_v3_ok("1000").set_delay(Duration::from_millis(300)))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("9000").set_delay(Duration::from_secs(4)))
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn_a.uri(), &bn_b.uri()], Duration::from_secs(3));
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("BN-A's block must be kept");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("1000"));
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "returned before the soft deadline ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2800),
+        "waited for the budget instead of the soft deadline ({elapsed:?})"
+    );
+
+    poll_broadcast_health(&manager, |scores| scores[1].error_rate == 1.0).await;
+    let scores = manager.health_scores().await;
+    assert!(scores[0].latency_ms > 0.0, "BN-A's success must be recorded: {scores:?}");
+}
+
+/// No block has arrived at the soft deadline. The one that arrives at 2 s is
+/// returned then, not held until the 3 s budget.
+#[tokio::test]
+async fn test_best_of_returns_first_block_after_soft_without_waiting_for_budget() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("1000").set_delay(Duration::from_secs(2)))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("9000").set_delay(Duration::from_secs(4)))
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn_a.uri(), &bn_b.uri()], Duration::from_secs(3));
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("the block that arrived at 2s");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("1000"));
+    assert!(
+        elapsed >= Duration::from_millis(1700) && elapsed < Duration::from_millis(2800),
+        "expected return near 2s, not at the 3s budget; took {elapsed:?}"
+    );
+}
+
+/// Every synced BN misses the hard deadline. A small-lag proposal-role BN is
+/// tried inside the backstop when the parent root is known, and its block is
+/// returned.
+#[tokio::test]
+async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
+    let synced = MockServer::start().await;
+    let unsynced = MockServer::start().await;
+    let parent = [0xabu8; 32];
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
+    let fallback_ok = ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", "7000")
+        .set_body_string(body);
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("1111").set_delay(Duration::from_secs(5)))
+        .expect(1)
+        .mount(&synced)
+        .await;
+
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
+        .mount(&unsynced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(fallback_ok)
+        .expect(1)
+        .mount(&unsynced)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&synced.uri(), &unsynced.uri()], Duration::from_millis(400));
+    manager.check_sync_status().await;
+
+    let start = tokio::time::Instant::now();
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
+            },
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("small-lag fallback block");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fallback must finish inside the backstop, took {elapsed:?}"
+    );
+}
+
+fn duty_block_body(parent: &str, proposer: u64, fee: &str) -> String {
+    let mut data = preparable_data("full", 1, proposer, parent, false);
+    data["body"]["execution_payload"]["fee_recipient"] =
+        serde_json::Value::String(format!("0x{fee}"));
+    produce_json(data)
+}
+
+fn mount_duty_block(value: &str, body: String) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", value)
+        .set_body_string(body)
+}
+
+fn deneb_fee_duty(fee: [u8; 20]) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: Some([0xab; 32]),
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: Some(fee),
+        expected_consensus_version: ForkName::Deneb,
+        shape: ShapeConstraint::Any,
+    }
+}
+
+/// A sole beacon node whose payload fee recipient does not match the duty
+/// still returns the block. The penalty is recorded when that block is signed,
+/// not when it is returned.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_returns_a_mismatched_fee_for_signing() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    let fee = "22".repeat(20);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &fee)))
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400));
+    let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let result = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await;
+    let block = result.expect("a mismatched fee must still be returned for signing");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("9000"));
+    assert!(
+        !logs_contain("signing block with fee-recipient mismatch"),
+        "returning a mismatch must not log the signing penalty"
+    );
+    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before);
+}
+
+/// `fee_recipient_policy = "reject"` drops a readable mismatch.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_rejects_a_mismatched_fee_when_configured() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400))
+        .with_fee_recipient_policy(FeeRecipientPolicy::Reject);
+    let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let result = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await;
+    assert!(result.is_err(), "reject policy must drop a wrong fee: {result:?}");
+    assert!(logs_contain("best-of candidate rejected"));
+    assert!(logs_contain("reason=fee") || logs_contain("reason=\"fee\""));
+    assert!(!logs_contain("signing block with fee-recipient mismatch"));
+    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before);
+}
+
+/// The production reject path logs the duty comparison, not only a test double.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_logs_a_hard_reject() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1", duty_block_body(&parent, 99, &"11".repeat(20))))
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400));
+    let result = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await;
+    assert!(result.is_err(), "a wrong proposer must be rejected: {result:?}");
+    assert!(logs_contain("best-of candidate rejected"));
+    assert!(logs_contain("reason=proposer") || logs_contain("reason=\"proposer\""));
+    assert!(logs_contain("proposer_expected=7"));
+    assert!(logs_contain("proposer_got=99"));
+    assert!(logs_contain("slot_expected=1"));
+    assert!(!logs_contain("signing block with fee-recipient mismatch"));
+}
+
+/// Every candidate is a hard reject. The error names each reason in index order.
+#[tokio::test]
+async fn all_rejected_round_names_the_reject_reasons() {
+    let slot_bn = MockServer::start().await;
+    let proposer_bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    let fee = "11".repeat(20);
+    let state = "00".repeat(32);
+    let wrong_slot = format!(
+        r#"{{"data":{{"slot":"9","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", wrong_slot))
+        .expect(1)
+        .mount(&slot_bn)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("8000", duty_block_body(&parent, 99, &fee)))
+        .expect(1)
+        .mount(&proposer_bn)
+        .await;
+
+    let manager = manager_with_block_budget(
+        &[&slot_bn.uri(), &proposer_bn.uri()],
+        Duration::from_millis(400),
+    );
+    let slot_before = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["slot"])
+        .get();
+    let proposer_before = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["proposer"])
+        .get();
+    let err = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await
+        .expect_err("both candidates are hard rejects");
+    assert_eq!(
+        err.to_string(),
+        "produce_block_v3: all candidates rejected: bn 0 slot, bn 1 proposer"
+    );
+    let slot_after = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["slot"])
+        .get();
+    let proposer_after = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["proposer"])
+        .get();
+    assert!(slot_after > slot_before, "slot rejects are counted");
+    assert!(proposer_after > proposer_before, "proposer rejects are counted");
+}
+
+/// A higher-value candidate with the wrong fee recipient ranks below a
+/// matching one. The signed block is the match, and the penalty warning is
+/// not emitted for the candidate that lost.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_ranks_a_fee_mismatch_below_a_match() {
+    let mismatch = MockServer::start().await;
+    let matching = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&mismatch)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1000", duty_block_body(&parent, 7, &"11".repeat(20))))
+        .expect(1)
+        .mount(&matching)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&mismatch.uri(), &matching.uri()], Duration::from_secs(3));
+    let block = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await
+        .expect("a matching candidate must be returned");
+    assert_eq!(
+        block.execution_payload_value.as_deref(),
+        Some("1000"),
+        "the matching fee recipient must outrank the higher mismatched value"
+    );
+    assert!(
+        !logs_contain("signing block with fee-recipient mismatch"),
+        "the penalty warning is only for the block that is signed"
+    );
+}
+
+/// A fee-penalized block stays on the ranked list, behind the preferred one.
+#[tokio::test]
+async fn produce_block_v3_ranked_lists_a_held_fee_mismatch_after_the_preferred_block() {
+    let mismatch = MockServer::start().await;
+    let matching = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&mismatch)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1000", duty_block_body(&parent, 7, &"11".repeat(20))))
+        .expect(1)
+        .mount(&matching)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&mismatch.uri(), &matching.uri()], Duration::from_secs(3));
+    let ranked = manager
+        .produce_block_v3_ranked(1, "0xrandao", None, None, Some(deneb_fee_duty([0x11; 20])))
+        .await
+        .expect("both candidates must be returned");
+    assert_eq!(ranked.len(), 2, "the held fee mismatch stays behind the preferred block");
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+    assert_eq!(ranked[1].response.execution_payload_value.as_deref(), Some("9000"));
+}
+
+/// No duty, so the parent is unknown. A small-lag proposal BN is not asked.
+#[tokio::test]
+async fn produce_block_v3_without_a_parent_does_not_ask_a_small_lag_bn() {
+    let synced = MockServer::start().await;
+    let small = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .expect(1)
+        .mount(&synced)
+        .await;
+
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
+        .mount(&small)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("7000"))
+        .expect(0)
+        .mount(&small)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&synced.uri(), &small.uri()], Duration::from_millis(400));
+    manager.check_sync_status().await;
+
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    assert!(result.is_err(), "no parent must not fall back to the small-lag BN: {result:?}");
 }
 
 // -- V4 sequential failover (issue 6.6 / D29) --
@@ -1899,6 +2537,8 @@ async fn test_multi_broadcast_sends_to_all_bns() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -1925,6 +2565,8 @@ async fn test_multi_broadcast_succeeds_if_one_bn_ok() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -1973,6 +2615,8 @@ async fn test_multi_broadcast_sync_messages() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_sync_committee_messages(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
 }
 
 #[tokio::test]
@@ -1998,6 +2642,8 @@ async fn test_multi_broadcast_aggregate_proofs() {
     let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
     let result = manager.submit_aggregate_and_proofs(&proofs).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/aggregate_and_proofs", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/aggregate_and_proofs", 1).await;
 }
 
 #[tokio::test]
@@ -2022,6 +2668,201 @@ async fn test_multi_broadcast_committee_subscriptions() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_beacon_committee_subscriptions(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+}
+
+/// Wiremock route that signals arrival, then blocks its server thread until released.
+struct HeldResponder {
+    arrived: Arc<tokio::sync::Notify>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl wiremock::Respond for HeldResponder {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.arrived.notify_one();
+        let (lock, cv) = &*self.released;
+        let released = lock.lock().unwrap_or_else(|err| err.into_inner());
+        drop(cv.wait_while(released, |released| !*released).unwrap_or_else(|err| err.into_inner()));
+        ResponseTemplate::new(200)
+    }
+}
+
+/// Releases a [`HeldResponder`] on drop, so no path leaves its server thread blocked.
+struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.0;
+        *lock.lock().unwrap_or_else(|err| err.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+/// BN-A answers at once and BN-B is held until the test releases it. The task
+/// records whether BN-B was still held when the call returned. The test
+/// releases BN-B when the call returns, or after `HOLD_LIMIT` if it has not,
+/// and then requires that record. A call that waits for every BN cannot return
+/// before the release, so it fails the assertion on every run. `HOLD_LIMIT` is
+/// shorter than the 30 s client timeout that would end BN-B.
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_first_ok_with_held_bn() {
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+    const HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = ReleaseOnDrop(Arc::clone(&released));
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(HeldResponder {
+            arrived: Arc::clone(&arrived),
+            released: Arc::clone(&released),
+        })
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = Arc::new(make_multi_manager(&[&bn_a.uri(), &bn_b.uri()]));
+    let mut call = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move {
+            let result =
+                manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+            let held = !*released.0.lock().unwrap_or_else(|err| err.into_inner());
+            (result, held)
+        }
+    });
+
+    tokio::time::timeout(HANG_GUARD, arrived.notified())
+        .await
+        .expect("BN-B never received the subscriptions");
+    let early = tokio::time::timeout(HOLD_LIMIT, &mut call).await;
+    drop(release);
+    let joined = match early {
+        Ok(joined) => joined,
+        Err(_) => tokio::time::timeout(HANG_GUARD, call)
+            .await
+            .expect("the call did not end after BN-B was released"),
+    };
+    let (result, held_at_return) = joined.expect("submit task panicked");
+    assert!(
+        held_at_return,
+        "first OK must return while BN-B is held; the call returned only after BN-B was \
+         released: {result:?}"
+    );
+    assert!(matches!(result, Ok(())), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_query_first_when_broadcast_off() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bn2)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+    config.broadcast_topics.subscriptions = false;
+    let manager = BnManager::new(config).unwrap();
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Ok(())), "{result:?}");
+
+    // A broadcast would leave BN-2's POST on a detached drain. Zero waits until
+    // every drain ends, so a broadcast has reached BN-2 before the count.
+    manager.wait_for_broadcast_drains(Duration::ZERO).await;
+    assert_eq!(sync_committee_subscription_posts(&bn1).await, 1);
+    assert_eq!(
+        sync_committee_subscription_posts(&bn2).await,
+        0,
+        "query-first must not reach BN-2 after BN-1 answered"
+    );
+}
+
+/// BN-0 holds every concrete role except Submission and BN-1 is Submission
+/// only. Both answer 200, so only the request counts show which role was used.
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_uses_the_submission_role() {
+    let off_role = MockServer::start().await;
+    let submission = MockServer::start().await;
+
+    for bn in [&off_role, &submission] {
+        Mock::given(method("POST"))
+            .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(bn)
+            .await;
+    }
+
+    let mut config = BnManagerConfig::new(vec![off_role.uri(), submission.uri()]);
+    config.roles = vec![
+        HashSet::from([
+            BnRole::Attestation,
+            BnRole::Proposal,
+            BnRole::SyncCommittee,
+            BnRole::Aggregation,
+        ]),
+        role_set(BnRole::Submission),
+    ];
+    let manager = BnManager::new(config).unwrap();
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(
+        matches!(result, Ok(())),
+        "a Submission-only BN must accept this operation: {result:?}"
+    );
+
+    manager.wait_for_broadcast_drains(Duration::ZERO).await;
+    assert_eq!(
+        sync_committee_subscription_posts(&submission).await,
+        1,
+        "the Submission-only BN must receive the subscriptions"
+    );
+    assert_eq!(
+        sync_committee_subscription_posts(&off_role).await,
+        0,
+        "a BN without the Submission role must not receive the subscriptions"
+    );
+}
+
+#[tokio::test]
+async fn test_submit_sync_committee_subscriptions_all_fail() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    for bn in [&bn1, &bn2] {
+        Mock::given(method("POST"))
+            .and(path(SYNC_COMMITTEE_SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(bn)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+    let result =
+        manager.submit_sync_committee_subscriptions(&[sync_committee_subscription()]).await;
+    assert!(matches!(result, Err(BeaconError::ApiError { status: 500, .. })), "{result:?}");
 }
 
 #[tokio::test]
@@ -2046,6 +2887,8 @@ async fn test_multi_broadcast_contribution_proofs() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_contribution_and_proofs(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/contribution_and_proofs", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/contribution_and_proofs", 1).await;
 }
 
 // ===================================================================
@@ -2262,6 +3105,8 @@ async fn test_sync_broadcast_sends_to_all_regardless_of_sync_status() {
 
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -2344,34 +3189,71 @@ async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
-        .expect(1)
+        .expect(2)
         .mount(&bn1)
         .await;
 
-    // BN2: syncing but block production works
+    // BN2 starts below the fallback floor. One sync read consumes this mock;
+    // the small-lag mock mounted later is what the duty call sees.
     Mock::given(method("GET"))
         .and(path("/eth/v1/node/syncing"))
         .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
-        .mount(&bn2)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/eth/v3/validator/blocks/1"))
-        .respond_with(ResponseTemplate::new(200)
-            .insert_header("Eth-Consensus-Version", "deneb")
-            .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "7000")
-            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
-        .expect(1)
+        .up_to_n_times(1)
         .mount(&bn2)
         .await;
 
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     manager.check_sync_status().await;
 
-    // BN1 (synced) fails, should fall back to BN2 (unsynced)
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
+    // No known parent: a distance-500 node is below the fallback floor and
+    // produce_block_v3 does not fall back.
+    let without_parent = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    assert!(
+        without_parent.is_err(),
+        "unsynced fallback requires a known parent: {without_parent:?}"
+    );
+
+    // Same nodes, but BN2 is small-lag and the parent is known.
+    let parent = [0xabu8; 32];
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+        ))
+        .mount(&bn2)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "7000")
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(&bn2)
+        .await;
+    manager.check_sync_status().await;
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(result.unwrap().execution_payload_value, Some("7000".to_string()));
 }
 
@@ -2460,6 +3342,10 @@ async fn test_health_scores_tracked_in_broadcast() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let _ = manager.prepare_beacon_proposer(&[]).await;
 
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 0.0 && scores[0].score > 0.8 && scores[1].error_rate == 1.0
+    })
+    .await;
     let scores = manager.health_scores().await;
     // BN1 succeeded
     assert_eq!(scores[0].error_rate, 0.0);
@@ -2735,7 +3621,11 @@ async fn test_health_best_strategy_records_health() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let _ = manager.produce_block_v3(1, "0xrandao", None, None).await.unwrap();
 
-    // Both BNs should have health recorded
+    // Health is queued and applied after the call returns.
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].latency_ms > 0.0 && scores[1].latency_ms > 0.0
+    })
+    .await;
     let scores = manager.health_scores().await;
     assert!(scores[0].latency_ms > 0.0, "BN1 latency should be tracked");
     assert!(scores[1].latency_ms > 0.0, "BN2 latency should be tracked");
@@ -3231,6 +4121,8 @@ async fn test_broadcast_partial_failure_still_succeeds() {
     // Overall result should be Ok despite BN1 failing
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -3282,6 +4174,10 @@ async fn test_broadcast_partial_failure_records_health() {
 
     let _ = manager.prepare_beacon_proposer(&[]).await;
 
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 1.0 && scores[1].error_rate == 0.0 && scores[1].score > 0.8
+    })
+    .await;
     // BN1 should have error recorded, BN2 should have success
     let health = manager.health_trackers().read().await;
     assert!(health[0].score() < health[1].score());
@@ -3293,32 +4189,42 @@ async fn test_broadcast_partial_failure_records_health() {
 
 fn sample_signed_block() -> SignedBeaconBlock {
     SignedBeaconBlock {
-        message: eth_types::BeaconBlock {
-            slot: 100,
-            proposer_index: 42,
-            parent_root: [1u8; 32],
-            state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
-        },
+        message: eth_types::external_vector_deneb_block(),
         signature: vec![0xaa; 96],
     }
 }
 
 fn sample_signed_blinded_block() -> SignedBlindedBeaconBlock {
     SignedBlindedBeaconBlock {
-        message: eth_types::BlindedBeaconBlock {
-            slot: 100,
-            proposer_index: 42,
-            parent_root: [1u8; 32],
-            state_root: [2u8; 32],
-            body: vec![0xbe, 0xef],
-        },
+        message: eth_types::external_vector_deneb_blinded_block(),
         signature: vec![0xbb; 96],
     }
 }
 
-/// query_best with N parallel BNs must take the health write lock once for
-/// the selection round (not once per result).
+/// `message.body` must be a JSON object. A hex string does not match.
+struct MessageBodyObject;
+
+impl wiremock::Match for MessageBodyObject {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|value| value.pointer("/message/body").cloned())
+            .is_some_and(|body| body.is_object())
+    }
+}
+
+fn blinded_post_body(requests: &[wiremock::Request]) -> serde_json::Value {
+    let post = requests
+        .iter()
+        .find(|req| {
+            req.method.as_str() == "POST" && req.url.path() == "/eth/v1/beacon/blinded_blocks"
+        })
+        .expect("blinded publish");
+    serde_json::from_slice(&post.body).expect("json body")
+}
+
+/// A best-of round queues one health sample per BN. The call returns without
+/// waiting on the health write lock; the recorder applies the samples after.
 #[tokio::test]
 async fn test_health_tracker_write_lock_taken_once_per_selection_round() {
     let bn1 = MockServer::start().await;
@@ -3351,18 +4257,15 @@ async fn test_health_tracker_write_lock_taken_once_per_selection_round() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
     manager.check_sync_status().await;
 
-    manager.health_trackers().reset_write_lock_count();
     let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
     assert!(result.is_ok());
 
-    let writes = manager.health_trackers().write_lock_count();
-    assert_eq!(
-        writes, 1,
-        "query_best must batch health updates into a single write lock (got {writes})"
-    );
+    poll_broadcast_health(&manager, |scores| scores.iter().all(|score| score.latency_ms > 0.0))
+        .await;
 }
 
-/// fallback_unsynced also records under one write per fallback round.
+/// Fallback health is queued per attempt. The block is returned without
+/// waiting on the health write lock.
 #[tokio::test]
 async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
     let bn1 = MockServer::start().await;
@@ -3382,11 +4285,12 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
         .mount(&bn1)
         .await;
 
-    // BN2, BN3: unsynced; BN2 fails, BN3 succeeds
+    // BN2, BN3: small lag (above the fallback floor); BN2 fails, BN3 succeeds.
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
     for bn in [&bn2, &bn3] {
         Mock::given(method("GET"))
             .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
             .mount(bn)
             .await;
     }
@@ -3396,6 +4300,8 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
         .expect(1)
         .mount(&bn2)
         .await;
+    let parent = [0xabu8; 32];
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(
@@ -3403,9 +4309,7 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
                 .insert_header("Eth-Consensus-Version", "deneb")
                 .insert_header("Eth-Execution-Payload-Blinded", "false")
                 .insert_header("Eth-Execution-Payload-Value", "7000")
-                .set_body_string(
-                    r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
-                ),
+                .set_body_string(body),
         )
         .expect(1)
         .mount(&bn3)
@@ -3414,14 +4318,29 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
     manager.check_sync_status().await;
 
-    manager.health_trackers().reset_write_lock_count();
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
 
-    // 1 write for the failed synced BN (query_best single path) +
-    // 1 write for the unsynced fallback round (BN2 err + BN3 ok batched).
-    let writes = manager.health_trackers().write_lock_count();
-    assert_eq!(writes, 2, "synced fail (1) + batched unsynced fallback (1) expected; got {writes}");
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 1.0 && scores[1].error_rate == 1.0 && scores[2].latency_ms > 0.0
+    })
+    .await;
 }
 
 /// Each of the six topic-gated submission methods respects its broadcast flag:
@@ -3444,6 +4363,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.sync_committee = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_sync_committee_messages(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3482,6 +4403,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.subscriptions = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_beacon_committee_subscriptions(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3521,6 +4444,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.attestations = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_attestation(&empty_atts).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+        poll_received(&bn2, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3559,6 +4484,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.attestations = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_payload_attestations(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3584,6 +4511,27 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
     // -- blocks (publish_block) --
     let signed = sample_signed_block();
     {
+        let bn = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .and(MessageBodyObject)
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()])).unwrap();
+        assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
+        let requests = bn.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body["message"]["body"].is_object(),
+            "bare Deneb publish body is an object: {body}"
+        );
+        assert!(body.get("signed_block").is_none(), "bare block is not block contents");
+        let hex_body = serde_json::to_value(&signed).unwrap();
+        assert!(hex_body["message"]["body"].is_string(), "in-memory body stays hex");
+    }
+    {
         let bn1 = MockServer::start().await;
         let bn2 = MockServer::start().await;
         for bn in [&bn1, &bn2] {
@@ -3598,6 +4546,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v2/beacon/blocks", 1).await;
+        poll_received(&bn2, "POST", "/eth/v2/beacon/blocks", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3628,6 +4578,7 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         for bn in [&bn1, &bn2] {
             Mock::given(method("POST"))
                 .and(path("/eth/v1/beacon/blinded_blocks"))
+                .and(MessageBodyObject)
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
                 .mount(bn)
@@ -3636,13 +4587,25 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
+        let body_before = blinded.message.body.clone();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+        assert_eq!(blinded.message.body, body_before);
+        poll_received(&bn1, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
+        let left = bn1.received_requests().await.expect("bn1");
+        let right = bn2.received_requests().await.expect("bn2");
+        let left_body = blinded_post_body(&left);
+        let right_body = blinded_post_body(&right);
+        assert_eq!(left_body, right_body, "both nodes receive the one prebuilt JSON body");
+        assert!(left_body["message"]["body"].is_object());
+        assert!(left_body["message"]["body"]["execution_payload_header"].is_object());
     }
     {
         let bn1 = MockServer::start().await;
         let bn2 = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/blinded_blocks"))
+            .and(MessageBodyObject)
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&bn1)
@@ -3660,15 +4623,132 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
     }
 }
 
-/// First `Ok` wins, including a 400 partial failure. The sibling 200 is not merged in.
 #[tokio::test]
-async fn submit_attestation_attributed_names_first_ok_bn_without_merging() {
+async fn publish_blinded_block_rejects_unsupported_forks_and_invalid_ssz_before_any_post() {
+    let bn = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bn)
+        .await;
+    let mut config = BnManagerConfig::new(vec![bn.uri()]);
+    config.broadcast_topics.blocks = true;
+    let manager = BnManager::new(config).unwrap();
+    let signed = sample_signed_blinded_block();
+
+    for version in ["phase0", "altair", "bellatrix", "capella", "DENEB", ""] {
+        let err = manager.publish_blinded_block(&signed, version).await.expect_err(version);
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("JSON blinded block is unsupported for consensus version {version}"),
+                    "{version}"
+                );
+            }
+            other => panic!("{version}: {other:?}"),
+        }
+    }
+
+    let gloas = manager.publish_blinded_block(&signed, "gloas").await.expect_err("gloas");
+    match gloas {
+        BeaconError::ParseError(msg) => {
+            assert_eq!(
+                msg,
+                "invalid JSON blinded block body: Gloas BeaconBlockBody layout is not supported"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let mut garbage = signed.clone();
+    garbage.message.body = vec![0xbe, 0xef];
+    let err = manager.publish_blinded_block(&garbage, "deneb").await.expect_err("bad ssz");
+    match err {
+        BeaconError::ParseError(msg) => {
+            assert!(
+                msg.starts_with("invalid JSON blinded block body: invalid SSZ body encoding:"),
+                "{msg}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(bn.received_requests().await.expect("requests").is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_blinded_publishes_keep_each_body() {
+    let bn = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .and(MessageBodyObject)
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&bn)
+        .await;
+    let mut config = BnManagerConfig::new(vec![bn.uri()]);
+    config.broadcast_topics.blocks = false;
+    let manager = Arc::new(BnManager::new(config).unwrap());
+    let deneb = sample_signed_blinded_block();
+    let electra = SignedBlindedBeaconBlock {
+        message: eth_types::external_vector_electra_blinded_block(),
+        signature: vec![0xcc; 96],
+    };
+    let left = manager.clone();
+    let right = manager.clone();
+    let deneb_publish = deneb.clone();
+    let electra_publish = electra.clone();
+    let (first, second) = tokio::join!(
+        left.publish_blinded_block(&deneb_publish, "deneb"),
+        right.publish_blinded_block(&electra_publish, "electra"),
+    );
+    assert!(first.is_ok(), "{first:?}");
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(deneb.message.body, deneb_publish.message.body);
+    assert_eq!(electra.message.body, electra_publish.message.body);
+
+    let requests = bn.received_requests().await.expect("requests");
+    let posts: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|req| req.url.path() == "/eth/v1/beacon/blinded_blocks")
+        .map(|req| serde_json::from_slice(&req.body).expect("json"))
+        .collect();
+    assert_eq!(posts.len(), 2);
+    let graffiti: Vec<_> = posts
+        .iter()
+        .map(|post| post["message"]["body"]["graffiti"].as_str().expect("graffiti").to_string())
+        .collect();
+    let deneb_json = eth_types::SignedBlindedBeaconBlockJson::from_signed_blinded(
+        &deneb,
+        eth_types::BodyForkLayout::Deneb,
+    )
+    .expect("deneb")
+    .message
+    .body;
+    let electra_json = eth_types::SignedBlindedBeaconBlockJson::from_signed_blinded(
+        &electra,
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra")
+    .message
+    .body;
+    assert!(graffiti.contains(&deneb_json["graffiti"].as_str().unwrap().to_string()));
+    assert!(graffiti.contains(&electra_json["graffiti"].as_str().unwrap().to_string()));
+    assert!(posts.iter().all(|post| post["message"]["body"].is_object()));
+    assert_ne!(deneb_json["graffiti"], electra_json["graffiti"]);
+}
+
+/// A fast 400 partial failure does not win. The slow 200 is kept, so the
+/// propagator reports no per-validator failure and none is marked rejected.
+#[tokio::test]
+async fn submit_attestation_attributed_prefers_a_later_complete_success() {
     let bn1 = MockServer::start().await;
     let bn2 = MockServer::start().await;
     let partial = serde_json::json!({
         "code": 400,
         "message": "some failures",
-        "failures": [{ "index": 2, "message": "invalid signature" }]
+        "failures": [{ "index": 0, "message": "invalid signature" }]
     });
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/pool/attestations"))
@@ -3678,28 +4758,50 @@ async fn submit_attestation_attributed_names_first_ok_bn_without_merging() {
         .await;
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/pool/attestations"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("[]").set_delay(Duration::from_millis(40)),
+        )
         .expect(1)
         .mount(&bn2)
         .await;
 
     let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
     config.broadcast_topics.attestations = true;
-    let manager = BnManager::new(config).unwrap();
-    let (reported_by, result) = manager
-        .submit_attestation_attributed(&VersionedAttestation::Electra(vec![]))
+    let manager = Arc::new(BnManager::new(config).unwrap());
+    let attestation = VersionedAttestation::Electra(vec![SingleAttestation {
+        committee_index: 0,
+        attester_index: 7,
+        data: AttestationData {
+            slot: "1".to_string(),
+            index: "0".to_string(),
+            beacon_block_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "0".to_string(),
+                root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "1".to_string(),
+                root: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            },
+        },
+        signature: "0x00".to_string(),
+    }]);
+    let outcome = Propagator::new(Arc::clone(&manager))
+        .propagate_indexed(&attestation)
         .await
         .expect("attributed submit");
 
-    assert_eq!(reported_by, Some(bn1.uri()));
-    match result {
-        SubmitAttestationResult::PartialFailure { failures } => {
-            assert_eq!(failures.len(), 1);
-            assert_eq!(failures[0].index, 2);
-            assert_eq!(failures[0].message, "invalid signature");
-        }
-        other => panic!("expected the first Ok partial failure, got {other:?}"),
-    }
+    assert_eq!(outcome.reported_by.as_deref(), Some(bn2.uri().as_str()));
+    assert_eq!(outcome.success_count, 1);
+    assert!(
+        outcome.failures.is_empty(),
+        "a complete success must not mark a validator rejected: {outcome:?}"
+    );
+    poll_received(&bn1, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&bn2, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 #[tokio::test]
@@ -3848,6 +4950,8 @@ async fn test_broadcast_reaches_only_the_matching_role() {
     let (result, tried) = with_broadcast_tried(manager.submit_attestation(&empty)).await;
     assert!(result.is_ok(), "attestation broadcast must succeed: {result:?}");
     assert_eq!(tried, Some(2), "tried must be the role-filtered count, not clients.len()=3");
+    poll_received(&attestation_bn, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&all_bn, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 /// Guard on the ARCH-P2-8 narrowing: broadcast is role-filtered, never tier-filtered.
@@ -3888,6 +4992,8 @@ async fn test_broadcast_is_not_tier_filtered() {
     let empty = VersionedAttestation::Electra(vec![]);
     let result = manager.submit_attestation(&empty).await;
     assert!(result.is_ok(), "unsynced BN must still receive the publish: {result:?}");
+    poll_received(&synced, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&unsynced, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 /// Pins All-role fallback: no Attestation specialist → All-role BN is used.
@@ -3956,6 +5062,8 @@ async fn test_broadcast_is_not_health_score_filtered() {
         result.is_ok(),
         "unhealthy role-matching BN must still receive the publish: {result:?}"
     );
+    poll_received(&healthy, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&unhealthy, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 // ===================================================================
@@ -4001,7 +5109,18 @@ async fn test_produce_block_v3_observes_proposer_bn_latency_ms() {
 
     manager.produce_block_v3(1, "0xrandao", None, None).await.expect("produce_block_v3");
 
-    let count_after = proposer_bn_latency_count(&endpoint);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let count_after = loop {
+        let count_after = proposer_bn_latency_count(&endpoint);
+        if count_after > count_before {
+            break count_after;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "produce_block_v3 must observe rvc_proposer_bn_latency_ms; before={count_before}, after={count_after}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(
         count_after > count_before,
         "produce_block_v3 must observe rvc_proposer_bn_latency_ms; before={count_before}, after={count_after}"
@@ -4034,4 +5153,576 @@ async fn test_get_genesis_does_not_observe_proposer_bn_latency_ms() {
         count_before,
         "non-proposer BN RPCs must not observe rvc_proposer_bn_latency_ms"
     );
+}
+
+fn shape_duty(shape: ShapeConstraint, parent: Option<[u8; 32]>) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 0,
+        expected_parent_root: parent,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: None,
+        expected_consensus_version: ForkName::Deneb,
+        shape,
+    }
+}
+
+fn block_document(parent_hex: &str, blinded: bool) -> String {
+    let kind = if blinded { "deneb-blinded" } else { "full" };
+    produce_json(preparable_data(kind, 1, 0, parent_hex, false))
+}
+
+fn http_message(extra_headers: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn block_headers(value: &str, blinded: bool, version: &str) -> String {
+    let flag = if blinded { "true" } else { "false" };
+    format!(
+        "Eth-Consensus-Version: {version}\r\nEth-Execution-Payload-Blinded: {flag}\r\nEth-Execution-Payload-Value: {value}\r\n"
+    )
+}
+
+/// One beacon node on the test runtime.
+///
+/// Wiremock's delay sleeps on a private runtime, so a paused test clock cannot
+/// release it. This server's sleep is the test clock. The receiver fires once
+/// that sleep is registered, which is still at virtual t = 0 when the caller
+/// is waiting on a blocking thread. Stepping before that signal would arm the
+/// delay in the future and miss the soft deadline.
+async fn paused_bn(
+    sync_body: String,
+    block_delay: Duration,
+    block_value: &'static str,
+    blinded: bool,
+    parent_hex: String,
+) -> (String, std::sync::mpsc::Receiver<()>) {
+    paused_bn_with(sync_body, block_delay, block_value, blinded, parent_hex, "deneb", None).await
+}
+
+/// `body` replaces [`block_document`]. `version` is `Eth-Consensus-Version`.
+async fn paused_bn_with(
+    sync_body: String,
+    block_delay: Duration,
+    block_value: &'static str,
+    blinded: bool,
+    parent_hex: String,
+    version: &'static str,
+    body: Option<String>,
+) -> (String, std::sync::mpsc::Receiver<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let sync_body = sync_body.clone();
+            let parent_hex = parent_hex.clone();
+            let body = body.clone();
+            let armed_tx = armed_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut got = 0usize;
+                loop {
+                    let n = sock.read(&mut buf[got..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    got += n;
+                    if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf[..got]);
+                let message = if head.contains("/eth/v1/node/syncing") {
+                    http_message("", &sync_body)
+                } else {
+                    if !block_delay.is_zero() {
+                        let sleep = tokio::time::sleep(block_delay);
+                        tokio::pin!(sleep);
+                        let mut signal = Some(armed_tx);
+                        std::future::poll_fn(|cx| {
+                            match std::future::Future::poll(sleep.as_mut(), cx) {
+                                std::task::Poll::Ready(()) => std::task::Poll::Ready(()),
+                                std::task::Poll::Pending => {
+                                    if let Some(tx) = signal.take() {
+                                        let _ = tx.send(());
+                                    }
+                                    std::task::Poll::Pending
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    let body = body.clone().unwrap_or_else(|| block_document(&parent_hex, blinded));
+                    http_message(&block_headers(block_value, blinded, version), &body)
+                };
+                let _ = sock.write_all(&message).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), armed_rx)
+}
+
+/// Block sleeps are already registered. Step the two arrivals, then the rest
+/// of a 3s budget's soft deadline (1.5s). Auto-advance stays off until both
+/// receivers fire, so the sleeps are armed at virtual t = 0.
+async fn drive_to_soft_deadline(armed: Vec<std::sync::mpsc::Receiver<()>>) {
+    tokio::task::spawn_blocking(move || {
+        for rx in armed {
+            rx.recv().expect("block response armed on the paused clock");
+        }
+    })
+    .await
+    .expect("arm wait");
+    step_paused(50).await;
+    step_paused(1_150).await;
+    step_paused(300).await;
+}
+
+/// Virtual steps. `sleep` under a paused clock fires each earlier timer first.
+/// One `advance` across both arrivals would deliver them together.
+async fn step_paused(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Builder-only: a fast local block does not end the wait. The later blinded
+/// block is the only candidate, even though the local value is higher.
+///
+/// Budget 3s, so the soft deadline is 1.5s. The local block is released at
+/// 50ms and the blinded block at 1.2s, both before that deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn builder_only_local_block_does_not_close_the_soft_window() {
+    let parent = "00".repeat(32);
+    let (local, local_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(50), "9000", false, parent.clone()).await;
+    let (blinded, blinded_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(1_200), "1000", true, parent).await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&local, &blinded], Duration::from_secs(3));
+    let started = tokio::time::Instant::now();
+    let duty = shape_duty(ShapeConstraint::BlindedOnly, Some([0u8; 32]));
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![local_armed, blinded_armed]).await;
+    let ranked = produce.await.expect("produce task").expect("ranked blocks");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_400) && elapsed <= Duration::from_millis(1_600),
+        "soft deadline is 1.5s, returned at {elapsed:?}"
+    );
+    assert_eq!(ranked.len(), 1, "the local block must not be a candidate");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// Execution-only: a fast blinded block is a hard reject. The later local
+/// block is the only candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn execution_only_blinded_block_is_a_hard_reject() {
+    let parent = "00".repeat(32);
+    let (blinded, blinded_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(50), "9000", true, parent.clone()).await;
+    let (local, local_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(1_200), "1000", false, parent).await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&blinded, &local], Duration::from_secs(3));
+    let started = tokio::time::Instant::now();
+    let duty = shape_duty(ShapeConstraint::LocalOnly, Some([0u8; 32]));
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![blinded_armed, local_armed]).await;
+    let ranked = produce.await.expect("produce task").expect("ranked blocks");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_400) && elapsed <= Duration::from_millis(1_600),
+        "soft deadline is 1.5s, returned at {elapsed:?}"
+    );
+    assert_eq!(ranked.len(), 1, "the blinded block must not be a candidate");
+    assert!(!ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// Synced nodes miss the budget. The first fallback is the wrong shape and is
+/// not returned. The next fallback, which matches, is.
+#[tokio::test(flavor = "current_thread")]
+async fn fallback_respects_the_shape_constraint() {
+    let parent = "ab".repeat(32);
+    let (synced, _) = paused_bn(
+        SYNCED_RESPONSE.to_string(),
+        Duration::from_secs(30),
+        "1111",
+        true,
+        parent.clone(),
+    )
+    .await;
+    const SMALL_LAG: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    let (wrong, _) =
+        paused_bn(SMALL_LAG.to_string(), Duration::ZERO, "9000", false, parent.clone()).await;
+    let (right, _) = paused_bn(SMALL_LAG.to_string(), Duration::ZERO, "1000", true, parent).await;
+    let manager = manager_with_block_budget(&[&synced, &wrong, &right], Duration::from_millis(400));
+    manager.check_sync_status().await;
+    let details = manager.sync_statuses().read().await.clone();
+    let summary: Vec<_> = details.iter().map(|d| (d.status, d.sync_distance)).collect();
+    assert!(matches!(details[0].status, BnSyncStatus::Synced), "sync {summary:?}");
+    assert_eq!(details[1].sync_distance, Some(9), "sync {summary:?}");
+    assert_eq!(details[2].sync_distance, Some(9), "sync {summary:?}");
+    tokio::time::pause();
+    let duty = shape_duty(ShapeConstraint::BlindedOnly, Some([0xab; 32]));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let result = manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await;
+        let _ = done_tx.send(result);
+    });
+    // 400 ms expires the synced attempt. After that, auto-advance would skip
+    // the fallback sockets and jump to the next timer. Waiting on the result
+    // from a blocking thread holds auto-advance off, so those accepts finish
+    // while the backstop is still open.
+    step_paused(400).await;
+    let ranked = tokio::task::spawn_blocking(move || done_rx.recv().expect("produce finished"))
+        .await
+        .expect("blocking wait")
+        .expect("fallback block");
+    assert_eq!(ranked.len(), 1, "the wrong-shape fallback must not be returned");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+fn fixture_raw(kind: &str) -> &'static str {
+    match kind {
+        "deneb-contents" => {
+            include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_block_contents.json")
+        }
+        "deneb-blinded" => {
+            include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json")
+        }
+        "electra-blinded" => {
+            include_str!(
+                "../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json"
+            )
+        }
+        other => panic!("unknown fixture {other}"),
+    }
+}
+
+fn patch_block(block: &mut serde_json::Value, slot: u64, proposer: u64, parent_hex: &str) {
+    for (key, value) in [
+        ("slot", slot.to_string()),
+        ("proposer_index", proposer.to_string()),
+        ("parent_root", format!("0x{parent_hex}")),
+        ("state_root", format!("0x{}", "22".repeat(32))),
+    ] {
+        block[key] = serde_json::Value::String(value);
+    }
+}
+
+/// Produce `data`. `extra_proof` appends one `kzg_proofs` entry on the Deneb contents fixture.
+fn preparable_data(
+    kind: &str,
+    slot: u64,
+    proposer: u64,
+    parent_hex: &str,
+    extra_proof: bool,
+) -> serde_json::Value {
+    if kind == "full" && !extra_proof {
+        let body =
+            serde_json::to_value(eth_types::external_vector_deneb_body()).expect("deneb body");
+        let mut block = serde_json::json!({ "body": body });
+        patch_block(&mut block, slot, proposer, parent_hex);
+        return block;
+    }
+    if kind == "full" {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(fixture_raw("deneb-contents")).expect("contents");
+        let mut data = doc["data"].take();
+        patch_block(data.get_mut("block").expect("block"), slot, proposer, parent_hex);
+        let proofs = data.get_mut("kzg_proofs").and_then(|v| v.as_array_mut()).expect("proofs");
+        let extra = proofs.first().cloned().expect("one proof");
+        proofs.push(extra);
+        return data;
+    }
+    let body: serde_json::Value = serde_json::from_str(fixture_raw(kind)).expect("blinded body");
+    let mut block = serde_json::json!({ "body": body });
+    patch_block(&mut block, slot, proposer, parent_hex);
+    block
+}
+
+fn produce_json(data: serde_json::Value) -> String {
+    serde_json::json!({ "data": data }).to_string()
+}
+
+fn any_duty(version: ForkName, parent: Option<[u8; 32]>, fee: Option<[u8; 20]>) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: parent,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: fee,
+        expected_consensus_version: version,
+        shape: ShapeConstraint::Any,
+    }
+}
+
+/// Fast `early` is unpreparable. The 1.2s block is the only candidate.
+async fn late_preparable(
+    early: (String, bool, &'static str),
+    late: (String, bool, &'static str),
+    duty: ProduceDuty,
+) -> Vec<beacon::RankedBlock> {
+    let parent = "ab".repeat(32);
+    let (bn_a, armed_a) = paused_bn_with(
+        "{}".into(),
+        Duration::from_millis(50),
+        "9000",
+        early.1,
+        parent.clone(),
+        early.2,
+        Some(early.0),
+    )
+    .await;
+    let (bn_b, armed_b) = paused_bn_with(
+        "{}".into(),
+        Duration::from_millis(1_200),
+        "1000",
+        late.1,
+        parent,
+        late.2,
+        Some(late.0),
+    )
+    .await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&bn_a, &bn_b], Duration::from_secs(3));
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![armed_a, armed_b]).await;
+    produce.await.expect("task").expect("late block")
+}
+
+/// BN-A's extra KZG proof must not close the soft window. BN-B is the block.
+#[tokio::test(flavor = "current_thread")]
+async fn unpreparable_kzg_cardinality_does_not_close_the_soft_window() {
+    let parent = "ab".repeat(32);
+    let ranked = late_preparable(
+        (produce_json(preparable_data("full", 1, 7, &parent, true)), false, "deneb"),
+        (produce_json(preparable_data("full", 1, 7, &parent, false)), false, "deneb"),
+        any_duty(ForkName::Deneb, Some([0xab; 32]), None),
+    )
+    .await;
+    assert_eq!(ranked.len(), 1, "the extra-proof block must not be held: {ranked:?}");
+    assert_eq!(ranked[0].bn_index, 1);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// A Deneb blinded body advertised as Fulu fails layout and must not win the window.
+#[tokio::test(flavor = "current_thread")]
+async fn blinded_deneb_body_under_fulu_does_not_close_the_soft_window() {
+    let parent = "ab".repeat(32);
+    let ranked = late_preparable(
+        (produce_json(preparable_data("deneb-blinded", 1, 7, &parent, false)), true, "fulu"),
+        (produce_json(preparable_data("electra-blinded", 1, 7, &parent, false)), true, "fulu"),
+        any_duty(ForkName::Fulu, Some([0xab; 32]), None),
+    )
+    .await;
+    assert_eq!(ranked.len(), 1, "the deneb body must not be held");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+fn syncing_body(distance: u64, optimistic: bool, el_offline: bool) -> String {
+    format!(
+        r#"{{"data":{{"head_slot":"1000","sync_distance":"{distance}","is_syncing":true,"is_optimistic":{optimistic},"el_offline":{el_offline}}}}}"#
+    )
+}
+
+async fn mount_syncing(server: &MockServer, distance: u64, optimistic: bool, el_offline: bool) {
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(syncing_body(distance, optimistic, el_offline)),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_produce_times(server: &MockServer, value: &str, times: u64) {
+    let parent = "ab".repeat(32);
+    let body = produce_json(preparable_data("full", 1, 7, &parent, false));
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block(value, body))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+fn unknown_parent_duty() -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: None,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: None,
+        expected_consensus_version: ForkName::Deneb,
+        shape: ShapeConstraint::Any,
+    }
+}
+
+/// No synced node. The first round still skips large-lag, optimistic, and
+/// execution-offline beacon nodes when the parent is unknown. Small lag stays.
+#[tokio::test]
+async fn initial_round_without_a_synced_node_skips_large_lag_optimistic_and_offline_bns_when_the_parent_is_unknown(
+) {
+    let small = MockServer::start().await;
+    let large = MockServer::start().await;
+    let optimistic = MockServer::start().await;
+    let offline = MockServer::start().await;
+    mount_syncing(&small, 9, false, false).await;
+    mount_syncing(&large, 17, false, false).await;
+    mount_syncing(&optimistic, 9, true, false).await;
+    mount_syncing(&offline, 9, false, true).await;
+    mount_produce_times(&small, "7000", 1).await;
+    mount_produce_times(&large, "1111", 0).await;
+    mount_produce_times(&optimistic, "2222", 0).await;
+    mount_produce_times(&offline, "3333", 0).await;
+
+    let manager = manager_with_block_budget(
+        &[&small.uri(), &large.uri(), &optimistic.uri(), &offline.uri()],
+        Duration::from_secs(3),
+    );
+    manager.check_sync_status().await;
+    let block = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, unknown_parent_duty())
+        .await
+        .expect("the small-lag block");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
+}
+
+/// A synced node fails. The small-lag peer is fallback-only, and an unknown
+/// parent does not open fallback, so that peer is not asked.
+#[tokio::test]
+async fn produce_block_v3_ranked_by_with_an_unknown_parent_does_not_ask_a_small_lag_bn() {
+    let synced = MockServer::start().await;
+    let small = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    mount_syncing(&small, 9, false, false).await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("no"))
+        .expect(1)
+        .mount(&synced)
+        .await;
+    mount_produce_times(&small, "7000", 0).await;
+
+    let manager = manager_with_block_budget(&[&synced.uri(), &small.uri()], Duration::from_secs(3));
+    manager.check_sync_status().await;
+    let err = manager
+        .produce_block_v3_ranked_by(1, "0xrandao", None, None, Some(unknown_parent_duty()), None)
+        .await
+        .expect_err("unknown parent must not fall back onto the small-lag block");
+    assert!(
+        err.to_string().contains("500"),
+        "the result is the synced node's failure, not a small-lag block: {err}"
+    );
+    // `expect(0)` on the small-lag produce is the pin: asking that node fails here.
+    synced.verify().await;
+    small.verify().await;
+}
+
+/// No node meets the floor. A known parent relaxes to the wider set, so the
+/// large-lag block is still produced.
+#[tokio::test]
+async fn initial_round_relaxes_when_the_parent_is_known_and_no_floor_node_exists() {
+    let large = MockServer::start().await;
+    mount_syncing(&large, 17, false, false).await;
+    mount_produce_times(&large, "7000", 1).await;
+    let manager = manager_with_block_budget(&[&large.uri()], Duration::from_secs(3));
+    manager.check_sync_status().await;
+    let parent = [0xabu8; 32];
+    let block = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            any_duty(ForkName::Deneb, Some(parent), None),
+        )
+        .await
+        .expect("known parent relaxes onto the large-lag node");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
+}
+
+/// Cross-BN ranking applies the operator boost to blinded blocks only.
+///
+/// BN-A returns a local block of value 10. BN-B returns a blinded block of
+/// value 9. Boost 0, 50, and 100 keep the local block (9×50/100 = 4). Boost
+/// `u64::MAX` ranks the blinded block first.
+#[tokio::test]
+async fn cross_bn_ranking_applies_the_builder_boost_factor() {
+    let cases = [(0u64, false), (50, false), (100, false), (u64::MAX, true)];
+    for (boost, blinded_wins) in cases {
+        let local = MockServer::start().await;
+        let blinded = MockServer::start().await;
+        let parent = "00".repeat(32);
+        let local_body = produce_json(preparable_data("full", 1, 7, &parent, false));
+        let blinded_body = produce_json(preparable_data("deneb-blinded", 1, 7, &parent, false));
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "10")
+                    .insert_header("Eth-Consensus-Block-Value", "0")
+                    .set_body_string(local_body),
+            )
+            .expect(1)
+            .mount(&local)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "true")
+                    .insert_header("Eth-Execution-Payload-Value", "9")
+                    .insert_header("Eth-Consensus-Block-Value", "0")
+                    .set_body_string(blinded_body),
+            )
+            .expect(1)
+            .mount(&blinded)
+            .await;
+
+        let manager =
+            manager_with_block_budget(&[&local.uri(), &blinded.uri()], Duration::from_millis(800));
+        let duty = any_duty(ForkName::Deneb, None, None);
+        let ranked = manager
+            .produce_block_v3_ranked(1, "0xrandao", None, Some(boost), Some(duty))
+            .await
+            .unwrap_or_else(|err| panic!("boost {boost}: {err}"));
+        assert!(!ranked.is_empty(), "boost {boost}");
+        assert_eq!(
+            ranked[0].response.is_blinded, blinded_wins,
+            "boost {boost}: value {:?}",
+            ranked[0].response.execution_payload_value
+        );
+        let expected = if blinded_wins { "9" } else { "10" };
+        assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some(expected));
+    }
 }

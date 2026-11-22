@@ -126,6 +126,11 @@ pub enum KeystoreError {
 
     #[error("Rate limit exceeded for keystore decryption: {0}")]
     RateLimitExceeded(String),
+
+    /// `Keystore::encrypt` refused the password: not UTF-8, or empty after
+    /// EIP-2335 processing. The reason is fixed text and never the password.
+    #[error("Invalid password: {0}")]
+    InvalidPassword(&'static str),
 }
 
 #[derive(Error, Debug)]

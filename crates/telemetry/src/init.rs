@@ -60,57 +60,33 @@ fn build_provider(
     resource: Resource,
     sampler: Sampler,
 ) -> Result<SdkTracerProvider> {
-    match config.exporter {
-        ExporterKind::Otlp => {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let (exporter, resource) = match config.exporter {
+        ExporterKind::Otlp => (
+            opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_endpoint(&config.endpoint)
-                .build()?;
-
-            let mut batch_config = BatchConfigBuilder::default();
-            if let Some(queue_size) = config.max_queue_size {
-                batch_config = batch_config.with_max_queue_size(queue_size);
-            }
-            if let Some(batch_size) = config.max_export_batch_size {
-                batch_config = batch_config.with_max_export_batch_size(batch_size);
-            }
-            let processor = BatchSpanProcessor::builder(exporter)
-                .with_batch_config(batch_config.build())
-                .build();
-
-            Ok(SdkTracerProvider::builder()
-                .with_sampler(sampler)
-                .with_resource(resource)
-                .with_span_processor(processor)
-                .build())
-        }
+                .build()?,
+            resource,
+        ),
         #[cfg(feature = "gcp-trace")]
-        ExporterKind::Gcp => build_gcp_provider(resource, sampler),
+        ExporterKind::Gcp => crate::gcp::exporter(resource)?,
+    };
+
+    let mut batch_config = BatchConfigBuilder::default();
+    if let Some(queue_size) = config.max_queue_size {
+        batch_config = batch_config.with_max_queue_size(queue_size);
     }
-}
+    if let Some(batch_size) = config.max_export_batch_size {
+        batch_config = batch_config.with_max_export_batch_size(batch_size);
+    }
+    let processor =
+        BatchSpanProcessor::builder(exporter).with_batch_config(batch_config.build()).build();
 
-#[cfg(feature = "gcp-trace")]
-fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerProvider> {
-    let handle = tokio::runtime::Handle::current();
-
-    tokio::task::block_in_place(|| {
-        let gcp_builder = handle
-            .block_on(
-                opentelemetry_gcloud_trace::GcpCloudTraceExporterBuilder::for_default_project_id(),
-            )
-            .map_err(|e| anyhow::anyhow!("GCP project ID detection failed: {e}"))?;
-
-        let provider_builder =
-            SdkTracerProvider::builder().with_sampler(sampler).with_resource(resource.clone());
-
-        let provider = handle
-            .block_on(
-                gcp_builder.with_resource(resource).create_provider_from_builder(provider_builder),
-            )
-            .map_err(|e| anyhow::anyhow!("GCP Cloud Trace exporter initialization failed: {e}"))?;
-
-        Ok(provider)
-    })
+    Ok(SdkTracerProvider::builder()
+        .with_sampler(sampler)
+        .with_resource(resource)
+        .with_span_processor(processor)
+        .build())
 }
 
 /// Build an [`EnvFilter`](tracing_subscriber::EnvFilter) honoring the rs-vc
@@ -614,6 +590,27 @@ mod tests {
         let result = build_provider(&config, resource, sampler);
         assert!(result.is_ok());
         result.unwrap().shutdown().ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_exporter_sends_spans_to_the_configured_endpoint() {
+        use opentelemetry::trace::Tracer;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let config = TelemetryConfig {
+            endpoint: format!("{}/v1/traces", server.uri()),
+            ..Default::default()
+        };
+        let (_layer, guard) = init_tracing(&config).expect("Tracing must initialize.");
+        let flushed = tokio::task::spawn_blocking(move || {
+            guard.provider.tracer("test").in_span("otlp-export", |_| {});
+            guard.provider.shutdown()
+        });
+        flushed.await.unwrap().expect("The export must succeed.");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "The exporter must send one request to the endpoint.");
     }
 
     #[test]

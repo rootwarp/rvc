@@ -24,7 +24,7 @@ pub fn run(args: ExitArgs) -> Result<()> {
 
     let keystore = Keystore::from_file(&args.keystore).context("Failed to load keystore file")?;
 
-    let password = password::resolve_password(args.password_file.as_deref())?;
+    let password = password::resolve_existing_password(args.password_file.as_deref())?;
 
     let secret_key = keystore.decrypt(password.as_bytes()).context("Failed to decrypt keystore")?;
 
@@ -343,6 +343,52 @@ mod tests {
             }
         }
         panic!("failed to force output path collision through exit::run()");
+    }
+
+    /// EIP-2335 sets no minimum length for decryption, so exit opens a keystore
+    /// whose password is under 8 bytes after processing, or even raw.
+    #[test]
+    fn exit_decrypts_a_keystore_whose_password_is_under_8_bytes_after_processing() {
+        let network = network::from_name("mainnet").unwrap();
+        let schedule = network::exit_fork_schedule(network);
+        for (validator_index, password) in [(1u64, "abcdefg\t"), (2, "pass")] {
+            assert!(crypto::process_password(password).len() < 8, "{password:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let secret_key = SecretKey::generate();
+            let keystore = Keystore::encrypt(
+                &secret_key,
+                password.as_bytes(),
+                "m/12381/3600/0/0/0",
+                EncryptionKdf::scrypt_cheap_for_tests(),
+            )
+            .unwrap();
+            let keystore_path = dir.path().join("keystore.json");
+            keystore.to_file(&keystore_path).unwrap();
+            let password_path = dir.path().join("password.txt");
+            fs::write(&password_path, password).unwrap();
+            let output_dir = dir.path().join("exits");
+
+            run(ExitArgs {
+                network: "mainnet".into(),
+                output_dir: output_dir.clone(),
+                validator_index,
+                epoch: 100,
+                keystore: keystore_path,
+                password_file: Some(password_path),
+            })
+            .unwrap_or_else(|e| panic!("{password:?}: {e:#}"));
+
+            let written = fs::read_dir(&output_dir).unwrap().next().unwrap().unwrap().path();
+            let signed: SignedVoluntaryExit =
+                serde_json::from_str(&fs::read_to_string(written).unwrap()).unwrap();
+            let expected = sign_voluntary_exit(
+                &signed.message,
+                &secret_key,
+                &schedule,
+                network.genesis_validators_root,
+            );
+            assert_eq!(signed.signature, expected.to_bytes().to_vec(), "{password:?}");
+        }
     }
 
     /// RED: Invalid keystore path returns clear error.

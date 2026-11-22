@@ -7,65 +7,74 @@ on:
   push:
     branches: [develop, main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Shrink CI target/ and avoid incremental artifacts that bloat caches/runners.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
+  # Each job that runs Rust tests sets timeout-minutes, so a wedged test fails
+  # the job instead of holding the runner for the 6-hour default (#789-6).
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
       # fetch-depth: 0 so the A-12 pin commit is reachable for the T19 stage.rs
       # byte-identity guard below (shallow tip alone cannot `git diff <pin>`).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: check
+          cache-all-crates: "false"
 
       # Authenticate release lookups. Anonymous setup-protoc calls have failed
       # this job with "API rate limit exceeded".
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       # T19 / TRC-1e: crates/slashing/src/stage.rs must stay byte-identical to the
-      # A-12 pin (initiative-start / post-ADR-005 redesign). Do not instrument
-      # stage.rs; see plan/tracing-2026-08-06/A-12-stage-rs-repin.md.
+      # A-12 pin. W4-S2 (#832) re-pinned the bytes. The pin is a blob: the
+      # redesign is one commit, and a commit cannot contain its own SHA.
+      # Do not instrument stage.rs; see plan/tracing-2026-08-06/A-12-stage-rs-repin.md.
       - name: T19 — stage.rs byte-identical to A-12 pin
         run: |
           set -euo pipefail
-          PIN=22aa3de5bf5ed0c03ed571694dc3a5652e460613
-          if ! git cat-file -e "${PIN}^{commit}"; then
-            echo "T19 / A-12: pin commit ${PIN} is not reachable; deepen the checkout."
-            exit 1
-          fi
-          if ! git diff --quiet "${PIN}" -- crates/slashing/src/stage.rs; then
+          PIN_BLOB=f0f1dc5a8890b223464c9cc85fec719158a6c44c
+          ACTUAL=$(git rev-parse "HEAD:crates/slashing/src/stage.rs")
+          if [ "$ACTUAL" != "$PIN_BLOB" ]; then
             echo "T19 / A-12 FAILURE: crates/slashing/src/stage.rs is not byte-identical to the A-12 pin."
-            echo "A-12 pin: ${PIN}"
+            echo "A-12 pin blob: ${PIN_BLOB}"
+            echo "Actual blob: ${ACTUAL}"
             echo "Record: plan/tracing-2026-08-06/A-12-stage-rs-repin.md"
             echo "Tracing must not instrument stage.rs. Authorized redesigns re-pin via A-12; do not weaken this guard."
-            git diff "${PIN}" -- crates/slashing/src/stage.rs
             exit 1
           fi
-          echo "T19: stage.rs byte-identical to A-12 pin ${PIN}"
+          echo "T19: stage.rs byte-identical to A-12 pin blob ${PIN_BLOB}"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -83,7 +92,7 @@ jobs:
       # Policy ignores for known-blocked transitive crates live in `.cargo/audit.toml`.
       - name: Install cargo-audit
         if: github.event_name == 'pull_request'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-audit
 
@@ -91,11 +100,24 @@ jobs:
         if: github.event_name == 'pull_request'
         run: cargo audit
 
+      # cargo-deny reads the resolved graph (all features). It fails on unsound,
+      # unmaintained, and yanked crates, and on sources other than crates.io.
+      # Ignores live in `deny.toml` and must agree with `.cargo/audit.toml`.
+      - name: Install cargo-deny
+        if: github.event_name == 'pull_request'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo deny (advisories, sources)
+        if: github.event_name == 'pull_request'
+        run: cargo deny check advisories sources
+
       # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
-      # it needs nightly; CI pins dtolnay/rust-toolchain@stable (A-E3).
+      # it needs nightly; CI installs the stable toolchain (A-E3).
       - name: Install cargo-machete
         if: github.event_name == 'pull_request'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-machete
 
@@ -179,75 +201,125 @@ jobs:
   test-all-features:
     name: Test (all features)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-all-features-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-all-features-
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-all-features
+          cache-all-crates: "false"
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       - name: Run workspace tests (all features)
         run: cargo nextest run --workspace --all-features --locked
 
+      # nextest does not run doctests (#789-12).
+      - name: Run doctests (all features)
+        run: cargo test --workspace --all-features --doc --locked
+
+  # Runs on pull requests and on pushes to develop and main.
   secret-scan:
     name: Secret Scan
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      # fetch-depth: 0 so the git-mode scan can read the pull request or push range.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Install gitleaks
+        run: ./scripts/install_gitleaks.sh
+
+      # useDefault merges a default global allowlist that hides real secrets.
+      # Every scan below uses the strict copies. See .gitleaks.toml.
+      - name: Build the strict gitleaks configs
         run: |
-          GITLEAKS_VERSION=8.21.2
-          GITLEAKS_SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
-          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
-          sudo tar -xz -C /usr/local/bin -f gitleaks.tar.gz gitleaks
-          rm -f gitleaks.tar.gz
-          gitleaks version
+          set -euo pipefail
+          python3 scripts/gitleaks_strict_config.py --out-dir "$RUNNER_TEMP/gitleaks"
+          {
+            echo "RVC_GITLEAKS_CONFIG=$RUNNER_TEMP/gitleaks/gitleaks.toml"
+            echo "RVC_GITLEAKS_EMITTED_CONFIG=$RUNNER_TEMP/gitleaks/gitleaks-emitted.toml"
+          } >> "$GITHUB_ENV"
 
       # Gate 2a: scan the source tree (working files); fail closed on any finding.
+      # --ignore-gitleaks-allow: an inline allow comment is not a baseline.
       - name: Gitleaks — source tree
-        run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+        run: gitleaks detect --no-git --source . --config "$RVC_GITLEAKS_CONFIG" --ignore-gitleaks-allow --redact --no-banner --exit-code 1
+
+      # The no-git scan misses a secret across a 10000-byte chunk boundary.
+      # Git mode reads each added hunk whole, merge commits included. A force
+      # push scans from the merge base. A base that is not in the clone scans
+      # the full history in git mode.
+      - name: Gitleaks — commits in the pull request or push range
+        env:
+          RANGE_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: ./scripts/gitleaks_range_scan.sh "$RVC_GITLEAKS_CONFIG" "$RANGE_BASE"
+
+      # A line that contains the word false must still surface a synthetic key.
+      # The running-guide allow is path-and-value, so the same value elsewhere fails too.
+      - name: Gitleaks — verify=false canary is detected
+        run: ./scripts/gitleaks_verify_false_canary.sh
+
+      # Prepend blank lines to every allowlisted file, then append a fresh key,
+      # the same value on a non-allowlisted path, and prefix/suffix grafts.
+      # Each of those must still fail. Removing any one allowlist entry must fail too.
+      - name: Gitleaks — line-shift canary
+        run: python3 scripts/gitleaks_line_shift_canary.py
+
+      # Synthetic secrets that the default allowlist or the no-git chunking
+      # hides. The strict config and the git-mode range scan must find each one.
+      - name: Gitleaks — allowlist and chunk-boundary canary
+        run: python3 scripts/gitleaks_scope_canary.py
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-secretscan-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-secretscan-
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: secret-scan
+          cache-all-crates: "false"
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The arch-gates job has no gitleaks, so this test skips its scan there.
+      # Here gitleaks is installed, and REQUIRE_GITLEAKS makes a skip a failure.
+      - name: Gitleaks — architecture gate with gitleaks required
+        env:
+          REQUIRE_GITLEAKS: "1"
+        run: cargo test --locked -p rvc-architecture-tests --test gitleaks_allow_scope
 
       # Gate 2b: emit a representative trace-level log sample through the redaction primitives,
       # then defend it two ways — (i) gitleaks over the emitted output catches a raw hex
@@ -261,7 +333,7 @@ jobs:
           test -s emitted-sample/emitted-trace.log
 
       - name: Gitleaks — emitted trace-level log sample
-        run: gitleaks detect --no-git --source emitted-sample --config .gitleaks-emitted.toml --redact --no-banner --exit-code 1
+        run: gitleaks detect --no-git --source emitted-sample --config "$RVC_GITLEAKS_EMITTED_CONFIG" --redact --no-banner --exit-code 1
 
       - name: Assert redaction on the emitted sample (raw absent, redacted present)
         run: |
@@ -283,38 +355,46 @@ jobs:
     name: Coverage
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-coverage-
+          shared-key: coverage
+          cache-all-crates: "false"
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       - name: Generate coverage report
         run: cargo llvm-cov nextest --locked --workspace --lcov --output-path lcov.info
@@ -343,7 +423,7 @@ jobs:
           } > coverage-summary.md
 
       - name: Post coverage comment
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
         with:
           header: coverage
           path: coverage-summary.md
@@ -352,31 +432,38 @@ jobs:
     name: Architecture Gates
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-arch-gates-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-arch-gates-
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: arch-gates
+          cache-all-crates: "false"
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       # G-3 (`tests/env_allowlist.rs`: env allow-list + figment absence) is in this package.
       - name: Run architecture tests
@@ -405,33 +492,41 @@ jobs:
     name: Spec Vectors
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RVC_SPEC_VECTORS_REQUIRED: "1"
       PRESET: minimal
     steps:
-      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-spec-vectors-deps-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-spec-vectors-deps-
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: spec-vectors
+          cache-all-crates: "false"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       # Archives only: the pin is the tarball digest, not a restored tests/ tree.
       # No restore-keys: a lock change must miss, not restore a stale archive.
       - name: Cache spec-vector archives
         id: spec-vector-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
           key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
@@ -459,7 +554,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -473,7 +568,7 @@ jobs:
         run: shellcheck scripts/devnet/*.sh scripts/devnet/lib/common.sh
 
       - name: Pytest (scripts)
-        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/ -q
+        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 --with pyyaml==6.0.3 pytest scripts/tests/ -q
 
   # TRC-5d / #435. First docker compose job on the PR lane. Not a required check.
   # 30 minutes covers a cold debug build of bin/rvc and bin/rvc-signer plus the
@@ -486,25 +581,28 @@ jobs:
     env:
       OTEL_TRACES_SAMPLER_ARG: "1.0"
     steps:
-      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-trace-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-trace-e2e-
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: trace-e2e
+          cache-all-crates: "false"
 
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -526,7 +624,7 @@ jobs:
       # Missing spans on an early fail must not fail this step.
       - name: Upload spans
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: trace-e2e-spans
           path: target/trace-e2e/spans.json

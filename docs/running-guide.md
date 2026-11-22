@@ -65,6 +65,38 @@ rvc start [OPTIONS]
 | `--init-slashing-db` | false | Allow creating a **fresh empty** slashing DB if the path is missing (SEC-3). Dangerous on a previously-active validator (zero history → double-sign risk). Use only for genuine first deploy; 0-byte/corrupt files always abort. Config equivalent: `allow_fresh_db = true` |
 | `--network <NETWORK>` | `mainnet` | Network preset: `mainnet`, `sepolia`, `holesky`, `goerli`, `custom` |
 
+If every configured beacon node disagrees with the chain identity agreed at
+startup — genesis validators root, genesis time, genesis fork version, slot
+duration, or slots per epoch — duties stop and the process stays up. The log
+line is `no admitted beacon node; duties halted`. A timeout or an HTTP 5xx
+does not revoke a node. Duties resume when a node matches that identity again.
+
+`proposer_nodes` is an optional block-production pool. Each proposer node is
+admitted only when its spec and genesis match the main pool's agreed
+identity. A mismatch, or a failed read at boot, leaves that node unadmitted
+and does not fail startup. If that boot pass admits nobody, proposals use
+the main pool and startup logs one warning: `no admitted proposer node;
+block production uses the main pool`. A later parsed mismatch revokes the
+node, including the last one, and proposals use the main pool. A monitor
+pass that finds no admitted proposer node logs that same sentence, and does
+not log `no admitted beacon node; duties halted`. A timeout or an HTTP 5xx
+leaves admission unchanged when neither response parses a disagreement. A
+revoked node is still probed and is admitted again when it matches. Block
+duties fail closed when the main pool has no admitted node, even if a
+proposer node is admitted. When a proposer pool is configured, the block
+fence watches both revocation generations, including when that pool has no
+admitted node. Produce still asks whichever pool is admitted when the block
+is requested, so a proposer node granted after that fence can be asked. If
+either watched generation moves before the signer's last check before BLS
+(for the header, after the slashing-protection reservation), the header is
+not signed. A BLS call already started is not stopped. For Gloas, a move
+before the signer's entry check for the envelope drops the envelope; a move
+after that check, or after it is signed, does not stop its publish. A
+parent-capture fence that no longer holds signs no RANDAO. With no proposer
+pool, the fence watches only the main generation. The proposer sync monitor
+publishes health tiers for admitted proposer endpoints on the same one-epoch
+interval. An empty list builds no proposer pool.
+
 #### Server Options
 
 | Flag | Default | Description |
@@ -123,7 +155,7 @@ All three TLS flags are required when `--grpc-signer-url` is set.
 |------|---------|-------------|
 | `--secret-provider <NAME>` | none | Secret provider to use for loading validator keys (e.g., `gcp`) |
 | `--gcp-project-id <ID>` | none | GCP project ID (required when `--secret-provider` includes `gcp`) |
-| `--gcp-secret-prefix <PREFIX>` | `validator-key-` | Prefix for GCP secret names |
+| `--gcp-secret-prefix <PREFIX>` | `validator-key-` | Case-sensitive prefix the GCP secret id must start with; ids whose suffix is not a pubkey load with one warning |
 | `--secret-refresh-interval <SECS>` | `0` | Interval in seconds to refresh keys from secret providers (0 = disabled) |
 
 #### Tracing Options (OpenTelemetry)
@@ -161,7 +193,7 @@ rvc voluntary-exit [OPTIONS]
 | `--confirm` | no | false | Skip confirmation prompt |
 | `--beacon-url <URL>` | no | `http://localhost:5052` | Beacon node URL |
 | `--slashing-db-path <PATH>` | no | none | Slashing DB path |
-| `--network <NETWORK>` | no | none | Network preset |
+| `--network <NETWORK>` | no | `mainnet` | Network preset |
 | `--genesis-validators-root <HEX>` | no | none | Override genesis root |
 | `--log-level <LEVEL>` | no | `info` | Log level |
 
@@ -173,6 +205,17 @@ rvc voluntary-exit \
   --password-file ./passwords.txt \
   --confirm
 ```
+
+`rvc voluntary-exit` and `rvc prepare-exit` sign with the local keystore. They
+are offline and are not doppelganger-gated. A voluntary exit is not a slashable
+duty, and the command logs a warning when it signs. `prepare-exit` writes the
+signed message to a file and does not broadcast it. `voluntary-exit` submits
+the signed exit to the beacon node after `--confirm`.
+
+- `--network` defaults to `mainnet`.
+- The command refuses when the beacon node's genesis validators root does not match the local root.
+- On a named network it refuses when the beacon node's Capella fork version does not match the preset. Custom networks are not checked against a preset.
+- It refuses an explicit `--epoch` before the Capella fork epoch, and every explicit epoch when Capella is unscheduled (`u64::MAX`).
 
 ## Configuration File
 
@@ -202,27 +245,40 @@ log_level = "info"
 # Multi-BN failover
 # beacon_nodes = ["http://bn1:5052", "http://bn2:5052"]
 
+# Optional proposer pool. Admitted only when spec and genesis match the main
+# pool. Empty builds no pool. No admitted proposer node uses beacon_nodes.
+# The block fence watches that pool's revocation generation even when it is
+# empty. Produce may still ask a node granted later. If either watched
+# generation moves before the signer's last check before BLS, the block is
+# not signed; a BLS call already started is not stopped.
+# proposer_nodes = ["http://proposer:5052"]
+
 # Keymanager API
 # keymanager_enabled = true
 # keymanager_address = "127.0.0.1:5062"
 # keymanager_token_file = "./keymanager-api-token.txt"
 # remote_signer_url = "https://web3signer:9000"
 
-# Secret provider
-# [secret_provider]
-# provider = "gcp"
-# gcp_project_id = "my-project"
-# gcp_secret_prefix = "validator-key-"
-# refresh_interval = 3600
-
 # gRPC remote signer (rvc-signer)
 # grpc_signer_url = "https://signer.example.com:50052"
 # grpc_signer_tls_cert = "./certs/client.pem"
 # grpc_signer_tls_key = "./certs/client-key.pem"
 # grpc_signer_tls_ca_cert = "./certs/ca.pem"
+
+# Secret provider (tables last: a key below a table header belongs to it)
+# [secret_provider]
+# providers = ["gcp"]
+# refresh_interval = 3600
+#
+# [secret_provider.gcp]
+# project_id = "my-project"
+# secret_prefix = "validator-key-"
 ```
 
 CLI flags override config file values.
+
+Unknown config keys fail startup. A key that is not a field of its table is an
+error and names the key and the file.
 
 ### `[timing]` — duty deadlines (TOML only)
 
@@ -264,6 +320,26 @@ payload_due_bps = 5000
 payload_attestation_due_bps = 7500
 ```
 
+### Validators file
+
+`validators.toml` (`--validators-config`) uses the same unknown-key failure as
+`config.toml`: startup names the key and the file, and
+`enable` must be written `enabled`. A reload of that file refuses a
+missing or zero `[defaults] fee_recipient`. There is still no reload trigger.
+The keys are in [validators-config.md](validators-config.md).
+
+When a proposer-config URL owns a field, a reload that repeats that field at
+its baseline keeps the URL value in memory. The baseline is the live value
+when the URL started owning the field. It can differ from the last saved file
+when an `update_config` that was not saved came before that claim. A hand edit
+that changes the field wins over the URL. The reload compares the file value
+with the baseline, so it cannot tell an untouched field from an edit back to
+the baseline: deleting `builder_proposals = false`, or deleting a
+`[defaults] gas_limit` whose 30000000 fallback equals the baseline, keeps the
+URL value. After a remote default graffiti, `set_default_graffiti` followed by
+a reload whose file omits graffiti brings the remote graffiti back when no
+graffiti was set at the claim (setter ownership is deferred to W4-C4).
+
 ## Password File Format
 
 One entry per line. Comments (`#`) and blank lines are ignored, and a leading
@@ -291,10 +367,20 @@ keystores with one shared password while still overriding individual validators:
 
 The password for each keystore is resolved in this order:
 
-1. the exact `pubkey=password` entry for that validator, if present;
-2. otherwise the `*` wildcard entry, if present;
-3. otherwise the keystore is skipped with a `No password found for public key …`
+1. a persisted keymanager import secret for that pubkey, under
+   `<keystore_path>/.rvc.keymanager-secrets/0x<pubkey>` (file mode `0600`,
+   directory mode `0700`), when that file is present — it wins over the
+   password file;
+2. the exact `pubkey=password` entry for that validator, if present;
+3. otherwise the `*` wildcard entry, if present;
+4. otherwise the keystore is skipped with a `No password found for public key …`
    warning.
+
+A secret that is unreadable, has the wrong mode, or does not decrypt its
+keystore aborts startup. The error names the file and does not print the
+password. A secret with no keystore is a warning.
+
+If a keystore for a key with an import secret changes while rvc is starting (for example, a copy into `keystore_path` is still running), startup aborts with `keystore directory changed during boot` and names the secret file. Let the copy finish, then restart.
 
 Existing password files that use only `pubkey=password` lines keep working
 unchanged — the wildcard is purely additive.
@@ -330,6 +416,37 @@ Set restrictive permissions: `chmod 600 passwords.txt`
 The gRPC healthz / DutyTracker listener is gone. Leftover `grpc_port` /
 `grpc_address` keys fail startup. Point probes at `/health`, `/livez`, and
 `/readyz` on this metrics port.
+
+### Container health check
+
+The images do not install `curl`. Each `HEALTHCHECK` runs the `health`
+subcommand of its binary. The subcommand sends one `GET` and stops after 3 s.
+It exits 0 on a 2xx status and 1 on any other result. It does not follow a
+redirect and it does not use a proxy.
+
+| Image | Command | Default `--url` |
+|-------|---------|-----------------|
+| `rvc` | `rvc health` | `http://127.0.0.1:8080/livez` |
+| `rvc-signer` | `rvc-signer health` | `http://127.0.0.1:9101/metrics` |
+
+Each health check has a start period of 300 s. During the start period, a
+failed probe does not count, and the first passed probe marks the container
+healthy. The probed listener starts late:
+
+- rvc serves `/livez` only after it connects to a beacon node, loads and
+  decrypts the keystores, and builds its services.
+- rvc-signer serves `/metrics` only after it decrypts the keystores.
+
+If a start takes more than 300 s (for example, many scrypt keystores, a slow
+secret provider, or a slow beacon node), the container becomes unhealthy. An
+orchestrator can then restart it in a loop. In that case, set a longer start
+period, for example `docker run --health-start-period=600s` or
+`start_period: 600s` in compose.
+
+If you change the metrics address or port, give the same address to `--url`.
+The probe trusts the process that answers on that address inside the
+container's network namespace. In a Kubernetes pod with a sidecar, or with
+`network_mode: host`, another process in the same namespace can own the port.
 
 ### Keymanager API (default port 5062, when enabled)
 
@@ -418,7 +535,7 @@ These two paths are **independently settable** in config and CLI:
 
 | Setting | Default | Role |
 |---------|---------|------|
-| `keystore_path` / `--keystore-path` | `./keystores` | EIP-2335 keys + process lock (`<keystore_path>/.rvc.lock`) + deletion denylist |
+| `keystore_path` / `--keystore-path` | `./keystores` | EIP-2335 keys + process lock (`<keystore_path>/.rvc.lock`) + deletion denylist + doppelganger marker. Must be a persistent, writable volume (compose: `/data/keystores` on `rvc-data`) |
 | `slashing_db_path` / `--slashing-db-path` | `./slashing_protection.sqlite` | EIP-3076 signing history |
 
 Footgun — **copied data-dir deployments**:
@@ -449,6 +566,112 @@ Send `SIGINT` (Ctrl+C) or `SIGTERM` for graceful shutdown. The client will:
 2. Close beacon node connections
 3. Persist slashing DB state
 4. Shut down metrics and gRPC servers
+
+Doppelganger detection exits `12` without a signal, and only after a
+write and its fsync have succeeded. Before any signing, startup pre-allocates a
+fixed-size `.rvc.doppelganger_record` in the keystore directory and fsyncs
+it. The file starts as `not-detected`. On detection the process overwrites
+that file in place and fsyncs it. An in-place overwrite does not allocate a
+new directory entry. On copy-on-write or thin storage (btrfs, ZFS, thin LVM)
+it can still allocate a new block. It also writes
+`.rvc.doppelganger_detected` in the keystore directory
+and, when that directory is not the parent of `slashing_db_path`, the same
+marker beside the slashing database. Until one of those writes succeeds the
+process stays up and refuses every new signature. Each failed marker write
+increments `rvc_doppelganger_marker_write_failures_total`. From the moment of
+detection, new signatures are refused. A slashable signature is checked
+again after its slashing-protection row is reserved and before the BLS call.
+That check is the admission boundary. It is not atomic with the BLS call.
+If detection has landed before the call, the call is not made and the
+reserved row stays. A BLS call that has already started, including a request
+already sent to a remote signer, can still return within the sign timeout.
+A non-slashable signature that passed its check before detection can still
+finish inside that timeout. A false positive stops every validator this
+process runs.
+
+The marker is written in the validator data directory (the keystore
+directory). The file records the detected public keys, the epoch, and the
+time. `keystore_path` must be a persistent, writable volume. In the shipped
+compose file that is `/data/keystores` on the `rvc-data` volume. With
+detection enabled, startup refuses to run when that directory is not
+writable, and when the fixed-size detection record cannot be pre-allocated.
+The latch cannot be guaranteed without that file. The next start reads the
+marker and the record before a signer or the keymanager API is built and
+exits 12 again when the marker is present or the record is `detected`. While
+either is in that state, restart-skip and a keymanager import cannot skip
+the forward window. A file that cannot be read, a symlink or FIFO at that
+path, or a file that is not valid also refuses to start.
+
+Clear it only after the other instance is no longer signing these keys. The
+command takes the keystore lock and refuses while a process holds it. A
+validator client started with `--disable-keystore-locking` holds no
+`.rvc.lock`, so the command cannot see that process. Stop it before
+clearing. The command also resets `.rvc.doppelganger_record` in place to
+`not-detected`. The next start runs a full forward window and does not
+restart-skip. That forced window stays in force until every key loaded on
+that boot has finished one. The first key to finish does not clear it for
+the others.
+A key deleted mid-window through the keymanager API keeps `.rvc.doppelganger_force_window` until a forward window completes.
+
+```bash
+rvc doppelganger clear-detection --datadir /var/lib/rvc/keystores --confirm
+```
+
+If shutdown wrote a fallback marker beside the slashing database, pass that
+database too. Otherwise the next start still exits 12.
+
+```bash
+rvc doppelganger clear-detection \
+  --datadir /var/lib/rvc/keystores \
+  --slashing-db-path /var/lib/rvc/slashing_protection.sqlite \
+  --confirm
+```
+
+Deleting only `.rvc.doppelganger_detected` by hand leaves a detected
+`.rvc.doppelganger_record` in place. The next start still exits 12, and that
+deletion does not force a fresh window.
+
+`clear-detection` resets a regular 4096-byte record in place. If the record
+is truncated, unreadable, a symlink, or a FIFO, the command returns an error
+and leaves the marker in place. Stop the process, remove that broken record,
+and run the command again:
+
+```bash
+rm /var/lib/rvc/keystores/.rvc.doppelganger_record
+rvc doppelganger clear-detection --datadir /var/lib/rvc/keystores --confirm
+```
+
+Do this only for a broken record. A valid `detected` record is reset by the
+command. Deleting that file by hand skips the force-window file.
+
+systemd should not restart this exit:
+
+```
+Restart=on-failure
+RestartPreventExitStatus=12
+```
+
+Docker Compose `restart: unless-stopped` cannot exclude one exit code. The
+process stays up and refuses signing until a write and its fsync have
+succeeded, then exits 12. A restarted container finds that record and exits
+12 again, which is why `keystore_path` has to survive the restart.
+
+`SIGINT`, `SIGTERM`, or cancellation after a write and its fsync have
+succeeded exits 12. The drain overwrites the pre-allocated record first,
+then tries the keystore marker and the fallback marker. Durability is that
+completed fsync, including the directory fsync after a marker rename. A
+later rewrite failure still exits 12 and does not retry. Reading the file
+back is not enough: a `pwrite` that reached the page cache and then failed
+to fsync is not durable, and neither is an unreadable file. The drain
+retries about once a second after tasks have been joined, and does not exit
+0 or 16, until a write returns success. `SIGKILL`, or any stop that does
+not let that first fsync finish, loses the latch: the next start has no
+durable record and can give the detected key a fresh window. Do not stop the
+node while `rvc_doppelganger_marker_write_failures_total` is rising. Boot
+still reads the files and refuses a detected record or a marker before a
+signer is built and again after the keystore lock. A panic in a registered
+task while the latch is set takes the same path. The counter counts each
+failed marker attempt.
 
 ## Example Configurations
 
@@ -493,6 +716,9 @@ rvc start -c config.toml \
   --secret-refresh-interval 3600
 ```
 
+The GCP secret id must start with the configured prefix (case-sensitive); a
+secret whose id only contains the prefix is not loaded.
+
 ### With OpenTelemetry Tracing
 
 ```bash
@@ -508,6 +734,31 @@ rvc start -c config.toml \
   --tracing-exporter gcp \
   --tracing-sample-rate 0.01
 ```
+
+The `gcp` exporter sends OTLP/HTTP to the Cloud Telemetry API
+(`https://telemetry.googleapis.com/v1/traces`). It ignores `--tracing-endpoint`.
+It uses Application Default Credentials (ADC). It finds the project ID in this
+order: `GCP_PROJECT`, `PROJECT_ID`, `GCP_PROJECT_ID`, the `quota_project_id` of
+the ADC file, and the metadata server. It sets the `gcp.project_id` resource
+attribute.
+
+Operator changes from v0.8.0 (the exporter used the Cloud Trace API before):
+
+1. Enable the Telemetry API in the destination project:
+   `gcloud services enable telemetry.googleapis.com`.
+2. Keep the Cloud Trace API (`cloudtrace.googleapis.com`) enabled in the
+   destination project. If it is disabled, Google discards the trace data.
+3. Grant `roles/telemetry.tracesWriter` to the application principal on the
+   destination project.
+4. Grant `roles/serviceusage.serviceUsageConsumer` to that principal on the
+   quota project.
+5. For user ADC credentials, set a quota project:
+   `gcloud auth application-default set-quota-project <project>`.
+6. Set `GCP_PROJECT` when the destination project is not the ADC quota project.
+7. The exporter keeps the OpenTelemetry span attribute names. The resource
+   attributes (`service.name`, `service.version`, `network.name`) now stay in
+   the OTLP resource, not in the label map of each span. Examine your Cloud
+   Trace filters and dashboards after the upgrade.
 
 #### Local Jaeger v2 (docker compose `tracing` profile)
 
@@ -689,7 +940,7 @@ rvc-signer serve [OPTIONS]
 | `--tls-key <PATH>` | none | Server TLS private key (PEM) |
 | `--tls-ca-cert <PATH>` | none | CA certificate for client authentication (PEM) |
 | `--backend <TYPE>` | `basic` | Signing backend: `basic` or `dvt` (requires `dvt` feature) |
-| `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address |
+| `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address (`GET /metrics`. Other paths get `404`.) |
 | `--reload-interval <SECS>` | `30` | Keystore hot-reload interval (0 to disable) |
 | `--dry-run` | false | Validate configuration and exit |
 | `--insecure` | false | Allow starting without TLS (NOT recommended for production) |

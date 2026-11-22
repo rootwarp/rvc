@@ -156,7 +156,6 @@ const UNVALIDATED: &[(&str, &str)] = &[
         "checked via effective_genesis_validators_root(); name not in validate body",
     ),
     ("network.network", "no field-name check in Config::validate"),
-    ("proposer_config.refresh_interval", "no field-name check in Config::validate"),
     ("proposer_config.url_insecure", "no field-name check in Config::validate"),
     ("proposer_config.url_token", "no field-name check in Config::validate"),
     ("safety.allow_unsupported_fork", "no field-name check in Config::validate"),
@@ -245,7 +244,7 @@ fn compact_ws(s: &str) -> String {
             }
             let prev_is_dot = out.ends_with('.');
             let next_is_dot = j < chars.len() && chars[j] == '.';
-            if !(prev_is_dot || next_is_dot) && !out.is_empty() && !out.ends_with(' ') {
+            if !(prev_is_dot || next_is_dot || out.is_empty() || out.ends_with(' ')) {
                 out.push(' ');
             }
             i = j;

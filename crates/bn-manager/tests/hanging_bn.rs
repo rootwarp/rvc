@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 
 use beacon::{BeaconClient, BeaconClientConfig};
 use eth_types::{ForkName, ForkSchedule};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BlockProducer, BnManager, BnManagerConfig, BroadcastTopics,
-    DutiesProvider, OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SyncCommitteeApi,
-    VersionedAttestation, ATTEMPT_TIMEOUT_FLOOR,
+    DutiesProvider, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock,
+    SyncCommitteeApi, VersionedAttestation, ATTEMPT_TIMEOUT_FLOOR,
 };
 
 /// How long each fixture BN waits before responding. Longer than any row budget.
@@ -27,8 +27,13 @@ const BUDGET: Duration = Duration::from_millis(80);
 /// Row budget. Tens of ms and well below [`ATTEMPT_TIMEOUT_FLOOR`].
 const ROW_BUDGET: Duration = Duration::from_millis(40);
 
-/// Scheduling slack. Several times smaller than `FLOOR - ROW_BUDGET`.
-const ROW_EPSILON: Duration = Duration::from_millis(50);
+/// Scheduling slack. Smaller than `FLOOR - ROW_BUDGET` by more than one budget.
+///
+/// A loaded `cargo nextest --workspace --all-features` run slipped a 40 ms
+/// `get_payload_attestation_data` budget to 100 ms (Actions run 39740511987).
+/// 120 ms of slack keeps that row under the ceiling. The ceiling stays under
+/// the attempt floor and the hang, so a missing inner deadline still fails.
+const ROW_EPSILON: Duration = Duration::from_millis(120);
 
 type OpFut<'a> = Pin<Box<dyn Future<Output = Result<(), BeaconError>> + Send + 'a>>;
 
@@ -95,6 +100,10 @@ fn op_submit_payload_attestations(manager: &BnManager) -> OpFut<'_> {
     Box::pin(async { manager.submit_payload_attestations(&[]).await })
 }
 
+fn op_get_block_root(manager: &BnManager) -> OpFut<'_> {
+    Box::pin(async { manager.get_block_root("33").await.map(|_| ()) })
+}
+
 fn op_get_sync_committee_contribution(manager: &BnManager) -> OpFut<'_> {
     Box::pin(async { manager.get_sync_committee_contribution(1, 0, "0x11").await.map(|_| ()) })
 }
@@ -109,19 +118,14 @@ fn op_publish_block(manager: &BnManager) -> OpFut<'_> {
 
 fn sample_signed_block() -> SignedBeaconBlock {
     SignedBeaconBlock {
-        message: eth_types::BeaconBlock {
-            slot: 1,
-            proposer_index: 0,
-            parent_root: [1u8; 32],
-            state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
-        },
+        message: eth_types::external_vector_deneb_block(),
         signature: vec![0xaa; 96],
     }
 }
 
-/// Twelve converted operations, named. `publish_block` is the generic `submit`
-/// helper's query_first arm (broadcast off).
+/// Converted operations, named. `publish_block` is the generic `submit`
+/// helper's query_first arm (broadcast off). `get_block_root` uses the
+/// attestation-fetch budget so a hung node cannot hold head capture.
 static BUDGETED_OPERATIONS: &[BudgetedOperation] = &[
     BudgetedOperation { op_name: "get_attester_duties", invoke: op_get_attester_duties },
     BudgetedOperation { op_name: "get_proposer_duties", invoke: op_get_proposer_duties },
@@ -131,6 +135,7 @@ static BUDGETED_OPERATIONS: &[BudgetedOperation] = &[
     },
     BudgetedOperation { op_name: "post_ptc_duties", invoke: op_post_ptc_duties },
     BudgetedOperation { op_name: "publish_block_ssz", invoke: op_publish_block_ssz },
+    BudgetedOperation { op_name: "get_block_root", invoke: op_get_block_root },
     BudgetedOperation { op_name: "get_attestation_data", invoke: op_get_attestation_data },
     BudgetedOperation { op_name: "submit_attestation", invoke: op_submit_attestation },
     BudgetedOperation {
@@ -160,7 +165,7 @@ struct HangingFleet {
 }
 
 impl HangingFleet {
-    async fn start(n: usize, budget: Duration, hang: Duration) -> Self {
+    async fn start(n: usize, budget: Duration, hang: Duration, broadcast: bool) -> Self {
         assert!(n > 0, "fleet needs at least one BN");
         assert!(hang > budget, "hang must outlast the operation budget");
         let mut servers = Vec::with_capacity(n);
@@ -186,11 +191,15 @@ impl HangingFleet {
             preparation: budget,
         };
         let mut config = BnManagerConfig::new(endpoints);
-        config.broadcast_topics = BroadcastTopics {
-            attestations: false,
-            blocks: false,
-            sync_committee: false,
-            subscriptions: false,
+        config.broadcast_topics = if broadcast {
+            BroadcastTopics::default()
+        } else {
+            BroadcastTopics {
+                attestations: false,
+                blocks: false,
+                sync_committee: false,
+                subscriptions: false,
+            }
         };
         let manager = BnManager::new(config).unwrap().with_operation_timeouts(timeouts);
         Self { servers, manager, budget, hang }
@@ -215,7 +224,7 @@ async fn harness_actually_hangs_past_the_budget() {
         let _ = (op.op_name, op.invoke);
     }
 
-    let fleet = HangingFleet::start(2, BUDGET, HANG).await;
+    let fleet = HangingFleet::start(2, BUDGET, HANG, false).await;
     assert!(fleet.hang > fleet.budget);
     assert_eq!(fleet.servers.len(), 2);
     // The manager is part of the fixture the rows drive. Touch it so the field
@@ -235,9 +244,9 @@ async fn harness_actually_hangs_past_the_budget() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn every_converted_site_still_returns_operation_timeout() {
-    assert_eq!(BUDGETED_OPERATIONS.len(), 12, "one row per converted operation");
+    assert_eq!(BUDGETED_OPERATIONS.len(), 13, "one row per converted operation");
     let names: Vec<&str> = BUDGETED_OPERATIONS.iter().map(|op| op.op_name).collect();
     assert_eq!(
         names,
@@ -247,6 +256,7 @@ async fn every_converted_site_still_returns_operation_timeout() {
             "post_sync_committee_duties",
             "post_ptc_duties",
             "publish_block_ssz",
+            "get_block_root",
             "get_attestation_data",
             "submit_attestation",
             "get_aggregate_attestation",
@@ -257,15 +267,16 @@ async fn every_converted_site_still_returns_operation_timeout() {
         ]
     );
     assert!(
-        ATTEMPT_TIMEOUT_FLOOR.saturating_sub(ROW_BUDGET) > ROW_EPSILON * 3,
-        "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) - budget ({ROW_BUDGET:?}) must be several times ε ({ROW_EPSILON:?})"
+        ATTEMPT_TIMEOUT_FLOOR.saturating_sub(ROW_BUDGET + ROW_EPSILON) > ROW_BUDGET,
+        "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) must stay more than a budget ({ROW_BUDGET:?}) above the elapsed ceiling ({:?})",
+        ROW_BUDGET + ROW_EPSILON
     );
     assert!(ROW_BUDGET < ATTEMPT_TIMEOUT_FLOOR);
     assert!(HANG > ATTEMPT_TIMEOUT_FLOOR, "a missing deadline must outlast the floor");
 
-    let fleet = HangingFleet::start(1, ROW_BUDGET, HANG).await;
+    let fleet = HangingFleet::start(1, ROW_BUDGET, HANG, false).await;
     for op in BUDGETED_OPERATIONS {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let err = (op.invoke)(&fleet.manager).await.expect_err(op.op_name);
         let elapsed = started.elapsed();
         assert!(
@@ -274,11 +285,100 @@ async fn every_converted_site_still_returns_operation_timeout() {
             op.op_name
         );
         assert!(
-            elapsed <= ROW_BUDGET + ROW_EPSILON,
-            "{} elapsed {elapsed:?} exceeded {:?} (floor {:?}); a site with no inner deadline would wait for the hang",
+            elapsed >= ROW_BUDGET && elapsed < ATTEMPT_TIMEOUT_FLOOR && elapsed < HANG,
+            "{} elapsed {elapsed:?}; a missing inner deadline waits for the hang ({HANG:?}) and an immediate error is under the budget ({ROW_BUDGET:?})",
+            op.op_name
+        );
+    }
+}
+
+/// B-001: one stalled BN must not turn another BN's 200 into `OperationTimeout`.
+///
+/// BN-A answers `POST /eth/v2/beacon/pool/attestations` immediately. BN-B delays
+/// that publish past the attestation budget. The call returns `Ok` before the
+/// budget, and the drain records BN-A's success and BN-B's timeout.
+#[tokio::test]
+async fn submit_attestation_returns_ok_before_budget_when_peer_hangs() {
+    /// Fast enough to stay under a loaded CI run, long enough that `join_all`
+    /// plus one outer timeout cannot return `Ok`.
+    const BUDGET_MS: u64 = 200;
+    let budget = Duration::from_millis(BUDGET_MS);
+    let hang = Duration::from_millis(800);
+    assert!(hang > budget);
+
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&bn_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]").set_delay(hang))
+        .mount(&bn_b)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn_a.uri(), bn_b.uri()]);
+    config.broadcast_topics.attestations = true;
+    let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+        attestation_submit: budget,
+        ..OperationTimeouts::default()
+    });
+
+    let started = Instant::now();
+    let result = manager.submit_attestation(&VersionedAttestation::Electra(vec![])).await;
+    let elapsed = started.elapsed();
+    assert!(result.is_ok(), "BN-A's 200 must win while BN-B is still hanging, got {result:?}");
+    assert!(
+        elapsed < budget,
+        "submit_attestation returned in {elapsed:?}, which is not before the {budget:?} budget"
+    );
+
+    let deadline = Instant::now() + hang + Duration::from_millis(500);
+    loop {
+        let scores = manager.health_scores().await;
+        let bn_a_success = scores[0].latency_ms > 0.0 && scores[0].error_rate == 0.0;
+        let bn_b_error = scores[1].error_rate == 1.0;
+        if bn_a_success && bn_b_error {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "drain did not record BN-A success and BN-B error: {scores:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let trackers = manager.health_trackers().read().await;
+    assert!(
+        trackers[0].latency_ema_ms().is_some() && trackers[0].error_rate() == 0.0,
+        "BN-A must hold a success"
+    );
+    assert!(trackers[1].error_rate() > 0.0, "BN-B's timeout must count as an error");
+}
+
+/// Broadcast topics on: every budgeted operation still returns by the backstop
+/// (budget + 250 ms), not when the hanging BN finally answers.
+#[tokio::test]
+async fn every_operation_with_broadcast_on_returns_within_backstop() {
+    let budget = Duration::from_millis(200);
+    let hang = Duration::from_millis(800);
+    let backstop = Duration::from_millis(250);
+    assert!(hang > budget + backstop, "a missing per-BN bound must be able to fail this test");
+    assert_eq!(BUDGETED_OPERATIONS.len(), 13);
+
+    let fleet = HangingFleet::start(2, budget, hang, true).await;
+    for op in BUDGETED_OPERATIONS {
+        let started = Instant::now();
+        let result = (op.invoke)(&fleet.manager).await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "{} must fail while every BN hangs, got {result:?}", op.op_name);
+        assert!(
+            elapsed <= budget + backstop,
+            "{} elapsed {elapsed:?} exceeded budget + 250 ms ({:?})",
             op.op_name,
-            ROW_BUDGET + ROW_EPSILON,
-            ATTEMPT_TIMEOUT_FLOOR
+            budget + backstop
         );
     }
 }

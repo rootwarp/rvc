@@ -199,6 +199,27 @@ impl ForkName {
         }
     }
 
+    /// Full blocks from Bellatrix onward carry an execution payload.
+    pub fn carries_execution_payload(self) -> bool {
+        self >= Self::Bellatrix
+    }
+
+    /// Fixed-section length of a Bellatrix or Capella beacon block body.
+    ///
+    /// The execution-payload offset sits at byte 380 on both forks. Capella
+    /// adds the `bls_to_execution_changes` offset, so its fixed section is
+    /// 388 bytes. Deneb and later use [`Self::body_layout`]. This length is
+    /// not a KZG layout: [`Self::body_layout`] stays `None` before Deneb.
+    pub fn pre_deneb_body_fixed_len(self) -> Option<usize> {
+        if self == Self::Bellatrix {
+            Some(384)
+        } else if self == Self::Capella {
+            Some(388)
+        } else {
+            None
+        }
+    }
+
     /// Body SSZ layout for KZG extraction, if the fork has blob commitments.
     ///
     /// Deneb → Deneb layout; Electra/Fulu → Electra layout; Gloas → Gloas
@@ -597,6 +618,15 @@ mod tests {
             let name = ForkName::from_str(s).unwrap();
             assert_eq!(name.body_layout(), body_fork_layout(s), "layout mismatch for {s}");
         }
+        assert!(!ForkName::Phase0.carries_execution_payload());
+        assert!(!ForkName::Altair.carries_execution_payload());
+        assert!(ForkName::Bellatrix.carries_execution_payload());
+        assert!(ForkName::Capella.carries_execution_payload());
+        assert!(ForkName::Gloas.carries_execution_payload());
+        assert_eq!(ForkName::Bellatrix.pre_deneb_body_fixed_len(), Some(384));
+        assert_eq!(ForkName::Capella.pre_deneb_body_fixed_len(), Some(388));
+        assert_eq!(ForkName::Altair.pre_deneb_body_fixed_len(), None);
+        assert_eq!(ForkName::Deneb.pre_deneb_body_fixed_len(), None);
         assert_eq!(ForkName::Phase0.body_layout(), None);
         assert_eq!(ForkName::Deneb.body_layout(), Some(BodyForkLayout::Deneb));
         assert_eq!(ForkName::Electra.body_layout(), Some(BodyForkLayout::Electra));

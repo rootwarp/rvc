@@ -3,64 +3,83 @@
 use super::*;
 use eth_types::{BeaconBlock, BlindedBeaconBlock};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn test_compute_block_root_matches_tree_hash() {
     use tree_hash::TreeHash;
     let block = eth_types::external_vector_electra_block();
-    let root = compute_block_root(&block).expect("valid Electra vector body");
+    let layout = eth_types::BodyForkLayout::Electra;
+    let root = compute_block_root_for_layout(&block, layout).expect("valid Electra vector body");
     assert_eq!(root, block.tree_hash_root().0);
     let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_block_root must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
+        "compute_block_root_for_layout must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
     );
+    let header = header_from_full(&block, layout).expect("electra header");
+    assert_eq!(header.object_root(), root, "pre-Gloas block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_tree_hash() {
     use tree_hash::TreeHash;
     let block = test_blinded_block(200);
-    let root = compute_blinded_block_root(&block).unwrap();
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root = compute_blinded_block_root_for_layout(&block, layout).unwrap();
     let expected = block.tree_hash_root();
     assert_eq!(root, expected.0);
+    let header = header_from_blinded(&block, layout).expect("deneb blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_external_vector() {
     let block = eth_types::external_vector_electra_blinded_block();
-    let root = compute_blinded_block_root(&block).expect("valid external vector blinded body");
+    let layout = eth_types::BodyForkLayout::Electra;
+    let root = compute_blinded_block_root_for_layout(&block, layout)
+        .expect("valid external vector blinded body");
     let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_blinded_block_root must match remerkleable external blinded Electra block root"
+        "compute_blinded_block_root_for_layout must match remerkleable external blinded Electra block root"
     );
+    let header = header_from_blinded(&block, layout).expect("electra blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
 fn test_compute_block_root_matches_external_deneb_vector() {
     let block = eth_types::external_vector_deneb_block();
-    let root = compute_block_root(&block).expect("valid Deneb external vector body");
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root =
+        compute_block_root_for_layout(&block, layout).expect("valid Deneb external vector body");
     let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_block_root must match remerkleable external Deneb block root"
+        "compute_block_root_for_layout must match remerkleable external Deneb block root"
     );
+    let header = header_from_full(&block, layout).expect("deneb header");
+    assert_eq!(header.object_root(), root, "pre-Gloas block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_external_deneb_vector() {
     let block = eth_types::external_vector_deneb_blinded_block();
-    let root = compute_blinded_block_root(&block).expect("valid Deneb blinded body");
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root =
+        compute_blinded_block_root_for_layout(&block, layout).expect("valid Deneb blinded body");
     let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_blinded_block_root must match remerkleable external Deneb block root"
+        "compute_blinded_block_root_for_layout must match remerkleable external Deneb block root"
     );
+    let header = header_from_blinded(&block, layout).expect("deneb blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
@@ -121,6 +140,42 @@ async fn test_propose_block_unblinded() {
     beacon_arc.assert_last_published_block(slot, 42);
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     signer_arc.assert_last_sign_block_header(&fork, &gvr);
+}
+
+/// `propose_block_until` passes its deadline into V3 produce. Each call keeps
+/// its own instant. `propose_block` passes `None`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn propose_block_until_forwards_the_deadline_to_produce_v3() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let beacon = Arc::new(MockBeaconClient::unblinded(test_block(slot)).with_produce_error());
+    let service = BlockService::new(
+        Arc::new(MockSigner::new()),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let first = tokio::time::Instant::now() + Duration::from_millis(40);
+    let second = tokio::time::Instant::now() + Duration::from_millis(400);
+    let fence = beacon::DutyFence::open();
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(first), &fence)
+        .await
+        .is_err());
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(second), &fence)
+        .await
+        .is_err());
+    assert!(service.propose_block(slot, &pubkey, 42, None).await.is_err());
+    assert_eq!(
+        beacon.recorded_deadline(),
+        vec![
+            (super::mocks::RecordedProduce::V3, Some(first)),
+            (super::mocks::RecordedProduce::V3, Some(second)),
+            (super::mocks::RecordedProduce::V3, None),
+        ]
+    );
 }
 
 /// D29: two distinct produce answers exist, but sign + publish is single-flight.
@@ -497,12 +552,27 @@ async fn test_blinded_block_publish_failure() {
     let slot = 200;
     let block = test_blinded_block(slot);
     let beacon = MockBeaconClient::blinded(block).with_publish_error();
-    let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
+    // A blinded publish error is a builder miss, including when the beacon node fails.
+    assert!(
+        matches!(result.unwrap_err(), BlockServiceError::BuilderFailure(_)),
+        "blinded publish failure must be BuilderFailure"
+    );
+    assert_eq!(
+        signer.header_calls.lock().unwrap().len(),
+        1,
+        "one signature, then the publish fails"
+    );
 }
 
 #[tokio::test]
@@ -702,14 +772,15 @@ async fn test_propose_block_at_epoch_boundary() {
 async fn test_propose_block_at_slot_zero_ssz() {
     let pubkey = test_pubkey();
     let slot = 0;
-    let beacon = MockBeaconClient::ssz_with_version(slot, 1, false, "capella");
+    // Deneb is a supported full-block fork. Capella is not; see the pre-Deneb SSZ test.
+    let beacon = MockBeaconClient::ssz_with_version(slot, 1, false, "deneb");
     let beacon_arc = Arc::new(beacon);
     let store = test_validator_store(&pubkey);
     let service = BlockService::new(
         Arc::new(MockSigner::new()),
         beacon_arc.clone(),
         Arc::new(store),
-        Arc::new(test_fork_schedule()),
+        Arc::new(test_fork_schedule_for("deneb")),
         [0xaa; 32],
     );
 
@@ -789,6 +860,7 @@ fn test_block_and_blobs_json_through_produce_response() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
 
     let contents = response.parse_full_block().unwrap();
@@ -836,8 +908,8 @@ async fn test_blinded_and_unblinded_roots_differ_through_production_logic() {
     let slot = 100;
 
     // Both blocks share the same slot + proposer_index but differ in body.
-    // The point: verify production code (compute_block_root / compute_blinded_block_root)
-    // produces different roots because tree_hash includes the body field.
+    // Tree hash includes the body, so the roots differ. The Deneb fixture
+    // matches the unblinded mock's header, so the signed root is that hash.
     let unblinded_block = BeaconBlock {
         slot,
         proposer_index: 42,
@@ -1014,7 +1086,14 @@ async fn test_propose_block_parent_root_mismatch_drops_duty() {
     );
 
     let expected_parent: Root = [0xee; 32];
-    let result = service.propose_block(slot, &pubkey, 42, Some(expected_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(result.is_err());
     assert!(
@@ -1053,12 +1132,19 @@ async fn test_propose_block_rejects_a_wrong_ancestor_parent() {
         [0xaa; 32],
     );
 
-    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: previous_slot_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(
         matches!(
             result,
-            Err(BlockServiceError::ParentRootMismatch { expected, got })
+            Err(BlockServiceError::ParentRootMismatch { expected, got, .. })
             if expected == previous_slot_parent && got == wrong_ancestor
         ),
         "wrong-ancestor parent must be ParentRootMismatch, got {result:?}"
@@ -1094,7 +1180,14 @@ async fn test_propose_block_accepts_the_previous_slot_parent() {
         [0xaa; 32],
     );
 
-    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: previous_slot_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(result.is_ok(), "previous-slot parent must be accepted, got {result:?}");
     assert_eq!(
@@ -1103,6 +1196,124 @@ async fn test_propose_block_accepts_the_previous_slot_parent() {
         "signer must be called when parent is the previous-slot root"
     );
     beacon_arc.assert_last_published_block(slot, 42);
+}
+
+struct ParentProposal {
+    result: Result<BlockProposalResult, BlockServiceError>,
+    signer_calls: usize,
+    publish_calls: usize,
+}
+
+async fn propose_with_parent(
+    slot: Slot,
+    block_parent: Root,
+    expected: Option<ExpectedParents>,
+) -> ParentProposal {
+    let pubkey = test_pubkey();
+    let mut block = test_block(slot);
+    block.parent_root = block_parent;
+    let beacon = Arc::new(MockBeaconClient::unblinded(block));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service.propose_block(slot, &pubkey, 42, expected).await;
+    let signer_calls = signer.block_calls.lock().unwrap().len();
+    let publish_calls = beacon.publish_calls.lock().unwrap().len();
+    ParentProposal { result, signer_calls, publish_calls }
+}
+
+/// Header at N-1 is {R1, parent R2}. A block on R1 and a block on R2 are both
+/// signed and published. A third root is `ParentRootMismatch` and is not signed.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_propose_block_accepts_header_and_reorg_parent() {
+    let header: Root = [0x11; 32];
+    let reorg: Root = [0x22; 32];
+    let third: Root = [0x33; 32];
+    let expected = ExpectedParents { root: header, parent: Some(reorg), closed: false };
+
+    for parent in [header, reorg] {
+        let proposal = propose_with_parent(100, parent, Some(expected)).await;
+        assert!(
+            proposal.result.is_ok(),
+            "parent {parent:?} must be signed and published, got {:?}",
+            proposal.result
+        );
+        assert_eq!(proposal.signer_calls, 1);
+        assert_eq!(proposal.publish_calls, 1);
+    }
+
+    let rejected = propose_with_parent(100, third, Some(expected)).await;
+    let text = rejected.result.as_ref().expect_err("third ancestor").to_string();
+    assert!(
+        matches!(
+            rejected.result,
+            Err(BlockServiceError::ParentRootMismatch { expected, reorg_parent, got, .. })
+            if expected == header && reorg_parent == Some(reorg) && got == third
+        ),
+        "a third ancestor must be ParentRootMismatch, got {:?}",
+        rejected.result
+    );
+    assert!(text.contains(&hex::encode(reorg)), "log and error must name the reorg parent: {text}");
+    assert_eq!(rejected.signer_calls, 0, "signer must not run after a parent rejection");
+    assert_eq!(rejected.publish_calls, 0, "a rejected block must not be published");
+    assert!(logs_contain("BN block response rejected"));
+    assert!(logs_contain("parent_root mismatch"));
+}
+
+/// N % 32 == 0 does not drop the parent of the N-1 header.
+#[tokio::test]
+async fn test_propose_block_accepts_reorg_parent_on_epoch_boundary() {
+    let slot = 40 * SLOTS_PER_EPOCH;
+    assert_eq!(slot % SLOTS_PER_EPOCH, 0);
+    let header: Root = [0x11; 32];
+    let reorg: Root = [0x22; 32];
+    let expected = ExpectedParents { root: header, parent: Some(reorg), closed: false };
+
+    let accepted = propose_with_parent(slot, reorg, Some(expected)).await;
+    assert!(
+        accepted.result.is_ok(),
+        "epoch-boundary reorg parent must be published, got {:?}",
+        accepted.result
+    );
+    assert_eq!(accepted.signer_calls, 1);
+    assert_eq!(accepted.publish_calls, 1);
+
+    let rejected = propose_with_parent(slot, [0x33; 32], Some(expected)).await;
+    assert!(matches!(rejected.result, Err(BlockServiceError::ParentRootMismatch { .. })));
+    assert_eq!(rejected.signer_calls, 0);
+    assert_eq!(rejected.publish_calls, 0);
+}
+
+/// A header below N-1 accepts only that header's root.
+#[tokio::test]
+async fn test_propose_block_rejects_header_parent_when_header_is_older() {
+    let header: Root = [0x11; 32];
+    let header_parent: Root = [0x22; 32];
+    let expected = ExpectedParents { root: header, parent: None, closed: false };
+
+    let accepted = propose_with_parent(100, header, Some(expected)).await;
+    assert!(accepted.result.is_ok(), "header root must be published, got {:?}", accepted.result);
+    assert_eq!(accepted.signer_calls, 1);
+    assert_eq!(accepted.publish_calls, 1);
+
+    let rejected = propose_with_parent(100, header_parent, Some(expected)).await;
+    assert!(
+        matches!(
+            rejected.result,
+            Err(BlockServiceError::ParentRootMismatch { expected, got, .. })
+            if expected == header && got == header_parent
+        ),
+        "header parent must be rejected, got {:?}",
+        rejected.result
+    );
+    assert_eq!(rejected.signer_calls, 0);
+    assert_eq!(rejected.publish_calls, 0);
 }
 
 /// Correct proposer_index with None parent_root — proposal proceeds.
@@ -1219,6 +1430,7 @@ fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBloc
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1272,7 +1484,7 @@ fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
 #[tokio::test]
 async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count() {
     let pubkey = test_pubkey();
-    let slot = 1000;
+    let slot = 50 * SLOTS_PER_EPOCH;
     let commitments = [[0xee; 48], [0xff; 48]];
 
     let response = block_and_blobs_response(slot, &commitments);
@@ -1290,7 +1502,7 @@ async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count
 #[tokio::test]
 async fn commitment_count_mismatch_still_warns_only() {
     let pubkey = test_pubkey();
-    let slot = 2000;
+    let slot = 50 * SLOTS_PER_EPOCH;
 
     // Body has 2 commitments. One blob and one proof: cardinality passes, the
     // commitment count does not.
@@ -1319,6 +1531,7 @@ async fn commitment_count_mismatch_still_warns_only() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
 
     let signer = Arc::new(MockSigner::new());
@@ -1369,6 +1582,7 @@ fn contents_response(data: serde_json::Value, version: &str) -> ProduceBlockResp
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1379,13 +1593,14 @@ struct ContentsHarness {
 }
 
 fn contents_harness(response: ProduceBlockResponse, pubkey: &PublicKey) -> ContentsHarness {
+    let version = response.consensus_version.clone();
     let signer = Arc::new(MockSigner::new());
     let beacon = Arc::new(MockBeaconClient::from_response(response));
     let service = BlockService::new(
         signer.clone(),
         beacon.clone(),
         Arc::new(test_validator_store(pubkey)),
-        Arc::new(test_fork_schedule()),
+        Arc::new(test_fork_schedule_for(&version)),
         [0xaa; 32],
     );
     ContentsHarness { service, signer, beacon }
@@ -1539,4 +1754,718 @@ async fn test_propose_block_rejects_mismatched_proposer_index() {
         ),
         "expected ProposerIndexMismatch {{ expected: 42, got: 99 }}"
     );
+}
+
+fn ranked_service(
+    blocks: Vec<BeaconBlock>,
+    signer: MockSigner,
+    beacon_extra: impl FnOnce(MockBeaconClient) -> MockBeaconClient,
+) -> (BlockService<MockSigner, MockBeaconClient>, Arc<MockSigner>, Arc<MockBeaconClient>, PublicKey)
+{
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(beacon_extra(
+        MockBeaconClient::unblinded(test_block(1)).with_ranked_blocks(blocks),
+    ));
+    let signer = Arc::new(signer);
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    (service, signer, beacon, pubkey)
+}
+
+/// A stale-parent candidate is skipped. The next candidate on the expected
+/// parent is the only block signed and published.
+#[tokio::test]
+async fn test_ranked_stale_parent_signs_the_expected_parent() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let stale: Root = [0x33; 32];
+    let mut bad = test_block(slot);
+    bad.parent_root = stale;
+    let mut good = test_block(slot);
+    good.parent_root = expected;
+    good.state_root = [0x44; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![bad, good], MockSigner::new(), |client| client);
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "expected-parent candidate must be signed: {result:?}");
+
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "exactly one sign_block_header");
+    assert_eq!(headers[0].header.parent_root, expected);
+    drop(headers);
+    assert_eq!(signer.block_calls.lock().unwrap().len(), 1);
+    let published = beacon.publish_full_calls.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].slot, slot);
+    assert_eq!(published[0].proposer_index, 42);
+}
+
+/// Every candidate fails parent or proposer checks. The last validation error
+/// is returned and the signer is not called.
+#[tokio::test]
+async fn test_ranked_all_candidates_rejected_does_not_sign() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let first_parent: Root = [0x33; 32];
+    let last_parent: Root = [0x44; 32];
+    let mut first = test_block(slot);
+    first.parent_root = first_parent;
+    let mut last = test_block(slot);
+    last.parent_root = last_parent;
+    last.proposer_index = 7;
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, last], MockSigner::new(), |client| client);
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await
+        .expect_err("both candidates must be rejected");
+    assert!(
+        matches!(err, BlockServiceError::ProposerIndexMismatch { expected: 42, got: 7 }),
+        "last candidate's proposer mismatch is the returned error, got {err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_full_calls.lock().unwrap().is_empty());
+}
+
+/// Signer refusal on the first passing candidate is final.
+#[tokio::test]
+async fn test_ranked_signer_refusal_does_not_sign_the_next_candidate() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let mut first = test_block(slot);
+    first.parent_root = expected;
+    let mut second = test_block(slot);
+    second.parent_root = expected;
+    second.state_root = [0x55; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, second], MockSigner::new().with_block_error(), |client| client);
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: None, closed: false }),
+        )
+        .await
+        .expect_err("signer refusal must fail the proposal");
+    assert!(matches!(err, BlockServiceError::Signer(_)), "got {err:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [2u8; 32]);
+    assert!(beacon.publish_full_calls.lock().unwrap().is_empty());
+}
+
+/// Publish failure after the first signature does not sign another candidate.
+#[tokio::test]
+async fn test_ranked_publish_failure_does_not_sign_the_next_candidate() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let mut first = test_block(slot);
+    first.parent_root = expected;
+    first.state_root = [0x61; 32];
+    let mut second = test_block(slot);
+    second.parent_root = expected;
+    second.state_root = [0x62; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, second], MockSigner::new(), |client| {
+            client.with_publish_error()
+        });
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: None, closed: false }),
+        )
+        .await
+        .expect_err("publish failure must fail the proposal");
+    assert!(matches!(err, BlockServiceError::Beacon(_)), "got {err:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [0x61; 32]);
+    assert_eq!(beacon.publish_calls.lock().unwrap().len(), 1);
+}
+
+fn block_with_fee(slot: Slot, parent: Root, state: Root, fee: [u8; 20]) -> BeaconBlock {
+    let mut body = eth_types::external_vector_deneb_body();
+    body.execution_payload.fee_recipient = fee;
+    BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: parent,
+        state_root: state,
+        body: body.as_ssz_bytes(),
+    }
+}
+
+fn json_fee_response(fee: &str, blinded: bool) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "11".repeat(32)),
+            "state_root": format!("0x{}", "22".repeat(32)),
+            "body": { "execution_payload": { "fee_recipient": fee } },
+        }),
+        is_blinded: blinded,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    }
+}
+
+/// A readable mismatch increments once. A match, a blinded block, and an
+/// unreadable fee do not.
+#[test]
+fn signed_fee_penalty_counts_only_a_readable_mismatch() {
+    let wrong = "0x2222222222222222222222222222222222222222";
+    let matching = "0x0000000000000000000000000000000000000000";
+    with_signed_fee_penalty_lock(|| {
+        let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(wrong, false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(matching, false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(wrong, true),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response("0xzz", false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+    });
+}
+
+/// The fee-matching head fails prepare. The wrong-fee candidate is signed,
+/// and that signature is the one that warns and counts.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_ranked_skipped_fee_match_signs_the_mismatch() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let matching = block_with_fee(slot, [0x33; 32], [0x41; 32], [0u8; 20]);
+    let wrong = block_with_fee(slot, expected, [0x44; 32], [0x22; 20]);
+    let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let (service, signer, _beacon, pubkey) =
+        ranked_service(vec![matching, wrong], MockSigner::new(), |client| client);
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "the wrong-fee candidate must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "the fee-matching stale parent must not be signed");
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [0x44; 32]);
+    drop(headers);
+    assert!(logs_contain("signing block with fee-recipient mismatch"));
+    assert!(logs_contain("0x2222222222222222222222222222222222222222"));
+    assert!(logs_contain("fee_expected=0x0000000000000000000000000000000000000000"));
+    assert!(
+        crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get() > before,
+        "signing the mismatch must increment the penalty counter"
+    );
+}
+
+fn store_with_builder_flag(pubkey: &PublicKey, enabled: bool) -> validator_store::ValidatorStore {
+    let store = validator_store::ValidatorStore::new([0u8; 20], 30_000_000);
+    let mut config = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    config.builder_boost_factor = Some(150);
+    config.builder_proposals = enabled;
+    store.add_validator(config).expect("validator");
+    store
+}
+
+/// Pre-Gloas max-profit with `builder_proposals` off asks for no builder bid.
+///
+/// The produce call carries boost 0 and `LocalOnly`. A blinded response is
+/// rejected before the signer runs.
+#[tokio::test]
+async fn max_profit_requests_no_builder_bid_when_builder_proposals_is_off() {
+    assert_pre_gloas_flag_off_is_local(BlockSelectionMode::MaxProfit).await;
+}
+
+/// Builder-always follows the same flag: off means no builder bid.
+#[tokio::test]
+async fn builder_always_requests_no_builder_bid_when_builder_proposals_is_off() {
+    assert_pre_gloas_flag_off_is_local(BlockSelectionMode::BuilderAlways).await;
+}
+
+async fn assert_pre_gloas_flag_off_is_local(mode: BlockSelectionMode) {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let beacon = Arc::new(MockBeaconClient::blinded(test_blinded_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let store = store_with_builder_flag(&pubkey, false);
+    store.set_global_block_selection_mode(mode);
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&beacon),
+        Arc::new(store),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("a blinded block is not signed when builder proposals are off");
+    assert_eq!(beacon.last_produce_call().builder_boost_factor, Some(0), "{mode}");
+    let duty = beacon.last_duty.lock().expect("duty").expect("duty was sent");
+    assert_eq!(duty.shape, crate::ShapeConstraint::LocalOnly, "{mode}");
+    assert!(signer.header_calls.lock().expect("headers").is_empty(), "{mode}");
+    assert!(
+        matches!(
+            err,
+            BlockServiceError::ModeShapeMismatch {
+                mode: BlockSelectionMode::ExecutionOnly,
+                shape: crate::CandidateShape::Blinded,
+            }
+        ),
+        "{mode}: {err:?}"
+    );
+}
+
+/// Builder-only keeps the builder walk when the flag is off.
+///
+/// A local block is still a miss. A blinded block is still signed. Boost stays
+/// `u64::MAX`.
+#[tokio::test]
+async fn builder_only_with_the_flag_off_fails_closed_at_the_walk() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let local = Arc::new(MockBeaconClient::unblinded(test_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&local),
+        Arc::new(store_with_builder_flag(&pubkey, false)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect_err("builder-only does not sign a local block");
+    assert!(matches!(err, BlockServiceError::BuilderOnly(_)), "{err:?}");
+    assert_eq!(local.last_produce_call().builder_boost_factor, Some(u64::MAX));
+    assert!(signer.header_calls.lock().expect("headers").is_empty());
+
+    let blinded = Arc::new(MockBeaconClient::blinded(test_blinded_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&blinded),
+        Arc::new(store_with_builder_flag(&pubkey, false)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect("builder-only still signs a blinded block");
+    assert!(result.is_blinded);
+    assert_eq!(blinded.last_produce_call().builder_boost_factor, Some(u64::MAX));
+    assert_eq!(signer.header_calls.lock().expect("headers").len(), 1);
+}
+
+/// Gloas does not turn the flag off into boost 0. V4 still uses the store boost.
+#[tokio::test]
+async fn gloas_max_profit_keeps_builder_boost_when_builder_proposals_is_off() {
+    let slot = test_gloas_slot();
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(super::mode::gloas_beacon(slot));
+    let signer = Arc::new(MockSigner::new());
+    let service = super::mode::gloas(
+        Arc::clone(&signer),
+        Arc::clone(&beacon),
+        &pubkey,
+        store_with_builder_flag(&pubkey, false),
+        Arc::new(CircuitBreakerState::new(0, 0)),
+        None,
+    );
+    let result = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit)
+        .await
+        .expect("Gloas max-profit still signs an external bid");
+    assert!(result.builder_path);
+    let calls = beacon.produce_v4_calls.lock().expect("v4");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].builder_config.builder_boost_factor, 150);
+}
+
+#[tokio::test]
+async fn fresh_block_duty_with_no_admitted_node_signs_no_randao() {
+    let pubkey = test_pubkey();
+    let slot = 64;
+    let mut beacon = MockBeaconClient::unblinded(test_block(slot));
+    beacon.refuse_admission = true;
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("halted");
+    assert!(err.to_string().contains("no admitted beacon node"), "{err}");
+    assert!(signer.randao_calls.lock().unwrap().is_empty());
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn block_candidate_captured_before_revocation_is_not_signed() {
+    use std::sync::atomic::Ordering;
+    let pubkey = test_pubkey();
+    let slot = 64;
+    let beacon = MockBeaconClient::unblinded(test_block(slot));
+    let revocation = Arc::clone(&beacon.revocation);
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    service.set_after_produce(move || {
+        revocation.fetch_add(1, Ordering::Release);
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("revoked");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert_eq!(signer.randao_calls.lock().unwrap().len(), 1, "RANDAO at duty start is kept");
+    assert!(signer.header_calls.lock().unwrap().is_empty(), "the candidate is not signed");
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+}
+
+/// Holds the fee-penalty lock across a current-thread proposal so the delta
+/// is not a race with another test's increment.
+fn assert_penalty_delta(delta: u64, body: impl std::future::Future<Output = ()>) {
+    with_signed_fee_penalty_lock(|| {
+        let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("penalty runtime");
+        runtime.block_on(body);
+        assert_eq!(
+            crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(),
+            before + delta,
+            "fee penalty delta"
+        );
+    });
+}
+
+fn service_for(
+    _pubkey: &PublicKey,
+    signer: MockSigner,
+    beacon: MockBeaconClient,
+    store: Arc<validator_store::ValidatorStore>,
+) -> BlockService<MockSigner, MockBeaconClient> {
+    BlockService::new(
+        Arc::new(signer),
+        Arc::new(beacon),
+        store,
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    )
+}
+
+/// A signer refusal is not a signed mismatch. The counter stays put and the
+/// warning is not emitted.
+#[test]
+#[tracing_test::traced_test]
+fn signer_refusal_does_not_count_a_fee_penalty() {
+    assert_penalty_delta(0, async {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let parent = [0x11u8; 32];
+        let block = block_with_fee(slot, parent, [0x44; 32], [0x22; 20]);
+        let beacon = MockBeaconClient::unblinded(block);
+        let service = service_for(
+            &pubkey,
+            MockSigner::new().with_block_error(),
+            beacon,
+            Arc::new(test_validator_store(&pubkey)),
+        );
+        let err = service
+            .propose_block(
+                slot,
+                &pubkey,
+                42,
+                Some(ExpectedParents { root: parent, parent: None, closed: false }),
+            )
+            .await
+            .expect_err("the signer refuses");
+        assert!(matches!(err, BlockServiceError::Signer(_)), "{err:?}");
+        assert!(
+            !logs_contain("signing block with fee-recipient mismatch"),
+            "a refused signature must not warn"
+        );
+    });
+}
+
+/// The duty fee is the one captured before produce. A store update after
+/// produce does not erase the mismatch.
+#[test]
+#[tracing_test::traced_test]
+fn penalty_compares_against_the_duty_fee_recipient() {
+    assert_penalty_delta(1, async {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let parent = [0x11u8; 32];
+        let block_fee = [0x22u8; 20];
+        let block = block_with_fee(slot, parent, [0x44; 32], block_fee);
+        let beacon = Arc::new(MockBeaconClient::unblinded(block));
+        let signer = Arc::new(MockSigner::new());
+        let store = Arc::new(test_validator_store(&pubkey));
+        let hook_store = Arc::clone(&store);
+        let service = BlockService::new(
+            signer.clone(),
+            beacon.clone(),
+            store,
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        service.set_after_produce(move || {
+            hook_store
+                .apply_default_update(validator_store::DefaultUpdate {
+                    fee_recipient: Some(block_fee),
+                    ..validator_store::DefaultUpdate::default()
+                })
+                .expect("fee update");
+        });
+        let result = service
+            .propose_block(
+                slot,
+                &pubkey,
+                42,
+                Some(ExpectedParents { root: parent, parent: None, closed: false }),
+            )
+            .await;
+        assert!(result.is_ok(), "the mismatch is still signed: {result:?}");
+        assert_eq!(signer.header_calls.lock().unwrap().len(), 1);
+        assert_eq!(beacon.publish_calls.lock().unwrap().len(), 1);
+        assert!(logs_contain("signing block with fee-recipient mismatch"));
+        assert!(logs_contain("fee_expected=0x0000000000000000000000000000000000000000"));
+        assert!(logs_contain("fee_got=0x2222222222222222222222222222222222222222"));
+        assert!(logs_contain("proposer=42"));
+        assert!(logs_contain(&format!("parent=0x{}", hex::encode(parent))));
+        assert!(logs_contain("fork=deneb") || logs_contain("fork=\"deneb\""));
+        assert!(logs_contain("exec="));
+    });
+}
+
+/// The re-org parent and the duty fee are the values `produce_block_v3_ranked_by` sees.
+#[tokio::test]
+async fn test_propose_block_forwards_reorg_parent_into_produce_duty() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let header = [0x11u8; 32];
+    let reorg = [0x22u8; 32];
+    let mut block = test_block(slot);
+    block.parent_root = header;
+    let beacon = Arc::new(MockBeaconClient::unblinded(block));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer,
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: header, parent: Some(reorg), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    let duty = beacon.last_duty.lock().unwrap().expect("duty was recorded");
+    assert_eq!(duty.expected_parent_root, Some(header));
+    assert_eq!(duty.alternate_parent_root, Some(reorg));
+    assert!(!duty.parent_closed);
+    assert_eq!(duty.expected_fee_recipient, Some([0u8; 20]));
+}
+
+/// SSZ blinded block whose parent is the re-org root is signed.
+#[tokio::test]
+async fn test_propose_block_ssz_blinded_accepts_reorg_parent() {
+    let slot = 100;
+    let header = [0x11u8; 32];
+    let reorg = [0x22u8; 32];
+    let mut block = eth_types::external_vector_deneb_blinded_block();
+    block.slot = slot;
+    block.proposer_index = 42;
+    block.parent_root = reorg;
+    let response = ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: true,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(eth_types::encode_blinded_beacon_block_ssz(&block, 0)),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    };
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: header, parent: Some(reorg), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "SSZ blinded re-org parent must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, reorg);
+    drop(headers);
+    assert_eq!(beacon.publish_ssz_calls.lock().unwrap().len(), 1);
+}
+
+fn ranked_response(block: BeaconBlock, value: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::to_value(&block).expect("block json"),
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some(value.to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    }
+}
+
+/// The mock returns both candidates. The walk skips the higher-value body
+/// that cannot be prepared and signs the next one.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_higher_value_unpreparable_candidate_is_skipped_by_the_walk() {
+    let slot = 100;
+    let parent = [0x11u8; 32];
+    let broken = ProduceBlockResponse {
+        data: serde_json::json!({
+            "slot": slot.to_string(),
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", hex::encode(parent)),
+            "state_root": format!("0x{}", "44".repeat(32)),
+            "body": { "execution_payload": { "fee_recipient": "0x0000000000000000000000000000000000000000" } },
+        }),
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("9000".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    };
+    let mut good = test_block(slot);
+    good.parent_root = parent;
+    good.state_root = [0x44; 32];
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(
+        MockBeaconClient::unblinded(test_block(1))
+            .with_ranked_responses(vec![broken, ranked_response(good, "1")]),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: parent, parent: None, closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "the preparable candidate must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "the unpreparable head must not be signed");
+    assert_eq!(headers[0].header.parent_root, parent);
+    assert_eq!(headers[0].header.state_root, [0x44; 32]);
+    assert!(logs_contain("BN block response rejected"), "the walk must log the skip");
 }

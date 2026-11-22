@@ -39,24 +39,45 @@ fn near_gloas_fork() -> ForkSchedule {
     }
 }
 
-fn gloas_block(slot: u64) -> BeaconBlock {
-    BeaconBlock {
+fn self_build_block(slot: u64) -> BeaconBlock {
+    let parent_root = [1u8; 32];
+    let spec = hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap();
+    let body = rvc_gloas::body_with_bid_binding(
+        &spec,
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
         slot,
-        proposer_index: 42,
-        parent_root: [1u8; 32],
-        state_root: [2u8; 32],
-        body: hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap(),
-    }
+        parent_root,
+    )
+    .expect("spec body accepts a self-build index");
+    BeaconBlock { slot, proposer_index: 42, parent_root, state_root: [2u8; 32], body }
 }
 
 fn contents_json(slot: u64) -> serde_json::Value {
-    let envelope =
-        format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+    let block = self_build_block(slot);
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    let spec =
+        hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap();
+    let bound = rvc_gloas::envelope_with_binding(
+        &spec,
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding");
     serde_json::json!({
         "version": "gloas",
         "data": {
-            "block": gloas_block(slot),
-            "execution_payload_envelope": envelope,
+            "block": block,
+            "execution_payload_envelope": format!("0x{}", hex::encode(bound)),
             "kzg_proofs": ["0xaa"],
             "blobs": ["0xbb"],
         }
@@ -85,15 +106,23 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
         .expect(1)
         .mount(&producer)
         .await;
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let (envelope_tx, envelope_rx) = std::sync::mpsc::channel();
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/blocks"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("producer has no cache"))
+        .respond_with(rvc_test_support::SignalOnReceipt::new(
+            ResponseTemplate::new(500).set_body_string("producer has no cache"),
+            block_tx,
+        ))
         .expect(1..)
         .mount(&producer)
         .await;
     Mock::given(method("POST"))
         .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
-        .respond_with(ResponseTemplate::new(500).set_body_string("producer has no cache"))
+        .respond_with(rvc_test_support::SignalOnReceipt::new(
+            ResponseTemplate::new(500).set_body_string("producer has no cache"),
+            envelope_tx,
+        ))
         .expect(1..)
         .mount(&producer)
         .await;
@@ -121,7 +150,7 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
 
     let manager = BnManager::new(BnManagerConfig::new(vec![producer.uri(), publisher.uri()]))
         .expect("BnManager");
-    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let pubkey = SecretKey::generate().public_key();
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
     store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
@@ -135,6 +164,19 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "second-BN self-build must succeed: {result:?}");
+
+    // Broadcast returns on the first 200 and drains the other BN off the
+    // caller. Both producer publishes notify before wiremock's expect() check.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        tokio::task::spawn_blocking(move || {
+            block_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("producer block");
+            envelope_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("producer envelope");
+        }),
+    )
+    .await
+    .expect("producer publish wait hung")
+    .expect("producer publish wait");
 
     let publisher_reqs = publisher.received_requests().await.unwrap();
     assert!(

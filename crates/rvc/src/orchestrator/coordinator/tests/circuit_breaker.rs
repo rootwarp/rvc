@@ -82,8 +82,8 @@ async fn test_non_builder_timeout_does_not_trip_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    let ctx = SlotContext::bare(slot, epoch);
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // Non-builder BN error must NOT record a miss.
     assert_eq!(
@@ -133,9 +133,10 @@ async fn test_builder_timeout_trips_breaker() {
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits this proposal (mirrors startup registration).
-    validator_store
-        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
-        .unwrap();
+    // The flag must be on: pre-Gloas builder-always with it off is local-only.
+    let mut validator = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    validator_store.add_validator(validator).unwrap();
     validator_store
         .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
 
@@ -166,8 +167,8 @@ async fn test_builder_timeout_trips_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    let ctx = SlotContext::bare(slot, epoch);
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // Builder BN error MUST record a miss.
     assert_eq!(
@@ -254,8 +255,8 @@ async fn test_signer_error_does_not_trip_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    let ctx = SlotContext::bare(slot, epoch);
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // Signer error must NOT record a miss.
     assert_eq!(

@@ -25,7 +25,7 @@
 //! - **remove** only after successful intentional re-import via the Keymanager API.
 //! - Loaders consult [`DeletionDenylist::contains`] and skip matching keys.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,31 @@ use tracing::{info, warn};
 
 /// Filename under the data directory for the denylist.
 pub const DELETED_KEYS_FILENAME: &str = ".rvc.deleted_keys";
+
+#[cfg(test)]
+thread_local! {
+    /// Every handle [`sync_handle`] fsyncs on this thread, in call order.
+    static DENYLIST_SYNCS: std::cell::RefCell<Vec<Synced>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The next fsync of this directory in [`sync_dir`] fails.
+    static DENYLIST_DIR_SYNC_FAILS: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One fsync seen by tests: the path the handle was opened from, keyed by
+/// whether `fstat` on that same handle says it is a directory.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Synced {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+/// Drain the fsyncs this thread has done so far.
+#[cfg(test)]
+pub(crate) fn take_syncs() -> Vec<Synced> {
+    DENYLIST_SYNCS.with(|syncs| std::mem::take(&mut *syncs.borrow_mut()))
+}
 
 /// Absolute path of the denylist file for `data_dir`.
 pub fn deleted_keys_path(data_dir: &Path) -> PathBuf {
@@ -62,6 +87,12 @@ pub enum DeletionDenylistError {
 pub struct DeletionDenylist {
     path: PathBuf,
     keys: Mutex<HashSet<[u8; 48]>>,
+    /// Directories a create still owes an fsync: the parent of a file this
+    /// instance created, each directory `create_dir_all` made for it, and the
+    /// deepest ancestor that already existed. Emptied only after all of them
+    /// are fsynced, so a failed insert leaves them to the next one. Locked
+    /// only while `keys` is held.
+    unsynced_dirs: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl DeletionDenylist {
@@ -79,7 +110,7 @@ impl DeletionDenylist {
                 "Loaded deletion denylist"
             );
         }
-        Ok(Self { path, keys: Mutex::new(keys) })
+        Ok(Self { path, keys: Mutex::new(keys), unsynced_dirs: Mutex::default() })
     }
 
     /// Construct an in-memory denylist bound to `path` without reading disk.
@@ -87,7 +118,7 @@ impl DeletionDenylist {
     /// Intended for tests that control persistence explicitly.
     #[cfg(test)]
     pub fn empty_at(path: PathBuf) -> Self {
-        Self { path, keys: Mutex::new(HashSet::new()) }
+        Self { path, keys: Mutex::new(HashSet::new()), unsynced_dirs: Mutex::default() }
     }
 
     /// Path of the backing file.
@@ -116,6 +147,12 @@ impl DeletionDenylist {
     }
 
     /// Record a deleted pubkey. Idempotent; persists immediately.
+    ///
+    /// The file is fsynced. When this call creates the file, its parent
+    /// directory is fsynced too. When it also has to create that directory,
+    /// every directory it creates and the deepest ancestor that already
+    /// existed are fsynced as well. A directory fsync that fails stays owed:
+    /// the next insert retries it, even though the file then exists.
     pub fn insert(&self, pubkey: &[u8; 48]) -> Result<(), DeletionDenylistError> {
         let mut keys = self.keys.lock();
         if !keys.insert(*pubkey) {
@@ -124,7 +161,7 @@ impl DeletionDenylist {
         }
         // Drop the set mutation intent only after durable write succeeds: if
         // append fails, roll back the in-memory insert so state stays consistent.
-        if let Err(e) = append_pubkey(&self.path, pubkey) {
+        if let Err(e) = append_pubkey(&self.path, pubkey, &mut self.unsynced_dirs.lock()) {
             keys.remove(pubkey);
             return Err(e);
         }
@@ -215,46 +252,94 @@ fn set_owner_only_perms(path: &Path) -> Result<(), DeletionDenylistError> {
     Ok(())
 }
 
-fn append_pubkey(path: &Path, pubkey: &[u8; 48]) -> Result<(), DeletionDenylistError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent).map_err(|source| DeletionDenylistError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+fn append_pubkey(
+    path: &Path,
+    pubkey: &[u8; 48],
+    unsynced_dirs: &mut BTreeSet<PathBuf>,
+) -> Result<(), DeletionDenylistError> {
+    let io = |source| DeletionDenylistError::Io { path: path.to_path_buf(), source };
+    let parent = parent_dir(path);
+    if !parent.exists() {
+        // Owed before the create, so a partial `create_dir_all` stays owed.
+        unsynced_dirs.extend(dirs_create_dir_all_adds_to(parent));
+        fs::create_dir_all(parent)
+            .map_err(|source| DeletionDenylistError::Io { path: parent.to_path_buf(), source })?;
+    }
+
+    let mut file = match open_for_append(path, true) {
+        Ok(file) => {
+            unsynced_dirs.insert(parent.to_path_buf());
+            file
         }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_for_append(path, false).map_err(io)?
+        }
+        Err(e) => return Err(io(e)),
+    };
+    file.write_all(format_pubkey_line(pubkey).as_bytes()).map_err(io)?;
+    sync_handle(&file, path).map_err(io)?;
+    for dir in unsynced_dirs.iter() {
+        sync_dir(dir).map_err(|source| DeletionDenylistError::Io { path: dir.clone(), source })?;
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-        file.write_all(format_pubkey_line(pubkey).as_bytes())
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-        file.sync_all()
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-        file.write_all(format_pubkey_line(pubkey).as_bytes())
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-        file.sync_all()
-            .map_err(|source| DeletionDenylistError::Io { path: path.to_path_buf(), source })?;
-    }
+    unsynced_dirs.clear();
 
     // Ensure mode even if the file already existed with looser perms.
     set_owner_only_perms(path)?;
+    Ok(())
+}
+
+fn open_for_append(path: &Path, create_new: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).create_new(create_new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// `dir`, each missing ancestor, and the deepest ancestor that exists: the
+/// directories that gain an entry when `create_dir_all(dir)` runs.
+fn dirs_create_dir_all_adds_to(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for ancestor in dir.ancestors() {
+        let ancestor = if ancestor.as_os_str().is_empty() { Path::new(".") } else { ancestor };
+        dirs.push(ancestor.to_path_buf());
+        if ancestor.exists() {
+            break;
+        }
+    }
+    dirs
+}
+
+/// Make the entries in `dir` durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if DENYLIST_DIR_SYNC_FAILS
+        .with(|failing| failing.borrow_mut().take_if(|failing| failing.as_path() == dir).is_some())
+    {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    sync_handle(&File::open(dir)?, dir)
+}
+
+/// `sync_all` on `handle`, opened from `path`.
+fn sync_handle(handle: &File, path: &Path) -> std::io::Result<()> {
+    handle.sync_all()?;
+    #[cfg(test)]
+    {
+        let synced = if handle.metadata()?.is_dir() { Synced::Dir } else { Synced::File };
+        DENYLIST_SYNCS.with(|syncs| syncs.borrow_mut().push(synced(path.to_path_buf())));
+    }
+    let _ = path;
     Ok(())
 }
 
@@ -326,6 +411,117 @@ mod tests {
         pk[0] = seed;
         pk[47] = seed.wrapping_add(1);
         pk
+    }
+
+    fn file(path: &Path) -> Synced {
+        Synced::File(path.to_path_buf())
+    }
+
+    fn dir(path: &Path) -> Synced {
+        Synced::Dir(path.to_path_buf())
+    }
+
+    struct ClearDirSyncFail;
+    impl Drop for ClearDirSyncFail {
+        fn drop(&mut self) {
+            DENYLIST_DIR_SYNC_FAILS.with(|failing| failing.take());
+        }
+    }
+
+    fn arm_dir_sync_fail(failing: &Path) -> ClearDirSyncFail {
+        DENYLIST_DIR_SYNC_FAILS.with(|slot| slot.replace(Some(failing.to_path_buf())));
+        ClearDirSyncFail
+    }
+
+    #[test]
+    fn insert_fsyncs_the_parent_directory_when_it_creates_the_file() {
+        let root = TempDir::new().unwrap();
+        let path = deleted_keys_path(root.path());
+        let denylist = DeletionDenylist::load(root.path()).unwrap();
+        take_syncs();
+        denylist.insert(&sample_pubkey(1)).unwrap();
+        assert_eq!(take_syncs(), [file(&path), dir(root.path())]);
+        denylist.insert(&sample_pubkey(2)).unwrap();
+        assert_eq!(
+            take_syncs(),
+            [file(&path)],
+            "an append to an existing file does not fsync the parent"
+        );
+
+        let created = root.path().join("created");
+        let nested = created.join("by-insert");
+        let denylist = DeletionDenylist::load(&nested).unwrap();
+        denylist.insert(&sample_pubkey(3)).unwrap();
+        assert_eq!(
+            take_syncs(),
+            [file(&deleted_keys_path(&nested)), dir(root.path()), dir(&created), dir(&nested)],
+            "every directory create_dir_all made, and the ancestor that held the first one"
+        );
+    }
+
+    #[test]
+    fn a_failed_parent_fsync_rolls_back_the_insert() {
+        let root = TempDir::new().unwrap();
+        let path = deleted_keys_path(root.path());
+        let denylist = DeletionDenylist::load(root.path()).unwrap();
+        let pk = sample_pubkey(4);
+        let guard = arm_dir_sync_fail(root.path());
+        let err = denylist.insert(&pk).expect_err("a failed parent fsync is reported");
+        drop(guard);
+        assert!(
+            matches!(&err, DeletionDenylistError::Io { path, .. } if path == root.path()),
+            "{err}"
+        );
+        assert!(!denylist.contains(&pk), "the in-memory insert is rolled back");
+        take_syncs();
+        denylist.insert(&pk).expect("retry");
+        assert_eq!(
+            take_syncs(),
+            [file(&path), dir(root.path())],
+            "the retry fsyncs the parent the failed create left unsynced"
+        );
+        assert!(denylist.contains(&pk));
+        assert!(DeletionDenylist::load(root.path()).unwrap().contains(&pk));
+    }
+
+    #[test]
+    fn a_failed_ancestor_fsync_stays_owed_to_the_retry() {
+        let root = TempDir::new().unwrap();
+        let created = root.path().join("created");
+        let nested = created.join("by-insert");
+        let path = deleted_keys_path(&nested);
+        let denylist = DeletionDenylist::load(&nested).unwrap();
+        let pk = sample_pubkey(5);
+        let guard = arm_dir_sync_fail(root.path());
+        let err = denylist.insert(&pk).expect_err("a failed ancestor fsync is reported");
+        drop(guard);
+        assert!(
+            matches!(&err, DeletionDenylistError::Io { path, .. } if path == root.path()),
+            "{err}"
+        );
+        assert!(!denylist.contains(&pk), "the in-memory insert is rolled back");
+        assert!(nested.is_dir(), "the directories stay created");
+        take_syncs();
+        denylist.insert(&pk).expect("retry");
+        assert_eq!(
+            take_syncs(),
+            [file(&path), dir(root.path()), dir(&created), dir(&nested)],
+            "the retry fsyncs every directory the failed insert created"
+        );
+        take_syncs();
+        denylist.insert(&sample_pubkey(6)).unwrap();
+        assert_eq!(take_syncs(), [file(&path)], "nothing is owed after the retry");
+        assert!(DeletionDenylist::load(&nested).unwrap().contains(&pk));
+    }
+
+    #[test]
+    fn relative_dirs_to_fsync_end_at_the_current_directory() {
+        let absent = Path::new("rvc-denylist-test-absent");
+        let nested = absent.join("keystore");
+        assert_eq!(
+            dirs_create_dir_all_adds_to(&nested),
+            [nested.clone(), absent.to_path_buf(), PathBuf::from(".")]
+        );
     }
 
     #[test]

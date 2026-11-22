@@ -51,7 +51,7 @@ impl GrpcSignerArgs {
 
 /// gRPC remote signer connection settings (resolved / `Config` field).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GrpcSignerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
