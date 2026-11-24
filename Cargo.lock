@@ -4118,6 +4118,7 @@ dependencies = [
  "rvc-slashing",
  "rvc-telemetry",
  "serde_json",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

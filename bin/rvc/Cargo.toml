@@ -60,3 +60,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["blocking"] }
 libc.workspace = true
 wiremock.workspace = true
+syn = { version = "=2.0.117", features = ["full", "visit"] }

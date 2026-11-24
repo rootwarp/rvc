@@ -10,7 +10,9 @@
 //!    SEC-2c liveness loop (not the legacy one-shot service).
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use bn_manager::BeaconNodeClient;
 use eth_types::ForkSchedule;
@@ -38,6 +40,54 @@ pub const EXIT_LISTENER_BIND: i32 = 15;
 /// A registered task panicked. The drain has already finished; supervisors
 /// that restart on non-zero will restart the process.
 pub const EXIT_CRITICAL_TASK_FAILED: i32 = 16;
+
+/// The longest time that the process waits, after the async work of `main`
+/// has returned, for blocking work that is still running: a detection write
+/// that timed out, or a signer or import body whose caller is gone. Then
+/// [`block_on_then_shutdown`] abandons that work, so the named exit code is
+/// not held by a blocking call that does not return. An exit with no blocking
+/// work still running does not wait.
+pub const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `fut` to completion on `runtime`, then shut the runtime down with
+/// [`RUNTIME_SHUTDOWN_GRACE`] for its blocking work, and return the output.
+///
+/// The runtime is shut down and dropped when this returns, so the caller can
+/// then call `process::exit` (ARCH-2i). This function does not exit.
+///
+/// # Examples
+///
+/// ```
+/// let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+/// assert_eq!(rvc::startup::block_on_then_shutdown(runtime, async { 7 }), 7);
+/// ```
+pub fn block_on_then_shutdown<F: Future>(runtime: tokio::runtime::Runtime, fut: F) -> F::Output {
+    block_on_then_shutdown_within(runtime, fut, RUNTIME_SHUTDOWN_GRACE)
+}
+
+/// [`block_on_then_shutdown`] with the grace `grace`.
+pub(crate) fn block_on_then_shutdown_within<F: Future>(
+    runtime: tokio::runtime::Runtime,
+    fut: F,
+    grace: Duration,
+) -> F::Output {
+    let out = runtime.block_on(fut);
+    shutdown_runtime(runtime, grace);
+    out
+}
+
+/// The one call that gives the grace to Tokio.
+fn shutdown_runtime(runtime: tokio::runtime::Runtime, grace: Duration) {
+    #[cfg(test)]
+    SHUTDOWN_GRACE.with(|seen| seen.set(Some(grace)));
+    runtime.shutdown_timeout(grace);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The grace of the last shutdown on this thread.
+    static SHUTDOWN_GRACE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
 
 /// Errors specific to the startup sequence.
 #[derive(Debug, thiserror::Error)]
@@ -390,6 +440,270 @@ pub fn acquire_keystore_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opens the gate when it drops, also on a panic.
+    struct OpenOnDrop(std::sync::Arc<crate::detection_marker::FsyncGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// Run a future that leaves one blocking task parked in a gate, shut the
+    /// runtime down with `shutdown`, and return the output, the parked count
+    /// and the watchdog state at the return.
+    fn shut_down_with_a_parked_task(
+        watchdog: Duration,
+        shutdown: impl FnOnce(
+            tokio::runtime::Runtime,
+            std::pin::Pin<Box<dyn Future<Output = i32>>>,
+        ) -> i32,
+    ) -> (i32, usize, bool) {
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(watchdog);
+        let opener = OpenOnDrop(std::sync::Arc::clone(&gate));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("The test needs a runtime.");
+        let parked = std::sync::Arc::clone(&gate);
+        let fut = async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _stuck = tokio::task::spawn_blocking(move || {
+                parked.wait_open(move || {
+                    let _ = tx.send(());
+                });
+            });
+            rx.await.expect("The blocking task must report that it waits in the gate.");
+            7
+        };
+        let out = shutdown(runtime, Box::pin(fut));
+        let state = (out, gate.blocked(), gate.watchdog_fired());
+        drop(opener);
+        state
+    }
+
+    #[test]
+    fn shutdown_returns_while_a_blocking_task_is_still_running() {
+        let state = shut_down_with_a_parked_task(Duration::from_secs(10), |runtime, fut| {
+            block_on_then_shutdown_within(runtime, fut, Duration::ZERO)
+        });
+        assert_eq!(
+            state,
+            (7, 1, false),
+            "The helper must return the output of the future while the blocking task still \
+             waits in the gate, and before the watchdog opens the gate."
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_does_not_wait_for_the_grace() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("The test needs a runtime.");
+        let start = std::time::Instant::now();
+        assert_eq!(block_on_then_shutdown(runtime, async { 7 }), 7);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "A shutdown with no blocking work must not wait for the grace: it took {elapsed:?}."
+        );
+    }
+
+    /// The production `.shutdown_timeout(..)` calls of `crates/rvc/src`.
+    #[derive(Default)]
+    struct ShutdownCalls {
+        enclosing: Vec<String>,
+        /// The enclosing fn of each call, and `true` when its one argument is
+        /// the bare path `grace`.
+        calls: Vec<(String, bool)>,
+        /// Each binding, assignment or compound assignment of `grace` in the
+        /// body of `shutdown_runtime`. The parameter is not in the body.
+        rebinds: Vec<String>,
+        /// One entry for each parameter of `shutdown_runtime` named `grace`:
+        /// `true` when it is a plain immutable binding of a `Duration`.
+        grace_params: Vec<bool>,
+    }
+
+    fn is_test_item(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().segments.last().is_some_and(|last| last.ident == "test")
+                || (attr.path().is_ident("cfg")
+                    && attr.parse_args::<syn::Ident>().is_ok_and(|arg| arg == "test"))
+        })
+    }
+
+    fn is_grace(expr: &syn::Expr) -> bool {
+        matches!(expr, syn::Expr::Path(path) if path.qself.is_none() && path.path.is_ident("grace"))
+    }
+
+    impl ShutdownCalls {
+        fn current(&self) -> String {
+            self.enclosing.last().cloned().unwrap_or_default()
+        }
+
+        fn note_grace_params(&mut self, sig: &syn::Signature) {
+            for input in &sig.inputs {
+                let syn::FnArg::Typed(arg) = input else { continue };
+                let syn::Pat::Ident(pat) = &*arg.pat else { continue };
+                if pat.ident == "grace" {
+                    let plain =
+                        pat.mutability.is_none() && pat.by_ref.is_none() && pat.subpat.is_none();
+                    let duration = matches!(&*arg.ty, syn::Type::Path(ty)
+                        if ty.path.segments.last().is_some_and(|last| last.ident == "Duration"));
+                    self.grace_params.push(plain && duration);
+                }
+            }
+        }
+
+        fn note_rebind(&mut self) {
+            if self.enclosing.iter().any(|name| name == "shutdown_runtime") {
+                self.rebinds.push(self.current());
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ShutdownCalls {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_item(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_item(&item.attrs) {
+                if item.sig.ident == "shutdown_runtime" {
+                    self.note_grace_params(&item.sig);
+                }
+                self.enclosing.push(item.sig.ident.to_string());
+                self.visit_block(&item.block);
+                self.enclosing.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_item(&item.attrs) {
+                self.enclosing.push(item.sig.ident.to_string());
+                self.visit_block(&item.block);
+                self.enclosing.pop();
+            }
+        }
+
+        fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+            if pat.ident == "grace" {
+                self.note_rebind();
+            }
+            syn::visit::visit_pat_ident(self, pat);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "shutdown_timeout" {
+                let bare = call.args.len() == 1 && call.args.first().is_some_and(is_grace);
+                self.calls.push((self.current(), bare));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+            if is_grace(&assign.left) {
+                self.note_rebind();
+            }
+            syn::visit::visit_expr_assign(self, assign);
+        }
+
+        fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+            let compound = !matches!(
+                binary.op,
+                syn::BinOp::Add(_)
+                    | syn::BinOp::Sub(_)
+                    | syn::BinOp::Mul(_)
+                    | syn::BinOp::Div(_)
+                    | syn::BinOp::Rem(_)
+                    | syn::BinOp::And(_)
+                    | syn::BinOp::Or(_)
+                    | syn::BinOp::BitXor(_)
+                    | syn::BinOp::BitAnd(_)
+                    | syn::BinOp::BitOr(_)
+                    | syn::BinOp::Shl(_)
+                    | syn::BinOp::Shr(_)
+                    | syn::BinOp::Eq(_)
+                    | syn::BinOp::Lt(_)
+                    | syn::BinOp::Le(_)
+                    | syn::BinOp::Ne(_)
+                    | syn::BinOp::Ge(_)
+                    | syn::BinOp::Gt(_)
+            );
+            if compound && is_grace(&binary.left) {
+                self.note_rebind();
+            }
+            syn::visit::visit_expr_binary(self, binary);
+        }
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("The test must read the source directory.") {
+            let path = entry.expect("The test must read a directory entry.").path();
+            if path.is_dir() && path.file_name().is_some_and(|name| name != "tests") {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn only_shutdown_runtime_calls_shutdown_timeout_with_the_bare_grace() {
+        let mut files = Vec::new();
+        rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut scan = ShutdownCalls::default();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("The test must read a source file.");
+            let parsed = syn::parse_file(&src).expect("The source must be valid Rust.");
+            syn::visit::Visit::visit_file(&mut scan, &parsed);
+        }
+        assert!(
+            files.len() > 50 && files.iter().any(|file| file.ends_with("src/startup.rs")),
+            "The scan must read the sources of the crate, startup.rs too."
+        );
+        assert_eq!(
+            (scan.calls, scan.rebinds, scan.grace_params),
+            (vec![("shutdown_runtime".to_string(), true)], Vec::<String>::new(), vec![true]),
+            "The production code must call shutdown_timeout one time, in shutdown_runtime, with \
+             its bare `grace` parameter, and must not bind or assign `grace` again. The one \
+             `grace` parameter of shutdown_runtime must be a plain immutable `Duration` binding, \
+             so rustc rejects each assignment (calls, rebinds, grace parameters)."
+        );
+    }
+
+    #[test]
+    fn public_shutdown_uses_the_grace_and_returns_while_a_blocking_task_is_still_running() {
+        assert_eq!(RUNTIME_SHUTDOWN_GRACE, Duration::from_secs(2));
+        // Only the time that the Tokio call waits shows the grace that Tokio
+        // got, so the test bounds that time. The watchdog opens the gate 1.5 s
+        // after the grace, apart from that bound.
+        let watchdog = RUNTIME_SHUTDOWN_GRACE + Duration::from_millis(1500);
+        let mut elapsed = Duration::ZERO;
+        let state = shut_down_with_a_parked_task(watchdog, |runtime, fut| {
+            let start = std::time::Instant::now();
+            let out = block_on_then_shutdown(runtime, fut);
+            elapsed = start.elapsed();
+            out
+        });
+        assert_eq!(
+            (state, SHUTDOWN_GRACE.with(std::cell::Cell::get)),
+            ((7, 1, false), Some(RUNTIME_SHUTDOWN_GRACE)),
+            "block_on_then_shutdown must shut down with RUNTIME_SHUTDOWN_GRACE and return while \
+             the blocking task still waits in the gate."
+        );
+        let limit = RUNTIME_SHUTDOWN_GRACE + Duration::from_millis(400);
+        assert!(
+            elapsed >= RUNTIME_SHUTDOWN_GRACE && elapsed < limit,
+            "block_on_then_shutdown must wait for the parked task for the grace and not longer: \
+             it took {elapsed:?}, and it must take at least {RUNTIME_SHUTDOWN_GRACE:?} and less \
+             than {limit:?}."
+        );
+    }
     use std::collections::HashMap;
 
     use beacon::{
