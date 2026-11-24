@@ -50,6 +50,8 @@ pub(crate) struct SelectionProofCache {
     entries: Mutex<Entries>,
     #[cfg(test)]
     waiter_registrations: AtomicUsize,
+    #[cfg(test)]
+    lookups: AtomicUsize,
 }
 
 enum Claim<'a> {
@@ -75,6 +77,8 @@ impl SelectionProofCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Signature, E>>,
     {
+        #[cfg(test)]
+        self.lookups.fetch_add(1, Ordering::SeqCst);
         let guard = loop {
             match self.claim(key) {
                 Claim::Ready(proof) => return Ok(proof),
@@ -101,6 +105,7 @@ impl SelectionProofCache {
     /// The cutoff never goes down. No new owner is admitted below it. An owner admitted before the
     /// eviction keeps its entry and can finish its sign. Its proof then goes to its waiters but not
     /// into the cache.
+    #[cfg_attr(not(test), expect(dead_code, reason = "W4-E8a3 calls it from the runner"))]
     pub(crate) fn evict_before(&self, slot: Slot) {
         let mut entries = self.entries.lock();
         entries.cutoff = entries.cutoff.max(slot);
@@ -111,6 +116,7 @@ impl SelectionProofCache {
     }
 
     /// Number of entries, ready or in flight.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.lock().map.len()
     }
@@ -196,6 +202,11 @@ impl SelectionProofCache {
     pub(crate) fn waiter_registrations(&self) -> usize {
         self.waiter_registrations.load(Ordering::SeqCst)
     }
+
+    /// Number of `get_or_sign` calls.
+    pub(crate) fn lookups(&self) -> usize {
+        self.lookups.load(Ordering::SeqCst)
+    }
 }
 
 /// Test harness for the cache protocol. W4-E8a2 and W4-E8a3 use it too.
@@ -250,6 +261,11 @@ pub(crate) mod test_support {
             if !self.opened.swap(true, Ordering::SeqCst) {
                 self.permits.add_permits(GATE_PERMITS);
             }
+        }
+
+        /// Waits until the gate is open.
+        pub(crate) async fn pass(&self) {
+            let _permit = self.permits.acquire().await;
         }
     }
 

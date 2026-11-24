@@ -359,7 +359,7 @@ async fn run_capped_phase(slot: Slot, epoch: u64, shape: AggregateShape) {
     let (arrived_tx, mut arrived) = watch::channel(0u64);
     let peak = Arc::new(PeakSigner::new(release_rx, arrived_tx));
     let phase_signer: Arc<dyn ValidatorSigner> = peak.clone();
-    orchestrator.aggregation_service = AggregationService::new(
+    orchestrator.aggregation_service = AggregationService::for_test(
         phase_signer.clone(),
         beacon.clone(),
         duty_tracker.clone(),

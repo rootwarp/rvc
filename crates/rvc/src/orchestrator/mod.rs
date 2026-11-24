@@ -13,7 +13,6 @@ pub(crate) mod epoch_boundary;
 mod error;
 pub mod head_events;
 pub(crate) mod payload_attestation;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod selection_proofs;
 pub(crate) mod slot_anchor;
 pub(crate) mod slot_context;

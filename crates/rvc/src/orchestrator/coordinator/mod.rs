@@ -37,6 +37,7 @@ use super::epoch_boundary::{EpochBoundaryRunner, EpochBoundaryTask};
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
+use super::selection_proofs::SelectionProofCache;
 use super::slot_anchor::SlotAnchor;
 use super::slot_context::{fetch_head_root, SlotContext};
 use super::sync_committee::SyncCommitteeService;
@@ -373,6 +374,12 @@ where
     pub(crate) pubkey_index: SharedPubkeyIndexRegistry,
     pub(crate) attestation_service: AttestationService<C, S>,
     pub(crate) aggregation_service: AggregationService,
+    /// The one selection-proof cache of this orchestrator, shared by aggregation.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "W4-E8a3 hands it to committee subscriptions")
+    )]
+    pub(crate) selection_proofs: Arc<SelectionProofCache>,
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
     pub(crate) duty_management: Arc<DutyManagementService>,
@@ -509,6 +516,7 @@ where
                 .with_builder_config_provider(Arc::new(BuilderConfigAdapter(builder.clone())));
         }
 
+        let selection_proofs = Arc::new(SelectionProofCache::default());
         let aggregation_signer: Arc<dyn ValidatorSigner> = signer.clone();
         let aggregation_service = AggregationService::new(
             aggregation_signer,
@@ -517,6 +525,7 @@ where
             pubkey_map.clone(),
             config.clone(),
             validator_store.clone(),
+            Arc::clone(&selection_proofs),
         );
 
         let sync_committee_service = SyncCommitteeService::new(
@@ -591,6 +600,7 @@ where
             pubkey_index,
             attestation_service,
             aggregation_service,
+            selection_proofs,
             sync_committee_service,
             payload_attestation_service,
             duty_management,

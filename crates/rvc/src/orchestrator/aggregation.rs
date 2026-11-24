@@ -7,14 +7,14 @@ use tracing::{debug, info, info_span, warn, Instrument, Span};
 use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use beacon::{VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
 use bn_manager::AttestationApi;
-use crypto::PublicKey;
+use crypto::{PublicKey, Signature};
 use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
     SignedElectraAggregateAndProof, Slot, MAX_COMMITTEES_PER_SLOT, MAX_VALIDATORS_PER_COMMITTEE,
 };
 use observability::logging::TruncatedPubkey;
-use signer::{is_aggregator, ValidatorSigner};
+use signer::{is_aggregator, SignerError, ValidatorSigner};
 use ssz08::Encode;
 use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
@@ -24,6 +24,7 @@ use super::dispatch::{
     sign_with_phase2_permit, Phase2SignError, Phase2SignerPermits, SlotEndDropCounter,
     SLOT_END_PUBLISH_OVERHANG,
 };
+use super::selection_proofs::{SelectionProofCache, SelectionProofError};
 use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
@@ -36,6 +37,8 @@ pub(crate) struct AggregationService {
     /// present in attestation.rs so that aggregation and selection proofs
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
+    /// Selection proofs shared with committee subscriptions, by `(slot, pubkey)`.
+    selection_proofs: Arc<SelectionProofCache>,
     /// Aggregator duties not pulled onto the sign pipeline before slot end.
     slot_end_drops: SlotEndDropCounter,
 }
@@ -45,6 +48,28 @@ enum ProducedAggregate {
     PreElectra(SignedAggregateAndProof),
     Electra(SignedElectraAggregateAndProof),
     Gloas(SignedElectraAggregateAndProof),
+}
+
+/// Why [`AggregationService::selection_proof`] gave no proof.
+#[derive(Debug)]
+enum ProofSkip {
+    /// The sign deadline passed, or the slot is below the eviction cutoff.
+    Cancelled,
+    /// Beacon-node admission moved.
+    Revoked,
+    /// D-3: the key is not enabled for signing.
+    Disabled,
+    Failed(SignerError),
+}
+
+impl From<Phase2SignError<ProofSkip>> for ProofSkip {
+    fn from(error: Phase2SignError<ProofSkip>) -> Self {
+        match error {
+            Phase2SignError::Cancelled => Self::Cancelled,
+            Phase2SignError::Revoked => Self::Revoked,
+            Phase2SignError::Failed(skip) => skip,
+        }
+    }
 }
 
 /// Selects the pre-refactor log message set for aggregate submission.
@@ -259,6 +284,7 @@ impl AggregationService {
         pubkey_map: PubkeyMap,
         config: OrchestratorConfig,
         validator_store: Arc<ValidatorStore>,
+        selection_proofs: Arc<SelectionProofCache>,
     ) -> Self {
         Self {
             signer,
@@ -267,8 +293,22 @@ impl AggregationService {
             pubkey_map,
             config,
             validator_store,
+            selection_proofs,
             slot_end_drops: SlotEndDropCounter::default(),
         }
+    }
+
+    /// [`Self::new`] with a cache of its own.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        signer: Arc<dyn ValidatorSigner>,
+        beacon: Arc<dyn AttestationApi>,
+        duty_tracker: Arc<DutyTracker>,
+        pubkey_map: PubkeyMap,
+        config: OrchestratorConfig,
+        validator_store: Arc<ValidatorStore>,
+    ) -> Self {
+        Self::new(signer, beacon, duty_tracker, pubkey_map, config, validator_store, Arc::default())
     }
 
     /// Duties dropped because slot end arrived before they were dispatched.
@@ -421,38 +461,33 @@ impl AggregationService {
                 return None;
             }
         };
-        let selection_proof = match sign_with_phase2_permit(
-            permits,
-            sign_deadline,
-            &fence,
-            super::slot_context::under_admission(
-                &fence,
-                self.signer
-                    .sign_selection_proof(
-                        slot,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .instrument(agg_span.clone()),
-            ),
-        )
-        .await
+        let selection_proof = match self
+            .selection_proof(slot, &pubkey, &fence, &agg_span, permits, sign_deadline)
+            .await
         {
             Ok(sig) => sig,
-            Err(Phase2SignError::Cancelled) => {
+            Err(ProofSkip::Cancelled) => {
                 warn!(
                     slot,
                     validator_index = %duty.validator_index,
-                    "phase-2 signer permit wait cancelled before selection proof"
+                    "selection proof cancelled at its sign deadline"
                 );
                 return None;
             }
-            Err(Phase2SignError::Revoked) => {
+            Err(ProofSkip::Revoked) => {
                 warn!(slot, "skipping aggregation: beacon node admission revoked");
                 return None;
             }
-            Err(Phase2SignError::Failed(e)) => {
+            Err(ProofSkip::Disabled) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                    slot,
+                    "Skipping aggregation duty: validator was disabled before its \
+                     selection proof was used (D-3)"
+                );
+                return None;
+            }
+            Err(ProofSkip::Failed(e)) => {
                 warn!(
                     slot,
                     validator_index = %duty.validator_index,
@@ -497,6 +532,66 @@ impl AggregationService {
             raw_validator_index: duty.raw.validator_index.clone(),
             proof,
         })
+    }
+
+    /// The selection proof for `(slot, pubkey)` from the shared cache.
+    ///
+    /// Only the owner of the key takes a phase-2 permit and signs. It checks D-3 again after the
+    /// permit wait, just before the signer call. A hit or a wait takes no permit and is followed
+    /// by a fence check. The whole lookup ends at `sign_deadline`, and a proof that arrives at or
+    /// after it is not used. D-3 is checked again before the proof is used.
+    async fn selection_proof(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fence: &beacon::DutyFence,
+        agg_span: &Span,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
+    ) -> Result<Signature, ProofSkip> {
+        let pk_bytes = pubkey.to_bytes();
+        let mut signed_here = false;
+        let lookup = self.selection_proofs.get_or_sign((slot, pk_bytes), || {
+            signed_here = true;
+            let sign = async move {
+                if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                    return Err(ProofSkip::Disabled);
+                }
+                super::slot_context::under_admission(
+                    fence,
+                    self.signer
+                        .sign_selection_proof(
+                            slot,
+                            pubkey,
+                            &self.config.fork_schedule,
+                            &self.config.genesis_validators_root,
+                        )
+                        .instrument(agg_span.clone()),
+                )
+                .await
+                .map_err(ProofSkip::Failed)
+            };
+            async move { Ok(sign_with_phase2_permit(permits, sign_deadline, fence, sign).await?) }
+        });
+        let proof = match tokio::time::timeout_at(sign_deadline, lookup).await {
+            Err(_elapsed) => return Err(ProofSkip::Cancelled),
+            Ok(Err(SelectionProofError::Evicted { slot })) => {
+                debug!(slot, "selection proof slot is below the eviction cutoff");
+                return Err(ProofSkip::Cancelled);
+            }
+            Ok(Err(SelectionProofError::Sign(skip))) => return Err(skip),
+            Ok(Ok(proof)) => proof,
+        };
+        if tokio::time::Instant::now() >= sign_deadline {
+            return Err(ProofSkip::Cancelled);
+        }
+        if !signed_here && !fence.holds() {
+            return Err(ProofSkip::Revoked);
+        }
+        if !self.validator_store.is_signing_enabled(&pk_bytes) {
+            return Err(ProofSkip::Disabled);
+        }
+        Ok(proof)
     }
 
     /// Fetch attestation data + aggregate, then sign_and_wrap for the fork.
@@ -1464,7 +1559,7 @@ mod tests {
         map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
-        AggregationService::new(
+        AggregationService::for_test(
             signer,
             beacon,
             duty_tracker,
@@ -1493,6 +1588,8 @@ mod tests {
         inner: StubValidatorSigner,
         calls: Mutex<Vec<&'static str>>,
         selection_proof: Option<Signature>,
+        /// When set, each later `sign_selection_proof` is recorded and then waits on this gate.
+        hold: Mutex<Option<Arc<Gate>>>,
     }
 
     impl RecordingSigner {
@@ -1501,7 +1598,12 @@ mod tests {
                 inner: StubValidatorSigner::new(),
                 calls: Mutex::new(Vec::new()),
                 selection_proof: None,
+                hold: Mutex::new(None),
             }
+        }
+
+        fn hold_on(&self, gate: Arc<Gate>) {
+            *self.hold.lock().unwrap() = Some(gate);
         }
 
         fn record(&self, name: &'static str) {
@@ -1524,6 +1626,10 @@ mod tests {
                     ) -> Result<Signature, SignerError> {
                         self.record(stringify!($name));
                         if stringify!($name) == "sign_selection_proof" {
+                            let hold = self.hold.lock().unwrap().clone();
+                            if let Some(gate) = hold {
+                                gate.pass().await;
+                            }
                             if let Some(proof) = &self.selection_proof {
                                 return Ok(proof.clone());
                             }
@@ -1845,7 +1951,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(fulu_epoch).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk);
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             rec.clone(),
             beacon,
             duty_tracker,
@@ -1888,7 +1994,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk);
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             rec.clone(),
             beacon,
             duty_tracker,
@@ -1925,7 +2031,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk.clone());
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             local_signer_service(sk),
             beacon,
             duty_tracker,
@@ -2098,7 +2204,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk.to_bytes(), pk);
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             local_signer_service(sk),
             beacon,
             duty_tracker,
@@ -2253,7 +2359,7 @@ mod tests {
         let config = create_test_config().with_dispatch_limits(
             DispatchLimits::validated(4, 1).expect("concurrency is non-zero"),
         );
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             signer,
             beacon.clone(),
             duty_tracker,
@@ -2337,7 +2443,7 @@ mod tests {
             aggregate_submit: Duration::from_secs(2),
             ..bn_manager::OperationTimeouts::default()
         });
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             local_signer_service(sk),
             beacon.clone(),
             duty_tracker,
@@ -2441,7 +2547,7 @@ mod tests {
             Arc::new(DutyTracker::new(Arc::new(MockBeaconNodeClient::new()), Vec::new()));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             Arc::new(StubValidatorSigner::new()),
             beacon,
             duty_tracker,
@@ -2609,7 +2715,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk);
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             rec.clone(),
             beacon,
             duty_tracker,
@@ -3117,7 +3223,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(50).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk);
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             rec.clone(),
             beacon,
             duty_tracker,
@@ -3235,7 +3341,7 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         let mut map = HashMap::new();
         map.insert(pk_bytes, pk.clone());
-        let service = AggregationService::new(
+        let service = AggregationService::for_test(
             rec.clone(),
             beacon,
             duty_tracker,
@@ -3319,5 +3425,728 @@ mod tests {
         super::note_aggregations_failed(1_000);
         let added = series() - before;
         assert!(added >= 1_000, "rvc_aggregations_total{{status=failed}} rose by {added}");
+    }
+
+    // -----------------------------------------------------------------------
+    // W4-E8a2: the selection proof comes from the shared cache.
+    // -----------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+
+    use crate::orchestrator::dispatch::{Phase2SignerPermits, SLOT_END_PUBLISH_OVERHANG};
+    use crate::orchestrator::selection_proofs::test_support::{
+        call_bounded, finished_output, join_bounded, spawn_get_or_sign, wait_until, Gate,
+        ProbeResult, SignProbe,
+    };
+    use crate::orchestrator::selection_proofs::{SelectionProofCache, SelectionProofKey};
+
+    const GUARD_EPOCH: u64 = 50;
+    const GUARD_SLOT: Slot = GUARD_EPOCH * SLOTS_PER_EPOCH;
+
+    /// One Electra validator with a cache-backed [`AggregationService`] and its observers.
+    struct CacheGuard {
+        service: Arc<AggregationService>,
+        beacon: Arc<MockBeaconNodeClient>,
+        rec: Arc<RecordingSigner>,
+        submits: Arc<AtomicUsize>,
+    }
+
+    impl CacheGuard {
+        fn nothing_used(&self) -> bool {
+            self.rec.calls().is_empty()
+                && self.beacon.get_attestation_data_calls().is_empty()
+                && self.submits.load(Ordering::SeqCst) == 0
+        }
+    }
+
+    struct GuardKey {
+        pk: PublicKey,
+        store: Arc<ValidatorStore>,
+        rec: Arc<RecordingSigner>,
+        cache: Arc<SelectionProofCache>,
+    }
+
+    impl GuardKey {
+        fn new(enabled: bool, selection_proof: Option<Signature>) -> Self {
+            let pk = SecretKey::generate().public_key();
+            let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+            let mut config = ValidatorConfig::new(pk.to_bytes());
+            config.enabled = enabled;
+            store.add_validator(config).unwrap();
+            let mut rec = RecordingSigner::new();
+            rec.selection_proof = selection_proof;
+            Self { pk, store, rec: Arc::new(rec), cache: Arc::default() }
+        }
+
+        fn cache_key(&self) -> SelectionProofKey {
+            (GUARD_SLOT, self.pk.to_bytes())
+        }
+
+        async fn service(
+            &self,
+            committee_length: &'static str,
+            api: impl FnOnce(Arc<MockBeaconNodeClient>) -> Arc<dyn AttestationApi>,
+        ) -> CacheGuard {
+            let pk_hex = format!("0x{}", hex::encode(self.pk.to_bytes()));
+            let submits = Arc::new(AtomicUsize::new(0));
+            let submit_count = Arc::clone(&submits);
+            let beacon = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_get_attester_duties(move |_epoch, _indices| {
+                        Ok(DependentRootResponse {
+                            dependent_root: "0xaabb".to_string(),
+                            execution_optimistic: false,
+                            data: vec![beacon::AttesterDuty {
+                                pubkey: pk_hex.clone(),
+                                validator_index: "1".to_string(),
+                                committee_index: "0".to_string(),
+                                committee_length: committee_length.to_string(),
+                                committees_at_slot: "1".to_string(),
+                                validator_committee_index: "0".to_string(),
+                                slot: GUARD_SLOT.to_string(),
+                            }],
+                        })
+                    })
+                    .with_get_attestation_data(|queried, _committee| {
+                        Ok(DataResponse { data: beacon_request_data(queried) })
+                    })
+                    .with_get_aggregate_attestation(|_slot, _root, _idx, _fork| {
+                        Ok(VersionedAggregateAttestation::Electra(matching_electra_body(
+                            GUARD_SLOT,
+                        )))
+                    })
+                    .with_submit_aggregate_and_proofs(move |_proofs| {
+                        submit_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+            );
+            let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+            duty_tracker.fetch_duties_for_epoch(GUARD_EPOCH).await.unwrap();
+            let pubkey_map = HashMap::from([(self.pk.to_bytes(), self.pk.clone())]);
+            let service = Arc::new(AggregationService::new(
+                self.rec.clone(),
+                api(Arc::clone(&beacon)),
+                duty_tracker,
+                Arc::new(parking_lot::RwLock::new(pubkey_map)),
+                create_test_config(),
+                Arc::clone(&self.store),
+                Arc::clone(&self.cache),
+            ));
+            CacheGuard { service, beacon, rec: Arc::clone(&self.rec), submits }
+        }
+
+        async fn seed(&self, proof: Signature) {
+            let sign =
+                move || -> BoxFuture<'static, ProbeResult> { Box::pin(async move { Ok(proof) }) };
+            let seeded = call_bounded(&self.cache, self.cache_key(), sign).await;
+            assert!(matches!(seeded, Some(Ok(_))), "the cache holds a ready proof: {seeded:?}");
+        }
+    }
+
+    fn plain_api(beacon: Arc<MockBeaconNodeClient>) -> Arc<dyn AttestationApi> {
+        beacon
+    }
+
+    fn spawn_produce(
+        service: &Arc<AggregationService>,
+        slot_end: tokio::time::Instant,
+        permits: Arc<Phase2SignerPermits>,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = Arc::clone(service);
+        tokio::spawn(async move {
+            service.produce_aggregations(GUARD_SLOT, GUARD_EPOCH, slot_end, &permits).await
+        })
+    }
+
+    /// True only if the task finished within the bound and did not panic.
+    async fn joined<T>(handle: tokio::task::JoinHandle<T>) -> bool {
+        let handles = [handle];
+        let _ = join_bounded(&handles).await;
+        let [handle] = handles;
+        finished_output(handle).await.is_some()
+    }
+
+    async fn produce_bounded(service: &Arc<AggregationService>) -> bool {
+        let permits = Arc::new(Phase2SignerPermits::new(8));
+        joined(spawn_produce(service, super::ample_slot_end(), permits)).await
+    }
+
+    fn spawn_selection_proof(
+        guard: &CacheGuard,
+        pk: &PublicKey,
+        fence: beacon::DutyFence,
+        permits: &Arc<Phase2SignerPermits>,
+        deadline: tokio::time::Instant,
+    ) -> tokio::task::JoinHandle<Result<Signature, super::ProofSkip>> {
+        let (service, pk, permits) = (Arc::clone(&guard.service), pk.clone(), Arc::clone(permits));
+        tokio::spawn(async move {
+            let span = tracing::Span::none();
+            service.selection_proof(GUARD_SLOT, &pk, &fence, &span, &permits, deadline).await
+        })
+    }
+
+    async fn selection_proof_bounded(
+        guard: &CacheGuard,
+        pk: &PublicKey,
+        fence: beacon::DutyFence,
+        permits: &Arc<Phase2SignerPermits>,
+    ) -> Option<Result<Signature, super::ProofSkip>> {
+        let handles = [spawn_selection_proof(guard, pk, fence, permits, super::ample_slot_end())];
+        let _ = join_bounded(&handles).await;
+        let [handle] = handles;
+        finished_output(handle).await
+    }
+
+    /// The cache state before a pass that a gate must stop.
+    #[derive(Debug, Clone, Copy)]
+    enum CacheBefore {
+        Ready,
+        OwnerInFlight,
+    }
+
+    /// One pass with `before` in the cache. The pass must make no cache lookup and use nothing.
+    async fn assert_gated_pass_skips_the_cache(
+        key: &GuardKey,
+        guard: &CacheGuard,
+        before: CacheBefore,
+        gate_name: &str,
+    ) {
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let owner = match before {
+            CacheBefore::Ready => {
+                key.seed(aggregator_proof(8)).await;
+                None
+            }
+            CacheBefore::OwnerInFlight => {
+                let owner = spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign());
+                assert!(wait_until(|| probe.calls() == 1).await, "the owner enters its sign");
+                Some(owner)
+            }
+        };
+        let lookups_before = key.cache.lookups();
+        let finished = produce_bounded(&guard.service).await;
+        let lookups = key.cache.lookups() - lookups_before;
+        gate.open();
+        if let Some(owner) = owner {
+            assert!(joined(owner).await, "the owner finishes");
+        }
+
+        assert!(finished, "{gate_name} ({before:?}): the pass finishes");
+        assert_eq!(lookups, 0, "{gate_name} ({before:?}): the pass makes no cache lookup");
+        assert!(
+            guard.nothing_used(),
+            "{gate_name} ({before:?}): no aggregate: calls={:?}, data fetches={}, submits={}",
+            guard.rec.calls(),
+            guard.beacon.get_attestation_data_calls().len(),
+            guard.submits.load(Ordering::SeqCst)
+        );
+    }
+
+    fn selection_proof_signs(calls: &[&str]) -> usize {
+        calls.iter().filter(|name| **name == "sign_selection_proof").count()
+    }
+
+    /// The beacon node refuses admission for selection proofs; every other call goes to `inner`.
+    struct RefusedAdmission(Arc<MockBeaconNodeClient>);
+
+    #[async_trait]
+    impl AttestationApi for RefusedAdmission {
+        fn admission_duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+            Err(BeaconError::HttpError("admission refused".into()))
+        }
+
+        async fn get_attestation_data(
+            &self,
+            slot: u64,
+            committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            self.0.get_attestation_data(slot, committee_index).await
+        }
+
+        async fn submit_attestation(
+            &self,
+            attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            self.0.submit_attestation(attestations).await
+        }
+
+        async fn get_aggregate_attestation(
+            &self,
+            slot: u64,
+            attestation_data_root: &str,
+            committee_index: Option<u64>,
+            fork: ForkName,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            self.0
+                .get_aggregate_attestation(slot, attestation_data_root, committee_index, fork)
+                .await
+        }
+
+        async fn submit_aggregate_and_proofs(
+            &self,
+            proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            self.0.submit_aggregate_and_proofs(proofs).await
+        }
+
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            self.0.submit_beacon_committee_subscriptions(subscriptions).await
+        }
+
+        async fn submit_sync_committee_subscriptions(
+            &self,
+            subscriptions: &[SyncCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            self.0.submit_sync_committee_subscriptions(subscriptions).await
+        }
+    }
+
+    /// D-3 runs before the cache: a disabled key makes no lookup, with a ready proof or an owner
+    /// in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cached_proof_is_not_used_for_a_disabled_key() {
+        for before in [CacheBefore::Ready, CacheBefore::OwnerInFlight] {
+            let key = GuardKey::new(false, None);
+            let guard = key.service("8", plain_api).await;
+            assert_gated_pass_skips_the_cache(&key, &guard, before, "a disabled key").await;
+        }
+    }
+
+    /// The admission check runs before the cache: a refused pass makes no lookup, with a ready
+    /// proof or an owner in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_proof_is_not_used_when_admission_is_refused() {
+        for before in [CacheBefore::Ready, CacheBefore::OwnerInFlight] {
+            let key = GuardKey::new(true, None);
+            let guard = key
+                .service("8", |beacon| -> Arc<dyn AttestationApi> {
+                    Arc::new(RefusedAdmission(beacon))
+                })
+                .await;
+            assert_gated_pass_skips_the_cache(&key, &guard, before, "a refused admission").await;
+        }
+    }
+
+    /// With the only phase-2 permit held, a waiter and a ready hit both return the cached proof.
+    /// A ready hit whose fence moved after admission is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hit_and_waiter_use_the_cached_proof_without_a_permit() {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let permits = Arc::new(Phase2SignerPermits::new(1));
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let owner = spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign());
+        let owner_entered = wait_until(|| probe.calls() == 1).await;
+
+        let open = beacon::DutyFence::open();
+        let waiter =
+            spawn_selection_proof(&guard, &key.pk, open, &permits, super::ample_slot_end());
+        let waiting = wait_until(|| key.cache.waiter_registrations() == 1).await;
+        gate.open();
+        let handles = [waiter];
+        let _ = join_bounded(&handles).await;
+        let [waiter] = handles;
+        let waited = finished_output(waiter).await;
+        let hit =
+            selection_proof_bounded(&guard, &key.pk, beacon::DutyFence::open(), &permits).await;
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let moved = beacon::DutyFence::at(0, Arc::clone(&generation));
+        generation.fetch_add(1, Ordering::SeqCst);
+        let moved_hit = selection_proof_bounded(&guard, &key.pk, moved, &permits).await;
+        drop(held);
+
+        assert!(owner_entered && waiting, "the first call waits for the held owner");
+        assert!(joined(owner).await, "the owner finishes");
+        let proof = probe.proof();
+        assert!(
+            matches!(&waited, Some(Ok(got)) if *got == proof),
+            "a waiter returns the owner's proof while the only permit is held: {waited:?}"
+        );
+        assert!(
+            matches!(&hit, Some(Ok(got)) if *got == proof),
+            "a ready hit returns the cached proof while the only permit is held: {hit:?}"
+        );
+        assert!(
+            matches!(moved_hit, Some(Err(super::ProofSkip::Revoked))),
+            "a ready hit whose fence moved is refused: {moved_hit:?}"
+        );
+        assert_eq!(guard.rec.calls(), Vec::<&str>::new(), "a hit or a wait does not sign");
+    }
+
+    /// The cache holds proofs, not decisions: each duty's `committee_length` decides again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_proof_recomputes_is_aggregator() {
+        let proof = aggregator_proof(8);
+        assert!(
+            !signer::is_aggregator(u64::MAX, &proof.to_bytes()),
+            "the proof must not select for the long committee"
+        );
+        let key = GuardKey::new(true, Some(proof));
+        let long = key.service("18446744073709551615", plain_api).await;
+        let short = key.service("8", plain_api).await;
+
+        assert!(produce_bounded(&long.service).await, "the long-committee pass finishes");
+        assert!(produce_bounded(&short.service).await, "the short-committee pass finishes");
+        assert!(produce_bounded(&long.service).await, "the second long-committee pass finishes");
+
+        assert_eq!(
+            selection_proof_signs(&key.rec.calls()),
+            1,
+            "one selection proof for the (slot, key); calls={:?}",
+            key.rec.calls()
+        );
+        assert_eq!(
+            short.submits.load(Ordering::SeqCst),
+            1,
+            "the reused proof selects for the short committee"
+        );
+        assert!(
+            long.beacon.get_attestation_data_calls().is_empty(),
+            "the reused proof does not select for the long committee"
+        );
+        assert_eq!(long.submits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The cache key holds the pubkey: a second key at the same slot signs its own proof.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_key_at_one_slot_signs_its_own_selection_proof() {
+        let first = GuardKey::new(true, None);
+        let mut second = GuardKey::new(true, None);
+        second.cache = Arc::clone(&first.cache);
+        let first_guard = first.service("8", plain_api).await;
+        let second_guard = second.service("8", plain_api).await;
+
+        assert!(produce_bounded(&first_guard.service).await, "the first key's pass finishes");
+        assert!(produce_bounded(&second_guard.service).await, "the second key's pass finishes");
+
+        assert_eq!(selection_proof_signs(&first.rec.calls()), 1);
+        assert_eq!(
+            selection_proof_signs(&second.rec.calls()),
+            1,
+            "the second key does not reuse the first key's proof"
+        );
+        assert_eq!(first.cache.len(), 2, "one ready proof per key");
+    }
+
+    /// A waiter whose fence moves while it waits does not use the owner's proof.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_rechecks_the_fence_after_the_wait() {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let generation = guard.beacon.track_admission();
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let owner = spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign());
+        let owner_entered = wait_until(|| probe.calls() == 1).await;
+
+        let pass = spawn_produce(
+            &guard.service,
+            super::ample_slot_end(),
+            Arc::new(Phase2SignerPermits::new(8)),
+        );
+        let waiting = wait_until(|| key.cache.waiter_registrations() == 1).await;
+        generation.fetch_add(1, Ordering::SeqCst);
+        gate.open();
+        let handles = [owner];
+        let unfinished = join_bounded(&handles).await;
+        let [owner] = handles;
+        let pass_joined = joined(pass).await;
+
+        assert!(owner_entered && waiting, "the pass waits for the held owner");
+        assert!(unfinished == 0 && pass_joined, "the owner and the pass finish");
+        assert_eq!(finished_output(owner).await, Some(Ok(probe.proof())));
+        assert!(
+            guard.nothing_used(),
+            "a revoked waiter does not aggregate: calls={:?}, data fetches={}",
+            guard.rec.calls(),
+            guard.beacon.get_attestation_data_calls().len()
+        );
+    }
+
+    /// D-3 is checked again after a wait, and before a waiter that takes over signs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_rechecks_d3_after_the_wait() {
+        for owner_fails in [false, true] {
+            let key = GuardKey::new(true, None);
+            let guard = key.service("8", plain_api).await;
+            let gate = Gate::new();
+            let probe = SignProbe::new(&gate);
+            let owner = if owner_fails {
+                spawn_get_or_sign(&key.cache, key.cache_key(), probe.fail())
+            } else {
+                spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign())
+            };
+            let owner_entered = wait_until(|| probe.calls() == 1).await;
+            let permits = Arc::new(Phase2SignerPermits::new(8));
+            let pass = spawn_produce(&guard.service, super::ample_slot_end(), permits);
+            let waiting = wait_until(|| key.cache.waiter_registrations() == 1).await;
+            key.store.set_enabled(&key.pk.to_bytes(), false);
+            gate.open();
+            let owner_joined = joined(owner).await;
+            let pass_joined = joined(pass).await;
+
+            assert!(owner_entered && waiting, "owner_fails={owner_fails}: the pass waits");
+            assert!(owner_joined && pass_joined, "owner_fails={owner_fails}: both finish");
+            assert!(
+                guard.nothing_used(),
+                "owner_fails={owner_fails}: a key disabled during the wait gets nothing: \
+                 calls={:?}, data fetches={}",
+                guard.rec.calls(),
+                guard.beacon.get_attestation_data_calls().len()
+            );
+        }
+    }
+
+    /// The key is disabled while its owner waits for the only phase-2 permit. With `promoted`,
+    /// the owner is a waiter that took over after the first owner failed.
+    async fn assert_disable_during_the_permit_wait_signs_nothing(promoted: bool) {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let permits = Arc::new(Phase2SignerPermits::new(1));
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let first_owner =
+            promoted.then(|| spawn_get_or_sign(&key.cache, key.cache_key(), probe.fail()));
+        let first_entered = !promoted || wait_until(|| probe.calls() == 1).await;
+        let open = beacon::DutyFence::open();
+        let call = spawn_selection_proof(&guard, &key.pk, open, &permits, super::ample_slot_end());
+        if let Some(first_owner) = first_owner {
+            assert!(wait_until(|| key.cache.waiter_registrations() == 1).await, "the call waits");
+            gate.open();
+            assert!(joined(first_owner).await, "the first owner fails and ends");
+        }
+        let at_permit = wait_until(|| key.cache.in_flight_len() == 1).await;
+        key.store.set_enabled(&key.pk.to_bytes(), false);
+        drop(held);
+        let handles = [call];
+        let _ = join_bounded(&handles).await;
+        let [call] = handles;
+        let call = finished_output(call).await;
+
+        assert!(first_entered && at_permit, "promoted={promoted}: the call owns the key");
+        assert!(
+            matches!(call, Some(Err(super::ProofSkip::Disabled))),
+            "promoted={promoted}: a key disabled during the permit wait gives Disabled: {call:?}"
+        );
+        assert_eq!(guard.rec.calls(), Vec::<&str>::new(), "promoted={promoted}: no signer call");
+        assert!(guard.nothing_used(), "promoted={promoted}: no beacon request");
+        assert_eq!(
+            (key.cache.len(), key.cache.in_flight_len()),
+            (0, 0),
+            "promoted={promoted}: no proof is cached"
+        );
+    }
+
+    /// D-3 is checked after the phase-2 permit wait, just before the signer call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_rechecks_d3_after_the_permit_wait() {
+        assert_disable_during_the_permit_wait_signs_nothing(false).await;
+        assert_disable_during_the_permit_wait_signs_nothing(true).await;
+    }
+
+    /// What changes while the owner's own selection-proof sign is pending.
+    #[derive(Debug, Clone, Copy)]
+    enum WhileOwnerSigns {
+        /// D-3 closes for the key.
+        Disable,
+        /// The clock reaches `sign_deadline`, and the sign is ready on its next poll.
+        ReachDeadline,
+    }
+
+    /// One owner whose own selection-proof sign is held on a gate. `change` happens while the
+    /// sign is pending, and then the sign returns a valid proof. With `direct`, the owner is a
+    /// `selection_proof` call and its result is returned. Without it, the owner is a full pass.
+    async fn run_owner_with_a_held_sign(
+        change: WhileOwnerSigns,
+        direct: bool,
+    ) -> (Option<Result<Signature, super::ProofSkip>>, CacheGuard) {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let gate = Arc::new(Gate::new());
+        key.rec.hold_on(Arc::clone(&gate));
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(20);
+        let permits = Arc::new(Phase2SignerPermits::new(8));
+        let (call, pass) = if direct {
+            let open = beacon::DutyFence::open();
+            let deadline = slot_end + SLOT_END_PUBLISH_OVERHANG;
+            (Some(spawn_selection_proof(&guard, &key.pk, open, &permits, deadline)), None)
+        } else {
+            (None, Some(spawn_produce(&guard.service, slot_end, permits)))
+        };
+        let signing = wait_until(|| selection_proof_signs(&key.rec.calls()) == 1).await;
+        if matches!(change, WhileOwnerSigns::Disable) {
+            key.store.set_enabled(&key.pk.to_bytes(), false);
+        }
+        gate.open();
+        if matches!(change, WhileOwnerSigns::ReachDeadline) {
+            tokio::time::advance(Duration::from_millis(20) + SLOT_END_PUBLISH_OVERHANG).await;
+        }
+        let result = match call {
+            Some(call) => {
+                let handles = [call];
+                let _ = join_bounded(&handles).await;
+                let [call] = handles;
+                finished_output(call).await
+            }
+            None => None,
+        };
+        let pass_joined = match pass {
+            Some(pass) => joined(pass).await,
+            None => true,
+        };
+
+        assert!(signing, "{change:?}: the owner enters its own selection-proof sign");
+        assert!(pass_joined, "{change:?}: the pass finishes");
+        (result, guard)
+    }
+
+    /// Asserts the result of both owner kinds: a direct call gets `expected`, and a full pass
+    /// signs only its selection proof and makes no beacon request.
+    async fn assert_held_owner_uses_nothing(
+        change: WhileOwnerSigns,
+        expected: fn(&super::ProofSkip) -> bool,
+    ) {
+        let (result, _) = run_owner_with_a_held_sign(change, true).await;
+        assert!(
+            matches!(&result, Some(Err(skip)) if expected(skip)),
+            "{change:?}: the owner's own proof is not used: {result:?}"
+        );
+        let (_, guard) = run_owner_with_a_held_sign(change, false).await;
+        assert_eq!(
+            guard.rec.calls(),
+            vec!["sign_selection_proof"],
+            "{change:?}: no aggregate sign after the owner's own proof"
+        );
+        assert!(
+            guard.beacon.get_attestation_data_calls().is_empty()
+                && guard.submits.load(Ordering::SeqCst) == 0,
+            "{change:?}: no beacon request after the owner's own proof"
+        );
+    }
+
+    /// D-3 closes while the owner's own sign is pending. The owner does not use its proof.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owner_rechecks_d3_after_its_own_sign() {
+        assert_held_owner_uses_nothing(WhileOwnerSigns::Disable, |skip| {
+            matches!(skip, super::ProofSkip::Disabled)
+        })
+        .await;
+    }
+
+    /// The owner's own proof is ready on its first poll at `sign_deadline`. It is not used.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owner_proof_ready_at_the_sign_deadline_is_not_used() {
+        assert_held_owner_uses_nothing(WhileOwnerSigns::ReachDeadline, |skip| {
+            matches!(skip, super::ProofSkip::Cancelled)
+        })
+        .await;
+    }
+
+    /// A proof that the owner publishes after the waiter's deadline, before the waiter's next
+    /// poll, is not used.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn proof_published_at_the_sign_deadline_is_not_used() {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let owner = spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign());
+        let owner_entered = wait_until(|| probe.calls() == 1).await;
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(20);
+        let permits = Arc::new(Phase2SignerPermits::new(8));
+        let pass = spawn_produce(&guard.service, slot_end, Arc::clone(&permits));
+        let sign_deadline = slot_end + SLOT_END_PUBLISH_OVERHANG;
+        let open = beacon::DutyFence::open();
+        let direct = spawn_selection_proof(&guard, &key.pk, open, &permits, sign_deadline);
+        let waiting = wait_until(|| key.cache.waiter_registrations() == 2).await;
+
+        gate.open();
+        tokio::time::advance(Duration::from_millis(20) + SLOT_END_PUBLISH_OVERHANG).await;
+        let handles = [owner];
+        let _ = join_bounded(&handles).await;
+        let [owner] = handles;
+        let owner = finished_output(owner).await;
+        let pass_joined = joined(pass).await;
+        let handles = [direct];
+        let _ = join_bounded(&handles).await;
+        let [direct] = handles;
+        let direct = finished_output(direct).await;
+
+        assert!(owner_entered && waiting, "the pass and the direct call wait for the held owner");
+        assert_eq!(owner, Some(Ok(probe.proof())), "the owner publishes its proof");
+        assert!(
+            matches!(direct, Some(Err(super::ProofSkip::Cancelled))),
+            "a proof ready at the deadline gives Cancelled: {direct:?}"
+        );
+        assert!(pass_joined, "the pass finishes");
+        assert!(
+            guard.nothing_used(),
+            "a proof at the deadline is not used: calls={:?}, data fetches={}",
+            guard.rec.calls(),
+            guard.beacon.get_attestation_data_calls().len()
+        );
+    }
+
+    /// A waiter takes no permit, stops at its own deadline, and leaves the owner in place.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn waiter_stops_at_its_own_sign_deadline() {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        let permits = Arc::new(Phase2SignerPermits::new(1));
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let gate = Gate::new();
+        let probe = SignProbe::new(&gate);
+        let owner = spawn_get_or_sign(&key.cache, key.cache_key(), probe.sign());
+        let owner_entered = wait_until(|| probe.calls() == 1).await;
+
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(20);
+        let pass = spawn_produce(&guard.service, slot_end, Arc::clone(&permits));
+        let open = beacon::DutyFence::open();
+        let sign_deadline = slot_end + SLOT_END_PUBLISH_OVERHANG;
+        let direct = spawn_selection_proof(&guard, &key.pk, open, &permits, sign_deadline);
+        let waiting = wait_until(|| key.cache.waiter_registrations() == 2).await;
+        tokio::time::advance(Duration::from_millis(20) + SLOT_END_PUBLISH_OVERHANG).await;
+        let pass_joined = joined(pass).await;
+        let handles = [direct];
+        let _ = join_bounded(&handles).await;
+        let [direct] = handles;
+        let direct = finished_output(direct).await;
+        let in_flight_after_deadline = key.cache.in_flight_len();
+        gate.open();
+        let handles = [owner];
+        let owner_unfinished = join_bounded(&handles).await;
+        let [owner] = handles;
+        drop(held);
+
+        assert!(owner_entered, "the owner enters its sign");
+        assert!(waiting, "the pass and the direct call wait for the owner without a permit");
+        assert!(pass_joined, "the waiter stops at its own sign deadline");
+        assert!(
+            matches!(direct, Some(Err(super::ProofSkip::Cancelled))),
+            "a waiter whose timer expires while the owner is pending gets Cancelled: {direct:?}"
+        );
+        assert_eq!(in_flight_after_deadline, 1, "the waiter's timeout leaves the owner in place");
+        assert_eq!(owner_unfinished, 0);
+        assert_eq!(finished_output(owner).await, Some(Ok(probe.proof())));
+        assert_eq!(key.cache.len(), 1, "the owner's proof is cached");
+        assert!(guard.nothing_used(), "a waiter past its deadline does not aggregate");
     }
 }
