@@ -83,6 +83,23 @@ def test_every_ignore_has_a_review_date_in_both_files():
             _review_date(path, advisory_id)
 
 
+# Issue #1029 AC3: these ignores must stay in both files until their review date.
+ISSUE_1029_IGNORES = ("RUSTSEC-2026-0543",) + tuple(
+    f"RUSTSEC-2026-{n:04d}" for n in range(574, 583)
+)
+ISSUE_1029_REVIEW = date(2027, 1, 26)
+
+
+def test_issue_1029_ignores_are_in_both_files_with_the_review_date():
+    for path in (AUDIT_TOML, DENY_TOML):
+        ids = _ignore_ids(path)
+        missing = [advisory_id for advisory_id in ISSUE_1029_IGNORES if advisory_id not in ids]
+        assert not missing, f"{path.name}: missing #1029 ignores {missing}"
+        for advisory_id in ISSUE_1029_IGNORES:
+            review = _review_date(path, advisory_id)
+            assert review == ISSUE_1029_REVIEW, f"{path.name}: {advisory_id} review date {review}"
+
+
 def test_deny_fails_on_every_unsound_unmaintained_or_yanked_crate():
     advisories = _deny_config()["advisories"]
     assert advisories.get("unsound") == "all"

@@ -24,6 +24,8 @@ ignore = [
     # and reports it. cargo-deny reads the resolved graph and does not, so
     # cargo-deny warns that this ignore is not used. Keep it to mirror
     # `.cargo/audit.toml`.
+    # `scripts/check_lock_only_advisories.py` fails CI if derivative enters
+    # the build graph.
     # Review by 2027-01-26.
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained. ark-ff depends on it and has no upgrade path. Lock-resident only, not compiled." },
 
@@ -66,6 +68,66 @@ ignore = [
     # Do not bump hyper/axum only for this advisory.
     # Review by 2027-01-26.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained. hyper 1.x depends on it. Transitive only, no direct use." },
+
+    # heapless 0.8.0: unsound (RUSTSEC-2026-0574 to -0582, 2026-11-18). The fix
+    # is >=0.9.4. Path in Cargo.lock: vsss-rs 5.3.0 -> elliptic-curve-tools
+    # 0.2.0 -> heapless 0.8.0. vsss-rs enables elliptic-curve-tools only with its
+    # `serde` feature. The workspace sets vsss-rs to default-features = false,
+    # features = ["std"], so heapless is not compiled (`cargo tree -i
+    # heapless@0.8.0 --workspace --all-features --target all` prints nothing).
+    # Lock-resident only. vsss-rs 5.3 requires elliptic-curve-tools 0.2, and
+    # elliptic-curve-tools 0.2 requires heapless 0.8, so `cargo update` cannot
+    # remove it.
+    # cargo-audit and cargo-deny match the package version (patched >= 0.9.4),
+    # not the affected functions. Each entry gives the function range of the
+    # advisory. `scripts/check_lock_only_advisories.py` (CI Check job) fails
+    # if heapless < 0.9.4 enters the build graph.
+    # cargo-deny reads the resolved graph and warns that this ignore is not
+    # used. Keep it to mirror `.cargo/audit.toml`.
+    # heapless FindMutView::pop use after free. Functions < 0.9.4. 0.8.0 has this
+    # function as FindMut::pop. Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.8.0 is unsound (FindMutView::pop use after free; FindMut::pop in 0.8.0). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless Spsc::peek Relaxed ordering. Functions < 0.9.4. 0.8.0 has this
+    # function as spsc::Queue::peek and Consumer::peek. Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.8.0 is unsound (Spsc::peek Relaxed ordering; spsc::Queue::peek in 0.8.0). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless IndexMap::truncate inconsistent state. Functions < 0.9.4. 0.8.0 has
+    # no IndexMap::truncate: package-level scanner match. Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.8.0 is unsound (IndexMap::truncate; not in 0.8.0, package-level match). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless panicking Drop UB. Functions < 0.9.3 (clear) and < 0.9.4 (retain,
+    # truncate, IntoIter::drop, HistoryBuf::write). 0.8.0 is in range.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.8.0 is unsound (panicking Drop UB in clear, retain, truncate, IntoIter::drop). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless SortedLinkedList::zeroize inconsistent state. Functions < 0.9.4.
+    # 0.8.0 has no zeroize for it: package-level scanner match.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.8.0 is unsound (SortedLinkedList::zeroize; not in 0.8.0, package-level match). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless Deque::try_from when full. Functions >= 0.9.2, < 0.9.4. 0.8.0 is
+    # outside that range: package-level scanner match. Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.8.0 is unsound (Deque::try_from, functions >= 0.9.2 < 0.9.4; 0.8.0 outside, package-level match). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless treiber stack race. Functions < 0.9.4 (arc_pool, box_pool,
+    # object_pool). 0.8.0 has pool::arc, boxed, object on the treiber stack.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.8.0 is unsound (treiber stack race in the arc, box and object pools). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless Deque::make_contiguous broken invariants. Functions < 0.9.4. 0.8.0
+    # has no Deque::make_contiguous: package-level scanner match.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.8.0 is unsound (Deque::make_contiguous; not in 0.8.0, package-level match). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+    # heapless IndexMap::insert at u16::MAX elements. Functions < 0.9.4. 0.8.0 is
+    # in range. Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.8.0 is unsound (IndexMap::insert at u16::MAX elements). Lock-resident only through vsss-rs -> elliptic-curve-tools 0.2, not compiled. The fix is >=0.9.4." },
+
+    # chrono: unmaintained (RUSTSEC-2026-0543, 2026-09-14). All versions are
+    # affected. Path in Cargo.lock: serde_with 3.17 (google-cloud-* crates,
+    # ark-serialize) -> chrono 0.4.44, through the optional `chrono_0_4`
+    # dependency. No crate enables the serde_with `chrono` feature, so chrono
+    # is not compiled (`cargo tree -i chrono@0.4.44 --workspace --all-features
+    # --target all` prints nothing). Lock-resident only. No patched version.
+    # `scripts/check_lock_only_advisories.py` fails CI if chrono enters the
+    # build graph.
+    # cargo-deny reads the resolved graph and warns that this ignore is not
+    # used. Keep it to mirror `.cargo/audit.toml`.
+    # Review by 2027-01-26.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no patched version. Lock-resident only through the optional chrono dependency of serde_with, not compiled." },
 ]
 
 [sources]

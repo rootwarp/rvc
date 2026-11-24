@@ -113,6 +113,11 @@ jobs:
         if: github.event_name == 'pull_request'
         run: cargo deny check advisories sources
 
+      # Some ignores hold only while the crate is not compiled (lock-only).
+      # Fail when a feature change brings such a crate into the build graph.
+      - name: Check lock-only advisory crates stay out of the build graph
+        run: python3 scripts/check_lock_only_advisories.py
+
       # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
       # it needs nightly; CI installs the stable toolchain (A-E3).
       - name: Install cargo-machete
