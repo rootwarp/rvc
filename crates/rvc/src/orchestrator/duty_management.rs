@@ -2401,6 +2401,30 @@ mod tests {
         );
     }
 
+    /// Harper B2 (#1043 R1): each chunk POST must give the beacon node the
+    /// watch that the call read before the duty reads. The beacon node then
+    /// checks that watch again before each HTTP attempt. 513 duties make 2
+    /// chunks.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn each_subscription_chunk_post_gives_the_pass_watch_to_the_beacon_node() {
+        let f = ManyKeys::new(513, make_config(), Vec::new()).await;
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let watches = f.mock.subscription_watches();
+        f.admission.fetch_add(1, Ordering::SeqCst);
+
+        assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
+        assert_eq!(
+            watches.len(),
+            2,
+            "Each of the 2 chunk POSTs must give a duty watch to the beacon node."
+        );
+        assert!(
+            watches.iter().all(|watch| watch.seen() == 0 && !watch.holds()),
+            "Each chunk POST must give the watch of the pass, and a revocation must move it."
+        );
+    }
+
     type Fields = std::collections::BTreeMap<String, String>;
 
     /// Records the fields of each WARN event, `message` too.
