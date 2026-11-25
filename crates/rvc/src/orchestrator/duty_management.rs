@@ -591,8 +591,9 @@ impl DutyManagementService {
     /// not sign again. The cache signs only for the owner of the key, and the
     /// owner checks the store gate again just before the signer call.
     ///
-    /// The subscriptions go in POSTs of 512 or fewer. The call sends each
-    /// POST, also after a failed POST.
+    /// The subscriptions go in POSTs of 512 or fewer. All POSTs start at the
+    /// same time, and each has its own `timeouts.preparation` bound. A failed
+    /// POST does not stop the other POSTs.
     ///
     /// `Ok` when the epoch needs no further send: each POST went out, or there
     /// is nothing to send (no own duty, or the store gate closed or the
@@ -602,7 +603,7 @@ impl DutyManagementService {
     /// delivers its proof: the cutoff stops only a new owner. A failed POST is
     /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
     /// is [`OrchestratorError::OperationTimedOut`]. After more than one failed
-    /// POST, the result is the first failure.
+    /// POST, the result is the first failure in chunk order.
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn submit_committee_subscriptions(
         &self,
@@ -734,14 +735,14 @@ impl DutyManagementService {
             return Ok(());
         }
 
-        // A failed chunk does not stop the later chunks. The first failure is
-        // the result, so the runner step tries again in the next slot.
-        let mut outcome = Ok(());
-        for chunk in subscriptions.chunks(SUBSCRIPTION_CHUNK) {
-            let sent = self.post_subscriptions(epoch, chunk).await;
-            outcome = outcome.and(sent);
-        }
-        outcome
+        // The chunks go out at the same time, so a slow POST does not use the
+        // time of the later chunks. The results stay in chunk order: the
+        // first failed chunk gives the result, and the runner step tries
+        // again in the next slot.
+        let posts = subscriptions
+            .chunks(SUBSCRIPTION_CHUNK)
+            .map(|chunk| self.post_subscriptions(epoch, chunk));
+        futures::future::join_all(posts).await.into_iter().fold(Ok(()), Result::and)
     }
 
     /// One committee-subscription POST, under `timeouts.preparation`.
