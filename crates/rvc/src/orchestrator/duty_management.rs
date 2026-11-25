@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -33,6 +34,14 @@ const PROPOSER_PREPARATION: &str = "proposer_preparation";
 
 /// The committee-subscription POST, as timed and as named by a timeout.
 const COMMITTEE_SUBSCRIPTION: &str = "committee_subscription";
+
+/// The maximum number of committee subscriptions in one POST. Each consensus
+/// client accepts this size.
+const SUBSCRIPTION_CHUNK: usize = 512;
+
+/// The maximum number of subscription selection proofs that sign at the same
+/// time. A lower `dispatch_limits.concurrency` sets a lower cap.
+const SUBSCRIPTION_SIGNS: usize = 32;
 
 /// How a [`DutyManagementService::prepare_proposers`] call that met no error ended.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -568,31 +577,40 @@ impl DutyManagementService {
     /// Gets a selection proof for each local attester duty of `epoch` from
     /// the shared cache, and POSTs the epoch's committee subscriptions.
     ///
+    /// Up to `min(32, dispatch_limits.concurrency)` duties get their proofs
+    /// at the same time. Each duty checks the store gate, then the admission
+    /// fence, and then gets its proof from the cache, so the concurrency does
+    /// not change which duties can sign.
+    ///
     /// A duty whose proof is in the cache, or in flight for aggregation, does
     /// not sign again. The cache signs only for the owner of the key, and the
     /// owner checks the store gate again just before the signer call.
     ///
-    /// `Ok` when the epoch needs no further send: the POST went out, or there
+    /// The subscriptions go in POSTs of 512 or fewer. The call sends each
+    /// POST, also after a failed POST.
+    ///
+    /// `Ok` when the epoch needs no further send: each POST went out, or there
     /// is nothing to send (no own duty, or the store gate closed or the
     /// admission revoked for each one). A selection proof that fails to sign
     /// is a warn, and skips its duty. A slot below the cache's eviction cutoff
     /// skips its duty too, unless a live owner admitted before the eviction
     /// delivers its proof: the cutoff stops only a new owner. A failed POST is
     /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
-    /// is [`OrchestratorError::OperationTimedOut`].
+    /// is [`OrchestratorError::OperationTimedOut`]. After more than one failed
+    /// POST, the result is the first failure.
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn submit_committee_subscriptions(
         &self,
         epoch: u64,
     ) -> Result<(), OrchestratorError> {
-        let mut subscriptions = Vec::new();
+        let mut own_duties = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
         for slot_offset in 0..SLOTS_PER_EPOCH {
             let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
             let duties = self.duty_tracker.get_duties_for_slot(slot).await;
 
-            for duty in &duties {
+            for duty in duties {
                 // Only subscribe for our own validators (O(1) by compressed bytes).
                 let Some(duty_bytes) = parse_pubkey_bytes(&duty.pubkey) else {
                     continue;
@@ -600,7 +618,13 @@ impl DutyManagementService {
                 let Some(pubkey) = pubkey_snapshot.get(&duty_bytes).cloned() else {
                     continue;
                 };
+                own_duties.push((slot, duty_bytes, pubkey, duty));
+            }
+        }
 
+        let signs = SUBSCRIPTION_SIGNS.min(self.config.dispatch_limits.concurrency as usize);
+        let subscriptions: Vec<BeaconCommitteeSubscription> = stream::iter(own_duties)
+            .map(|(slot, duty_bytes, pubkey, duty)| async move {
                 // Same store gate as aggregate production: doppelganger-off
                 // signing allows every pubkey, so `enabled = false` must skip
                 // before `sign_selection_proof`.
@@ -611,7 +635,7 @@ impl DutyManagementService {
                         slot,
                         "Skipping committee subscription: validator signing is disabled"
                     );
-                    continue;
+                    return None;
                 }
 
                 let committee_length = duty.committee_length;
@@ -631,7 +655,7 @@ impl DutyManagementService {
                             slot,
                             "skipping committee subscription: beacon node admission revoked"
                         );
-                        continue;
+                        return None;
                     }
                 };
                 let lookup = self.selection_proofs.get_or_sign((slot, duty_bytes), || async {
@@ -657,7 +681,7 @@ impl DutyManagementService {
                             slot,
                             "subscription selection proof slot is below the eviction cutoff"
                         );
-                        continue;
+                        return None;
                     }
                     Err(SelectionProofError::Sign(SubscriptionProofSkip::Disabled)) => {
                         warn!(
@@ -665,7 +689,7 @@ impl DutyManagementService {
                             slot,
                             "Skipping committee subscription: validator signing is disabled"
                         );
-                        continue;
+                        return None;
                     }
                     Err(SelectionProofError::Sign(SubscriptionProofSkip::Failed(e))) => {
                         warn!(
@@ -674,31 +698,50 @@ impl DutyManagementService {
                             error = %e,
                             "Failed to sign selection proof for subscription"
                         );
-                        continue;
+                        return None;
                     }
                 };
 
                 let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
 
-                subscriptions.push(BeaconCommitteeSubscription {
+                Some(BeaconCommitteeSubscription {
                     validator_index: wire.validator_index.clone(),
                     committee_index: wire.committee_index.clone(),
                     committees_at_slot: wire.committees_at_slot.clone(),
                     slot: wire.slot.clone(),
                     is_aggregator: is_agg,
-                });
-            }
-        }
+                })
+            })
+            .buffer_unordered(signs)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
 
         if subscriptions.is_empty() {
             return Ok(());
         }
 
+        // A failed chunk does not stop the later chunks. The first failure is
+        // the result, so the runner step tries again in the next slot.
+        let mut outcome = Ok(());
+        for chunk in subscriptions.chunks(SUBSCRIPTION_CHUNK) {
+            let sent = self.post_subscriptions(epoch, chunk).await;
+            outcome = outcome.and(sent);
+        }
+        outcome
+    }
+
+    /// One committee-subscription POST, under `timeouts.preparation`.
+    async fn post_subscriptions(
+        &self,
+        epoch: u64,
+        subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), OrchestratorError> {
         let count = subscriptions.len();
         match utils::timed(
             COMMITTEE_SUBSCRIPTION,
             self.config.timeouts.preparation,
-            self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
+            self.beacon.submit_beacon_committee_subscriptions(subscriptions),
         )
         .await
         {
@@ -1700,12 +1743,13 @@ mod tests {
     /// A service with `count` enabled keys that sign through one
     /// [`SlowRemote`]. Key `i` has one attester duty at slot offset `i % 32`
     /// of [`SUBSCRIBED_EPOCH`]. The beacon node records the size of each
-    /// subscription POST.
+    /// subscription POST, and `admission` is its admission generation.
     struct ManyKeys {
         service: DutyManagementService,
         remote: Arc<SlowRemote>,
         keys: Vec<[u8; 48]>,
         post_sizes: Arc<parking_lot::Mutex<Vec<usize>>>,
+        admission: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl ManyKeys {
@@ -1745,7 +1789,7 @@ mod tests {
                         answers.lock().pop_front().unwrap_or(Ok(()))
                     }),
             );
-            mock.track_admission();
+            let admission = mock.track_admission();
             let beacon = mock as Arc<dyn BeaconNodeClient>;
             let indices = (0..count).map(|i| i.to_string()).collect();
             let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
@@ -1775,7 +1819,7 @@ mod tests {
                 config,
                 Arc::default(),
             );
-            Self { service, remote, keys, post_sizes }
+            Self { service, remote, keys, post_sizes, admission }
         }
 
         fn post_sizes(&self) -> Vec<usize> {
@@ -1842,6 +1886,10 @@ mod tests {
     ///
     /// Key 1 must make no cache lookup. Key 3 reads its fence after the
     /// revoke and must make no cache lookup. Only keys 0 and 2 sign.
+    ///
+    /// Control: the mock beacon node gives a new fence that holds after its
+    /// admission generation moves. The first sign moves the generation, and
+    /// each later duty reads its own new fence and signs.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_concurrent_subscriptions_keep_the_per_sign_fence_and_store_gate() {
         let mut f = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -1872,6 +1920,21 @@ mod tests {
                 Err(OrchestratorError::Beacon(bn_manager::BeaconError::NoAdmittedNode))
             ),
             "The revoked beacon node refuses the POST of the two proofs: {outcome:?}"
+        );
+
+        let control = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let admission = Arc::clone(&control.admission);
+        control.remote.on_sign(move || {
+            admission.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let outcome = control.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert!(matches!(outcome, Ok(())), "control: the POST is accepted: {outcome:?}");
+        assert_eq!(
+            control.remote.started(),
+            control.keys,
+            "Control: each duty after the generation moves must read its own fence and sign."
         );
     }
 
