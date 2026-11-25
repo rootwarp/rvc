@@ -451,6 +451,9 @@ pub struct BnManager {
     health_trackers: SharedHealthTrackers,
     /// Per-endpoint broadcast permits. See [`fan_out::MAX_INFLIGHT_PER_BN`].
     inflight: fan_out::InflightGate,
+    /// [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`] permits, or one for each node when
+    /// there are more nodes. Thus one call can always take its permits.
+    subscription_attempts: Arc<tokio::sync::Semaphore>,
     operation_timeouts: Option<OperationTimeouts>,
     broadcast_topics: crate::traits::BroadcastTopics,
     roles: Vec<HashSet<BnRole>>,
@@ -595,6 +598,15 @@ struct BestSelect<T> {
 /// [`BnManager::with_op_timeout`] uses that same backstop. Waiting until the
 /// instant itself drops the held block as `OperationTimeout`.
 const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
+
+/// Subscription node attempts that can be active or queued at one time, for
+/// all chunks and all nodes: two waves of the broadcast permits of one node.
+///
+/// A call takes one permit for each beacon node before it makes its attempts.
+/// Each attempt keeps its permit until the attempt ends, also on the drain
+/// after the first `Ok`. When the call returns, it gives back the permits
+/// that no attempt took. A later call waits on its own task for its permits.
+const SUBSCRIPTION_ATTEMPTS_IN_FLIGHT: usize = 2 * fan_out::MAX_INFLIGHT_PER_BN;
 
 /// A budget `tokio::time::timeout` can add to `now`, including the 250 ms backstop.
 ///
@@ -761,11 +773,15 @@ impl BnManager {
         let admission_generation =
             Arc::new((0..clients.len()).map(|_| AtomicU64::new(0)).collect());
         let admission_gate = Arc::new((0..clients.len()).map(|_| Mutex::new(())).collect());
+        let subscription_attempts = Arc::new(tokio::sync::Semaphore::new(
+            SUBSCRIPTION_ATTEMPTS_IN_FLIGHT.max(clients.len()),
+        ));
         Ok(Self {
             clients,
             sync_statuses,
             health_trackers,
             inflight,
+            subscription_attempts,
             operation_timeouts: None,
             broadcast_topics,
             roles,
@@ -5011,19 +5027,29 @@ impl AttestationApi for BnManager {
     /// after a permit, after an earlier node and before a retry (Harper B2).
     /// An error after the watch moves is [`BeaconError::RevokedInFlight`], also
     /// when an earlier node or a higher node index gave a different error.
+    /// Each node attempt keeps one permit of [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`]
+    /// until it ends (self-check S4).
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
+        let nodes = u32::try_from(self.clients.len()).unwrap_or(u32::MAX);
+        let reserved = Arc::clone(&self.subscription_attempts)
+            .acquire_many_owned(nodes)
+            .await
+            .map_err(|_| BeaconError::HttpError("subscription permits closed".to_string()))?;
+        let permits = Mutex::new(reserved);
         let payload = Arc::new((subscriptions.to_vec(), duties_watch.clone()));
         #[cfg(test)]
         let gauge = Arc::clone(&self.subscription_gauge);
         let attempt = move |client: &BeaconClient| {
             let (client, payload) = (client.clone(), Arc::clone(&payload));
+            let permit = permits.lock().unwrap_or_else(std::sync::PoisonError::into_inner).split(1);
             #[cfg(test)]
             let live = LiveAttempt::new(&gauge);
             Box::pin(async move {
+                let _permit = permit;
                 #[cfg(test)]
                 let _live = live;
                 client.submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1).await
