@@ -4977,6 +4977,8 @@ impl AttestationApi for BnManager {
 
     /// Each node attempt checks `duties_watch` when its HTTP attempt starts:
     /// after a permit, after an earlier node and before a retry (Harper B2).
+    /// An error after the watch moves is [`BeaconError::RevokedInFlight`], also
+    /// when an earlier node or a higher node index gave a different error.
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -4996,6 +4998,7 @@ impl AttestationApi for BnManager {
             }),
         )
         .await
+        .map_err(|err| if duties_watch.holds() { err } else { BeaconError::RevokedInFlight })
     }
 
     async fn submit_sync_committee_subscriptions(
