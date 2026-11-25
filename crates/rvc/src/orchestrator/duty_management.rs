@@ -1878,20 +1878,41 @@ mod tests {
         }
     }
 
-    /// The store gate and the admission fence stay in each per-duty future.
-    /// Keys 0 to 3 have one duty each, in slot order, and the beacon node of
-    /// the service is a real `BnManager`:
+    /// The store gate and the admission fences stay in each per-duty future.
+    /// Keys 0 to 3 have one duty each, in slot order.
+    ///
+    /// Part 1 uses the mock beacon node. Key 1 is disabled, and the first
+    /// sign (key 0) moves the admission generation. The mock gives a new
+    /// fence that holds after the move, but the duties were read before it:
+    /// only key 0 signs. On the base code, the duty cache stops serving the
+    /// duties of the later slots after the move.
+    ///
+    /// Part 2 uses a real `BnManager` as the beacon node of the service:
     /// - The first sign (key 0) disables key 1.
     /// - The second sign (key 2) revokes the only beacon node.
     ///
     /// Key 1 must make no cache lookup. Key 3 reads its fence after the
     /// revoke and must make no cache lookup. Only keys 0 and 2 sign.
-    ///
-    /// Control: the mock beacon node gives a new fence that holds after its
-    /// admission generation moves. The first sign moves the generation, and
-    /// each later duty reads its own new fence and signs.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_concurrent_subscriptions_keep_the_per_sign_fence_and_store_gate() {
+        let moved = ManyKeys::new(4, make_config(), Vec::new()).await;
+        moved.service.validator_store.set_enabled(&moved.keys[1], false);
+        let admission = Arc::clone(&moved.admission);
+        moved.remote.on_sign(move || {
+            admission.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let outcome = moved.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(
+            moved.remote.started(),
+            [moved.keys[0]],
+            "Part 1: only key 0 must sign: key 1 is disabled, and keys 2 and 3 are after the move."
+        );
+        assert_eq!(moved.service.selection_proofs.lookups(), 1, "Part 1: one cache lookup");
+        assert!(matches!(outcome, Ok(())), "Part 1: the POST is accepted: {outcome:?}");
+        assert_eq!(moved.post_sizes(), [1], "Part 1: the POST must carry only key 0.");
+
         let mut f = ManyKeys::new(4, make_config(), Vec::new()).await;
         let config = bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]);
         let manager = Arc::new(bn_manager::BnManager::new(config).expect("bn manager"));
@@ -1907,34 +1928,19 @@ mod tests {
         assert_eq!(
             f.remote.started(),
             [f.keys[0], f.keys[2]],
-            "Only key 0 and key 2 must sign: key 1 is disabled, and key 3 is after the revoke."
+            "Part 2: only key 0 and key 2 must sign: key 1 is disabled, and key 3 is after the revoke."
         );
         assert_eq!(
             f.service.selection_proofs.lookups(),
             2,
-            "The disabled key and the key after the revoke must make no cache lookup."
+            "Part 2: the disabled key and the key after the revoke must make no cache lookup."
         );
         assert!(
             matches!(
                 outcome,
                 Err(OrchestratorError::Beacon(bn_manager::BeaconError::NoAdmittedNode))
             ),
-            "The revoked beacon node refuses the POST of the two proofs: {outcome:?}"
-        );
-
-        let control = ManyKeys::new(4, make_config(), Vec::new()).await;
-        let admission = Arc::clone(&control.admission);
-        control.remote.on_sign(move || {
-            admission.fetch_add(1, Ordering::SeqCst);
-        });
-
-        let outcome = control.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
-
-        assert!(matches!(outcome, Ok(())), "control: the POST is accepted: {outcome:?}");
-        assert_eq!(
-            control.remote.started(),
-            control.keys,
-            "Control: each duty after the generation moves must read its own fence and sign."
+            "Part 2: the revoked beacon node refuses the POST of the two proofs: {outcome:?}"
         );
     }
 
