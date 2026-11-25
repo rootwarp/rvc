@@ -2024,8 +2024,11 @@ mod tests {
     /// Key 1 must make no cache lookup. Key 3 reads its fence after the
     /// revocation and must make no cache lookup. Only keys 0 and 2 sign.
     ///
-    /// In both parts, the generation moves after the duty read, so the call
-    /// must send no POST and must return `RevokedInFlight` (self-check F2).
+    /// This guard must pass on the base code too (issue AC), so it checks
+    /// only the sign requests and the cache lookups. After a move, the base
+    /// code sends the POST and this code does not (self-check F2).
+    /// `no_subscription_post_after_a_revocation_during_the_sign_requests`
+    /// checks the POST, the result and the fence reads after a move.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_concurrent_subscriptions_keep_the_per_sign_fence_and_store_gate() {
         let moved = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2034,9 +2037,8 @@ mod tests {
         moved.remote.on_sign(move || {
             admission.fetch_add(1, Ordering::SeqCst);
         });
-        let fences = moved.mock.duty_fence_calls();
 
-        let outcome = moved.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let _ = moved.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
         assert_eq!(
             moved.remote.started(),
@@ -2044,19 +2046,9 @@ mod tests {
             "Part 1: only key 0 must sign: key 1 is disabled, and keys 2 and 3 are after the move."
         );
         assert_eq!(
-            moved.mock.duty_fence_calls() - fences,
-            3,
-            "Part 1: each of the 3 enabled duties must read its own fence, and the disabled duty must read none."
-        );
-        assert_eq!(
             moved.service.selection_proofs.lookups(),
             1,
             "Part 1: only key 0 must make a cache lookup."
-        );
-        assert!(moved.post_starts().is_empty(), "Part 1: no POST must start after the move.");
-        assert!(
-            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
-            "Part 1: the call must return RevokedInFlight: {outcome:?}"
         );
 
         let mut f = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2074,7 +2066,7 @@ mod tests {
         f.remote.on_sign(move || revoker.testing_revoke_admission(0));
         f.service.beacon = manager as Arc<dyn BeaconNodeClient>;
 
-        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let _ = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
         assert_eq!(
             f.remote.started(),
@@ -2085,13 +2077,6 @@ mod tests {
             f.service.selection_proofs.lookups(),
             2,
             "Part 2: the disabled key and the key after the revocation must make no cache lookup."
-        );
-        assert!(
-            matches!(
-                outcome,
-                Err(OrchestratorError::Beacon(bn_manager::BeaconError::RevokedInFlight))
-            ),
-            "Part 2: the call must return RevokedInFlight, not the NoAdmittedNode of a POST: {outcome:?}"
         );
     }
 
@@ -2288,11 +2273,12 @@ mod tests {
         f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
     }
 
-    /// Each of the 4 duties checks its fence. Then the admission generation
-    /// moves at the start of the last sign request. The proofs go into the
-    /// cache, but the duties came before the move: the call must send no
-    /// POST and must return `RevokedInFlight` (self-check F2). A retry with
-    /// duties read after the move must send them with the cached proofs.
+    /// Each of the 4 duties reads and checks its own fence. Then the
+    /// admission generation moves at the start of the last sign request. The
+    /// proofs go into the cache, but the duties came before the move: the
+    /// call must send no POST and must return `RevokedInFlight` (self-check
+    /// F2). A retry with duties read after the move must send them with the
+    /// cached proofs. Part 2 does the same move with a real `BnManager`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_subscription_post_after_a_revocation_during_the_sign_requests() {
         let f = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2303,10 +2289,16 @@ mod tests {
         f.remote.on_sign(move || {
             admission.fetch_add(1, Ordering::SeqCst);
         });
+        let fences = f.mock.duty_fence_calls();
 
         let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
         assert_eq!(f.remote.started(), f.keys, "Each of the 4 duties must sign before the move.");
+        assert_eq!(
+            f.mock.duty_fence_calls() - fences,
+            4,
+            "Each of the 4 duties must read its own fence (self-check F4)."
+        );
         assert!(f.post_starts().is_empty(), "No POST must start after the move.");
         assert!(
             matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
@@ -2322,6 +2314,33 @@ mod tests {
         assert!(matches!(retry, Ok(())), "The retry must return Ok: {retry:?}");
         f.assert_each_duty_once(&f.posts(), "The POST of the retry");
         assert_eq!(f.remote.started().len(), 4, "The retry must make no new sign request.");
+
+        let mut real = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let config = bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]);
+        let manager = Arc::new(
+            bn_manager::BnManager::new(config).expect("The beacon node manager must start."),
+        );
+        for _ in 0..3 {
+            real.remote.on_sign(|| {});
+        }
+        let revoker = Arc::clone(&manager);
+        real.remote.on_sign(move || revoker.testing_revoke_admission(0));
+        real.service.beacon = manager as Arc<dyn BeaconNodeClient>;
+
+        let outcome = real.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(
+            real.remote.started(),
+            real.keys,
+            "Part 2: each of the 4 duties must sign before the revocation."
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(OrchestratorError::Beacon(bn_manager::BeaconError::RevokedInFlight))
+            ),
+            "Part 2: the call must return RevokedInFlight, not the NoAdmittedNode of a POST: {outcome:?}"
+        );
     }
 
     type Fields = std::collections::BTreeMap<String, String>;
