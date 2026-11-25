@@ -582,6 +582,11 @@ impl DutyManagementService {
     /// fence, and then gets its proof from the cache, so the concurrency does
     /// not change which duties can sign.
     ///
+    /// The call reads the revocation watch of the beacon node before it reads
+    /// the duties, and each duty checks that watch with its own fence. After
+    /// a revocation, no later duty signs, because its duty can come from the
+    /// revoked node. The duty cache applies the same rule to each read.
+    ///
     /// A duty whose proof is in the cache, or in flight for aggregation, does
     /// not sign again. The cache signs only for the owner of the key, and the
     /// owner checks the store gate again just before the signer call.
@@ -603,6 +608,7 @@ impl DutyManagementService {
         &self,
         epoch: u64,
     ) -> Result<(), OrchestratorError> {
+        let duties_watch = self.beacon.revocation_watch();
         let mut own_duties = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
@@ -629,6 +635,7 @@ impl DutyManagementService {
         }
 
         let signs = SUBSCRIPTION_SIGNS.min(self.config.dispatch_limits.concurrency as usize);
+        let duties_watch = &duties_watch;
         let subscriptions: Vec<BeaconCommitteeSubscription> = stream::iter(own_duties)
             .map(|(slot, duty_bytes, pubkey, duty)| async move {
                 // Same store gate as aggregate production: doppelganger-off
@@ -651,7 +658,7 @@ impl DutyManagementService {
                     Ok(fence)
                         if !super::slot_context::admission_blocks(
                             signer::SigningDuty::SelectionProof,
-                            &[&fence],
+                            &[&fence, duties_watch],
                         ) =>
                     {
                         fence
@@ -824,10 +831,13 @@ pub(crate) enum PreparePoint {
 type PrepareHook = Box<dyn FnMut(PreparePoint)>;
 
 #[cfg(test)]
+type SlotDutiesHook = Box<dyn FnMut(Slot)>;
+
+#[cfg(test)]
 thread_local! {
     /// Runs in [`DutyManagementService::submit_committee_subscriptions`] after
     /// the read of the duties of each slot, when a test sets it on this thread.
-    static AFTER_SLOT_DUTIES: std::cell::RefCell<Option<Box<dyn FnMut(Slot)>>> =
+    static AFTER_SLOT_DUTIES: std::cell::RefCell<Option<SlotDutiesHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
