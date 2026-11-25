@@ -12970,4 +12970,164 @@ mod tests {
             "After the move, the call must return RevokedInFlight: {outcome:?}"
         );
     }
+
+    /// Self-check S6 (#1043): with the subscriptions topic off, the call asks
+    /// one node at a time, and each node answers 503. While the duty watch
+    /// holds, the call returns the 503. Then the first node moves the watch in
+    /// its answer: it revokes node C, which has no submission role. The next
+    /// node must get no POST, and the call must return `RevokedInFlight`, not
+    /// the earlier 503.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_query_first_subscription_error_after_a_revocation_is_revoked_in_flight() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::OnceLock;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// Counts the POST, revokes node C one time when armed, then answers 503.
+        struct UnavailableThenRevoke {
+            manager: Arc<OnceLock<Arc<BnManager>>>,
+            armed: Arc<AtomicBool>,
+            posts: Arc<AtomicUsize>,
+        }
+
+        impl Respond for UnavailableThenRevoke {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                self.posts.fetch_add(1, Ordering::SeqCst);
+                if let (true, Some(manager)) =
+                    (self.armed.swap(false, Ordering::SeqCst), self.manager.get())
+                {
+                    manager.revoke_admission(2);
+                }
+                ResponseTemplate::new(503)
+            }
+        }
+
+        let nodes = [MockServer::start().await, MockServer::start().await];
+        let (cell, armed) = (Arc::new(OnceLock::new()), Arc::new(AtomicBool::new(false)));
+        let posts = Arc::new(AtomicUsize::new(0));
+        for node in &nodes {
+            let respond = UnavailableThenRevoke {
+                manager: Arc::clone(&cell),
+                armed: Arc::clone(&armed),
+                posts: Arc::clone(&posts),
+            };
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(respond)
+                .mount(node)
+                .await;
+        }
+        let mut endpoints: Vec<String> = nodes.iter().map(MockServer::uri).collect();
+        endpoints.push("http://127.0.0.1:9".to_string());
+        let mut config = BnManagerConfig::new(endpoints);
+        let submission = HashSet::from([BnRole::Submission]);
+        config.roles = vec![submission.clone(), submission, HashSet::from([BnRole::Proposal])];
+        config.broadcast_topics.subscriptions = false;
+        let manager =
+            Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
+        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The responders must get the manager.");
+        let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
+        let subscriptions = [committee_subscription()];
+
+        let held =
+            manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            2,
+            "While the watch holds, each node must get one POST."
+        );
+        assert!(
+            matches!(held, Err(BeaconError::ApiError { status: 503, .. })),
+            "While the watch holds, the call must return the 503: {held:?}"
+        );
+
+        armed.store(true, Ordering::SeqCst);
+        let moved =
+            manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+
+        assert!(!watch.holds(), "The revocation of node C must move the duty watch.");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            3,
+            "After the move, the next node must get no POST."
+        );
+        assert!(
+            matches!(moved, Err(BeaconError::RevokedInFlight)),
+            "After the move, the call must return RevokedInFlight: {moved:?}"
+        );
+    }
+
+    /// Self-check S6 (#1043): node A has the submission and proposal roles,
+    /// node B has the submission role, and node C has the aggregation role.
+    /// Four held broadcasts take the four permits of node A, and the
+    /// subscription attempt of node A waits. Node B revokes node C and
+    /// answers 503. Then node A gets its permit after the move. Each attempt
+    /// fails. The call must return `RevokedInFlight`, not the 503 of the
+    /// highest node index.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_subscription_broadcast_after_a_revocation_is_revoked_in_flight() {
+        use std::collections::HashSet;
+        use std::sync::OnceLock;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// Revokes node C, tells the test, then answers 503.
+        struct RevokeThenUnavailable(Arc<OnceLock<Arc<BnManager>>>, Arc<tokio::sync::Notify>);
+
+        impl Respond for RevokeThenUnavailable {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                if let Some(manager) = self.0.get() {
+                    manager.revoke_admission(2);
+                }
+                self.1.notify_one();
+                ResponseTemplate::new(503)
+            }
+        }
+
+        let (node_a, node_b) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&node_a)
+            .await;
+        let (cell, moved) = (Arc::new(OnceLock::new()), Arc::new(tokio::sync::Notify::new()));
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(RevokeThenUnavailable(Arc::clone(&cell), Arc::clone(&moved)))
+            .mount(&node_b)
+            .await;
+        let endpoints = vec![node_a.uri(), node_b.uri(), "http://127.0.0.1:9".to_string()];
+        let mut config = BnManagerConfig::new(endpoints);
+        config.roles = vec![
+            HashSet::from([BnRole::Submission, BnRole::Proposal]),
+            HashSet::from([BnRole::Submission]),
+            HashSet::from([BnRole::Aggregation]),
+        ];
+        let manager =
+            Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
+        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The responder must get the manager.");
+        let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
+
+        let held = HeldPermits::take(&manager, BnRole::Proposal).await;
+
+        let subscriptions = [committee_subscription()];
+        let mut call = manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch);
+        assert!(futures::poll!(call.as_mut()).is_pending(), "Node A must wait for a permit.");
+        let notified = tokio::time::timeout(Duration::from_secs(10), moved.notified()).await;
+        assert!(notified.is_ok(), "Node B must answer the POST in 10 s.");
+        assert!(!watch.holds(), "The revocation of node C must move the duty watch.");
+        held.release().await;
+        let outcome = call.await;
+
+        let to_a = node_a.received_requests().await.expect("Node A must record its requests.");
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert_eq!((to_a.len(), to_b.len()), (0, 1), "Only node B must get a POST.");
+        assert!(
+            matches!(outcome, Err(BeaconError::RevokedInFlight)),
+            "After the move, the call must return RevokedInFlight: {outcome:?}"
+        );
+    }
 }
