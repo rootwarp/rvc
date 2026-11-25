@@ -2333,10 +2333,11 @@ mod tests {
 
     /// Each of the 4 duties reads and checks its own fence. Then the
     /// admission generation moves at the start of the last sign request. The
-    /// proofs go into the cache, but the duties came before the move: the
-    /// call must send no POST and must return `RevokedInFlight` (self-check
-    /// F2). A retry with duties read after the move must send them with the
-    /// cached proofs. Part 2 does the same move with a real `BnManager`.
+    /// 4 sign requests are in flight at the move, and their proofs must go
+    /// into no cache entry (RSA B1, #1043 R1). The call must send no POST,
+    /// and it must return `RevokedInFlight` (self-check F2). A retry with
+    /// duties read after the move must sign the 4 proofs again and send
+    /// them. Part 2 does the same move with a real `BnManager`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_subscription_post_after_a_revocation_during_the_sign_requests() {
         let f = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2363,7 +2364,11 @@ mod tests {
             "The call must return RevokedInFlight: {outcome:?}"
         );
         let cache = (f.service.selection_proofs.len(), f.service.selection_proofs.in_flight_len());
-        assert_eq!(cache, (4, 0), "The cache must hold the 4 ready proofs for the retry.");
+        assert_eq!(
+            cache,
+            (0, 0),
+            "The cache must hold no proof from a sign request in flight at the move."
+        );
 
         let fetch = f.service.duty_tracker.fetch_duties_for_epoch(SUBSCRIBED_EPOCH).await;
         fetch.expect("The duty fetch after the move must return the duties.");
@@ -2371,7 +2376,7 @@ mod tests {
 
         assert!(matches!(retry, Ok(())), "The retry must return Ok: {retry:?}");
         f.assert_each_duty_once(&f.posts(), "The POST of the retry");
-        assert_eq!(f.remote.started().len(), 4, "The retry must make no new sign request.");
+        assert_eq!(f.remote.started().len(), 8, "The retry must sign the 4 proofs again.");
 
         let mut real = ManyKeys::new(4, make_config(), Vec::new()).await;
         let config = bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]);
@@ -2398,6 +2403,93 @@ mod tests {
                 Err(OrchestratorError::Beacon(bn_manager::BeaconError::RevokedInFlight))
             ),
             "Part 2: the call must return RevokedInFlight, not the NoAdmittedNode of a POST: {outcome:?}"
+        );
+    }
+
+    /// RSA B1 (#1043 R1): keys 0 to 3 have one duty each, in slot order. The
+    /// store disables key 1 at the start of the sign request of key 1, after
+    /// its last gate check. The proof of key 1 must go into no cache entry and
+    /// no POST. The POST contains the other 3 duties. For a revocation during
+    /// the sign requests, see
+    /// `no_subscription_post_after_a_revocation_during_the_sign_requests`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_sign_in_flight_at_a_store_disable_gives_no_proof() {
+        let f = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let (store, key) = (Arc::clone(&f.service.validator_store), f.keys[1]);
+        f.remote.on_sign(|| {});
+        f.remote.on_sign(move || store.set_enabled(&key, false));
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(f.remote.started(), f.keys, "Each of the 4 duties must start a sign request.");
+        let mut sent: Vec<(String, String)> = f.posts().into_iter().flatten().collect();
+        sent.sort();
+        let expected: Vec<(String, String)> =
+            [0, 2, 3].into_iter().map(|i| (i.to_string(), duty_slot(i).to_string())).collect();
+        assert_eq!(
+            sent, expected,
+            "The POST must not contain the duty of key 1, which the store disabled during its sign request."
+        );
+        assert_eq!(
+            f.service.selection_proofs.slots(),
+            std::collections::BTreeSet::from([duty_slot(0), duty_slot(2), duty_slot(3)]),
+            "The cache must hold the proofs of keys 0, 2 and 3, and no proof of key 1."
+        );
+        assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
+    }
+
+    /// RSA B1 (#1043 R1): the duty of key 0 passes its fence check, and then
+    /// it waits for another owner of its selection proof. The admission
+    /// generation moves during the wait, and then the other owner fails. The
+    /// duty becomes the owner. Its last check before the sign must stop the
+    /// sign before the signer call. The call must return `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_subscription_owner_checks_the_fence_again_before_its_sign() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let f = ManyKeys::new(1, make_config(), Vec::new()).await;
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone());
+        let _log = tracing::subscriber::set_default(subscriber);
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let cache = Arc::clone(&f.service.selection_proofs);
+        let mut other =
+            std::pin::pin!(cache.get_or_sign((duty_slot(0), f.keys[0]), || async move {
+                let _ = held.await;
+                Err::<crypto::Signature, ()>(())
+            }));
+        assert!(futures::poll!(other.as_mut()).is_pending(), "The other owner must hold the key.");
+        let mut pass = std::pin::pin!(f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH));
+        for _ in 0..1_000 {
+            if cache.waiter_registrations() == 1 {
+                break;
+            }
+            assert!(futures::poll!(pass.as_mut()).is_pending(), "The call must wait.");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.waiter_registrations(), 1, "The duty must wait for the other owner.");
+
+        f.admission.fetch_add(1, Ordering::SeqCst);
+        release.send(()).expect("The other owner must wait for the release.");
+        let other = other.await;
+        let outcome = pass.await;
+
+        assert!(
+            matches!(other, Err(SelectionProofError::Sign(()))),
+            "The other owner must fail: {other:?}"
+        );
+        let messages: Vec<String> =
+            warns.0.lock().iter().filter_map(|fields| fields.get("message").cloned()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message == "SignerService: beacon node admission revoked"),
+            "The new owner must stop the sign before the signer call: {messages:?}"
+        );
+        assert!(f.remote.started().is_empty(), "The signer backend must get no request.");
+        assert!(
+            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
+            "The call must return RevokedInFlight: {outcome:?}"
         );
     }
 
