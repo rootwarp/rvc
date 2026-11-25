@@ -43,7 +43,7 @@ use crate::v4_wire::{
     PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH, QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI,
     QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
 };
-use crate::BeaconError;
+use crate::{BeaconError, DutyFence};
 
 #[derive(Debug, Deserialize)]
 struct AttestationSubmissionError {
@@ -1682,6 +1682,18 @@ impl BeaconClient {
             .await
     }
 
+    /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
+    /// `duties_watch` held. Each HTTP attempt, also a retry, starts only while
+    /// the watch holds. Else the result is [`BeaconError::RevokedInFlight`].
+    pub async fn submit_beacon_committee_subscriptions_fenced(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+        duties_watch: &DutyFence,
+    ) -> Result<(), BeaconError> {
+        let _ = duties_watch;
+        self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+
     /// Subscribes validators to sync-committee subnets ahead of their period
     /// (`POST /eth/v1/validator/sync_committee_subscriptions`).
     pub async fn submit_sync_committee_subscriptions(
@@ -3175,5 +3187,108 @@ mod tests {
             }
             other => panic!("expected parse error, got {other:?}"),
         }
+    }
+
+    const SUBSCRIPTIONS_PATH: &str = "/eth/v1/validator/beacon_committee_subscriptions";
+
+    /// One subscription for the duty-watch tests.
+    fn committee_subscription() -> BeaconCommitteeSubscription {
+        BeaconCommitteeSubscription {
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committees_at_slot: "1".to_string(),
+            slot: "33".to_string(),
+            is_aggregator: false,
+        }
+    }
+
+    /// Harper B2 (#1043 R1): a subscription POST starts only while its duty
+    /// watch holds. After the watch moves, the next call must send no POST,
+    /// and it must return `RevokedInFlight`. A call with no watch still sends
+    /// its POST.
+    #[tokio::test]
+    async fn a_subscription_post_starts_only_while_the_duty_watch_holds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(server.uri()).with_max_retries(0))
+            .expect("The client must start.");
+        let generation = Arc::new(AtomicU64::new(0));
+        let watch = DutyFence::at(0, Arc::clone(&generation));
+        let subscriptions = [committee_subscription()];
+        let posts = || async { server.received_requests().await.unwrap_or_default().len() };
+
+        let sent =
+            client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+
+        assert!(matches!(sent, Ok(())), "While the watch holds, the POST must go out: {sent:?}");
+        assert_eq!(posts().await, 1, "While the watch holds, the node must get one POST.");
+
+        generation.fetch_add(1, Ordering::SeqCst);
+        let refused =
+            client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+
+        assert_eq!(posts().await, 1, "After the move, the node must get no new POST.");
+        assert!(
+            matches!(refused, Err(BeaconError::RevokedInFlight)),
+            "After the move, the call must return RevokedInFlight: {refused:?}"
+        );
+
+        let unwatched = client.submit_beacon_committee_subscriptions(&subscriptions).await;
+
+        assert!(
+            matches!(unwatched, Ok(())),
+            "A call with no watch must send its POST: {unwatched:?}"
+        );
+        assert_eq!(posts().await, 2, "A call with no watch must send one POST.");
+    }
+
+    /// RSA B2 (#1043 R1): the first subscription POST gets a 503, and the
+    /// duty watch moves while the node answers. The client must not send a
+    /// retry after the move, and it must return `RevokedInFlight`.
+    #[tokio::test]
+    async fn a_subscription_retry_does_not_post_after_a_revocation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// Moves the generation, then answers 503.
+        struct MoveThenUnavailable(Arc<AtomicU64>);
+
+        impl Respond for MoveThenUnavailable {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(503)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let generation = Arc::new(AtomicU64::new(0));
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(MoveThenUnavailable(Arc::clone(&generation)))
+            .mount(&server)
+            .await;
+        let config = BeaconClientConfig::new(server.uri())
+            .with_max_retries(2)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).expect("The client must start.");
+        let watch = DutyFence::at(0, Arc::clone(&generation));
+
+        let outcome = client
+            .submit_beacon_committee_subscriptions_fenced(&[committee_subscription()], &watch)
+            .await;
+
+        let posts = server.received_requests().await.unwrap_or_default().len();
+        assert_eq!(posts, 1, "After the move, the client must not send a retry.");
+        assert!(
+            matches!(outcome, Err(BeaconError::RevokedInFlight)),
+            "After the move, the call must return RevokedInFlight: {outcome:?}"
+        );
     }
 }

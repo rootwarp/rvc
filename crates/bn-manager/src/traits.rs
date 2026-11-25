@@ -431,6 +431,20 @@ pub trait AttestationApi: Send + Sync {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError>;
 
+    /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
+    /// `duties_watch` held. After a move, no POST may start, and the result is
+    /// [`BeaconError::RevokedInFlight`]. The default checks the watch one time.
+    /// A client that can wait before an HTTP attempt (for a permit, an earlier
+    /// node or a retry) must check the watch at the start of each attempt.
+    async fn submit_beacon_committee_subscriptions_fenced(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+        duties_watch: &beacon::DutyFence,
+    ) -> Result<(), BeaconError> {
+        let _ = duties_watch;
+        self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+
     /// Subscribe validators to sync-committee subnets
     /// (`POST /eth/v1/validator/sync_committee_subscriptions`).
     ///
@@ -1245,5 +1259,94 @@ mod tests {
         assert!(!err.to_string().contains("duty-aware production requires BnManager"), "{err}");
         let hits = server.received_requests().await.expect("requests");
         assert!(!hits.is_empty(), "v4_by must reach the node");
+    }
+
+    // -- The default subscription POST with a duty watch --
+
+    /// Counts the subscription POSTs. The tests do not use the other methods.
+    #[derive(Default)]
+    struct SubscriptionCounter(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl AttestationApi for SubscriptionCounter {
+        async fn get_attestation_data(
+            &self,
+            _slot: u64,
+            _committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::Unsupported("get_attestation_data"))
+        }
+
+        async fn submit_attestation(
+            &self,
+            _attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::Unsupported("submit_attestation"))
+        }
+
+        async fn get_aggregate_attestation(
+            &self,
+            _slot: u64,
+            _attestation_data_root: &str,
+            _committee_index: Option<u64>,
+            _fork: ForkName,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::Unsupported("get_aggregate_attestation"))
+        }
+
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::Unsupported("submit_aggregate_and_proofs"))
+        }
+
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn submit_sync_committee_subscriptions(
+            &self,
+            _subscriptions: &[SyncCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::Unsupported("submit_sync_committee_subscriptions"))
+        }
+    }
+
+    /// Harper B2 (#1043 R1): while the duty watch holds, the default sends
+    /// the POST. After the watch moves, the default must send no POST, and it
+    /// must return `RevokedInFlight`.
+    #[tokio::test]
+    async fn the_default_subscription_post_checks_the_duty_watch() {
+        use std::sync::atomic::Ordering;
+        let counter = SubscriptionCounter::default();
+        let generation = Arc::new(AtomicU64::new(0));
+        let watch = beacon::DutyFence::at(0, Arc::clone(&generation));
+
+        let sent = counter.submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
+
+        assert!(matches!(sent, Ok(())), "While the watch holds, the POST must go out: {sent:?}");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "While the watch holds, one POST goes out."
+        );
+
+        generation.fetch_add(1, Ordering::SeqCst);
+        let refused = counter.submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
+
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "After the move, the default must send no POST."
+        );
+        assert!(
+            matches!(refused, Err(BeaconError::RevokedInFlight)),
+            "After the move, the default must return RevokedInFlight: {refused:?}"
+        );
     }
 }

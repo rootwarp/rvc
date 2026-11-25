@@ -5284,6 +5284,11 @@ impl_beacon_client_passthrough! {
             &self,
             subscriptions: &[BeaconCommitteeSubscription],
         ) -> Result<(), BeaconError>;
+        async fn submit_beacon_committee_subscriptions_fenced(
+            &self,
+            subscriptions: &[BeaconCommitteeSubscription],
+            duties_watch: &DutyFence,
+        ) -> Result<(), BeaconError>;
         async fn submit_sync_committee_subscriptions(
             &self,
             subscriptions: &[SyncCommitteeSubscription],
@@ -5659,13 +5664,13 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 28 passthrough methods, plus 15 hand-written BlockProducer methods.
+        // 29 passthrough methods, plus 15 hand-written BlockProducer methods.
         // Duty-carrying produce methods cannot sit in the macro (async_trait).
         let mut surface: Vec<&str> = BEACON_CLIENT_PASSTHROUGH_METHODS.to_vec();
         surface.extend_from_slice(BEACON_CLIENT_BLOCK_PRODUCER_METHODS);
         assert_eq!(
             surface.len(),
-            43,
+            44,
             "update the passthrough macro or BEACON_CLIENT_BLOCK_PRODUCER_METHODS"
         );
 
@@ -12770,5 +12775,176 @@ mod tests {
             BnManager::new(BnManagerConfig::new(pair.map(String::from).to_vec()))
                 .unwrap_or_else(|err| panic!("{pair:?} are two nodes: {err}"));
         }
+    }
+
+    const SUBSCRIPTIONS_PATH: &str = "/eth/v1/validator/beacon_committee_subscriptions";
+
+    /// One subscription for the duty-watch tests.
+    fn committee_subscription() -> BeaconCommitteeSubscription {
+        BeaconCommitteeSubscription {
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committees_at_slot: "1".to_string(),
+            slot: "33".to_string(),
+            is_aggregator: false,
+        }
+    }
+
+    /// Held broadcasts that take each broadcast permit of the nodes of one role.
+    struct HeldPermits {
+        gate: Arc<tokio::sync::Semaphore>,
+        holders: Vec<tokio::task::JoinHandle<Result<(), BeaconError>>>,
+    }
+
+    impl HeldPermits {
+        /// Starts one held broadcast for each permit and waits until each one
+        /// holds its permit.
+        async fn take(manager: &Arc<BnManager>, role: BnRole) -> Self {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let holders = (0..fan_out::MAX_INFLIGHT_PER_BN)
+                .map(|_| {
+                    let (manager, gate, entered) =
+                        (Arc::clone(manager), Arc::clone(&gate), Arc::clone(&entered));
+                    tokio::spawn(async move {
+                        let hold = move |_client: &BeaconClient| {
+                            let (gate, entered) = (Arc::clone(&gate), Arc::clone(&entered));
+                            Box::pin(async move {
+                                entered.fetch_add(1, Ordering::SeqCst);
+                                let _permit = gate.acquire().await;
+                                Ok::<(), BeaconError>(())
+                            }) as BoxFut<'static, ()>
+                        };
+                        manager.broadcast("hold", role, None, hold).await
+                    })
+                })
+                .collect();
+            for _ in 0..1_000 {
+                if entered.load(Ordering::SeqCst) == fan_out::MAX_INFLIGHT_PER_BN {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                entered.load(Ordering::SeqCst),
+                fan_out::MAX_INFLIGHT_PER_BN,
+                "The held broadcasts must take each permit."
+            );
+            Self { gate, holders }
+        }
+
+        /// Gives the permits back. Each held broadcast must return `Ok`.
+        async fn release(self) {
+            self.gate.add_permits(fan_out::MAX_INFLIGHT_PER_BN);
+            for holder in self.holders {
+                let held = holder.await.expect("Each held broadcast must end.");
+                assert!(matches!(held, Ok(())), "Each held broadcast must return Ok: {held:?}");
+            }
+        }
+    }
+
+    /// Harper B2 (#1043 R1): node A has the proposal role, and node B has
+    /// the submission role. Four held broadcasts take the four permits of
+    /// node B. A subscription chunk then waits for a permit of node B. While
+    /// it waits, node A loses its admission. The duty watch moves, and the
+    /// stamp of node B still holds. When the permit comes, the chunk must not
+    /// start its POST, and it must return `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_subscription_chunk_that_waits_for_a_permit_does_not_post_after_a_revocation() {
+        use std::collections::HashSet;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let node_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&node_b)
+            .await;
+        let mut config = BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string(), node_b.uri()]);
+        config.roles = vec![HashSet::from([BnRole::Proposal]), HashSet::from([BnRole::Submission])];
+        let manager =
+            Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
+        let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
+
+        let held = HeldPermits::take(&manager, BnRole::Submission).await;
+
+        let subscriptions = [committee_subscription()];
+        let mut chunk =
+            manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch);
+        assert!(futures::poll!(chunk.as_mut()).is_pending(), "The chunk must wait for a permit.");
+        manager.revoke_admission(0);
+        assert!(!watch.holds(), "The revocation of node A must move the duty watch.");
+        held.release().await;
+        let outcome = chunk.await;
+
+        let posts = node_b.received_requests().await.unwrap_or_default().len();
+        assert_eq!(posts, 0, "The chunk must not start its POST to node B after the move.");
+        assert!(
+            matches!(outcome, Err(BeaconError::RevokedInFlight)),
+            "After the move, the chunk must return RevokedInFlight: {outcome:?}"
+        );
+    }
+
+    /// Harper B2 (#1043 R1): with the subscriptions topic off, the call asks
+    /// one node at a time. The first node that gets the POST loses its
+    /// admission while it answers, and the duty watch moves. The call must not
+    /// start a POST on the next node, and it must return `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_query_first_subscription_fallback_does_not_post_after_a_revocation() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::OnceLock;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// Counts the POST, revokes its own node, and then answers 200.
+        struct RevokeOnPost {
+            manager: Arc<OnceLock<Arc<BnManager>>>,
+            index: usize,
+            posts: Arc<AtomicUsize>,
+        }
+
+        impl Respond for RevokeOnPost {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                self.posts.fetch_add(1, Ordering::SeqCst);
+                if let Some(manager) = self.manager.get() {
+                    manager.revoke_admission(self.index);
+                }
+                ResponseTemplate::new(200)
+            }
+        }
+
+        let nodes = [MockServer::start().await, MockServer::start().await];
+        let cell = Arc::new(OnceLock::new());
+        let posts = Arc::new(AtomicUsize::new(0));
+        for (index, node) in nodes.iter().enumerate() {
+            let respond =
+                RevokeOnPost { manager: Arc::clone(&cell), index, posts: Arc::clone(&posts) };
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(respond)
+                .mount(node)
+                .await;
+        }
+        let mut config = BnManagerConfig::new(nodes.iter().map(MockServer::uri).collect());
+        config.broadcast_topics.subscriptions = false;
+        let manager =
+            Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
+        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The responders must get the manager.");
+        let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
+
+        let outcome = manager
+            .submit_beacon_committee_subscriptions_fenced(&[committee_subscription()], &watch)
+            .await;
+
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "After the first node loses its admission, the next node must get no POST."
+        );
+        assert!(
+            matches!(outcome, Err(BeaconError::RevokedInFlight)),
+            "After the move, the call must return RevokedInFlight: {outcome:?}"
+        );
     }
 }

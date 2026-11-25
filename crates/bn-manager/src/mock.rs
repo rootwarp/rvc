@@ -325,6 +325,10 @@ pub struct MockBeaconNodeClient {
     revoke_after_aggregate: AtomicBool,
     /// Number of [`BeaconNodeClient::duty_fence`] calls.
     duty_fence_calls: AtomicU64,
+    /// The duty watch of each
+    /// [`AttestationApi::submit_beacon_committee_subscriptions_fenced`] call,
+    /// in call sequence.
+    subscription_watches: Mutex<Vec<beacon::DutyFence>>,
 }
 
 /// Arrival of one role-trait call, before the injected request delay.
@@ -367,6 +371,13 @@ impl MockBeaconNodeClient {
     /// Number of [`BeaconNodeClient::duty_fence`] calls so far.
     pub fn duty_fence_calls(&self) -> u64 {
         self.duty_fence_calls.load(Ordering::SeqCst)
+    }
+
+    /// The duty watch of each
+    /// [`AttestationApi::submit_beacon_committee_subscriptions_fenced`] call so
+    /// far, in call sequence.
+    pub fn subscription_watches(&self) -> Vec<beacon::DutyFence> {
+        self.subscription_watches.lock().unwrap_or_else(|err| err.into_inner()).clone()
     }
 
     fn fence_now(&self) -> beacon::DutyFence {
@@ -1403,6 +1414,20 @@ impl AttestationApi for MockBeaconNodeClient {
             .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
     }
 
+    /// Records `duties_watch` and sends the POST. The mock does not check the
+    /// watch, so a test sees the check of the caller.
+    async fn submit_beacon_committee_subscriptions_fenced(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+        duties_watch: &beacon::DutyFence,
+    ) -> Result<(), BeaconError> {
+        self.subscription_watches
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(duties_watch.clone());
+        self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+
     async fn submit_sync_committee_subscriptions(
         &self,
         subscriptions: &[SyncCommitteeSubscription],
@@ -1537,6 +1562,31 @@ mod tests {
         assert!(mock.revocation_commit().is_none());
         let _ = mock.track_admission();
         assert!(mock.revocation_commit().is_none(), "the mock keeps the trait default");
+    }
+
+    /// The fenced subscription call records its watch and sends the POST.
+    /// The mock does not check the watch. Thus a moved watch also sends.
+    #[tokio::test]
+    async fn a_fenced_subscription_call_records_the_watch_and_sends() {
+        let posts = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&posts);
+        let mock =
+            MockBeaconNodeClient::new().with_submit_beacon_committee_subscriptions(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        let generation = Arc::new(AtomicU64::new(3));
+        let watch = beacon::DutyFence::at(2, Arc::clone(&generation));
+
+        let sent = mock.submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
+
+        assert!(matches!(sent, Ok(())), "The mock must send with a moved watch: {sent:?}");
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "The mock must send one POST.");
+        let watches = mock.subscription_watches();
+        assert_eq!(watches.len(), 1, "The mock must record one watch.");
+        assert_eq!(watches[0].seen(), 2, "The mock must record the watch of the call.");
+        let recorded = watches[0].generation().expect("The recorded watch must have a generation.");
+        assert!(Arc::ptr_eq(&recorded, &generation), "The mock must record the same generation.");
     }
 
     #[tokio::test]
