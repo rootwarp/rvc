@@ -236,6 +236,9 @@ pub fn ensure_genesis_validators_root(
 #[derive(Clone)]
 pub struct BeaconClient {
     client: Client,
+    /// Follows no redirect. Only the fenced POST uses it: a redirect is a new
+    /// request that would start with no check of the duty watch.
+    fenced_client: Client,
     config: BeaconClientConfig,
     /// Logs the node-version v1 fallback once per BN (D25).
     node_version_v1_fallback_logged: Arc<AtomicBool>,
@@ -262,11 +265,17 @@ impl BeaconClient {
             .timeout(config.timeout)
             .build()
             .map_err(|e| BeaconError::HttpError(e.to_string()))?;
+        let fenced_client = Client::builder()
+            .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
 
         let config = BeaconClientConfig { endpoint: endpoint.to_string(), ..config };
 
         Ok(Self {
             client,
+            fenced_client,
             config,
             node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
             admission_generation: Arc::new(Mutex::new(None)),
@@ -1685,13 +1694,14 @@ impl BeaconClient {
     /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
     /// `duties_watch` held. Each HTTP attempt, also a retry, starts only while
     /// the watch holds. Else the result is [`BeaconError::RevokedInFlight`].
+    /// The POST follows no redirect: a 3xx answer is an [`BeaconError::ApiError`].
     pub async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
         let path = "/eth/v1/validator/beacon_committee_subscriptions";
-        self.post_empty_gated(path, &subscriptions, &[], duties_watch)
+        self.post_empty_gated(&self.fenced_client, path, &subscriptions, &[], duties_watch)
             .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
     }
@@ -1915,13 +1925,14 @@ impl BeaconClient {
         body: &B,
         headers: &[(&str, &str)],
     ) -> Result<(), BeaconError> {
-        self.post_empty_gated(path, body, headers, &DutyFence::open()).await
+        self.post_empty_gated(&self.client, path, body, headers, &DutyFence::open()).await
     }
 
-    /// [`Self::post_empty_with_headers`] that starts each HTTP attempt, also
-    /// each retry, only while `gate` holds.
+    /// [`Self::post_empty_with_headers`] on `http` that starts each HTTP
+    /// attempt, also each retry, only while `gate` holds.
     async fn post_empty_gated<B: Serialize>(
         &self,
+        http: &Client,
         path: &str,
         body: &B,
         headers: &[(&str, &str)],
@@ -1945,8 +1956,7 @@ impl BeaconClient {
                 let body_bytes = body_bytes.clone();
                 let url = url.clone();
                 async move {
-                    let mut request = self
-                        .client
+                    let mut request = http
                         .post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
                         .body(body_bytes);
