@@ -479,6 +479,8 @@ pub struct BnManager {
     /// Fires after the liveness stamp re-check and before the witness read.
     #[cfg(test)]
     after_stamp_recheck: tokio::sync::Notify,
+    #[cfg(test)]
+    subscription_gauge: Arc<AttemptGauge>,
     /// Fires after each sync-monitor admission re-check.
     #[cfg(any(test, feature = "test-utils"))]
     sync_polled: Arc<tokio::sync::Notify>,
@@ -650,6 +652,34 @@ fn fallback_backstop(
     }
 }
 
+/// Counts the live subscription node attempts and keeps the peak (self-check S4).
+#[cfg(test)]
+#[derive(Default)]
+struct AttemptGauge {
+    live: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+/// One live attempt on an [`AttemptGauge`]. The drop ends it.
+#[cfg(test)]
+struct LiveAttempt(Arc<AttemptGauge>);
+
+#[cfg(test)]
+impl LiveAttempt {
+    fn new(gauge: &Arc<AttemptGauge>) -> Self {
+        let live = gauge.live.fetch_add(1, Ordering::SeqCst) + 1;
+        gauge.peak.fetch_max(live, Ordering::SeqCst);
+        Self(Arc::clone(gauge))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LiveAttempt {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl BnManager {
     /// Creates a new `BnManager` from the given configuration.
     ///
@@ -752,6 +782,8 @@ impl BnManager {
             metric_pool: crate::metrics::METRIC_POOL_MAIN,
             #[cfg(test)]
             after_stamp_recheck: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            subscription_gauge: Arc::default(),
             #[cfg(any(test, feature = "test-utils"))]
             sync_polled: Arc::new(tokio::sync::Notify::new()),
         })
@@ -4984,18 +5016,26 @@ impl AttestationApi for BnManager {
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
+        let payload = Arc::new((subscriptions.to_vec(), duties_watch.clone()));
+        #[cfg(test)]
+        let gauge = Arc::clone(&self.subscription_gauge);
+        let attempt = move |client: &BeaconClient| {
+            let (client, payload) = (client.clone(), Arc::clone(&payload));
+            #[cfg(test)]
+            let live = LiveAttempt::new(&gauge);
+            Box::pin(async move {
+                #[cfg(test)]
+                let _live = live;
+                client.submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1).await
+            }) as BoxFut<'static, ()>
+        };
         self.submit(
             "submit_beacon_committee_subscriptions",
             self.broadcast_topics.subscriptions,
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.preparation),
-            owned_attempt!((subscriptions.to_vec(), duties_watch.clone()), |client, payload| {
-                let (subscriptions, duties_watch) = payload.as_ref();
-                client
-                    .submit_beacon_committee_subscriptions_fenced(subscriptions, duties_watch)
-                    .await
-            }),
+            attempt,
         )
         .await
         .map_err(|err| if duties_watch.holds() { err } else { BeaconError::RevokedInFlight })
@@ -13132,5 +13172,50 @@ mod tests {
             matches!(outcome, Err(BeaconError::RevokedInFlight)),
             "After the move, the call must return RevokedInFlight: {outcome:?}"
         );
+    }
+
+    /// Self-check S4 (#1043): node A answers at once, and node B answers each
+    /// POST after 300 ms. The test sends 16 chunks at the same time. That is
+    /// more than the limit of 8 subscription attempts. Each chunk must return
+    /// `Ok`, and each node must get each POST. The peak number of active and
+    /// queued subscription attempts must be at most 8.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_attempts_with_a_slow_node_stay_at_the_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (node_a, node_b) = (MockServer::start().await, MockServer::start().await);
+        for (node, delay) in [(&node_a, Duration::ZERO), (&node_b, Duration::from_millis(300))] {
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(ResponseTemplate::new(200).set_delay(delay))
+                .mount(node)
+                .await;
+        }
+        let config = BnManagerConfig::new(vec![node_a.uri(), node_b.uri()]);
+        let manager = BnManager::new(config).expect("The beacon node manager must start.");
+        let watch = BeaconNodeClient::revocation_watch(&manager);
+        let subscriptions = [committee_subscription()];
+        let limit = 2 * fan_out::MAX_INFLIGHT_PER_BN;
+        let chunks = 2 * limit;
+
+        let outcomes =
+            futures::future::join_all((0..chunks).map(|_| {
+                manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch)
+            }))
+            .await;
+        manager.wait_for_broadcast_drains(Duration::ZERO).await;
+
+        assert!(outcomes.iter().all(Result::is_ok), "Each chunk must return Ok: {outcomes:?}");
+        for node in [&node_a, &node_b] {
+            let posts =
+                node.received_requests().await.expect("Each node must record its requests.");
+            assert_eq!(posts.len(), chunks, "Each node must get the POST of each chunk.");
+        }
+        let peak = manager.subscription_gauge.peak.load(Ordering::SeqCst);
+        assert!(peak <= limit, "The peak of active and queued attempts must be at most 8: {peak}");
+        assert_eq!(peak, limit, "The 16 chunks must use all 8 attempt permits.");
+        let live = manager.subscription_gauge.live.load(Ordering::SeqCst);
+        assert_eq!(live, 0, "Each subscription attempt must end.");
     }
 }
