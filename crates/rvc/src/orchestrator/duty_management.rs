@@ -43,6 +43,10 @@ const SUBSCRIPTION_CHUNK: usize = 512;
 /// time. A lower `dispatch_limits.concurrency` sets a lower cap.
 const SUBSCRIPTION_SIGNS: usize = 32;
 
+/// The maximum number of subscription chunk POSTs in flight at the same time:
+/// the broadcast permits of one beacon node (RSA B4).
+const SUBSCRIPTION_CHUNKS_IN_FLIGHT: usize = bn_manager::MAX_INFLIGHT_PER_BN;
+
 /// How a [`DutyManagementService::prepare_proposers`] call that met no error ended.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PrepareOutcome {
@@ -616,9 +620,11 @@ impl DutyManagementService {
     /// sign ended before the move stays in the cache. The signer bounds each
     /// sign with its own sign timeout.
     ///
-    /// The subscriptions go in POSTs of 512 or fewer. All POSTs start at the
-    /// same time, and each has its own `timeouts.preparation` bound. A failed
-    /// POST does not stop the other POSTs.
+    /// The subscriptions go in POSTs with a maximum of 512 subscriptions in
+    /// each POST. A maximum of `SUBSCRIPTION_CHUNKS_IN_FLIGHT` (4) POSTs are
+    /// in flight at the same time (RSA B4). Each POST has its own
+    /// `timeouts.preparation` bound, from its start. A failed POST does not
+    /// stop the other POSTs.
     ///
     /// `Ok` when the epoch needs no further send: each POST went out, or there
     /// is nothing to send (no own duty, or the store gate closed for each
@@ -787,14 +793,21 @@ impl DutyManagementService {
             return Ok(());
         }
 
-        // The chunks go out at the same time, so a slow POST does not use the
-        // time of the later chunks. The results stay in chunk order: the
-        // first failed chunk gives the result, and the runner step tries
-        // again in the next slot.
-        let posts = subscriptions
-            .chunks(SUBSCRIPTION_CHUNK)
-            .map(|chunk| self.post_subscriptions(epoch, duties_watch, chunk));
-        futures::future::join_all(posts).await.into_iter().fold(Ok(()), Result::and)
+        // Each chunk checks the watch when it starts. The first failed chunk
+        // in the sequence of the chunks gives the result. The stream items
+        // are chunk numbers: a `Chunks` iterator across an await is not `Send`.
+        let chunks = subscriptions.len().div_ceil(SUBSCRIPTION_CHUNK);
+        let subscriptions = &subscriptions;
+        let mut sent: Vec<(usize, Result<(), OrchestratorError>)> = stream::iter(0..chunks)
+            .map(|index| async move {
+                let chunk = subscriptions.chunks(SUBSCRIPTION_CHUNK).nth(index).unwrap_or_default();
+                (index, self.post_subscriptions(epoch, duties_watch, chunk).await)
+            })
+            .buffer_unordered(SUBSCRIPTION_CHUNKS_IN_FLIGHT)
+            .collect()
+            .await;
+        sent.sort_unstable_by_key(|(index, _)| *index);
+        sent.into_iter().map(|(_, outcome)| outcome).fold(Ok(()), Result::and)
     }
 
     /// One committee-subscription POST, under `timeouts.preparation`. No POST
