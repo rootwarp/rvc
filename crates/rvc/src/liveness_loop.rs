@@ -72,6 +72,14 @@ pub struct LivenessLoopSpawn {
     loop_task: LivenessObservationLoop,
 }
 
+impl LivenessLoopSpawn {
+    /// The detection persister of the loop. The shutdown drain writes through
+    /// it, so the loop and the drain share the in-flight state of each path.
+    pub fn persister(&self) -> Option<Arc<crate::detection_marker::DetectionPersister>> {
+        self.loop_task.detection_persister.clone()
+    }
+}
+
 /// Process exit requested by the liveness loop.
 ///
 /// Production uses [`ShutdownHandle`]. Tests use a recording impl. The only
@@ -111,13 +119,14 @@ pub struct LivenessObservationLoop {
     last_query_failure_warned: parking_lot::Mutex<Option<Epoch>>,
     /// Drain request. Production [`prepare_liveness_loop`] always sets this.
     exit_request: Option<Arc<dyn ExitRequest>>,
-    /// The paths of the detection: the keystore directory for the record and
-    /// the marker, and the owned fallback marker beside the slashing database.
-    /// The fallback marker records the keystore directory as its owner. The
-    /// loop gets the fallback only in these paths, with that keystore
-    /// directory. Production always sets the keystore directory. It sets the
-    /// fallback when the slashing database is in a different directory.
-    detection_paths: Option<crate::detection_marker::DetectionPaths>,
+    /// The writer of the detection paths: the keystore directory for the
+    /// record and the marker, and the owned fallback marker beside the
+    /// slashing database. The fallback marker records the keystore directory
+    /// as its owner. The loop gets the fallback only in these paths, with that
+    /// keystore directory. Production always sets the keystore directory. It
+    /// sets the fallback when the slashing database is in a different
+    /// directory. The shutdown drain uses the same persister.
+    detection_persister: Option<Arc<crate::detection_marker::DetectionPersister>>,
     /// Replaces the monotonic clock in tests. Production leaves this unset.
     #[cfg(any(test, feature = "test-utils"))]
     clock_seam: Option<Arc<ClockSeam>>,
@@ -202,7 +211,7 @@ impl LivenessObservationLoop {
             no_index_noted: parking_lot::Mutex::new(HashSet::new()),
             last_query_failure_warned: parking_lot::Mutex::new(None),
             exit_request: None,
-            detection_paths: None,
+            detection_persister: None,
             #[cfg(any(test, feature = "test-utils"))]
             clock_seam: None,
         }
@@ -252,8 +261,19 @@ impl LivenessObservationLoop {
     /// owned fallback marker when `paths` has a fallback. A caller can give
     /// the fallback only with its keystore directory. This call replaces the
     /// paths of a previous call.
-    pub fn with_detection_paths(mut self, paths: crate::detection_marker::DetectionPaths) -> Self {
-        self.detection_paths = Some(paths);
+    pub fn with_detection_paths(self, paths: crate::detection_marker::DetectionPaths) -> Self {
+        self.with_detection_persister(crate::detection_marker::DetectionPersister::new(paths))
+    }
+
+    /// Write the detection through `persister` before exit 12. The shutdown
+    /// drain gives the same persister, so it starts no second write on a path
+    /// whose write of this loop is still running. This call replaces the
+    /// paths of a previous call.
+    pub fn with_detection_persister(
+        mut self,
+        persister: Arc<crate::detection_marker::DetectionPersister>,
+    ) -> Self {
+        self.detection_persister = Some(persister);
         self
     }
 
@@ -352,7 +372,7 @@ impl LivenessObservationLoop {
                 }
                 if latched && !self.machine.detection_persisted() {
                     let detected_pubkeys = self.machine.detected_hexes();
-                    self.persist_detection_marker(current_epoch, &detected_pubkeys);
+                    self.persist_detection_marker(current_epoch, &detected_pubkeys).await;
                 }
                 // The durable flag of the machine is the only durability flag.
                 // Only a durable report of this loop or of the drain sets it.
@@ -378,7 +398,12 @@ impl LivenessObservationLoop {
                     debug!(pending, safe, current_epoch, slot_in_epoch, "forward-window tick");
                 }
 
-                self.record_completed_imports();
+                // A latched process exits 12 and the next boot refuses, so the
+                // sidecars stay. A cleanup that blocks on a hung keystore
+                // directory or on `TrackedKeys` could hold the exit.
+                if !self.machine.detected_latch() {
+                    self.record_completed_imports();
+                }
 
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
@@ -397,8 +422,11 @@ impl LivenessObservationLoop {
     }
 
     /// Write the detection to each configured path with
-    /// [`crate::detection_marker::persist_all`]: the record and the marker in
-    /// the keystore directory, and the owned fallback marker when one is set.
+    /// [`crate::detection_marker::DetectionPersister::persist`]: the record
+    /// and the marker in the keystore directory, and the owned fallback
+    /// marker when one is set. Each path is written on its own blocking
+    /// thread, so a hung keystore mount does not block the runtime or the
+    /// fallback.
     ///
     /// [`crate::detection_marker::log_persist_report`] logs and counts each
     /// failed path. A loop with no detection paths has no keystore directory
@@ -407,8 +435,8 @@ impl LivenessObservationLoop {
     /// returned `Ok` on at least one path. Otherwise the loop stays up and
     /// latched, and the next tick writes again. Exit 12 waits for the flag. A
     /// later read is not durability.
-    fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
-        let Some(paths) = &self.detection_paths else {
+    async fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
+        let Some(persister) = &self.detection_persister else {
             crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
             error!(
                 "doppelganger detected but no data directory is configured for the marker; \
@@ -421,7 +449,7 @@ impl LivenessObservationLoop {
             unix_secs: crate::detection_marker::unix_secs_now(),
             pubkeys: pubkeys.to_vec(),
         };
-        let report = crate::detection_marker::persist_all(paths, &marker);
+        let report = persister.persist(&marker).await;
         crate::detection_marker::log_persist_report(&report, "liveness loop");
         if report.durable() {
             self.machine.mark_detection_persisted();
@@ -1634,12 +1662,13 @@ mod tests {
     /// Register one pending key with the index "1" on `machine`. Build the
     /// production loop with `prepare_liveness_loop`, with `dir` as the keystore
     /// directory. Then start it with `spawn_liveness_loop` on `executor`.
+    /// Return the detection persister of the loop.
     fn spawn_production_loop(
         machine: &Arc<ForwardWindowMachine>,
         beacon: Arc<dyn LivenessApi>,
         dir: &std::path::Path,
         executor: &TaskExecutor,
-    ) {
+    ) -> Arc<crate::detection_marker::DetectionPersister> {
         let pk = new_pk();
         machine.register(&pk, 0);
         let reg = PubkeyIndexRegistry::shared();
@@ -1662,7 +1691,9 @@ mod tests {
             )),
         )
         .expect("`prepare_liveness_loop` must build the loop when a machine is available.");
+        let persister = prepared.persister().expect("The built loop must have a persister.");
         spawn_liveness_loop(prepared, executor);
+        persister
     }
 
     /// W4-D2c fix1: the task that `spawn_liveness_loop` registers must run the
@@ -1705,23 +1736,24 @@ mod tests {
     /// 2. Write the detection marker in the keystore directory.
     /// 3. Request exit 12 through the executor.
     ///
-    /// The runtime has one thread. The tick does not wait between the
-    /// liveness answer and the exit request. Thus the tick is complete when
-    /// the test continues after the first request. A latched key is not
-    /// pending, so the loop sends no second request.
+    /// The runtime has one thread. The test waits until the first round of
+    /// the persister of the loop has its result. The tick has then made its
+    /// exit request. A latched key is not pending, so the loop sends no
+    /// second request.
     #[tokio::test]
     async fn spawned_production_loop_writes_the_marker_and_requests_the_exit() {
         let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
         let m = machine();
         let (beacon, mut requests) = counted_liveness(true);
         let (executor, mut shutdown_rx) = TaskExecutor::new(CancellationToken::new());
-        spawn_production_loop(&m, beacon, dir.path(), &executor);
+        let persister = spawn_production_loop(&m, beacon, dir.path(), &executor);
 
         tokio::select! {
             biased;
             _ = requests.wait_for(|count| *count > 0) => {}
             () = executor.wait_until_work_finished("liveness_loop") => {}
         }
+        wait_for_rounds(&persister, 1).await;
         let reason = shutdown_rx.try_recv();
         assert!(m.detected_latch(), "The liveness loop must latch the detection of a live key.");
         assert!(
@@ -3688,13 +3720,17 @@ mod tests {
         }
     }
 
-    /// One run tick has these results:
-    /// - The not-live key becomes Safe.
-    /// - The live key becomes Detected.
-    /// - The loop writes the marker before it requests the exit.
-    /// - The loop requests the exit before it removes the Safe key's sidecar.
+    /// W4-D3d2 (fix round 1): the first run tick makes the not-live key Safe
+    /// and removes its sidecar. Then the test writes the sidecar again and
+    /// registers a live key. The second tick has these results:
+    ///
+    /// - The live key becomes Detected, and the loop requests the exit one
+    ///   time.
+    /// - The latched loop keeps the sidecar of the Safe key: a cleanup that
+    ///   blocks on the keystore directory or on `TrackedKeys` cannot hold
+    ///   exit 12.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn run_removes_a_safe_sidecar_only_after_the_exit_request() {
+    async fn run_keeps_a_safe_sidecar_once_the_detection_latches() {
         let dir = tempfile::tempdir().expect("The test must create a directory.");
         let m = machine();
         let (safe_pk, live_pk) = (new_pk(), new_pk());
@@ -3728,16 +3764,15 @@ mod tests {
         loop_.drive_once_for_test(11, CLOSED_EPOCH_SLOT).await;
         loop_.drive_once_for_test(12, CLOSED_EPOCH_SLOT).await;
         assert!(sidecar.exists(), "A Pending key must keep its sidecar.");
-        m.register(&live_pk, 13);
 
         let task = tokio::spawn(loop_.run());
-        for _ in 0..256 {
-            if !sidecar.exists() {
-                break;
-            }
-            assert!(!task.is_finished(), "The loop must not stop before the sidecar removal.");
-            tokio::task::yield_now().await;
-        }
+        poll_until_parked(&task).await;
+        assert!(!sidecar.exists(), "The run tick must remove the sidecar of the Safe key.");
+        std::fs::write(&sidecar, "{\"imported_unix_seconds\":1}")
+            .expect("The test must write the sidecar again.");
+        m.register(&live_pk, 13);
+        tokio::time::advance(Duration::from_secs(12)).await;
+        poll_until_parked(&task).await;
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
         task.await.expect("The liveness loop must stop without a panic.");
@@ -3754,12 +3789,17 @@ mod tests {
         assert_eq!(
             *exit.present.lock().expect("The record lock must not be poisoned."),
             vec![true],
-            "The loop must request the exit one time, before it removes the sidecar."
+            "The loop must request the exit one time, with the sidecar present."
         );
-        assert!(!sidecar.exists(), "The same tick must remove the sidecar after the exit request.");
+        assert!(sidecar.exists(), "The latched loop must keep the sidecar of the Safe key.");
     }
 
+    /// Wait until the loop task waits in its slot sleep. Use this only with
+    /// paused time: paused time moves only when no task can run and no
+    /// blocking write runs, so the 1 ms sleep ends after each write of the
+    /// tick has returned and the loop has parked.
     async fn poll_until_parked(task: &tokio::task::JoinHandle<()>) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
         for _ in 0..32 {
             if task.is_finished() {
                 panic!("liveness loop ended");
@@ -4025,9 +4065,10 @@ mod tests {
     /// in place, the drain exits 12, and the next boot refuses that record.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn in_place_record_survives_marker_and_fallback_write_failure() {
-        let _guard = crate::detection_marker::arm_marker_write_failures(u32::MAX);
         let keys = tempfile::tempdir().expect("keys");
         let fallback = tempfile::tempdir().expect("fallback");
+        let _keys_faults = marker_writes_fail(keys.path());
+        let _fallback_faults = marker_writes_fail(fallback.path());
         crate::detection_marker::preallocate_detection_record(keys.path()).expect("record");
         let m = latched_machine();
         let clock = test_clock();
@@ -4149,7 +4190,7 @@ mod tests {
     async fn drain_retries_while_three_writes_fail_and_exits_12_after_one_succeeds() {
         let root = tempfile::tempdir().expect("The test must create a temporary directory.");
         let fallback = tempfile::tempdir().expect("The test must create the database directory.");
-        let guard = crate::detection_marker::arm_marker_write_failures(u32::MAX);
+        let guard = marker_writes_fail(fallback.path());
         let m = latched_machine();
         let machine = Arc::clone(&m);
         let token = CancellationToken::new();
@@ -4160,6 +4201,7 @@ mod tests {
             Some(fallback_in(fallback.path())),
             test_clock(),
         );
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
                 drain_inputs(executor, shutdown_rx, token, Some(detection)),
@@ -4167,12 +4209,7 @@ mod tests {
             )
             .await
         });
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            if drain.is_finished() {
-                break;
-            }
-        }
+        wait_for_rounds(&persister, 1).await;
 
         assert!(!drain.is_finished(), "The drain must stay active while the three writes fail.");
         assert!(
@@ -4210,29 +4247,26 @@ mod tests {
         // both finished. The flag is that acknowledgement. The drain must not
         // infer it by reading the marker back.
         m.mark_detection_persisted();
-        let _guard = crate::detection_marker::arm_marker_write_failures(u32::MAX);
+        let _guard = marker_writes_fail(keys.path());
         let clock = test_clock();
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
-        let keystore = keys.path().to_path_buf();
-        let started = std::time::Instant::now();
+        let detection = detection_shutdown(m, keys.path().to_path_buf(), None, clock);
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
-                drain_inputs(
-                    executor,
-                    shutdown_rx,
-                    token,
-                    Some(detection_shutdown(m, keystore, None, clock)),
-                ),
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
                 std::future::ready(()),
             )
             .await
         });
-        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "a durable marker must not sleep on a rewrite failure"
+        wait_until(|| drain.is_finished() || persister.rounds() > 0).await;
+        assert_eq!(
+            persister.rounds(),
+            0,
+            "a durable marker must not start a rewrite round or sleep on a rewrite failure"
         );
+        let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
             "an already-durable marker must exit 12, got {res:?}"
@@ -4249,31 +4283,22 @@ mod tests {
     async fn fsync_failure_after_pwrite_retries_until_a_write_returns_ok() {
         let keys = tempfile::tempdir().expect("keys");
         crate::detection_marker::preallocate_detection_record(keys.path()).expect("record");
-        let guard = crate::detection_marker::arm_fsync_failures(u32::MAX);
+        let guard = fsyncs_fail(keys.path());
         let m = latched_machine();
         let machine = Arc::clone(&m);
         let clock = test_clock();
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
-        let keystore = keys.path().to_path_buf();
+        let detection = detection_shutdown(m, keys.path().to_path_buf(), None, clock);
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
-                drain_inputs(
-                    executor,
-                    shutdown_rx,
-                    token,
-                    Some(detection_shutdown(m, keystore, None, clock)),
-                ),
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
                 std::future::ready(()),
             )
             .await
         });
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            if drain.is_finished() {
-                break;
-            }
-        }
+        wait_for_rounds(&persister, 1).await;
         assert!(!drain.is_finished(), "a failed fsync must not exit 12");
         assert!(
             matches!(
@@ -4301,6 +4326,19 @@ mod tests {
             "the drain exits 12 once a write returns Ok, got {res:?}"
         );
         assert!(machine.detection_persisted());
+        let latched: Vec<String> =
+            machine.detected_hexes().iter().map(|key| format!("0x{key}")).collect();
+        let marker = crate::detection_marker::inspect(keys.path());
+        assert!(
+            persister.finished(crate::detection_marker::PersistPath::KeystoreMarker) == 2
+                && matches!(
+                    &marker,
+                    crate::detection_marker::MarkerInspect::Present(found)
+                        if found.pubkeys == latched
+                ),
+            "After the fault ends, a new keystore marker write must end and publish the marker \
+             with the latched key. The marker is {marker:?}."
+        );
     }
 
     /// The first marker write fails, the drain waits, and the retry exits 12.
@@ -4310,32 +4348,24 @@ mod tests {
     /// failed path one time, so the counter increases by exactly 3.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn shutdown_retries_a_failed_marker_write_then_exits_12() {
-        let _guard = crate::detection_marker::arm_marker_write_failures(1);
         let before = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.get();
         let keys = tempfile::tempdir().expect("keys");
+        let guard = marker_writes_fail(keys.path());
         let m = latched_machine();
         let clock = test_clock();
         let token = CancellationToken::new();
         let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
-        let keystore = keys.path().to_path_buf();
+        let detection = detection_shutdown(m, keys.path().to_path_buf(), None, clock);
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
-                drain_inputs(
-                    executor,
-                    shutdown_rx,
-                    token,
-                    Some(detection_shutdown(m, keystore, None, clock)),
-                ),
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
                 std::future::ready(()),
             )
             .await
         });
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            if drain.is_finished() {
-                break;
-            }
-        }
+        wait_for_rounds(&persister, 1).await;
+        drop(guard);
         assert!(!drain.is_finished(), "the drain must wait out the failed marker write");
         assert!(
             matches!(
@@ -4382,34 +4412,26 @@ mod tests {
         let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
         crate::detection_marker::preallocate_detection_record(keys.path())
             .expect("The test must preallocate the record.");
-        let guard = crate::detection_marker::arm_fsync_failures(u32::MAX);
+        let guard = fsyncs_fail(keys.path());
         let (m, task, executor, shutdown_rx, token, clock) = spawn_live_loop(keys.path());
-        for _ in 0..64 {
-            if m.detected_latch() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        poll_until_parked(&task).await;
         assert!(m.detected_latch(), "The loop must set the latch while each fsync fails.");
         assert!(
             !executor.doppelganger_exit_requested(),
             "The loop must not request exit 12 while each fsync fails."
         );
         let machine = Arc::clone(&m);
-        let keystore = keys.path().to_path_buf();
+        let detection = detection_shutdown(m, keys.path().to_path_buf(), None, clock);
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
-                drain_inputs(
-                    executor,
-                    shutdown_rx,
-                    token,
-                    Some(detection_shutdown(m, keystore, None, clock)),
-                ),
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
                 std::future::ready(()),
             )
             .await
         });
-        advance_in_steps(5).await;
+        advance_rounds(&persister, 5).await;
+        wait_for_rounds(&persister, 6).await;
 
         assert!(!drain.is_finished(), "The drain must not finish while each fsync fails.");
         assert!(
@@ -4424,7 +4446,7 @@ mod tests {
             "The durable flag must stay clear while each fsync fails."
         );
         drop(guard);
-        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
@@ -4457,6 +4479,7 @@ mod tests {
             Some(fallback_in(&db_dir)),
             test_clock(),
         );
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
                 drain_inputs(executor, shutdown_rx, token, Some(detection)),
@@ -4464,7 +4487,8 @@ mod tests {
             )
             .await
         });
-        advance_in_steps(FAILING_SECS).await;
+        advance_rounds(&persister, FAILING_SECS as usize).await;
+        wait_for_rounds(&persister, FAILING_SECS as usize + 1).await;
 
         assert!(!drain.is_finished(), "The drain must not finish while both writes fail.");
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
@@ -4476,7 +4500,7 @@ mod tests {
              {FAILING_SECS} s, the failure counter increased by {failures}."
         );
         std::fs::create_dir(&db_dir).expect("The test must create the fallback directory.");
-        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         let (_outcome, res) = finish_within(drain, Duration::from_secs(2)).await;
         assert!(
             matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
@@ -4492,14 +4516,15 @@ mod tests {
         );
     }
 
-    /// Move paused time forward by 1 s, `secs` times. Yield after each step,
-    /// so that the drain and the loop can run.
-    async fn advance_in_steps(secs: u64) {
-        for _ in 0..secs {
+    /// Let the drain of `persister` run `rounds` failed rounds: wait for the
+    /// result of each round, then move paused time by the retry wait of 1 s.
+    async fn advance_rounds(
+        persister: &crate::detection_marker::DetectionPersister,
+        rounds: usize,
+    ) {
+        for round in 1..=rounds {
+            wait_for_rounds(persister, round).await;
             tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
         }
     }
 
@@ -4630,6 +4655,7 @@ mod tests {
         // check uses the increase from the value before the drain.
         let detection =
             detection_shutdown(latched_machine(), keys, Some(fallback.clone()), test_clock());
+        let persister = Arc::clone(&detection.persister);
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
                 drain_inputs(executor, shutdown_rx, token, Some(detection)),
@@ -4637,13 +4663,7 @@ mod tests {
             )
             .await
         });
-        let last_path = paths[2].display().to_string();
-        for _ in 0..64 {
-            if logs_contain(&last_path) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for_rounds(&persister, 1).await;
 
         let failures = crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL
             .get()
@@ -4984,7 +5004,7 @@ mod tests {
         let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
         crate::detection_marker::preallocate_detection_record(keys.path())
             .expect("The test must pre-allocate the record.");
-        let _failures = crate::detection_marker::arm_marker_write_failures(u32::MAX);
+        let _failures = marker_writes_fail(keys.path());
         let marker_path = crate::detection_marker::marker_path(keys.path());
         let marker_error = crate::detection_marker::write_marker(
             keys.path(),
@@ -5602,9 +5622,1070 @@ mod tests {
             let live = ValidatorLivenessData { index: key.pubkey_hex, is_live: true };
             let answer = EpochLiveness { epoch: key.next_check_epoch, samples: Some(vec![live]) };
             let _ = self.loop_task.machine.apply_live_answers_only(&[answer]);
+            let persister = self.persister().expect("The built loop must have a persister.");
             let task = tokio::spawn(self.loop_task.with_clock_seam(ClockSeam::new(epoch, 0)).run());
-            poll_until_parked(&task).await;
+            wait_for_rounds(&persister, 1).await;
+            assert!(!task.is_finished(), "The loop must not stop after its first tick.");
         }
+    }
+
+    /// The real-time limit of a wait for a blocking write. It is hang
+    /// protection only: each caller asserts its condition after the wait.
+    const WAIT_LIMIT: Duration = Duration::from_secs(10);
+
+    /// Yield until `done` returns `true`, for at most [`WAIT_LIMIT`] of real
+    /// time. Paused time does not move: a yield is not an idle runtime.
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !done() && started.elapsed() < WAIT_LIMIT {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Wait until each configured path of `persister` has the result of
+    /// `rounds` rounds, then assert it. On a current-thread runtime, the task
+    /// of the last round has then reached its next await: the retry sleep of
+    /// the drain or the slot sleep of the loop.
+    async fn wait_for_rounds(
+        persister: &crate::detection_marker::DetectionPersister,
+        rounds: usize,
+    ) {
+        use crate::detection_marker::PersistPath;
+        let fallback = persister.paths().fallback.is_some();
+        let done = || {
+            [PersistPath::Record, PersistPath::KeystoreMarker]
+                .into_iter()
+                .chain(fallback.then_some(PersistPath::FallbackMarker))
+                .all(|path| persister.finished(path) >= rounds)
+        };
+        wait_until(done).await;
+        assert!(
+            done(),
+            "Each path must have the result of {rounds} rounds. The persister started {} rounds.",
+            persister.rounds()
+        );
+    }
+
+    /// Arm the directory faults `faults` for `dir`. They reach the threads of
+    /// the blocking pool.
+    fn dir_faults(
+        dir: &std::path::Path,
+        faults: crate::detection_marker::DirFaults,
+    ) -> crate::detection_marker::DirFaultGuard {
+        crate::detection_marker::arm_dir_faults(dir, faults)
+    }
+
+    /// Each marker write in `dir` fails until the guard drops.
+    fn marker_writes_fail(dir: &std::path::Path) -> crate::detection_marker::DirFaultGuard {
+        let faults =
+            crate::detection_marker::DirFaults { marker_write_fails: true, ..Default::default() };
+        dir_faults(dir, faults)
+    }
+
+    /// Each fsync in `dir` fails until the guard drops.
+    fn fsyncs_fail(dir: &std::path::Path) -> crate::detection_marker::DirFaultGuard {
+        dir_faults(
+            dir,
+            crate::detection_marker::DirFaults { fsync_fails: true, ..Default::default() },
+        )
+    }
+
+    /// A latched machine and a persister whose keystore directory hangs in
+    /// each fsync. The record is pre-allocated in `keystore`. The owned
+    /// fallback marker is in its own directory and has no fault.
+    struct HungKeystore {
+        machine: Arc<ForwardWindowMachine>,
+        persister: Arc<crate::detection_marker::DetectionPersister>,
+        keystore: std::path::PathBuf,
+        fallback: crate::detection_marker::FallbackMarkerPath,
+        _faults: crate::detection_marker::DirFaultGuard,
+    }
+
+    /// Make the directories `keystore` and `fallback` in `root`, latch a
+    /// machine for `detected`, and hold each fsync in `keystore` in `gate`.
+    fn hung_keystore_fixture(
+        root: &std::path::Path,
+        detected: &crypto::PublicKey,
+        gate: Arc<crate::detection_marker::FsyncGate>,
+    ) -> HungKeystore {
+        let keystore = root.join("keystore");
+        let db_dir = root.join("fallback");
+        for dir in [&keystore, &db_dir] {
+            std::fs::create_dir(dir).expect("The test must create the directory.");
+        }
+        crate::detection_marker::preallocate_detection_record(&keystore)
+            .expect("The test must pre-allocate the record.");
+        let fallback = fallback_in(&db_dir);
+        let paths = crate::detection_marker::DetectionPaths {
+            keystore_dir: keystore.clone(),
+            fallback: Some(fallback.clone()),
+        };
+        let faults =
+            crate::detection_marker::DirFaults { fsync_gate: Some(gate), ..Default::default() };
+        HungKeystore {
+            machine: latched_machine_for(detected),
+            persister: crate::detection_marker::DetectionPersister::new(paths),
+            _faults: dir_faults(&keystore, faults),
+            keystore,
+            fallback,
+        }
+    }
+
+    /// Wait until the fallback write of `persister` has its result, then move
+    /// paused time by the persist timeout. Paused time cannot move before:
+    /// the parked keystore writes stop the auto-advance.
+    async fn advance_after_fallback(persister: &crate::detection_marker::DetectionPersister) {
+        use crate::detection_marker::PersistPath;
+        wait_until(|| persister.finished(PersistPath::FallbackMarker) == 1).await;
+        tokio::time::advance(crate::detection_marker::DETECTION_PERSIST_TIMEOUT).await;
+    }
+
+    /// Open `gate` and wait until the keystore writes of `persister` end.
+    /// Return `true` when both ended.
+    async fn release_keystore_writes(
+        gate: &crate::detection_marker::FsyncGate,
+        persister: &crate::detection_marker::DetectionPersister,
+    ) -> bool {
+        use crate::detection_marker::PersistPath;
+        gate.open();
+        let ended = || {
+            !persister.in_flight(PersistPath::Record)
+                && !persister.in_flight(PersistPath::KeystoreMarker)
+        };
+        wait_until(ended).await;
+        ended()
+    }
+
+    /// The line of [`ThreadLog`] for a timed-out path of the drain.
+    fn drain_timed_out_line(
+        kind: crate::detection_marker::PersistPath,
+        path: &std::path::Path,
+    ) -> String {
+        format!(
+            "ERROR rvc::detection_marker message={REPORT_MESSAGE} context=shutdown drain \
+             kind={kind:?} path={} error={}",
+            path.display(),
+            crate::detection_marker::PersistError::TimedOut
+        )
+    }
+
+    /// W4-D3d2 (746-10): each fsync in the keystore directory hangs. The
+    /// drain writes the three paths off the runtime. The test requires these
+    /// results:
+    ///
+    /// - The fallback write returns before paused time moves.
+    /// - 1 ns before the persist timeout, the drain still waits. At the
+    ///   timeout, it returns exit 12.
+    /// - The owned fallback marker holds the latched key.
+    /// - The drain logs `TimedOut` for the record and the keystore marker.
+    /// - The two keystore writes still wait in the gate, and the watchdog of
+    ///   the gate did not fire.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hung_keystore_path_still_reaches_the_fallback() {
+        use crate::detection_marker::PersistPath;
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let hung = hung_keystore_fixture(root.path(), &new_pk(), Arc::clone(&gate));
+        let log = ThreadLog::default();
+        let _log = log.capture();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection = crate::bootstrap::DetectionShutdown {
+            machine: Arc::clone(&hung.machine),
+            persister: Arc::clone(&hung.persister),
+            epoch_clock: test_clock(),
+        };
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        wait_until(|| hung.persister.finished(PersistPath::FallbackMarker) == 1).await;
+        let deadline = Duration::from_secs(5);
+        tokio::time::advance(deadline - Duration::from_nanos(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let pending = !drain.is_finished();
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        let parked = (gate.blocked(), gate.watchdog_fired());
+        let released = release_keystore_writes(&gate, &hung.persister).await;
+
+        assert!(
+            pending,
+            "The drain must still wait 1 ns before the persist timeout, after the fallback write \
+             returned."
+        );
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the fallback write. The result is {res:?}."
+        );
+        assert_eq!(
+            parked,
+            (2, false),
+            "The two keystore writes must still wait in the gate when the drain returns, and the \
+             watchdog must not have opened the gate."
+        );
+        assert!(released, "The two keystore writes must end after the gate opens.");
+        let fallback =
+            present_marker(crate::detection_marker::inspect_fallback(&hung.fallback).owned);
+        assert_eq!(
+            fallback.map(|marker| marker.pubkeys),
+            Some(hung.machine.detected_hexes().iter().map(|key| format!("0x{key}")).collect()),
+            "The owned fallback marker must hold the latched key."
+        );
+        assert_eq!(
+            log.path_lines(),
+            [
+                drain_timed_out_line(
+                    PersistPath::Record,
+                    &crate::detection_marker::record_path(&hung.keystore)
+                ),
+                drain_timed_out_line(
+                    PersistPath::KeystoreMarker,
+                    &crate::detection_marker::marker_path(&hung.keystore)
+                ),
+            ],
+            "The drain must log TimedOut for the record and the keystore marker. The log is {:#?}.",
+            log.lines()
+        );
+    }
+
+    /// W4-D3d2: each fsync in the keystore directory hangs while the running
+    /// loop writes the detection. The loop must write the fallback off the
+    /// runtime and request exit 12 one time, with the fallback marker present
+    /// and the durable flag set at the request. The keystore writes must still
+    /// wait in the gate, and the watchdog must not fire.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn running_loop_reaches_the_fallback_while_the_keystore_hangs() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let hung = hung_keystore_fixture(root.path(), &new_pk(), Arc::clone(&gate));
+        let persister = Arc::clone(&hung.persister);
+        let fallback = hung.fallback.clone();
+        let live = spawn_configured_loop(
+            |loop_| loop_.with_detection_persister(persister),
+            |machine| FallbackAtExit {
+                machine: Arc::clone(machine),
+                fallback,
+                requests: std::sync::Mutex::default(),
+            },
+        );
+        advance_after_fallback(&hung.persister).await;
+        let requests =
+            || live.exits.requests.lock().expect("The test must read the requests.").len();
+        wait_until(|| requests() == 1).await;
+        let parked = (gate.blocked(), gate.watchdog_fired());
+        let released = release_keystore_writes(&gate, &hung.persister).await;
+
+        let requests =
+            live.exits.requests.lock().expect("The test must read the requests.").clone();
+        assert_eq!(
+            requests
+                .into_iter()
+                .map(|(code, marker, durable)| (code, marker.is_some(), durable))
+                .collect::<Vec<_>>(),
+            [(EXIT_DOPPELGANGER_DETECTED, true, true)],
+            "The loop must request exit 12 one time, with the fallback marker present and the \
+             durable flag set."
+        );
+        assert_eq!(
+            parked,
+            (2, false),
+            "The two keystore writes must still wait in the gate at the request, and the watchdog \
+             must not have opened the gate."
+        );
+        assert!(released, "The two keystore writes must end after the gate opens.");
+        live.cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        live.task.await.expect("The loop task must not panic.");
+    }
+
+    /// Register one live key with the index "1" on `machine`. Build the loop
+    /// with `prepare_liveness_loop` for `keys`, `fallback` and `tracked`, take
+    /// the detection state of the drain with `drain_detection`, and spawn the
+    /// loop with `spawn_liveness_loop`, as `run_with_clock` does. Return that
+    /// detection state.
+    fn boot_wired_loop(
+        machine: &Arc<ForwardWindowMachine>,
+        keys: &std::path::Path,
+        fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+        tracked: Arc<TrackedKeys>,
+        executor: &TaskExecutor,
+    ) -> crate::bootstrap::DetectionShutdown {
+        let pk = new_pk();
+        machine.register(&pk, 0);
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "1".to_string());
+        let pubkey_map: PubkeyMap =
+            Arc::new(parking_lot::RwLock::new(HashMap::from([(pk.to_bytes(), pk)])));
+        let paths =
+            crate::detection_marker::DetectionPaths { keystore_dir: keys.to_path_buf(), fallback };
+        let prepared = prepare_liveness_loop(
+            Some(Arc::clone(machine)),
+            counted_liveness(true).0,
+            reg,
+            Some(pubkey_map),
+            test_clock(),
+            executor,
+            Some((paths, tracked)),
+        );
+        let config = crate::config::Config {
+            keystore_path: keys.to_path_buf(),
+            slashing_db_path: keys.join("slashing.sqlite"),
+            ..Default::default()
+        };
+        let detection = crate::bootstrap::drain_detection(
+            prepared.as_ref(),
+            Some(Arc::clone(machine)),
+            &config,
+            &test_clock(),
+        );
+        if let Some(prepared) = prepared {
+            spawn_liveness_loop(prepared, executor);
+        }
+        detection.expect("A machine must give the drain its detection state.")
+    }
+
+    /// W4-D3d2 (fix round 1, F4): the boot-wired loop leaves both keystore
+    /// writes parked, and the executor drain aborts it after the Orchestrator
+    /// budget. The test requires these results:
+    ///
+    /// - The executor drain aborts the loop task.
+    /// - The first drain round gives `TimedOut` at once for both parked paths
+    ///   and starts no second write: two writes still wait in the gate.
+    /// - After the gate opens, the late successes of the loop writes make the
+    ///   next round durable with no new write, and the drain returns exit 12.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn boot_wired_drain_starts_no_second_write_on_a_parked_loop_path() {
+        use crate::detection_marker::PersistPath;
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keystore");
+        std::fs::create_dir(&keys).expect("The test must create the keystore directory.");
+        crate::detection_marker::preallocate_detection_record(&keys)
+            .expect("The test must pre-allocate the record.");
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let faults = crate::detection_marker::DirFaults {
+            fsync_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        };
+        let _faults = dir_faults(&keys, faults);
+        let machine = machine();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection =
+            boot_wired_loop(&machine, &keys, None, Arc::new(TrackedKeys::new()), &executor);
+        let persister = Arc::clone(&detection.persister);
+        wait_until(|| gate.blocked() == 2).await;
+        let cancelled = token.clone();
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        wait_until(|| cancelled.is_cancelled()).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        wait_until(|| persister.rounds() == 2 || gate.blocked() > 2).await;
+        let spawned = || {
+            (persister.spawned(PersistPath::Record), persister.spawned(PersistPath::KeystoreMarker))
+        };
+        assert_eq!(
+            (persister.rounds(), gate.blocked(), spawned(), machine.detection_persisted()),
+            (2, 2, (1, 1), false),
+            "The first drain round must time out at once on the two paths that the loop left \
+             parked, start no second write, and not be durable."
+        );
+        let released = release_keystore_writes(&gate, &persister).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (outcome, res) = join_in_paused_time(drain).await;
+        assert!(
+            released && outcome.aborted.contains(&"liveness_loop"),
+            "The executor drain must abort the loop task, and the parked writes must end after \
+             the gate opens. The drain aborted {:?}.",
+            outcome.aborted
+        );
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The late successes must make the drain return exit 12. The result is {res:?}."
+        );
+        assert_eq!(
+            (spawned(), gate.watchdog_fired()),
+            ((1, 1), false),
+            "The drain must not write a path again after its late success."
+        );
+    }
+
+    /// W4-D3d2 (fix round 1, F1): a sidecar is in the keystore directory, and
+    /// a thread holds `TrackedKeys` until a gate opens. A sidecar cleanup
+    /// would wait for that lock on the runtime thread. The boot-wired loop
+    /// detects its key, and the fallback marker is writable. The drain must
+    /// return exit 12 while the lock is still held, with the sidecar kept.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn boot_wired_loop_exits_12_while_tracked_keys_is_held() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keystore");
+        let db_dir = root.path().join("fallback");
+        for dir in [&keys, &db_dir] {
+            std::fs::create_dir(dir).expect("The test must create the directory.");
+        }
+        let sidecar = keys.join(format!("0x{}.import_meta.json", hex::encode([0x44; 48])));
+        std::fs::write(&sidecar, "{\"imported_unix_seconds\":1}")
+            .expect("The test must write the sidecar.");
+        let tracked = Arc::new(TrackedKeys::new());
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let holder = {
+            let (tracked, gate) = (Arc::clone(&tracked), Arc::clone(&gate));
+            std::thread::spawn(move || {
+                let _held = tracked.lock();
+                gate.wait_open(|| {});
+            })
+        };
+        wait_until(|| gate.blocked() == 1).await;
+        let machine = machine();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection =
+            boot_wired_loop(&machine, &keys, Some(fallback_in(&db_dir)), tracked, &executor);
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::pending(),
+            )
+            .await
+        });
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        let held = (gate.blocked(), gate.watchdog_fired());
+        gate.open();
+        holder.join().expect("The lock holder must not panic.");
+
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12. The result is {res:?}."
+        );
+        assert_eq!(
+            held,
+            (1, false),
+            "The drain must return while the thread still holds TrackedKeys, before the watchdog \
+             opens the gate."
+        );
+        assert!(sidecar.exists(), "The latched loop must keep the sidecar.");
+    }
+
+    /// W4-D3d2 (fix round 1, F2): a result that is not exit 12 drops the
+    /// keystore lock guard, so a second lock attempt succeeds. The production
+    /// boot test checks that exit 12 keeps the lock.
+    #[test]
+    fn a_result_that_is_not_exit_12_releases_the_keystore_lock() {
+        let dir = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let guard = crate::startup::acquire_keystore_lock(dir.path())
+            .expect("The test must take the keystore lock.");
+        crate::bootstrap::keep_keystore_lock_on_detection(&Ok(()), Some(guard));
+        assert!(
+            crate::startup::acquire_keystore_lock(dir.path()).is_ok(),
+            "A result that is not exit 12 must drop the keystore lock guard."
+        );
+    }
+
+    /// W4-D3d2 (fix round 1, F3): all three writes of drain round 1 park and
+    /// time out. Then the fallback write ends with `Ok`, and each later
+    /// fallback write fails. The late success must make the next round
+    /// durable with no new fallback write, so the drain returns exit 12 while
+    /// the keystore writes still wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn late_fallback_success_after_a_timeout_makes_the_drain_exit_12() {
+        use crate::detection_marker::PersistPath;
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let hung = hung_keystore_fixture(root.path(), &new_pk(), Arc::clone(&gate));
+        let fallback_gate = crate::detection_marker::FsyncGate::with_watchdog(WAIT_LIMIT);
+        let faults = crate::detection_marker::DirFaults {
+            fsync_gate: Some(Arc::clone(&fallback_gate)),
+            ..Default::default()
+        };
+        let fallback_faults = dir_faults(&hung.fallback.dir, faults);
+        let log = ThreadLog::default();
+        let _log = log.capture();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let detection = crate::bootstrap::DetectionShutdown {
+            machine: Arc::clone(&hung.machine),
+            persister: Arc::clone(&hung.persister),
+            epoch_clock: test_clock(),
+        };
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        wait_until(|| gate.blocked() == 2 && fallback_gate.blocked() == 1).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        wait_until(|| log.path_lines().len() == 3).await;
+        drop(fallback_faults);
+        wait_until(|| !hung.persister.in_flight(PersistPath::FallbackMarker)).await;
+        let _later_writes_fail = marker_writes_fail(&hung.fallback.dir);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_until(|| drain.is_finished()).await;
+        let finished = (drain.is_finished(), gate.blocked());
+        let released = release_keystore_writes(&gate, &hung.persister).await;
+
+        assert_eq!(
+            finished,
+            (true, 2),
+            "The drain must return while the keystore writes still wait. The first round logged \
+             {:#?}.",
+            log.path_lines()
+        );
+        let (_outcome, res) = drain.await.expect("The drain task must not panic.");
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)) && released,
+            "The late fallback success must make the drain return exit 12. The result is {res:?}."
+        );
+        let fallback =
+            present_marker(crate::detection_marker::inspect_fallback(&hung.fallback).owned);
+        assert_eq!(
+            (hung.persister.spawned(PersistPath::FallbackMarker), fallback.is_some()),
+            (1, true),
+            "The first fallback write must be on the disk, and the drain must not write the \
+             fallback again."
+        );
+    }
+
+    /// The fixed secret key, the validator index and the password of the
+    /// production boot test.
+    const BOOT_KEY: [u8; 32] = [0x2d; 32];
+    const BOOT_INDEX: &str = "9";
+    const BOOT_PASSWORD: &str = "w4d3d2-boot";
+
+    /// Mount a beacon node on `server` that serves `pubkey` with
+    /// [`BOOT_INDEX`] at the genesis `genesis_time`, and that answers each
+    /// liveness request with "live".
+    async fn mount_live_beacon_node(server: &wiremock::MockServer, pubkey: &str, genesis: u64) {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let far = "18446744073709551615";
+        let spec = serde_json::json!({
+            "GENESIS_FORK_VERSION": "0x00000000", "ALTAIR_FORK_EPOCH": "0",
+            "ALTAIR_FORK_VERSION": "0x01000000", "BELLATRIX_FORK_EPOCH": "0",
+            "BELLATRIX_FORK_VERSION": "0x02000000", "CAPELLA_FORK_EPOCH": "0",
+            "CAPELLA_FORK_VERSION": "0x03000000", "DENEB_FORK_EPOCH": "0",
+            "DENEB_FORK_VERSION": "0x04000000", "ELECTRA_FORK_EPOCH": "0",
+            "ELECTRA_FORK_VERSION": "0x05000000", "FULU_FORK_EPOCH": far,
+            "FULU_FORK_VERSION": "0x06000000", "GLOAS_FORK_EPOCH": far,
+            "GLOAS_FORK_VERSION": "0x07000000", "SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32"
+        });
+        let validator = serde_json::json!({ "data": [{
+            "index": BOOT_INDEX, "status": "active_ongoing", "validator": { "pubkey": pubkey }
+        }] });
+        let gets = [
+            ("/eth/v1/config/spec", serde_json::json!({ "data": spec })),
+            (
+                "/eth/v1/beacon/genesis",
+                serde_json::json!({ "data": { "genesis_time": genesis.to_string(),
+                    "genesis_validators_root": format!("0x{}", "11".repeat(32)),
+                    "genesis_fork_version": "0x00000000" } }),
+            ),
+            (
+                "/eth/v1/beacon/states/head/fork",
+                serde_json::json!({ "execution_optimistic": false, "finalized": false,
+                    "data": { "previous_version": "0x04000000",
+                    "current_version": "0x05000000", "epoch": "0" } }),
+            ),
+            (
+                "/eth/v1/node/syncing",
+                serde_json::json!({ "data": { "head_slot": "100000", "sync_distance": "0",
+                    "is_syncing": false, "is_optimistic": false, "el_offline": false } }),
+            ),
+            (
+                "/eth/v2/node/version",
+                serde_json::json!({ "data": { "beacon_node": { "code": "MK", "name": "mock-bn",
+                    "version": "w4d3d2", "commit": "00" } } }),
+            ),
+            ("/eth/v1/beacon/states/head/validators", validator.clone()),
+        ];
+        for (route, body) in gets {
+            let reply = ResponseTemplate::new(200).set_body_json(body);
+            Mock::given(method("GET")).and(path(route)).respond_with(reply).mount(server).await;
+        }
+        let posts = [
+            (r"^/eth/v1/beacon/states/head/validators$", validator),
+            (
+                r"^/eth/v1/validator/liveness/\d+$",
+                serde_json::json!({ "data": [{ "index": BOOT_INDEX, "is_live": true }] }),
+            ),
+            (
+                r"^/eth/v1/validator/duties/(attester|sync)/\d+$",
+                serde_json::json!({ "dependent_root": format!("0x{}", "22".repeat(32)),
+                    "execution_optimistic": false, "data": [] }),
+            ),
+        ];
+        for (route, body) in posts {
+            let reply = ResponseTemplate::new(200).set_body_json(body);
+            Mock::given(method("POST"))
+                .and(path_regex(route))
+                .respond_with(reply)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/eth/v1/validator/duties/proposer/\d+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": format!("0x{}", "22".repeat(32)),
+                "execution_optimistic": false, "data": []
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// W4-D3d2 fix round 2 (F2, F3): the production `bootstrap::run` with
+    /// detection and keystore locking on. The beacon node answers "live" for
+    /// the one key. The record write and the keystore marker write of each
+    /// round wait in a gate (before the marker rename), and each fallback
+    /// write fails until the test removes that fault. The test cancels the
+    /// process token while the writes of the loop wait. It requires these
+    /// results:
+    ///
+    /// - The first drain round starts no second keystore write: two writes
+    ///   still wait in the gate after it logged its three failed paths.
+    /// - After the fallback fault ends, `run` returns exit 12.
+    /// - After `run` returns, a second keystore lock attempt (as
+    ///   `clear-detection` makes it) fails while the marker write still waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_boot_keeps_the_lock_and_starts_no_second_write_on_exit_12() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let (keys, db_dir) = (root.path().join("keys"), root.path().join("db"));
+        for dir in [&keys, &db_dir] {
+            std::fs::create_dir(dir).expect("The test must create the directory.");
+        }
+        let secret = crypto::SecretKey::from_bytes(&BOOT_KEY).expect("The key must be valid.");
+        let pubkey = format!("0x{}", hex::encode(secret.public_key().to_bytes()));
+        let keystore = crypto::Keystore::encrypt(
+            &secret,
+            BOOT_PASSWORD.as_bytes(),
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .and_then(|keystore| keystore.to_json())
+        .expect("The test must encrypt the keystore.");
+        std::fs::write(keys.join(format!("keystore-{pubkey}.json")), keystore)
+            .expect("The test must write the keystore.");
+        let password_file = root.path().join("password.txt");
+        std::fs::write(&password_file, format!("*={BOOT_PASSWORD}\n"))
+            .expect("The test must write the password file.");
+        let validators = root.path().join("validators.toml");
+        std::fs::write(
+            &validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x{}\"\n\n[[validators]]\npubkey = \"{pubkey}\"\n",
+                "11".repeat(20)
+            ),
+        )
+        .expect("The test must write the validator file.");
+        let genesis = crate::detection_marker::unix_secs_now() - 3_600;
+        let server = wiremock::MockServer::start().await;
+        mount_live_beacon_node(&server, &pubkey, genesis).await;
+        let gate = crate::detection_marker::FsyncGate::with_watchdog(Duration::from_secs(60));
+        let faults = crate::detection_marker::DirFaults {
+            keystore_writes_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        };
+        let _keystore_faults = dir_faults(&keys, faults);
+        let fallback_faults = marker_writes_fail(&db_dir);
+        let config = crate::config::Config {
+            beacon_url: server.uri(),
+            beacon_nodes: vec![server.uri()],
+            network: crate::config::Network::Custom,
+            genesis_time: Some(genesis),
+            genesis_validators_root: Some(format!("0x{}", "11".repeat(32))),
+            keystore_path: keys.clone(),
+            password_file: Some(password_file),
+            slashing_db_path: db_dir.join("slashing.sqlite"),
+            allow_fresh_db: true,
+            doppelganger_detection: true,
+            metrics_port: 0,
+            validators_config: Some(validators),
+            ..Default::default()
+        };
+        let options = crate::bootstrap::RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: bn_manager::OperationTimeouts::default(),
+        };
+        let log = ThreadLog::default();
+        let _log = log.capture();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let run = tokio::spawn(crate::bootstrap::run(config, options, executor, shutdown_rx));
+        let drain_lines = || {
+            log.path_lines().iter().filter(|line| line.contains("context=shutdown drain")).count()
+        };
+        let boot_limit = std::time::Instant::now();
+        while gate.blocked() < 2 && !run.is_finished() && boot_limit.elapsed() < CHILD_WATCHDOG {
+            tokio::task::yield_now().await;
+        }
+        if run.is_finished() {
+            panic!("run must not stop before the drain. The result is {:?}.", run.await);
+        }
+        assert_eq!(gate.blocked(), 2, "The loop must park its two keystore writes after boot.");
+        token.cancel();
+        wait_until(|| drain_lines() >= 3).await;
+        let first_round = (drain_lines(), gate.blocked());
+        drop(fallback_faults);
+        wait_until(|| run.is_finished()).await;
+        let finished = run.is_finished();
+        let second = crate::startup::acquire_keystore_lock(&keys).map(drop);
+        let parked = gate.blocked();
+        gate.open();
+
+        assert_eq!(
+            first_round,
+            (3, 2),
+            "The first drain round must log its three failed paths and start no second write on \
+             the two keystore paths that the loop left parked."
+        );
+        assert!(finished, "run must return after the fallback fault ends.");
+        let res = run.await.expect("The run task must not panic.");
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "run must return exit 12. The result is {res:?}."
+        );
+        assert!(
+            second.is_err() && parked == 2 && !gate.watchdog_fired(),
+            "After run returns, a second keystore lock attempt must fail while the marker write \
+             still waits. The attempt gave {second:?}, and {parked} writes waited."
+        );
+    }
+
+    /// The name of the environment variable that gives the child process of
+    /// [`hung_keystore_write_still_exits_12_in_a_child_process`] its root
+    /// directory. The parent owns that directory.
+    const DETECTION_EXIT_CHILD_ROOT: &str = "RVC_TEST_DETECTION_EXIT_CHILD_ROOT";
+
+    /// The real-time limit of the parent for the child process. It is hang
+    /// protection only.
+    const CHILD_WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// The secret key bytes of the latched key, the signer key and the
+    /// imported key of the child process.
+    const CHILD_KEYS: [u8; 3] = [0x11, 0x22, 0x33];
+
+    /// The slot and the signing root of the block that the child process
+    /// signs.
+    const CHILD_SIGN: (u64, Root) = (21, [0x5a; 32]);
+
+    /// The stdout line of a child process whose parked work still waits after
+    /// the runtime shut down: the two keystore fsyncs, the sign and the
+    /// import.
+    const CHILD_LINE: &str = "detection-exit-child: blocked_fsyncs=2 blocked_holds=2";
+
+    fn child_key(index: usize) -> crypto::SecretKey {
+        crypto::SecretKey::from_bytes(&[CHILD_KEYS[index]; 32])
+            .expect("The child key bytes must be a valid secret key.")
+    }
+
+    /// A signing backend that waits in `0` until it opens.
+    struct ParkedSigner(Arc<crate::detection_marker::FsyncGate>);
+
+    #[async_trait::async_trait]
+    impl crypto::Signer for ParkedSigner {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; 48],
+        ) -> Result<crypto::Signature, crypto::SigningError> {
+            self.0.wait_open(|| {});
+            Err(crypto::SigningError::RemoteSignerError("the test gate opened".to_string()))
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            Vec::new()
+        }
+    }
+
+    /// Start a slashable block sign of [`CHILD_SIGN`] with the signer key
+    /// and the slashing database `db_path`. The sign commits its reservation,
+    /// then its backend waits in `gate`.
+    fn park_slashable_sign(
+        db_path: &std::path::Path,
+        gate: &Arc<crate::detection_marker::FsyncGate>,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, signer::SigningGateError>> {
+        let db = Arc::new(SlashingDb::open(db_path).expect("The test must open the database."));
+        db.set_genesis_validators_root(&gvr()).expect("The test must pin the root.");
+        let backend: Arc<dyn crypto::Signer> = Arc::new(ParkedSigner(Arc::clone(gate)));
+        let pubkey = child_key(1).public_key();
+        tokio::spawn(async move {
+            let locks = signer::ValidatorLockMap::new();
+            signer::sign_slashable(signer::SignSlashableRequest {
+                locks: &locks,
+                pubkey: &pubkey,
+                enablement: signer::always_enabled(),
+                signer: backend,
+                signing_root: CHILD_SIGN.1,
+                sign_timeout: CHILD_WATCHDOG,
+                policy: signer::TimeoutPolicySource::Fixed(signer::TimeoutPolicy::DiscardStagedRow),
+                hooks: Arc::new(signer::NoopSignHooks),
+                op_name: "hung_keystore_exit_child",
+                slashing_db: db,
+                client_cn: "local-vc".to_string(),
+                gvr: gvr(),
+                kind: signer::SlashableKind::Block { slot: CHILD_SIGN.0 },
+                fork_name: None,
+                pre_reserve_barrier: None,
+            })
+            .await
+        })
+    }
+
+    /// Start a windowed keystore import of the imported key into `keys`, with
+    /// the validator file `validators`. The import persists the disabled hold,
+    /// then waits in `gate` before it publishes the keystore.
+    fn park_windowed_import(
+        keys: &std::path::Path,
+        validators: &std::path::Path,
+        gate: &Arc<crate::detection_marker::FsyncGate>,
+    ) -> tokio::task::JoinHandle<Result<[u8; 48], keymanager_api::traits::ImportKeystoreError>>
+    {
+        use keymanager_api::traits::KeystoreManager;
+        let sk = child_key(2);
+        let pk_hex = format!("0x{}", hex::encode(sk.public_key().to_bytes()));
+        std::fs::create_dir(keys).expect("The test must create the import directory.");
+        std::fs::write(
+            validators,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\
+                 gas_limit = 30000000\n\n[[validators]]\npubkey = \"{pk_hex}\"\nenabled = true\n"
+            ),
+        )
+        .expect("The test must write the validator file.");
+        let store = Arc::new(
+            validator_store::ValidatorStore::load_from_config(validators)
+                .expect("The test must load the validator file."),
+        );
+        let composite = Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(
+            crypto::KeyManager::new(),
+        )));
+        let pubkey_map: PubkeyMap = Arc::default();
+        let (key_gen, _key_gen_rx) = tokio::sync::watch::channel(0u64);
+        let denylist = Arc::new(crate::deletion_denylist::DeletionDenylist::empty_at(
+            keys.join(".rvc.deleted_keys"),
+        ));
+        let admissions = Arc::new(crate::key_admission::KeyAdmissionService::new(
+            Arc::clone(&pubkey_map),
+            key_gen.clone(),
+            Arc::clone(&composite),
+            store,
+            denylist,
+            None,
+            test_clock(),
+        ));
+        let adapter = crate::keymanager_adapters::KeystoreManagerAdapter::new(
+            keys.to_path_buf(),
+            composite,
+            pubkey_map,
+            key_gen,
+        )
+        .with_admission_service(admissions);
+        adapter.set_doppelganger_window(CHILD_WATCHDOG);
+        let parked = Arc::clone(gate);
+        adapter.set_before_admit_hook(Arc::new(move || parked.wait_open(|| {})));
+        let json = crypto::Keystore::encrypt(
+            &sk,
+            b"testpass",
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .and_then(|keystore| keystore.to_json())
+        .expect("The test must encrypt the keystore.");
+        tokio::spawn(async move { adapter.import_keystore(&json, "testpass").await })
+    }
+
+    /// The child process of
+    /// [`hung_keystore_write_still_exits_12_in_a_child_process`]. Without
+    /// [`DETECTION_EXIT_CHILD_ROOT`] it returns at once.
+    ///
+    /// The child parks a slashable sign after its reservation and a windowed
+    /// import after its disabled hold. Then it runs the real drain while each
+    /// fsync in the keystore directory waits in a gate that never opens. It
+    /// shuts its runtime down with the helper of `main`, prints the parked
+    /// counts, and exits with the status that `main` maps from the result.
+    #[test]
+    #[ignore = "child of hung_keystore_write_still_exits_12_in_a_child_process"]
+    fn hung_keystore_exit_child() {
+        let Some(root) = std::env::var_os(DETECTION_EXIT_CHILD_ROOT) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("The child must build its runtime.");
+        let fsyncs = crate::detection_marker::FsyncGate::without_watchdog();
+        let holds = crate::detection_marker::FsyncGate::without_watchdog();
+        let hung = hung_keystore_fixture(&root, &child_key(0).public_key(), Arc::clone(&fsyncs));
+        let res = crate::startup::block_on_then_shutdown(runtime, async {
+            let _sign = park_slashable_sign(&hung.fallback.slashing_db_path, &holds);
+            let _import =
+                park_windowed_import(&root.join("import"), &root.join("validators.toml"), &holds);
+            wait_until(|| holds.blocked() == 2).await;
+            let token = CancellationToken::new();
+            let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+            let detection = crate::bootstrap::DetectionShutdown {
+                machine: Arc::clone(&hung.machine),
+                persister: Arc::clone(&hung.persister),
+                epoch_clock: test_clock(),
+            };
+            let drain = crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            );
+            tokio::join!(drain, advance_after_fallback(&hung.persister)).0 .1
+        });
+        println!(
+            "detection-exit-child: blocked_fsyncs={} blocked_holds={}",
+            fsyncs.blocked(),
+            holds.blocked()
+        );
+        std::io::Write::flush(&mut std::io::stdout()).expect("The child must flush stdout.");
+        std::process::exit(res.err().map_or(0, |err| err.named_exit_code().unwrap_or(1)));
+    }
+
+    /// Kills and reaps the child process on drop, also when an assertion
+    /// fails.
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// W4-D3d2 (746-10): the child process runs the real drain with each
+    /// fsync in its keystore directory blocked by a gate that never opens,
+    /// and a sign and an import parked. It exits through
+    /// `startup::block_on_then_shutdown` and the exit mapping of `main`. The
+    /// parent requires these results:
+    ///
+    /// - The exit status is exactly 12.
+    /// - Stdout has [`CHILD_LINE`]: the parked work still waited after the
+    ///   runtime shut down.
+    /// - The owned fallback marker holds the latched key. The keystore marker
+    ///   is absent, and its temporary file is left.
+    /// - After the exit, the slashing database still has the reservation of
+    ///   the parked sign, and the validator file still has the disabled hold
+    ///   of the parked import. The keystore of the import is not published.
+    #[test]
+    fn hung_keystore_write_still_exits_12_in_a_child_process() {
+        use std::io::Read;
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let name = module_path!().split_once("::").map_or(module_path!(), |(_, path)| path);
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().expect("The test binary path."))
+                .args([&format!("{name}::hung_keystore_exit_child"), "--exact", "--ignored"])
+                .arg("--nocapture")
+                .env(DETECTION_EXIT_CHILD_ROOT, root.path())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("The test must start the child process."),
+        );
+        let mut stdout = child.0.stdout.take().expect("The child must have a stdout pipe.");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let read = stdout.read_to_string(&mut text);
+            let _ = sender.send(read.map(|_| text));
+        });
+        let finished = receiver.recv_timeout(CHILD_WATCHDOG);
+        if finished.is_err() {
+            let _ = child.0.kill();
+        }
+        let status = child.0.wait().ok().and_then(|status| status.code());
+        let stdout = finished.or_else(|_| receiver.recv_timeout(CHILD_WATCHDOG));
+        let stdout = stdout.ok().and_then(Result::ok).unwrap_or_default();
+
+        assert_eq!(
+            status,
+            Some(EXIT_DOPPELGANGER_DETECTED),
+            "The child must exit with status 12 within {CHILD_WATCHDOG:?}. Its stdout is \
+             {stdout:?}."
+        );
+        assert!(
+            stdout.lines().any(|line| line == CHILD_LINE),
+            "The child must print {CHILD_LINE:?}. Its stdout is {stdout:?}."
+        );
+        let fallback = fallback_in(&root.path().join("fallback"));
+        let marker = present_marker(crate::detection_marker::inspect_fallback(&fallback).owned);
+        let latched = format!("0x{}", hex::encode(child_key(0).public_key().to_bytes()));
+        assert_eq!(
+            marker.map(|marker| marker.pubkeys),
+            Some(vec![latched]),
+            "The owned fallback marker must hold the latched key."
+        );
+        let keystore = root.path().join("keystore");
+        let temps: Vec<String> = std::fs::read_dir(&keystore)
+            .expect("The test must read the keystore directory.")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".rvc.doppelganger_tmp.") && name.ends_with(".tmp"))
+            .collect();
+        let inspected = crate::detection_marker::inspect(&keystore);
+        assert!(
+            matches!(inspected, crate::detection_marker::MarkerInspect::Absent) && temps.len() == 1,
+            "The keystore marker write must not reach its rename: the marker must be absent and \
+             one temporary file must be left. The marker is {inspected:?}, and the temporary \
+             files are {temps:?}."
+        );
+
+        let db = SlashingDb::open(&fallback.slashing_db_path)
+            .expect("The restart must open the slashing database.");
+        let signer_key = hex::encode(child_key(1).public_key().to_bytes());
+        let blocks = db.get_blocks(&signer_key).expect("The restart must read the blocks.");
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| (block.slot, block.signing_root.is_some()))
+                .collect::<Vec<_>>(),
+            [(CHILD_SIGN.0, true)],
+            "After the restart, the slashing database must still have the reservation that the \
+             sign committed before its backend call. The blocks are {blocks:?}."
+        );
+        let store =
+            validator_store::ValidatorStore::load_from_config(&root.path().join("validators.toml"))
+                .expect("The restart must load the validator file.");
+        let imported = child_key(2).public_key().to_bytes();
+        let hold = store.get_config(&imported).and_then(|config| config.doppelganger_hold_until);
+        let mut staged: Vec<String> = std::fs::read_dir(root.path().join("import"))
+            .expect("The test must read the import directory.")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".json") || name.ends_with(".json.partial"))
+            .collect();
+        staged.sort();
+        let key = format!("0x{}", hex::encode(imported));
+        let partials = [format!("{key}.import_meta.json.partial"), format!("{key}.json.partial")];
+        assert!(
+            !store.is_signing_enabled(&imported) && hold.is_some() && staged == partials,
+            "After the restart, the imported key must stay disabled with its hold, and its \
+             keystore must stay staged as `.partial`. The hold is {hold:?}, and the keystore \
+             files are {staged:?}."
+        );
+        let clean = tempfile::tempdir().expect("The test must create a clean keystore.");
+        let restart = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("The test must build a runtime.");
+        let err = restart.block_on(boot_refusing(clean.path(), Some(fallback.slashing_db_path)));
+        assert_eq!(
+            err.exit_code(),
+            EXIT_DOPPELGANGER_DETECTED,
+            "A restart with this slashing database must refuse with exit 12, because of its \
+             fallback marker. The error is {err}."
+        );
     }
 
     /// A signal with the latch clear returns Ok and leaves the record clear.
@@ -5641,9 +6722,13 @@ mod tests {
     }
 
     fn latched_machine() -> Arc<ForwardWindowMachine> {
+        latched_machine_for(&new_pk())
+    }
+
+    /// A machine whose latch is set for `pk`.
+    fn latched_machine_for(pk: &crypto::PublicKey) -> Arc<ForwardWindowMachine> {
         let m = machine();
-        let pk = new_pk();
-        m.register(&pk, 0);
+        m.register(pk, 0);
         let samples =
             vec![ValidatorLivenessData { index: hex::encode(pk.to_bytes()), is_live: true }];
         let _ = m.apply_liveness_tick(&[EpochLiveness { epoch: 0, samples: Some(samples) }], 0, 0);
@@ -5701,7 +6786,9 @@ mod tests {
         fallback: Option<crate::detection_marker::FallbackMarkerPath>,
         epoch_clock: Arc<MonotonicEpochClock>,
     ) -> crate::bootstrap::DetectionShutdown {
-        crate::bootstrap::DetectionShutdown { machine, keystore_dir, fallback, epoch_clock }
+        let paths = crate::detection_marker::DetectionPaths { keystore_dir, fallback };
+        let persister = crate::detection_marker::DetectionPersister::new(paths);
+        crate::bootstrap::DetectionShutdown { machine, persister, epoch_clock }
     }
 
     /// Return the fallback path for `slashing.sqlite` in `dir`.
@@ -5781,6 +6868,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+        poll_until_parked(&task).await;
         (m, task, executor, shutdown_rx, token, clock)
     }
 

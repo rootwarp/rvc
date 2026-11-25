@@ -43,8 +43,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1628,6 +1628,11 @@ fn write_path(
                 gate.wait_open(|| {});
             }
         }
+        if let Some(gate) =
+            faults.keystore_writes_gate.filter(|_| path != PersistPath::FallbackMarker)
+        {
+            gate.wait_open(|| {});
+        }
     }
     match (path, &paths.fallback) {
         (PersistPath::Record, _) => {
@@ -1651,7 +1656,11 @@ fn write_path(
 /// time, and a round waits at most [`DETECTION_PERSIST_TIMEOUT`]. A blocking
 /// thread cannot be cancelled. Thus a path whose earlier write is still
 /// running gets no second thread: its result is [`PersistError::TimedOut`]
-/// until that write returns.
+/// until that write returns. A write that returns `Ok` after its round timed
+/// out is not lost: the thread stores the success before it frees the path,
+/// and each later round gives `Ok` for that path without a new write. Such a
+/// path keeps the marker of that earlier write: a later round does not write
+/// its own marker there.
 ///
 /// The paths share the Tokio blocking pool. A hung path holds at most one
 /// pool thread, so a hung keystore mount holds at most two and does not stop
@@ -1683,22 +1692,37 @@ pub struct DetectionPersister {
     rounds: AtomicUsize,
 }
 
+/// No write of the path runs, and none returned `Ok`.
+const PATH_IDLE: u8 = 0;
+/// A blocking write of the path runs.
+const PATH_IN_FLIGHT: u8 = 1;
+/// A write of the path returned `Ok` in this process, also after its round
+/// timed out. The path stays durable. It is not written again.
+const PATH_WRITTEN: u8 = 2;
+
 #[derive(Debug, Default)]
 struct PathSlot {
-    in_flight: AtomicBool,
+    /// [`PATH_IDLE`], [`PATH_IN_FLIGHT`] or [`PATH_WRITTEN`]. A round claims
+    /// the path and reads a stored success in one compare-exchange.
+    state: AtomicU8,
     #[cfg(test)]
     spawned: AtomicUsize,
     #[cfg(test)]
     finished: AtomicUsize,
 }
 
-/// Clears the in-flight flag of a path when the blocking write ends, also on
-/// a panic and when the closure is dropped before it runs.
-struct InFlight(Arc<PathSlot>);
+/// Ends the claim of a path when the blocking write ends: [`PATH_WRITTEN`]
+/// after a write that returned `Ok`, else [`PATH_IDLE`]. A panic and a
+/// closure that is dropped before it runs also end the claim.
+struct InFlight {
+    slot: Arc<PathSlot>,
+    written: bool,
+}
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.in_flight.store(false, Ordering::SeqCst);
+        let state = if self.written { PATH_WRITTEN } else { PATH_IDLE };
+        self.slot.state.store(state, Ordering::SeqCst);
     }
 }
 
@@ -1715,8 +1739,14 @@ impl DetectionPersister {
         })
     }
 
+    /// The paths that this persister writes.
+    pub fn paths(&self) -> &DetectionPaths {
+        &self.paths
+    }
+
     /// Write `marker` to each configured path, as [`persist_all`] does, and
-    /// return the result of each path. A path that does not return within
+    /// return the result of each path. A path whose earlier write returned
+    /// `Ok` gives `Ok` with no write, so it keeps the earlier marker. A path that does not return within
     /// [`DETECTION_PERSIST_TIMEOUT`], or whose earlier write is still running,
     /// gives [`PersistError::TimedOut`].
     pub async fn persist(&self, marker: &DetectionMarker) -> PersistReport {
@@ -1750,17 +1780,30 @@ impl DetectionPersister {
         marker: &DetectionMarker,
     ) -> Result<(), PersistError> {
         let slot = self.slot(path);
-        if slot.in_flight.swap(true, Ordering::SeqCst) {
-            return Err(PersistError::TimedOut);
+        #[cfg(test)]
+        if let Some(hook) = dir_faults(&self.paths.keystore_dir).and_then(|f| f.before_claim) {
+            hook(path);
+        }
+        match slot.state.compare_exchange(
+            PATH_IDLE,
+            PATH_IN_FLIGHT,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(PATH_WRITTEN) => return Ok(()),
+            Err(_) => return Err(PersistError::TimedOut),
         }
         #[cfg(test)]
         slot.spawned.fetch_add(1, Ordering::SeqCst);
-        let in_flight = InFlight(Arc::clone(slot));
+        let in_flight = InFlight { slot: Arc::clone(slot), written: false };
         let paths = Arc::clone(&self.paths);
         let marker = marker.clone();
         let write = tokio::task::spawn_blocking(move || {
-            let _in_flight = in_flight;
-            write_path(path, &paths, &marker)
+            let mut in_flight = in_flight;
+            let result = write_path(path, &paths, &marker);
+            in_flight.written = result.is_ok();
+            result
         });
         let joined = tokio::time::timeout(DETECTION_PERSIST_TIMEOUT, write).await;
         #[cfg(test)]
@@ -1792,7 +1835,7 @@ impl DetectionPersister {
     /// `true` while a blocking write of `path` has not ended.
     #[cfg(test)]
     pub(crate) fn in_flight(&self, path: PersistPath) -> bool {
-        self.slot(path).in_flight.load(Ordering::SeqCst)
+        self.slot(path).state.load(Ordering::SeqCst) == PATH_IN_FLIGHT
     }
 
     /// The number of [`DetectionPersister::persist`] calls.
@@ -2283,6 +2326,13 @@ pub(crate) struct DirFaults {
     /// The write of this one path of a persist round with this keystore
     /// directory waits until the gate opens.
     pub(crate) path_gate: Option<(PersistPath, Arc<FsyncGate>)>,
+    /// The record write and the keystore marker write of a persist round
+    /// with this keystore directory wait until the gate opens. Boot writes do
+    /// not wait.
+    pub(crate) keystore_writes_gate: Option<Arc<FsyncGate>>,
+    /// Runs in each path of a persist round with this keystore directory,
+    /// immediately before the round claims the path.
+    pub(crate) before_claim: Option<Arc<dyn Fn(PersistPath) + Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -2295,7 +2345,13 @@ static DIR_FAULTS: std::sync::Mutex<Vec<(PathBuf, DirFaults)>> = std::sync::Mute
 #[cfg(test)]
 pub(crate) fn arm_dir_faults(dir: &Path, faults: DirFaults) -> DirFaultGuard {
     let path_gate = faults.path_gate.as_ref().map(|(_, gate)| Arc::clone(gate));
-    let gates = faults.fsync_gate.iter().cloned().chain(path_gate).collect();
+    let gates = faults
+        .fsync_gate
+        .iter()
+        .chain(&faults.keystore_writes_gate)
+        .cloned()
+        .chain(path_gate)
+        .collect();
     let mut registry = DIR_FAULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     registry.retain(|(armed, _)| armed != dir);
     registry.push((dir.to_path_buf(), faults));
@@ -6242,20 +6298,20 @@ mod tests {
         let third = persister.persist(&recovered).await;
         assert!(
             third.record.is_ok() && third.keystore_marker.is_ok() && third.durable(),
-            "Round 3 must write both paths. The report is {third:?}."
+            "Round 3 must count the late successes of round 1. The report is {third:?}."
         );
-        assert_eq!(spawned(&persister), (2, 2), "Round 3 must start a new thread on each path.");
-        assert_eq!(finished(&persister), (1, 1), "The results of round 3 must reach the round.");
+        assert_eq!(spawned(&persister), (1, 1), "Round 3 must not write a durable path again.");
+        assert_eq!(finished(&persister), (0, 0), "No result of round 1 reached a round.");
         assert_eq!(persister.rounds(), 3);
         assert_eq!(
             inspect_record(dir.path()),
-            RecordInspect::Detected { epoch: 8, unix_secs: 80 },
-            "The record must contain the marker of round 3."
+            RecordInspect::Detected { epoch: 7, unix_secs: 70 },
+            "The record must contain the marker of round 1."
         );
         let MarkerInspect::Present(written) = inspect(dir.path()) else {
             panic!("The keystore marker must be present after round 3.");
         };
-        assert_eq!(written, recovered, "The keystore marker must contain the marker of round 3.");
+        assert_eq!(written, hung, "The keystore marker must contain the marker of round 1.");
         assert!(!gate.watchdog_fired(), "The watchdog must not open the gate.");
     }
 
@@ -6484,6 +6540,70 @@ mod tests {
         assert!(!gate.watchdog_fired(), "The watchdog must not open the gate.");
     }
 
+    /// W4-D3d2 fix round 2: the fallback write of round 1 parks and times
+    /// out, and both keystore paths fail. In round 2, a test seam immediately
+    /// before the claim of the fallback lets that old write end with `Ok`.
+    /// Round 2 must then give `Ok` for the fallback and be durable, with one
+    /// fallback write and the marker of round 1 on the disk.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_write_that_ends_before_the_claim_is_durable_with_one_write() {
+        let (keys, _db, paths) = paths_with_a_fallback();
+        let fallback = paths.fallback.clone().expect("The paths have a fallback.");
+        let persister = DetectionPersister::new(paths);
+        let gate = FsyncGate::with_watchdog(Duration::from_secs(10));
+        let armed = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let (gate, armed, persister) =
+                (Arc::clone(&gate), Arc::clone(&armed), Arc::clone(&persister));
+            move |path: PersistPath| {
+                if path == PersistPath::FallbackMarker && armed.swap(false, Ordering::SeqCst) {
+                    gate.open();
+                    let start = std::time::Instant::now();
+                    while persister.in_flight(path) && start.elapsed() < WAIT_LIMIT {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        };
+        let faults = DirFaults {
+            fsync_fails: true,
+            path_gate: Some((PersistPath::FallbackMarker, Arc::clone(&gate))),
+            before_claim: Some(Arc::new(hook)),
+            ..DirFaults::default()
+        };
+        let _keys = arm_dir_faults(keys.path(), faults);
+        let first = DetectionMarker { epoch: 21, unix_secs: 210, pubkeys: vec![pubkey()] };
+        let round = persister.persist(&first);
+        tokio::pin!(round);
+        assert!(futures::poll!(&mut round).is_pending(), "Round 1 must wait for the fallback.");
+        wait_until(|| gate.blocked() == 1).await;
+        tokio::time::advance(DETECTION_PERSIST_TIMEOUT).await;
+        let report = round.await;
+        assert!(
+            report.fallback_marker.as_ref().is_some_and(timed_out) && !report.durable(),
+            "Round 1 must time out the fallback and not be durable. The report is {report:?}."
+        );
+        armed.store(true, Ordering::SeqCst);
+        let second = DetectionMarker { epoch: 22, unix_secs: 220, pubkeys: vec![pubkey()] };
+        let report = persister.persist(&second).await;
+        assert!(
+            matches!(report.fallback_marker, Some(Ok(()))) && report.durable(),
+            "Round 2 must count the fallback write that ended before its claim. The report is \
+             {report:?}."
+        );
+        let owned = match inspect_fallback(&fallback).owned {
+            MarkerInspect::Present(marker) => Some(marker),
+            _ => None,
+        };
+        assert_eq!(
+            (persister.spawned(PersistPath::FallbackMarker), owned),
+            (1, Some(first.clone())),
+            "Round 2 must start no second fallback write, and the fallback must keep the marker \
+             of round 1."
+        );
+        assert!(!gate.watchdog_fired(), "The watchdog must not open the gate.");
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dropped_round_keeps_the_claim_of_its_parked_write() {
         let (keys, _db, paths) = paths_with_a_fallback();
@@ -6529,11 +6649,12 @@ mod tests {
         assert!(!persister.in_flight(record), "The parked record write must end.");
         let later = DetectionMarker { epoch: 15, unix_secs: 150, pubkeys: vec![pubkey()] };
         let report = persister.persist(&later).await;
-        assert!(report.record.is_ok(), "A later round must write the record. {report:?}");
+        assert!(report.record.is_ok(), "A later round must count the late success. {report:?}");
         assert_eq!(
-            inspect_record(keys.path()),
-            RecordInspect::Detected { epoch: 15, unix_secs: 150 },
-            "The record must contain the marker of the later round."
+            (persister.spawned(record), inspect_record(keys.path())),
+            (1, RecordInspect::Detected { epoch: 14, unix_secs: 140 }),
+            "The later round must not write the record again: the record keeps the marker of \
+             the dropped round."
         );
         assert!(!gate.watchdog_fired(), "The watchdog must not open the gate.");
     }
@@ -6661,15 +6782,16 @@ mod tests {
     #[test]
     fn in_flight_flag_clears_when_the_write_panics() {
         let slot = Arc::new(PathSlot::default());
-        slot.in_flight.store(true, Ordering::SeqCst);
-        let in_flight = InFlight(Arc::clone(&slot));
+        slot.state.store(PATH_IN_FLIGHT, Ordering::SeqCst);
+        let in_flight = InFlight { slot: Arc::clone(&slot), written: false };
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _in_flight = in_flight;
             panic!("The test injects a panic in the blocking write.");
         }));
         assert!(panicked.is_err());
-        assert!(
-            !slot.in_flight.load(Ordering::SeqCst),
+        assert_eq!(
+            slot.state.load(Ordering::SeqCst),
+            PATH_IDLE,
             "The guard must clear the flag on a panic."
         );
     }

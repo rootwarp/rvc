@@ -19,13 +19,7 @@ use clap::Parser;
 ///
 /// `None` means the error is not a named code; `main` returns it through anyhow.
 fn named_process_exit_code(err: &anyhow::Error) -> Option<i32> {
-    let be = err.downcast_ref::<rvc::bootstrap::BootstrapError>()?;
-    let code = be.exit_code();
-    if be.is_keystore_locked() || code != 1 {
-        Some(code)
-    } else {
-        None
-    }
+    err.downcast_ref::<rvc::bootstrap::BootstrapError>()?.named_exit_code()
 }
 
 fn main() -> anyhow::Result<()> {

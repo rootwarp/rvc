@@ -26,7 +26,10 @@ pub use keys::{load_signing_keys, LoadedKeys};
 #[cfg(any(test, feature = "test-utils"))]
 pub use run::run_with_slot_clock;
 #[cfg(test)]
-pub(crate) use run::{await_shutdown_and_drain_with_signal, DetectionShutdown, ShutdownInputs};
+pub(crate) use run::{
+    await_shutdown_and_drain_with_signal, drain_detection, keep_keystore_lock_on_detection,
+    DetectionShutdown, ShutdownInputs,
+};
 pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
@@ -151,6 +154,23 @@ impl BootstrapError {
     /// Whether this is a keystore lock contention / acquisition failure.
     pub fn is_keystore_locked(&self) -> bool {
         matches!(self, Self::Startup(StartupError::KeystoreLocked(_)))
+    }
+
+    /// The named process exit status of this failure (NFR-3). `None` when the
+    /// failure has no named status: `main` then returns the error with the
+    /// default status.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rvc::bootstrap::BootstrapError;
+    ///
+    /// assert_eq!(BootstrapError::DoppelgangerDetected.named_exit_code(), Some(12));
+    /// assert_eq!(BootstrapError::InvalidConfig("x".into()).named_exit_code(), None);
+    /// ```
+    pub fn named_exit_code(&self) -> Option<i32> {
+        let code = self.exit_code();
+        (self.is_keystore_locked() || code != 1).then_some(code)
     }
 }
 

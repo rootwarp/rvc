@@ -166,7 +166,7 @@ async fn run_with_clock<C: SlotClock + 'static>(
         }
     };
     let slashing_db = slashing_handles.db;
-    let _keystore_lock_guard = slashing_handles.keystore_lock;
+    let keystore_lock_guard = slashing_handles.keystore_lock;
     let deletion_denylist = slashing_handles.denylist;
     if config.doppelganger_detection {
         // This process holds the keystore lock when locking is enabled. A
@@ -470,6 +470,10 @@ async fn run_with_clock<C: SlotClock + 'static>(
         Ok(signal) => signal,
         Err(err) => return Err(stop_boot_tasks(executor, err).await),
     };
+    // The drain writes through the persister of the loop, so it starts no
+    // second write on a path whose write of the loop still runs.
+    let detection =
+        drain_detection(liveness_task.as_ref(), forward_window_machine, &config, &epoch_clock);
     if let Some(task) = liveness_task {
         spawn_liveness_loop(task, &executor);
     }
@@ -482,15 +486,6 @@ async fn run_with_clock<C: SlotClock + 'static>(
 
     // Operator signal, panicking registered tasks, and internal token cancel
     // (e.g. slashing-monitor ShutdownRequested) converge on one drain path.
-    let detection = forward_window_machine.map(|machine| DetectionShutdown {
-        machine,
-        keystore_dir: config.keystore_path.clone(),
-        fallback: crate::detection_marker::FallbackMarkerPath::for_config(
-            &config.keystore_path,
-            &config.slashing_db_path,
-        ),
-        epoch_clock: Arc::clone(&epoch_clock),
-    });
     let (outcome, res) = await_shutdown_and_drain(
         ShutdownInputs {
             executor,
@@ -509,6 +504,7 @@ async fn run_with_clock<C: SlotClock + 'static>(
         "TaskExecutor drain complete"
     );
 
+    keep_keystore_lock_on_detection(&res, keystore_lock_guard);
     info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
     res?;
     Ok(())
@@ -531,17 +527,54 @@ pub(crate) struct ShutdownInputs {
     pub(crate) detection: Option<DetectionShutdown>,
 }
 
-/// Machine and directories the drain uses to leave a durable detection record.
+/// Machine and persister the drain uses to leave a durable detection record.
 pub(crate) struct DetectionShutdown {
     /// Process latch and the detected pubkey hexes.
     pub(crate) machine: Arc<doppelganger::ForwardWindowMachine>,
-    /// Keystore directory. The primary marker is written here.
-    pub(crate) keystore_dir: std::path::PathBuf,
-    /// Fallback marker of the slashing database when its directory is not
-    /// the keystore.
-    pub(crate) fallback: Option<crate::detection_marker::FallbackMarkerPath>,
+    /// Writer of the record, the keystore marker and the fallback marker. In
+    /// production it is the persister of the liveness loop.
+    pub(crate) persister: Arc<crate::detection_marker::DetectionPersister>,
     /// Epoch recorded in the marker.
     pub(crate) epoch_clock: Arc<doppelganger::MonotonicEpochClock>,
+}
+
+/// Keep the keystore lock until the process exits when the drain returns
+/// exit 12. A detection write that timed out can still run on a blocking
+/// thread and publish a marker during the runtime shutdown grace.
+/// `clear-detection` takes the same lock, so it cannot clear the detection
+/// before that writer ends with the process. The lock is a `flock`, and the
+/// process exit releases it. Each other result drops the guard. With keystore
+/// locking off, `guard` is `None` and no lock is held.
+pub(crate) fn keep_keystore_lock_on_detection(
+    res: &Result<(), BootstrapError>,
+    guard: Option<super::KeystoreLockGuard>,
+) {
+    if matches!(res, Err(BootstrapError::DoppelgangerDetected)) {
+        std::mem::forget(guard);
+    }
+}
+
+/// The detection state of the drain when `machine` is set. The drain gets
+/// the persister of the liveness loop `liveness_task`. Only when no loop
+/// persister exists, the drain gets a new persister for the paths of
+/// `config`: no write of a loop can then be in flight.
+pub(crate) fn drain_detection(
+    liveness_task: Option<&crate::liveness_loop::LivenessLoopSpawn>,
+    machine: Option<Arc<doppelganger::ForwardWindowMachine>>,
+    config: &Config,
+    epoch_clock: &Arc<doppelganger::MonotonicEpochClock>,
+) -> Option<DetectionShutdown> {
+    let machine = machine?;
+    let persister = liveness_task.and_then(|task| task.persister()).unwrap_or_else(|| {
+        crate::detection_marker::DetectionPersister::new(crate::detection_marker::DetectionPaths {
+            keystore_dir: config.keystore_path.clone(),
+            fallback: crate::detection_marker::FallbackMarkerPath::for_config(
+                &config.keystore_path,
+                &config.slashing_db_path,
+            ),
+        })
+    });
+    Some(DetectionShutdown { machine, persister, epoch_clock: Arc::clone(epoch_clock) })
 }
 
 /// Wait until an operator signal, a [`ShutdownReason`], or token cancel, then
@@ -553,8 +586,10 @@ pub(crate) struct DetectionShutdown {
 /// [`BootstrapError::DoppelgangerDetected`] (exit 12) and outranks a panic, a
 /// signal, or token cancel. Exit 12 follows only after a write and its fsync
 /// returned `Ok` in this process (a rename also needs the directory fsync).
-/// The record is overwritten in place first; the keystore marker and the
-/// slashing-database parent are additional paths. A later rewrite failure
+/// The three paths (the record in place, the keystore marker, and the
+/// fallback marker beside the slashing database) are written at the same
+/// time, each on its own blocking thread. A path whose earlier write returned
+/// `Ok` keeps that earlier marker and is not written again. A later rewrite failure
 /// does not retry once that acknowledgement is set. A read-back, including an
 /// unreadable file, is not durability. When the acknowledgement is still
 /// clear, this keeps retrying and does not return `Ok` or exit 16. `SIGKILL`
@@ -722,11 +757,16 @@ fn shell_word(path: &std::path::Path) -> Option<String> {
 
 /// Write a durable detection record once the latch is set.
 ///
-/// Each round writes each path with [`crate::detection_marker::persist_all`]:
-/// the pre-allocated keystore record in place, the keystore marker, and
-/// [`DetectionShutdown::fallback`]. [`crate::detection_marker::log_persist_report`]
-/// logs and counts each failed path. `true` only when this process has seen a
-/// write and its fsync return `Ok` (a rename also needs the directory fsync).
+/// Each round writes the paths with [`DetectionShutdown::persister`] at the
+/// same time: the pre-allocated keystore record in place, the keystore
+/// marker, and the owned fallback marker. Each path is written on its own
+/// blocking thread with a timeout, so a hung keystore mount does not stop the
+/// fallback. A path whose earlier write still runs gives `TimedOut` without a
+/// second write. A path whose earlier write returned `Ok` gives `Ok` with no
+/// write and keeps that earlier marker.
+/// [`crate::detection_marker::log_persist_report`] logs and counts each
+/// failed path. `true` only when this process has seen a write and its fsync
+/// return `Ok` (a rename also needs the directory fsync).
 /// A later rewrite failure does not retry. A read of the record or a marker
 /// is not durability, and neither is an unreadable file. Only a latch whose
 /// flag is still clear sleeps and retries. Exit 12 without a completed fsync
@@ -736,10 +776,6 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
     if !detection.machine.detected_latch() {
         return false;
     }
-    let paths = crate::detection_marker::DetectionPaths {
-        keystore_dir: detection.keystore_dir.clone(),
-        fallback: detection.fallback.clone(),
-    };
     loop {
         if detection.machine.detection_persisted() {
             return true;
@@ -749,7 +785,7 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
             unix_secs: crate::detection_marker::unix_secs_now(),
             pubkeys: detection.machine.detected_hexes(),
         };
-        let report = crate::detection_marker::persist_all(&paths, &marker);
+        let report = detection.persister.persist(&marker).await;
         crate::detection_marker::log_persist_report(&report, "shutdown drain");
         if report.durable() {
             detection.machine.mark_detection_persisted();
@@ -3368,7 +3404,7 @@ mod tests {
         let rest = &prod[start..];
         let body = &rest[..rest.find("pub(crate) struct ShutdownInputs").unwrap_or(0)];
         assert!(
-            body.contains("let _keystore_lock_guard = slashing_handles.keystore_lock;"),
+            body.contains("let keystore_lock_guard = slashing_handles.keystore_lock;"),
             "The scan must find the boot body that holds the keystore lock."
         );
         assert!(
@@ -3835,6 +3871,98 @@ mod tests {
     /// argument.
     fn boot_calls_proposer_sync_monitor(src: &str) -> bool {
         boot_calls(src, "spawn_proposer_sync_monitor", Some("proposer_bn_manager"))
+    }
+
+    /// W4-D3d2: with no liveness loop, `drain_detection` gives the drain a new
+    /// persister for the keystore directory and the fallback of the config.
+    /// With no machine, the drain gets no detection state. The test
+    /// `boot_wired_drain_starts_no_second_write_on_a_parked_loop_path` checks
+    /// the persister of a loop.
+    #[test]
+    fn drain_detection_without_a_loop_uses_the_paths_of_the_config() {
+        use crate::detection_marker::{DetectionPaths, FallbackMarkerPath};
+        let config = Config {
+            keystore_path: "/rvc/keys".into(),
+            slashing_db_path: "/rvc/db/slashing.sqlite".into(),
+            ..Default::default()
+        };
+        let clock = Arc::new(doppelganger::MonotonicEpochClock::new(0, 12_000));
+        let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(
+            slashing::SlashingDb::open_in_memory().expect("The in-memory database must open."),
+        );
+        let machine = Arc::new(doppelganger::ForwardWindowMachine::new(
+            reader,
+            doppelganger::DEFAULT_MONITORING_EPOCHS,
+            [0; 32],
+        ));
+        let own = drain_detection(None, Some(Arc::clone(&machine)), &config, &clock);
+        let config_paths = DetectionPaths {
+            keystore_dir: config.keystore_path.clone(),
+            fallback: FallbackMarkerPath::for_config(
+                &config.keystore_path,
+                &config.slashing_db_path,
+            ),
+        };
+        assert!(config_paths.fallback.is_some(), "The config must give a fallback marker.");
+        assert!(
+            own.is_some_and(|detection| *detection.persister.paths() == config_paths
+                && Arc::ptr_eq(&detection.machine, &machine)),
+            "With no loop, the drain must get the machine and a persister for the paths of the \
+             config."
+        );
+        assert!(
+            drain_detection(None, None, &config, &clock).is_none(),
+            "With no machine, the drain must get no detection state."
+        );
+    }
+
+    /// W4-D3d2: `run_with_clock` gives `drain_detection` the prepared loop
+    /// (`liveness_task.as_ref()`) before it spawns the loop. After the drain,
+    /// it gives the keystore lock guard to `keep_keystore_lock_on_detection`.
+    #[test]
+    fn run_gives_the_drain_the_loop_and_keeps_the_lock_on_detection() {
+        let src = include_str!("run.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body before tests");
+        let file = syn::parse_file(body).expect("The production body must be valid Rust.");
+        let mut calls = DrainDetectionCalls::default();
+        syn::visit::Visit::visit_file(&mut calls, &file);
+        assert_eq!(
+            calls.0,
+            [true],
+            "run_with_clock must call drain_detection one time, with `liveness_task.as_ref()` \
+             as its first argument."
+        );
+        assert!(
+            boot_calls(body, "keep_keystore_lock_on_detection", None),
+            "run_with_clock must keep the keystore lock on a detection exit."
+        );
+    }
+
+    /// Each `drain_detection(..)` call in `run_with_clock`: `true` when its
+    /// first argument is `liveness_task.as_ref()`.
+    #[derive(Default)]
+    struct DrainDetectionCalls(Vec<bool>, bool);
+
+    impl<'ast> syn::visit::Visit<'ast> for DrainDetectionCalls {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let outer = std::mem::replace(&mut self.1, item.sig.ident == "run_with_clock");
+            syn::visit::visit_item_fn(self, item);
+            self.1 = outer;
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let named = matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|last| last.ident == "drain_detection"));
+            if self.1 && named {
+                let loop_ref = matches!(call.args.first(), Some(syn::Expr::MethodCall(method))
+                    if method.method == "as_ref"
+                        && method.args.is_empty()
+                        && matches!(&*method.receiver, syn::Expr::Path(path)
+                            if path.path.is_ident("liveness_task")));
+                self.0.push(loop_ref);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
     }
 
     /// ARCH-2h: the production body joins tasks. It does not sleep in place
