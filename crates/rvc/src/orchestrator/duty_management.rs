@@ -2231,4 +2231,31 @@ mod tests {
             "The call must return the timeout of the second chunk: {outcome:?}"
         );
     }
+
+    /// Each POST waits 2 s, less than `timeouts.preparation` (3 s). The 4
+    /// POSTs must start at the same time, so a runner bound of 3 s does not
+    /// stop a later chunk before it starts (self-check F1).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_subscription_posts_start_at_the_same_time() {
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let f = ManyKeys::with_mock(2_000, make_config(), Vec::new(), |mock| {
+            mock.with_method_delay(method, Duration::from_secs(2))
+        })
+        .await;
+
+        let pass = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH);
+        let outcome = tokio::time::timeout(Duration::from_secs(3), pass).await;
+
+        let starts = f.post_starts();
+        assert_eq!(starts.len(), 4, "All 4 POSTs must start in the runner bound of 3 s.");
+        assert!(
+            starts.iter().all(|start| *start == starts[0]),
+            "The 4 POSTs must start at the same time: {starts:?}"
+        );
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "The call must return Ok in the runner bound of 3 s: {outcome:?}"
+        );
+        f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
+    }
 }
