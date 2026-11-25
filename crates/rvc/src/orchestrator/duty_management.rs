@@ -616,9 +616,9 @@ impl DutyManagementService {
     /// owner checks the store gate, its fence and the watch just before the
     /// signer call, with no await between them, and again after the sign
     /// (RSA B1). A proof from a sign that is in flight at a store disable or
-    /// at a revocation goes into no cache entry and no POST. A proof whose
-    /// sign ended before the move stays in the cache. The signer bounds each
-    /// sign with its own sign timeout.
+    /// at a revocation goes into no cache entry and no POST. When the sign of
+    /// a proof stops before the move, the proof stays in the cache. The
+    /// signer bounds each sign with its own sign timeout.
     ///
     /// The subscriptions go in POSTs with a maximum of 512 subscriptions in
     /// each POST. A maximum of `SUBSCRIPTION_CHUNKS_IN_FLIGHT` (4) POSTs are
@@ -1809,7 +1809,7 @@ mod tests {
     impl SlowRemote {
         fn new() -> Self {
             let key = crypto::SecretKey::from_bytes(&[0x11; 32])
-                .expect("The fixed bytes must make a valid secret key.");
+                .expect("The fixed bytes must make a secret key.");
             Self {
                 proof: key.sign(b"fixed selection proof"),
                 in_flight: AtomicUsize::new(0),
@@ -1820,8 +1820,8 @@ mod tests {
             }
         }
 
-        /// Runs `hook` at the start of the next sign request that has no hook
-        /// yet.
+        /// Adds `hook` to the next sign request that has no hook. The hook runs
+        /// at the start of that sign request.
         fn on_sign(&self, hook: impl FnOnce() + Send + 'static) {
             self.hooks.lock().push_back(Box::new(hook));
         }
@@ -1852,6 +1852,7 @@ mod tests {
             pubkey: &[u8; 48],
         ) -> Result<crypto::Signature, crypto::SigningError> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = InFlightGuard(&self.in_flight);
             self.peak.fetch_max(now, Ordering::SeqCst);
             self.started.lock().push(*pubkey);
             let hook = self.hooks.lock().pop_front();
@@ -1863,12 +1864,21 @@ mod tests {
                 let _ = held.await;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(self.proof.clone())
         }
 
         fn public_keys(&self) -> Vec<[u8; 48]> {
             Vec::new()
+        }
+    }
+
+    /// Lowers the count of sign requests in flight when the sign request
+    /// ends, also when the caller drops it (Harper N4).
+    struct InFlightGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -1983,7 +1993,8 @@ mod tests {
             Self { service, mock, remote, keys, posts, admission }
         }
 
-        /// The items of each answered subscription POST, in answer order.
+        /// The items of each answered subscription POST, in the sequence of
+        /// the answers.
         fn posts(&self) -> Vec<PostItems> {
             self.posts.lock().clone()
         }
@@ -2003,7 +2014,7 @@ mod tests {
                 .collect()
         }
 
-        /// Checks that `posts` carry the duty of each key once.
+        /// Checks that `posts` contain the duty of each key one time.
         fn assert_each_duty_once(&self, posts: &[PostItems], pass: &str) {
             let mut sent: Vec<_> = posts.iter().flatten().cloned().collect();
             sent.sort();
@@ -2012,9 +2023,17 @@ mod tests {
             expected.sort();
             assert!(
                 sent == expected,
-                "{pass} must carry the validator index and slot of each of the {} duties once.",
+                "{pass} must contain the validator index and the slot of each of the {} duties one time.",
                 expected.len()
             );
+        }
+
+        /// The sizes of the answered subscription POSTs, from small to
+        /// large. Concurrent POSTs can arrive in any sequence (Harper N2).
+        fn sorted_post_sizes(&self) -> Vec<usize> {
+            let mut sizes = self.post_sizes();
+            sizes.sort_unstable();
+            sizes
         }
     }
 
@@ -2023,8 +2042,8 @@ mod tests {
     }
 
     /// 655-AC1: 2,000 own duties sign through a signer that waits 2 ms for
-    /// each sign request. The call must end in less than 1 s of paused time
-    /// and send 4 POSTs of 512 or fewer subscriptions.
+    /// each sign request. The call must complete in less than 1 s of paused
+    /// time. It must send 4 POSTs with a maximum of 512 duties in each POST.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_committee_subscriptions_for_2000_keys_finish_within_one_second() {
         let f = ManyKeys::new(2_000, make_config(), Vec::new()).await;
@@ -2035,16 +2054,16 @@ mod tests {
 
         assert!(
             elapsed < Duration::from_secs(1),
-            "The 2,000 subscriptions must end in less than 1 s of paused time, not {elapsed:?}."
+            "The 2,000 subscriptions must complete in less than 1 s of paused time, not {elapsed:?}."
         );
         assert!(
             matches!(outcome, Ok(())),
             "The call must return Ok for 4 accepted POSTs: {outcome:?}"
         );
         assert_eq!(
-            f.post_sizes(),
-            [512, 512, 512, 464],
-            "The 2,000 subscriptions must go in 4 POSTs of 512 or fewer."
+            f.sorted_post_sizes(),
+            [464, 512, 512, 512],
+            "The 2,000 subscriptions must go in 4 POSTs with a maximum of 512 duties in each POST."
         );
         f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
         assert_eq!(f.remote.started().len(), 2_000, "Each duty must sign one selection proof.");
@@ -2058,7 +2077,7 @@ mod tests {
     async fn subscription_sign_cap_is_the_lower_of_32_and_the_dispatch_concurrency() {
         for (concurrency, peak) in [(4, 4), (64, 32)] {
             let limits = DispatchLimits::validated(concurrency, 2)
-                .expect("The limits are not zero, so they must be valid.");
+                .expect("The dispatch limits must pass validation.");
             let config = make_config().with_dispatch_limits(limits);
             let f = ManyKeys::new(40, config, Vec::new()).await;
 
@@ -2085,10 +2104,10 @@ mod tests {
     /// Keys 0 to 3 have one duty each, in slot order.
     ///
     /// Part 1 uses the mock beacon node. Key 1 is disabled, and the first
-    /// sign request (key 0) moves the admission generation. The mock gives a
-    /// new fence that holds after the move, but the duties were read before
-    /// it: only key 0 signs. On the base code, the duty cache does not serve
-    /// the duties of the later slots after the move.
+    /// sign request (key 0) moves the admission generation. After the move,
+    /// the mock gives a new fence that holds. But the call read the duties
+    /// before the move, and thus only key 0 signs. On the base code, the duty
+    /// cache gives no duty for the later slots after the move.
     ///
     /// Part 2 uses a real `BnManager` as the beacon node of the service:
     /// - The first sign request (key 0) disables key 1.
@@ -2097,9 +2116,10 @@ mod tests {
     /// Key 1 must make no cache lookup. Key 3 reads its fence after the
     /// revocation and must make no cache lookup. Only keys 0 and 2 sign.
     ///
-    /// This guard must pass on the base code too (issue AC), so it checks
-    /// only the sign requests and the cache lookups. After a move, the base
-    /// code sends the POST and this code does not (self-check F2).
+    /// This guard must also pass on the base code (issue AC). For this
+    /// reason, it checks only the sign requests and the cache lookups. After
+    /// a move, the base code sends the POST, and this code does not
+    /// (self-check F2).
     /// `no_subscription_post_after_a_revocation_during_the_sign_requests`
     /// checks the POST, the result and the fence reads after a move.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2228,7 +2248,7 @@ mod tests {
     /// two POSTs.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn exactly_one_chunk_at_512() {
-        for (count, sizes) in [(512, vec![512]), (513, vec![512, 1])] {
+        for (count, sizes) in [(512, vec![512]), (513, vec![1, 512])] {
             let f = ManyKeys::new(count, make_config(), Vec::new()).await;
 
             let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
@@ -2238,18 +2258,18 @@ mod tests {
                 "With {count} duties, the call must return Ok: {outcome:?}"
             );
             assert_eq!(
-                f.post_sizes(),
+                f.sorted_post_sizes(),
                 sizes,
-                "The POST sizes for {count} duties must be {sizes:?}."
+                "The sorted POST sizes for {count} duties must be {sizes:?}."
             );
             f.assert_each_duty_once(&f.posts(), &format!("The POSTs for {count} duties"));
         }
     }
 
     /// 2,000 duties make 4 chunks, and the second chunk gets a 503. The call
-    /// sends the other 3 chunks too, then returns the 503. The retry uses the
-    /// cached proofs, and its first and fourth chunks fail: it returns the
-    /// first failure.
+    /// also sends the other 3 chunks, and then it returns the 503. The retry
+    /// uses the cached proofs. The first and fourth chunks of the retry fail,
+    /// and the retry returns the first failure.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn subscription_chunk_failure_tries_every_chunk_then_errs() {
         let answers = vec![
@@ -2304,8 +2324,8 @@ mod tests {
     }
 
     /// The sign request of the first duty waits until the test releases it.
-    /// The other 31 requests of the first group end after 2 ms. The 8 later
-    /// requests must start while the first request waits.
+    /// The other 31 requests of the first group complete after 2 ms. The 8
+    /// later requests must start while the first request waits.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn subscription_sign_requests_do_not_wait_for_a_held_request() {
         let f = ManyKeys::new(40, make_config(), Vec::new()).await;
@@ -2333,8 +2353,9 @@ mod tests {
 
     /// The second of 4 POSTs waits for more than `timeouts.preparation`
     /// (3 s), and the fourth POST gets a 503. The call must send each chunk.
-    /// It must return the timeout of the second chunk: the first failure in
-    /// chunk order, not the first failure in time.
+    /// It must return the timeout of the second chunk. That is the first
+    /// failure in the sequence of the chunks, and not the first failure in
+    /// time.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_timed_out_subscription_chunk_does_not_stop_the_later_chunks() {
         let answers = vec![Ok(()), Ok(()), refused(503, "fourth")];
@@ -2363,7 +2384,7 @@ mod tests {
     }
 
     /// Each POST waits 2 s, less than `timeouts.preparation` (3 s). The 4
-    /// POSTs must start at the same time, so a runner bound of 3 s does not
+    /// POSTs must start at the same time. Then a runner bound of 3 s does not
     /// stop a later chunk before it starts (self-check F1).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn slow_subscription_posts_start_at_the_same_time() {
@@ -2624,10 +2645,10 @@ mod tests {
         }
     }
 
-    /// A duty whose public key does not parse gets no subscription. The call
-    /// must log one warn with the slot and the validator index of the duty
-    /// (self-check F7).
-    #[tokio::test]
+    /// A duty has an invalid public key and gets no subscription. The call
+    /// must log one WARN event with the slot and the validator index of that
+    /// duty (self-check F7).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_subscription_duty_with_an_invalid_public_key_logs_a_warn() {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -2673,7 +2694,57 @@ mod tests {
         assert_eq!(
             *warns.0.lock(),
             [expected],
-            "The call must log one warn with the slot and the validator index of the duty."
+            "The call must log one WARN event with the slot and the validator index of the duty."
+        );
+    }
+
+    /// Harper N3 (#1043 R1): one subscription POST takes exactly
+    /// `timeouts.preparation` (3 s) in the first pass. The same POST takes
+    /// 1 ms more in the second pass. The first POST must not time out, and
+    /// the second POST must time out.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_post_uses_the_configured_preparation_timeout() {
+        let bound = make_config().timeouts.preparation;
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let delays = [bound, bound + Duration::from_millis(1)];
+        let f = ManyKeys::with_mock(1, make_config(), Vec::new(), |mock| {
+            mock.with_call_delays(method, delays)
+        })
+        .await;
+
+        let at_bound = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let past_bound = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert!(
+            matches!(at_bound, Ok(())),
+            "A POST that takes timeouts.preparation must not time out: {at_bound:?}"
+        );
+        assert!(
+            matches!(
+                past_bound,
+                Err(OrchestratorError::OperationTimedOut { operation: "committee_subscription" })
+            ),
+            "A POST that takes 1 ms more than timeouts.preparation must time out: {past_bound:?}"
+        );
+    }
+
+    /// Harper N3 (#1043 R1): the beacon node gives a duty for local key 0
+    /// and a duty for key 1. Key 1 is not in the local key map. The call must
+    /// skip the duty of key 1: key 1 gets no sign request and no
+    /// subscription.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_skips_a_duty_for_an_unknown_public_key() {
+        let f = ManyKeys::new(2, make_config(), Vec::new()).await;
+        f.service.pubkey_map.write().remove(&f.keys[1]);
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
+        assert_eq!(f.remote.started(), [f.keys[0]], "Only the local key 0 must sign.");
+        assert_eq!(
+            f.posts(),
+            [vec![("0".to_string(), duty_slot(0).to_string())]],
+            "The POST must contain only the duty of the local key 0."
         );
     }
 }
