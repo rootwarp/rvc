@@ -609,6 +609,12 @@ impl DutyManagementService {
         for slot_offset in 0..SLOTS_PER_EPOCH {
             let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
             let duties = self.duty_tracker.get_duties_for_slot(slot).await;
+            #[cfg(test)]
+            AFTER_SLOT_DUTIES.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(slot);
+                }
+            });
 
             for duty in duties {
                 // Only subscribe for our own validators (O(1) by compressed bytes).
@@ -816,6 +822,14 @@ pub(crate) enum PreparePoint {
 
 #[cfg(test)]
 type PrepareHook = Box<dyn FnMut(PreparePoint)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`DutyManagementService::submit_committee_subscriptions`] after
+    /// the read of the duties of each slot, when a test sets it on this thread.
+    static AFTER_SLOT_DUTIES: std::cell::RefCell<Option<Box<dyn FnMut(Slot)>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1942,6 +1956,31 @@ mod tests {
             ),
             "Part 2: the revoked beacon node refuses the POST of the two proofs: {outcome:?}"
         );
+    }
+
+    /// Keys 0 to 3 have one duty each, in slot order. The admission
+    /// generation moves after the read of the first slot (key 0). Key 0 must
+    /// not sign, because its duty was read before the move. The later slots
+    /// have no duty that the cache serves after the move.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duties_read_before_a_revocation_do_not_sign() {
+        let f = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let admission = Arc::clone(&f.admission);
+        AFTER_SLOT_DUTIES.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |slot| {
+                if slot == SUBSCRIBED_EPOCH * SLOTS_PER_EPOCH {
+                    admission.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        });
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        AFTER_SLOT_DUTIES.with(|hook| hook.borrow_mut().take());
+
+        assert!(f.remote.started().is_empty(), "No duty read before the move must sign.");
+        assert_eq!(f.service.selection_proofs.lookups(), 0, "No duty must make a cache lookup.");
+        assert!(matches!(outcome, Ok(())), "Nothing to send is Ok: {outcome:?}");
+        assert!(f.post_sizes().is_empty(), "The call must send no POST.");
     }
 
     /// `SUBSCRIPTION_CHUNK`: 512 subscriptions go in one POST, and 513 go in
