@@ -1604,9 +1604,10 @@ async fn subscription_recomputes_is_aggregator_for_each_committee_length() {
 }
 
 /// RSA N2 (#1038 R1): admission moves while the subscription pass waits for an aggregation
-/// owner. After the owner is cancelled, the subscription owns the key, but the signer refuses
-/// its stale admission: no new backend call and no POST. The pass read its duty before the
-/// move. For this reason, it must return `RevokedInFlight` (Harper B1, #1043 R1).
+/// owner. After the owner is cancelled, the subscription owns the key, but its last check
+/// before the sign refuses the stale admission (RSA B1, #1043 R1): no new backend call and no
+/// POST. The pass read its duty before the move. For this reason, it must return
+/// `RevokedInFlight` (Harper B1, #1043 R1).
 #[tokio::test(flavor = "current_thread")]
 async fn subscription_takeover_signs_nothing_after_a_revocation() {
     let s = Subscribing::new().await;

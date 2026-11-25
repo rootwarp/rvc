@@ -59,11 +59,15 @@ pub(crate) enum PrepareOutcome {
     Stale,
 }
 
-/// Why the owner of a subscription's selection proof did not sign.
+/// Why the owner of a subscription's selection proof did not sign, or did
+/// not keep its proof.
 enum SubscriptionProofSkip {
     /// The store gate closed after the first check, for example while the
-    /// caller waited for another owner.
+    /// caller waited for another owner or during the sign.
     Disabled,
+    /// The fence or the pass watch moved after the first check, for example
+    /// while the caller waited for another owner or during the sign.
+    Revoked,
     Failed(SignerError),
 }
 
@@ -598,13 +602,19 @@ impl DutyManagementService {
     /// the duties, and each duty checks that watch with its own fence. After
     /// a revocation, no later duty signs, because its duty can come from the
     /// revoked node. The duty cache applies the same rule to each read. Each
-    /// POST checks the watch again: after a move, the call sends no POST and
-    /// returns `Beacon(RevokedInFlight)`, so the runner step tries again with
-    /// current duties. Proofs signed before the move stay in the cache.
+    /// POST checks the watch again when it starts, and the beacon node checks
+    /// it again before each HTTP attempt (Harper B2). After a move, the call
+    /// sends no POST and returns `Beacon(RevokedInFlight)`. Then the runner
+    /// step tries again with current duties.
     ///
     /// A duty whose proof is in the cache, or in flight for aggregation, does
-    /// not sign again. The cache signs only for the owner of the key, and the
-    /// owner checks the store gate again just before the signer call.
+    /// not sign again. The cache signs only for the owner of the key. The
+    /// owner checks the store gate, its fence and the watch just before the
+    /// signer call, with no await between them, and again after the sign
+    /// (RSA B1). A proof from a sign that is in flight at a store disable or
+    /// at a revocation goes into no cache entry and no POST. A proof whose
+    /// sign ended before the move stays in the cache. The signer bounds each
+    /// sign with its own sign timeout.
     ///
     /// The subscriptions go in POSTs of 512 or fewer. All POSTs start at the
     /// same time, and each has its own `timeouts.preparation` bound. A failed
@@ -695,10 +705,10 @@ impl DutyManagementService {
                     }
                 };
                 let lookup = self.selection_proofs.get_or_sign((slot, duty_bytes), || async {
-                    if !self.validator_store.is_signing_enabled(&pk_bytes) {
-                        return Err(SubscriptionProofSkip::Disabled);
-                    }
-                    super::slot_context::under_admission(
+                    // RSA B1: the last check before the sign. The signer call
+                    // comes next, with no await between them.
+                    self.subscription_sign_allowed(&pk_bytes, &fence, duties_watch)?;
+                    let signed = super::slot_context::under_admission(
                         &fence,
                         self.signer.sign_selection_proof(
                             slot,
@@ -707,8 +717,15 @@ impl DutyManagementService {
                             &self.config.genesis_validators_root,
                         ),
                     )
-                    .await
-                    .map_err(SubscriptionProofSkip::Failed)
+                    .await;
+                    let proof = match signed {
+                        Ok(proof) => proof,
+                        Err(error) => return Err(SubscriptionProofSkip::Failed(error)),
+                    };
+                    // RSA B1: a store disable or a revocation during the sign
+                    // gives no proof. The cache keeps no entry for it, and the
+                    // duty gets no subscription.
+                    self.subscription_sign_allowed(&pk_bytes, &fence, duties_watch).map(|()| proof)
                 });
                 let selection_proof = match lookup.await {
                     Ok(sig) => sig,
@@ -724,6 +741,13 @@ impl DutyManagementService {
                             pubkey = %TruncatedPubkey::new(&duty.pubkey),
                             slot,
                             "Skipping committee subscription: validator signing is disabled"
+                        );
+                        return None;
+                    }
+                    Err(SelectionProofError::Sign(SubscriptionProofSkip::Revoked)) => {
+                        warn!(
+                            slot,
+                            "skipping committee subscription: beacon node admission revoked"
                         );
                         return None;
                     }
@@ -810,6 +834,27 @@ impl DutyManagementService {
                 Err(OrchestratorError::OperationTimedOut { operation: COMMITTEE_SUBSCRIPTION })
             }
         }
+    }
+
+    /// `Ok` while the store gate of `pk_bytes` is open, and `fence` and
+    /// `duties_watch` hold. The owner of a subscription proof checks this
+    /// just before its sign and again after it (RSA B1).
+    fn subscription_sign_allowed(
+        &self,
+        pk_bytes: &[u8; 48],
+        fence: &beacon::DutyFence,
+        duties_watch: &beacon::DutyFence,
+    ) -> Result<(), SubscriptionProofSkip> {
+        if !self.validator_store.is_signing_enabled(pk_bytes) {
+            return Err(SubscriptionProofSkip::Disabled);
+        }
+        if super::slot_context::admission_blocks(
+            signer::SigningDuty::SelectionProof,
+            &[fence, duties_watch],
+        ) {
+            return Err(SubscriptionProofSkip::Revoked);
+        }
+        Ok(())
     }
 
     /// Count attester/proposer/sync duties for the epoch and emit the
