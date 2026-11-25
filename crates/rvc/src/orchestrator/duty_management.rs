@@ -1709,6 +1709,7 @@ mod tests {
         peak: AtomicUsize,
         started: parking_lot::Mutex<Vec<[u8; 48]>>,
         hooks: parking_lot::Mutex<VecDeque<SignHook>>,
+        held: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
     impl SlowRemote {
@@ -1721,12 +1722,20 @@ mod tests {
                 peak: AtomicUsize::new(0),
                 started: parking_lot::Mutex::default(),
                 hooks: parking_lot::Mutex::default(),
+                held: parking_lot::Mutex::default(),
             }
         }
 
         /// Runs `hook` at the start of the next sign that has no hook yet.
         fn on_sign(&self, hook: impl FnOnce() + Send + 'static) {
             self.hooks.lock().push_back(Box::new(hook));
+        }
+
+        /// Holds the next sign request until the test sends on the result.
+        fn hold_next(&self) -> tokio::sync::oneshot::Sender<()> {
+            let (release, held) = tokio::sync::oneshot::channel();
+            *self.held.lock() = Some(held);
+            release
         }
 
         fn started(&self) -> Vec<[u8; 48]> {
@@ -1753,6 +1762,10 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
+            let held = self.held.lock().take();
+            if let Some(held) = held {
+                let _ = held.await;
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(self.proof.clone())
@@ -1765,15 +1778,25 @@ mod tests {
 
     type Answers = Vec<Result<(), beacon::BeaconError>>;
 
+    /// The (validator index, slot) of each item of one subscription POST.
+    type PostItems = Vec<(String, String)>;
+
+    /// The slot of the duty of key `i` in [`ManyKeys`].
+    fn duty_slot(i: usize) -> Slot {
+        SUBSCRIBED_EPOCH * SLOTS_PER_EPOCH + i as u64 % SLOTS_PER_EPOCH
+    }
+
     /// A service with `count` enabled keys that sign through one
     /// [`SlowRemote`]. Key `i` has one attester duty at slot offset `i % 32`
-    /// of [`SUBSCRIBED_EPOCH`]. The beacon node records the size of each
-    /// subscription POST, and `admission` is its admission generation.
+    /// of [`SUBSCRIBED_EPOCH`]. The beacon node records the items of each
+    /// subscription POST that it answers, and `admission` is its admission
+    /// generation.
     struct ManyKeys {
         service: DutyManagementService,
+        mock: Arc<bn_manager::MockBeaconNodeClient>,
         remote: Arc<SlowRemote>,
         keys: Vec<[u8; 48]>,
-        post_sizes: Arc<parking_lot::Mutex<Vec<usize>>>,
+        posts: Arc<parking_lot::Mutex<Vec<PostItems>>>,
         admission: Arc<std::sync::atomic::AtomicU64>,
     }
 
@@ -1781,6 +1804,16 @@ mod tests {
         /// `answers[n]` is the answer to subscription POST `n`. A POST after
         /// the list gets `Ok`.
         async fn new(count: usize, config: OrchestratorConfig, answers: Answers) -> Self {
+            Self::with_mock(count, config, answers, |mock| mock).await
+        }
+
+        /// [`Self::new`], with `setup` applied to the mock beacon node.
+        async fn with_mock(
+            count: usize,
+            config: OrchestratorConfig,
+            answers: Answers,
+            setup: impl FnOnce(bn_manager::MockBeaconNodeClient) -> bn_manager::MockBeaconNodeClient,
+        ) -> Self {
             let pubkeys: Vec<crypto::PublicKey> =
                 (0..count).map(|_| crypto::SecretKey::generate().public_key()).collect();
             let duties: Vec<beacon::AttesterDuty> = pubkeys
@@ -1793,14 +1826,13 @@ mod tests {
                     committee_length: "128".to_string(),
                     committees_at_slot: "1".to_string(),
                     validator_committee_index: "0".to_string(),
-                    slot: (SUBSCRIBED_EPOCH * SLOTS_PER_EPOCH + i as u64 % SLOTS_PER_EPOCH)
-                        .to_string(),
+                    slot: duty_slot(i).to_string(),
                 })
                 .collect();
-            let post_sizes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            let record = Arc::clone(&post_sizes);
+            let posts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let record = Arc::clone(&posts);
             let answers = parking_lot::Mutex::new(VecDeque::from(answers));
-            let mock = Arc::new(
+            let mock = Arc::new(setup(
                 bn_manager::MockBeaconNodeClient::new()
                     .with_get_attester_duties(move |_epoch, _indices| {
                         Ok(beacon::DependentRootResponse {
@@ -1810,12 +1842,15 @@ mod tests {
                         })
                     })
                     .with_submit_beacon_committee_subscriptions(move |subscriptions| {
-                        record.lock().push(subscriptions.len());
+                        let items = subscriptions
+                            .iter()
+                            .map(|s| (s.validator_index.clone(), s.slot.clone()));
+                        record.lock().push(items.collect());
                         answers.lock().pop_front().unwrap_or(Ok(()))
                     }),
-            );
+            ));
             let admission = mock.track_admission();
-            let beacon = mock as Arc<dyn BeaconNodeClient>;
+            let beacon = Arc::clone(&mock) as Arc<dyn BeaconNodeClient>;
             let indices = (0..count).map(|i| i.to_string()).collect();
             let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
             duty_tracker
@@ -1849,11 +1884,41 @@ mod tests {
                 config,
                 Arc::default(),
             );
-            Self { service, remote, keys, post_sizes, admission }
+            Self { service, mock, remote, keys, posts, admission }
+        }
+
+        /// The items of each answered subscription POST, in answer order.
+        fn posts(&self) -> Vec<PostItems> {
+            self.posts.lock().clone()
         }
 
         fn post_sizes(&self) -> Vec<usize> {
-            self.post_sizes.lock().clone()
+            self.posts.lock().iter().map(Vec::len).collect()
+        }
+
+        /// The paused-clock instant at which each subscription POST started.
+        fn post_starts(&self) -> Vec<tokio::time::Instant> {
+            let stamps = self.mock.call_stamps().into_iter();
+            stamps
+                .filter(|stamp| {
+                    stamp.method == bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions
+                })
+                .map(|stamp| stamp.at)
+                .collect()
+        }
+
+        /// Checks that `posts` carry the duty of each key once.
+        fn assert_each_duty_once(&self, posts: &[PostItems], pass: &str) {
+            let mut sent: Vec<_> = posts.iter().flatten().cloned().collect();
+            sent.sort();
+            let mut expected: Vec<_> =
+                (0..self.keys.len()).map(|i| (i.to_string(), duty_slot(i).to_string())).collect();
+            expected.sort();
+            assert!(
+                sent == expected,
+                "{pass} must carry the validator index and slot of each of the {} duties once.",
+                expected.len()
+            );
         }
     }
 
@@ -1885,6 +1950,7 @@ mod tests {
             [512, 512, 512, 464],
             "The 2,000 subscriptions must go in 4 POSTs of 512 or fewer."
         );
+        f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
         assert_eq!(f.remote.started().len(), 2_000, "Each duty must sign one selection proof.");
         assert_eq!(f.remote.peak(), 32, "Not more than 32 signs must be in flight.");
     }
@@ -1942,6 +2008,7 @@ mod tests {
         moved.remote.on_sign(move || {
             admission.fetch_add(1, Ordering::SeqCst);
         });
+        let fences = moved.mock.duty_fence_calls();
 
         let outcome = moved.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
@@ -1949,6 +2016,11 @@ mod tests {
             moved.remote.started(),
             [moved.keys[0]],
             "Part 1: only key 0 must sign: key 1 is disabled, and keys 2 and 3 are after the move."
+        );
+        assert_eq!(
+            moved.mock.duty_fence_calls() - fences,
+            3,
+            "Part 1: each of the 3 enabled duties must read its own fence, and the disabled duty must read none."
         );
         assert_eq!(
             moved.service.selection_proofs.lookups(),
@@ -2040,6 +2112,7 @@ mod tests {
                 sizes,
                 "The POST sizes for {count} duties must be {sizes:?}."
             );
+            f.assert_each_duty_once(&f.posts(), &format!("The POSTs for {count} duties"));
         }
     }
 
@@ -2062,14 +2135,17 @@ mod tests {
         let f = ManyKeys::new(2_000, make_config(), answers).await;
 
         let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
-        let first_posts = f.post_sizes();
+        let first_posts = f.posts();
+        let first_signs = f.remote.started().len();
+        let cache = (f.service.selection_proofs.len(), f.service.selection_proofs.in_flight_len());
         let retry = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
         assert_eq!(
-            first_posts,
+            first_posts.iter().map(Vec::len).collect::<Vec<_>>(),
             [512, 512, 512, 464],
             "The call must send all 4 chunks, also the 2 after the 503."
         );
+        f.assert_each_duty_once(&first_posts, "The 4 POSTs of the first pass");
         assert!(
             matches!(
                 &outcome,
@@ -2078,7 +2154,14 @@ mod tests {
             ),
             "The call must return the 503 of the second chunk: {outcome:?}"
         );
+        assert_eq!(first_signs, 2_000, "The first pass must sign one proof for each duty.");
+        assert_eq!(
+            cache,
+            (2_000, 0),
+            "After the failed pass, the cache must hold 2,000 ready proofs and no proof in flight."
+        );
         assert_eq!(f.post_sizes().len(), 8, "The retry must send all 4 chunks again.");
+        f.assert_each_duty_once(&f.posts()[4..], "The 4 POSTs of the retry");
         assert!(
             matches!(
                 &retry,
@@ -2088,5 +2171,64 @@ mod tests {
             "The retry must return its first failure: {retry:?}"
         );
         assert_eq!(f.remote.started().len(), 2_000, "The retry must sign no proof again.");
+    }
+
+    /// The sign request of the first duty waits until the test releases it.
+    /// The other 31 requests of the first group end after 2 ms. The 8 later
+    /// requests must start while the first request waits.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_sign_requests_do_not_wait_for_a_held_request() {
+        let f = ManyKeys::new(40, make_config(), Vec::new()).await;
+        let release = f.remote.hold_next();
+        let mut pass = std::pin::pin!(f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH));
+
+        for round in 1..=4 {
+            let early = tokio::time::timeout(Duration::from_millis(2), pass.as_mut()).await;
+            assert!(early.is_err(), "In round {round}, the call must wait for the held request.");
+        }
+
+        assert_eq!(
+            f.remote.started().len(),
+            40,
+            "All 40 sign requests must start while the first request waits."
+        );
+        release.send(()).expect("The held request must wait for the release.");
+        let outcome = pass.await;
+        assert!(
+            matches!(outcome, Ok(())),
+            "After the release, the call must return Ok: {outcome:?}"
+        );
+        f.assert_each_duty_once(&f.posts(), "The POST");
+    }
+
+    /// The second of 4 POSTs waits for more than `timeouts.preparation`
+    /// (3 s), and the fourth POST gets a 503. The call sends each chunk. It
+    /// returns the timeout of the second chunk: the first failure in chunk
+    /// order, not the first failure in time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_timed_out_subscription_chunk_does_not_stop_the_later_chunks() {
+        let answers = vec![Ok(()), Ok(()), refused(503, "fourth")];
+        let hold = [Duration::ZERO, Duration::from_secs(4)];
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let f = ManyKeys::with_mock(2_000, make_config(), answers, |mock| {
+            mock.with_call_delays(method, hold)
+        })
+        .await;
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(f.post_starts().len(), 4, "The call must start all 4 POSTs.");
+        assert_eq!(
+            f.post_sizes(),
+            [512, 512, 464],
+            "The beacon node must answer the first, third and fourth POSTs."
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(OrchestratorError::OperationTimedOut { operation: "committee_subscription" })
+            ),
+            "The call must return the timeout of the second chunk: {outcome:?}"
+        );
     }
 }
