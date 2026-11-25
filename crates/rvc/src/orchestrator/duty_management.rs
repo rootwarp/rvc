@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,15 +10,15 @@ use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use builder::legacy_proposer_ops_retired;
-use crypto::Signature;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
 use observability::logging::TruncatedPubkey;
-use signer::{is_aggregator, SignerService, ValidatorSigner};
+use signer::{is_aggregator, SignerError, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::error::OrchestratorError;
+use super::selection_proofs::{SelectionProofCache, SelectionProofError};
 use super::utils::{self, TimedOutcome};
 use crate::pubkey_index::{parse_pubkey_bytes, RegistryFreshness, SharedPubkeyIndexRegistry};
 
@@ -50,6 +50,14 @@ pub(crate) enum PrepareOutcome {
     Stale,
 }
 
+/// Why the owner of a subscription's selection proof did not sign.
+enum SubscriptionProofSkip {
+    /// The store gate closed after the first check, for example while the
+    /// caller waited for another owner.
+    Disabled,
+    Failed(SignerError),
+}
+
 /// [`PrepareOutcome::Stale`] with no POST: the indices wait for a re-check.
 fn deferred_preparation(epoch: u64) -> PrepareOutcome {
     info!(
@@ -70,12 +78,12 @@ pub(crate) struct DutyManagementService {
     config: OrchestratorConfig,
     /// Tracks which sync committee periods have been prefetched to ensure idempotency.
     prefetched_periods: RwLock<HashSet<u64>>,
+    /// The selection proofs that aggregation uses too.
+    selection_proofs: Arc<SelectionProofCache>,
 }
 
-/// Selection proofs already signed, by duty slot and validator pubkey.
-pub(crate) type SelectionProofs = parking_lot::Mutex<HashMap<(Slot, [u8; 48]), Signature>>;
-
 impl DutyManagementService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         signer: Arc<SignerService>,
         beacon: Arc<dyn BeaconNodeClient>,
@@ -84,6 +92,7 @@ impl DutyManagementService {
         pubkey_map: PubkeyMap,
         pubkey_index: SharedPubkeyIndexRegistry,
         config: OrchestratorConfig,
+        selection_proofs: Arc<SelectionProofCache>,
     ) -> Self {
         Self {
             signer,
@@ -94,7 +103,13 @@ impl DutyManagementService {
             pubkey_index,
             config,
             prefetched_periods: RwLock::new(HashSet::new()),
+            selection_proofs,
         }
+    }
+
+    /// Drops the selection proofs below `slot`. See [`SelectionProofCache::evict_before`].
+    pub(crate) fn evict_selection_proofs_before(&self, slot: Slot) {
+        self.selection_proofs.evict_before(slot);
     }
 
     #[tracing::instrument(name = "orchestrator.fetch_epoch_duties", level = "debug", skip_all, fields(epoch = epoch))]
@@ -550,29 +565,25 @@ impl DutyManagementService {
         pubkeys.iter().filter(|pubkey| index_registry.index_of(pubkey).is_some()).count()
     }
 
-    /// [`Self::submit_committee_subscriptions_with`], keeping no proof.
-    pub(crate) async fn submit_committee_subscriptions(
-        &self,
-        epoch: u64,
-    ) -> Result<(), OrchestratorError> {
-        self.submit_committee_subscriptions_with(epoch, &SelectionProofs::default()).await
-    }
-
-    /// Signs a selection proof for each local attester duty of `epoch` that
-    /// `proofs` does not hold yet, keeping it there, and POSTs the epoch's
-    /// committee subscriptions.
+    /// Gets a selection proof for each local attester duty of `epoch` from
+    /// the shared cache, and POSTs the epoch's committee subscriptions.
+    ///
+    /// A duty whose proof is in the cache, or in flight for aggregation, does
+    /// not sign again. The cache signs only for the owner of the key, and the
+    /// owner checks the store gate again just before the signer call.
     ///
     /// `Ok` when the epoch needs no further send: the POST went out, or there
     /// is nothing to send (no own duty, or the store gate closed or the
     /// admission revoked for each one). A selection proof that fails to sign
-    /// is a warn, and skips its duty. A failed POST is
+    /// is a warn, and skips its duty. A slot below the cache's eviction cutoff
+    /// skips its duty too, unless a live owner admitted before the eviction
+    /// delivers its proof: the cutoff stops only a new owner. A failed POST is
     /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
     /// is [`OrchestratorError::OperationTimedOut`].
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
-    pub(crate) async fn submit_committee_subscriptions_with(
+    pub(crate) async fn submit_committee_subscriptions(
         &self,
         epoch: u64,
-        proofs: &SelectionProofs,
     ) -> Result<(), OrchestratorError> {
         let mut subscriptions = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
@@ -623,25 +634,40 @@ impl DutyManagementService {
                         continue;
                     }
                 };
-                let kept = proofs.lock().get(&(slot, duty_bytes)).cloned();
-                let signed = match kept {
-                    Some(proof) => Ok(proof),
-                    None => {
-                        super::slot_context::under_admission(
-                            &fence,
-                            self.signer.sign_selection_proof(
-                                slot,
-                                &pubkey,
-                                &self.config.fork_schedule,
-                                &self.config.genesis_validators_root,
-                            ),
-                        )
-                        .await
+                let lookup = self.selection_proofs.get_or_sign((slot, duty_bytes), || async {
+                    if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                        return Err(SubscriptionProofSkip::Disabled);
                     }
-                };
-                let selection_proof = match signed {
+                    super::slot_context::under_admission(
+                        &fence,
+                        self.signer.sign_selection_proof(
+                            slot,
+                            &pubkey,
+                            &self.config.fork_schedule,
+                            &self.config.genesis_validators_root,
+                        ),
+                    )
+                    .await
+                    .map_err(SubscriptionProofSkip::Failed)
+                });
+                let selection_proof = match lookup.await {
                     Ok(sig) => sig,
-                    Err(e) => {
+                    Err(SelectionProofError::Evicted { slot }) => {
+                        debug!(
+                            slot,
+                            "subscription selection proof slot is below the eviction cutoff"
+                        );
+                        continue;
+                    }
+                    Err(SelectionProofError::Sign(SubscriptionProofSkip::Disabled)) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                            slot,
+                            "Skipping committee subscription: validator signing is disabled"
+                        );
+                        continue;
+                    }
+                    Err(SelectionProofError::Sign(SubscriptionProofSkip::Failed(e))) => {
                         warn!(
                             validator_index = %duty.validator_index,
                             slot,
@@ -653,7 +679,6 @@ impl DutyManagementService {
                 };
 
                 let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
-                proofs.lock().insert((slot, duty_bytes), selection_proof);
 
                 subscriptions.push(BeaconCommitteeSubscription {
                     validator_index: wire.validator_index.clone(),
@@ -866,6 +891,7 @@ mod tests {
             pubkey_map,
             crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
+            Arc::default(),
         )
     }
 
@@ -971,6 +997,7 @@ mod tests {
             pubkey_map,
             crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
+            Arc::default(),
         );
 
         // First attempt at PERIOD-1: fails
@@ -1221,6 +1248,7 @@ mod tests {
             pubkey_map,
             crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
+            Arc::default(),
         );
 
         let current_slot = slot_base;
@@ -1299,6 +1327,7 @@ mod tests {
             pubkey_map,
             crate::pubkey_index::PubkeyIndexRegistry::shared(),
             config,
+            Arc::default(),
         )
     }
 
@@ -1494,6 +1523,7 @@ mod tests {
             pubkey_map,
             crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
+            Arc::default(),
         );
         (service, mock)
     }
@@ -1530,6 +1560,7 @@ mod tests {
         let outcome = service.submit_committee_subscriptions(1).await;
 
         assert!(matches!(outcome, Ok(())), "nothing to send is Ok: {outcome:?}");
+        assert_eq!(service.selection_proofs.lookups(), 0, "a revoked admission makes no lookup");
         logs_assert(|lines: &[&str]| {
             let count = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
             let skipped = count("skipping committee subscription: beacon node admission revoked");
@@ -1546,6 +1577,7 @@ mod tests {
         let outcome = service.submit_committee_subscriptions(1).await;
 
         assert!(matches!(outcome, Ok(())), "control: {outcome:?}");
+        assert_eq!(service.selection_proofs.lookups(), 1, "control: one lookup for the duty");
         let posts = mock
             .call_stamps()
             .iter()
@@ -1554,5 +1586,36 @@ mod tests {
             })
             .count();
         assert_eq!(posts, 1, "control: an admitting beacon node gets the duty's POST");
+    }
+
+    /// W4-E8a3: the store gate runs first. A disabled key reads no admission
+    /// fence and makes no cache lookup, so a ready proof or an owner in flight
+    /// cannot give it a subscription (RSA N2, #1038 R1 and R2). Control: the
+    /// enabled key reads one fence, makes one lookup and POSTs.
+    #[tokio::test]
+    async fn test_disabled_key_makes_no_selection_proof_lookup() {
+        let local = crypto::SecretKey::generate();
+        let pk_bytes = local.public_key().to_bytes();
+        let (service, mock) = build_subscribing_service(local).await;
+        service.validator_store.set_enabled(&pk_bytes, false);
+
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(matches!(outcome, Ok(())), "nothing to send is Ok: {outcome:?}");
+        assert_eq!(mock.duty_fence_calls(), 0, "a disabled key reads no admission fence");
+        assert_eq!(service.selection_proofs.lookups(), 0, "a disabled key makes no lookup");
+        service.validator_store.set_enabled(&pk_bytes, true);
+        let outcome = service.submit_committee_subscriptions(1).await;
+        assert!(matches!(outcome, Ok(())), "control: {outcome:?}");
+        assert_eq!(mock.duty_fence_calls(), 1, "control: one fence for the duty");
+        assert_eq!(service.selection_proofs.lookups(), 1, "control: one lookup for the duty");
+        let posts = mock
+            .call_stamps()
+            .iter()
+            .filter(|stamp| {
+                stamp.method == bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions
+            })
+            .count();
+        assert_eq!(posts, 1, "control: the enabled key POSTs");
     }
 }

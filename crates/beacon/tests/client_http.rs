@@ -4386,7 +4386,22 @@ async fn test_submit_beacon_committee_subscriptions_success() {
 
     Mock::given(method("POST"))
         .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
-        .and(body_json(&subscriptions))
+        .and(body_json(serde_json::json!([
+            {
+                "validator_index": "1234",
+                "committee_index": "1",
+                "committees_at_slot": "64",
+                "slot": "10000",
+                "is_aggregator": true
+            },
+            {
+                "validator_index": "5678",
+                "committee_index": "2",
+                "committees_at_slot": "64",
+                "slot": "10000",
+                "is_aggregator": false
+            }
+        ])))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&mock_server)

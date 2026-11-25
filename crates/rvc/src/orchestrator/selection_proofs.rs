@@ -105,7 +105,6 @@ impl SelectionProofCache {
     /// The cutoff never goes down. No new owner is admitted below it. An owner admitted before the
     /// eviction keeps its entry and can finish its sign. Its proof then goes to its waiters but not
     /// into the cache.
-    #[cfg_attr(not(test), expect(dead_code, reason = "W4-E8a3 calls it from the runner"))]
     pub(crate) fn evict_before(&self, slot: Slot) {
         let mut entries = self.entries.lock();
         entries.cutoff = entries.cutoff.max(slot);
@@ -201,6 +200,11 @@ impl SelectionProofCache {
 
     pub(crate) fn waiter_registrations(&self) -> usize {
         self.waiter_registrations.load(Ordering::SeqCst)
+    }
+
+    /// The slots of the entries, ready or in flight.
+    pub(crate) fn slots(&self) -> std::collections::BTreeSet<Slot> {
+        self.entries.lock().map.keys().map(|(slot, _)| *slot).collect()
     }
 
     /// Number of `get_or_sign` calls.

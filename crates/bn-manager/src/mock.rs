@@ -323,6 +323,8 @@ pub struct MockBeaconNodeClient {
     tracked_admission: Mutex<Option<Arc<AtomicU64>>>,
     revoke_after_attestation_data: AtomicBool,
     revoke_after_aggregate: AtomicBool,
+    /// Number of [`BeaconNodeClient::duty_fence`] calls.
+    duty_fence_calls: AtomicU64,
 }
 
 /// Arrival of one role-trait call, before the injected request delay.
@@ -360,6 +362,11 @@ impl MockBeaconNodeClient {
     pub fn revoke_after_aggregate(&self) {
         let _ = self.track_admission();
         self.revoke_after_aggregate.store(true, Ordering::Release);
+    }
+
+    /// Number of [`BeaconNodeClient::duty_fence`] calls so far.
+    pub fn duty_fence_calls(&self) -> u64 {
+        self.duty_fence_calls.load(Ordering::SeqCst)
     }
 
     fn fence_now(&self) -> beacon::DutyFence {
@@ -1490,6 +1497,7 @@ impl LivenessApi for MockBeaconNodeClient {
 
 impl BeaconNodeClient for MockBeaconNodeClient {
     fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        self.duty_fence_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.fence_now())
     }
 

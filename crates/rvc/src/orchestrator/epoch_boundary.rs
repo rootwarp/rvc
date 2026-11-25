@@ -86,7 +86,7 @@ use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
-use super::duty_management::{DutyManagementService, PrepareOutcome, SelectionProofs};
+use super::duty_management::{DutyManagementService, PrepareOutcome};
 use super::utils;
 use crate::pubkey_index::RegistryFreshness;
 
@@ -382,9 +382,6 @@ pub(crate) struct EpochBoundaryRunner {
     /// leaves it to the next attempt, in this epoch or a later one.
     preferences_owed: AtomicBool,
     progress: parking_lot::Mutex<Option<EpochProgress>>,
-    /// The selection proofs the subscription step signed in the progress
-    /// epoch, kept across its attempts.
-    selection_proofs: SelectionProofs,
     /// The processed slots of the task that runs the passes.
     processed: parking_lot::Mutex<Option<watch::Receiver<Option<Slot>>>>,
 }
@@ -414,7 +411,6 @@ impl EpochBoundaryRunner {
             genesis_validators_root,
             preferences_owed: AtomicBool::new(false),
             progress: parking_lot::Mutex::new(None),
-            selection_proofs: SelectionProofs::default(),
             processed: parking_lot::Mutex::new(None),
         }
     }
@@ -510,8 +506,9 @@ impl EpochBoundaryRunner {
         }
     }
 
-    /// Moves the progress to `epoch` when that is later, and warns once for
-    /// the steps the old epoch did not finish. `true` when it moved.
+    /// Moves the progress to `epoch` when that is later, drops the selection
+    /// proofs below the epoch's first slot, and warns once for the steps the
+    /// old epoch did not finish. `true` when it moved.
     fn begin_epoch(&self, epoch: u64) -> bool {
         let mut progress = self.progress.lock();
         if progress.as_ref().is_some_and(|current| current.epoch >= epoch) {
@@ -519,7 +516,7 @@ impl EpochBoundaryRunner {
         }
         let old = progress.replace(EpochProgress::new(epoch));
         drop(progress);
-        self.selection_proofs.lock().clear();
+        self.duty_management.evict_selection_proofs_before(epoch.saturating_mul(SLOTS_PER_EPOCH));
         if let Some(old) = old {
             old.warn_unfinished();
         }
@@ -707,8 +704,7 @@ impl EpochBoundaryRunner {
             if self.subscribed(epoch, duty_epoch) {
                 continue;
             }
-            let proofs = &self.selection_proofs;
-            let post = self.duty_management.submit_committee_subscriptions_with(duty_epoch, proofs);
+            let post = self.duty_management.submit_committee_subscriptions(duty_epoch);
             if post.await.is_ok() {
                 self.mark_subscribed(epoch, duty_epoch);
             } else {
@@ -911,11 +907,14 @@ mod tests {
         create_test_fork_schedule, fast_timeouts, m2_metric_lock, CountingRegistrationSigner,
         MockBlockBeacon, MockSubmitter, TEST_GENESIS_TIME,
     };
+    use crate::orchestrator::selection_proofs::test_support::{call_bounded, ProbeResult};
+    use crate::orchestrator::selection_proofs::SelectionProofCache;
     use crate::orchestrator::{
         DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorError,
         OrchestratorHandle,
     };
     use crate::pubkey_index::{PubkeyIndexRegistry, PubkeyIndexSource};
+    use futures::future::BoxFuture;
 
     const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -928,6 +927,8 @@ mod tests {
         duty_tracker: Arc<DutyTracker>,
         breaker: Arc<CircuitBreakerState>,
         runner: Arc<EpochBoundaryRunner>,
+        /// The selection-proof cache of the runner's duty management.
+        selection_proofs: Arc<SelectionProofCache>,
         /// Duty slots of each subscription POST, in POST order.
         subscription_slots: Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
         /// Attester-duties requests still to answer 503, per epoch.
@@ -1258,6 +1259,7 @@ mod tests {
         let timeouts = config.timeouts.clone();
         let fork_schedule = Arc::clone(&config.fork_schedule);
         let genesis_validators_root = config.genesis_validators_root;
+        let selection_proofs = Arc::new(SelectionProofCache::default());
         let duty_management = Arc::new(DutyManagementService::new(
             signer,
             beacon,
@@ -1266,6 +1268,7 @@ mod tests {
             Arc::clone(&pubkey_map),
             pubkey_index,
             config,
+            Arc::clone(&selection_proofs),
         ));
         let breaker = Arc::new(CircuitBreakerState::new(BREAKER_CONSECUTIVE_LIMIT, 5));
         let runner = Arc::new(EpochBoundaryRunner::new(
@@ -1285,6 +1288,7 @@ mod tests {
             duty_tracker,
             breaker,
             runner,
+            selection_proofs,
             subscription_slots,
             failing_attester,
             failing_prepare,
@@ -3071,9 +3075,58 @@ mod tests {
 
         f.runner.run_pending(64).await;
 
-        let kept: BTreeSet<Slot> =
-            f.runner.selection_proofs.lock().keys().map(|(slot, _)| *slot).collect();
-        assert_eq!(kept, BTreeSet::from([65, 97]), "epoch 2 keeps the proofs of epochs 2 and 3");
+        assert_eq!(
+            f.selection_proofs.slots(),
+            BTreeSet::from([65, 97]),
+            "epoch 2 keeps the proofs of epochs 2 and 3"
+        );
+        let signed = spans.0.lock().iter().filter(|name| **name == "sign.selection_proof").count();
+        assert_eq!(signed, 3, "epoch 2 reuses the slot-65 proof that epoch 1 signed");
+    }
+
+    /// W4-E8a3: the first pass of epoch 2 drops the proofs below slot 64 and
+    /// keeps slot 64. The pass then adds the subscription proofs of epochs 2
+    /// and 3 (slots 65 and 97).
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_epoch_evicts_old_proofs() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let proof = signer::mock_sig(b"seeded selection proof");
+        for slot in [63, 64] {
+            let seeded = proof.clone();
+            let sign =
+                move || -> BoxFuture<'static, ProbeResult> { Box::pin(async move { Ok(seeded) }) };
+            let cached = call_bounded(&f.selection_proofs, (slot, [0x77; 48]), sign).await;
+            assert!(matches!(cached, Some(Ok(_))), "slot {slot} is seeded: {cached:?}");
+        }
+
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            f.selection_proofs.slots(),
+            BTreeSet::from([64, 65, 97]),
+            "slot 63 is evicted; slot 64 and the proofs of epochs 2 and 3 stay"
+        );
+    }
+
+    /// Lead note on #880 (RSA B1 of #1035): over six epochs of runner passes,
+    /// the cache holds only the subscription proofs of the current and the
+    /// next epoch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_proofs_stay_bounded_over_epochs() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+
+        for epoch in 1..=6 {
+            let first = epoch * SLOTS_PER_EPOCH;
+            for slot in [first, first + 1] {
+                f.runner.run_pending(slot).await;
+                assert_eq!(
+                    f.selection_proofs.slots(),
+                    BTreeSet::from([first + 1, first + SLOTS_PER_EPOCH + 1]),
+                    "slot {slot}: the proofs of epochs {epoch} and {} only",
+                    epoch + 1
+                );
+            }
+        }
     }
 
     /// Harper B4 (#855 Decisions): a subscription POST cut by its own 3 s

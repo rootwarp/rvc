@@ -470,7 +470,7 @@ impl AggregationService {
                 warn!(
                     slot,
                     validator_index = %duty.validator_index,
-                    "selection proof cancelled at its sign deadline"
+                    "selection proof cancelled: its sign deadline passed or its slot was evicted"
                 );
                 return None;
             }
@@ -3782,6 +3782,34 @@ mod tests {
             "a ready hit whose fence moved is refused: {moved_hit:?}"
         );
         assert_eq!(guard.rec.calls(), Vec::<&str>::new(), "a hit or a wait does not sign");
+    }
+
+    /// A lookup below the eviction cutoff gives `Cancelled`, and the pass signs and fetches
+    /// nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn evicted_lookup_is_cancelled_without_a_sign() {
+        let key = GuardKey::new(true, None);
+        let guard = key.service("8", plain_api).await;
+        key.cache.evict_before(GUARD_SLOT + 1);
+        let permits = Arc::new(Phase2SignerPermits::new(8));
+
+        let direct =
+            selection_proof_bounded(&guard, &key.pk, beacon::DutyFence::open(), &permits).await;
+        let finished = produce_bounded(&guard.service).await;
+
+        assert!(
+            matches!(direct, Some(Err(super::ProofSkip::Cancelled))),
+            "an evicted lookup gives Cancelled: {direct:?}"
+        );
+        assert!(finished, "the pass finishes");
+        assert!(
+            guard.nothing_used(),
+            "an evicted slot gets nothing: calls={:?}, data fetches={}, submits={}",
+            guard.rec.calls(),
+            guard.beacon.get_attestation_data_calls().len(),
+            guard.submits.load(Ordering::SeqCst)
+        );
+        assert_eq!((key.cache.len(), key.cache.in_flight_len()), (0, 0), "no entry is added");
     }
 
     /// The cache holds proofs, not decisions: each duty's `committee_length` decides again.

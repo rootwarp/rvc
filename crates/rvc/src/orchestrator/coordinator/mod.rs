@@ -374,11 +374,9 @@ where
     pub(crate) pubkey_index: SharedPubkeyIndexRegistry,
     pub(crate) attestation_service: AttestationService<C, S>,
     pub(crate) aggregation_service: AggregationService,
-    /// The one selection-proof cache of this orchestrator, shared by aggregation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "W4-E8a3 hands it to committee subscriptions")
-    )]
+    /// The one selection-proof cache of this orchestrator, shared by aggregation, committee
+    /// subscriptions and the epoch-boundary runner.
+    #[cfg(test)]
     pub(crate) selection_proofs: Arc<SelectionProofCache>,
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
@@ -565,6 +563,7 @@ where
             pubkey_map.clone(),
             pubkey_index.clone(),
             config.clone(),
+            Arc::clone(&selection_proofs),
         ));
         let epoch_boundary = Arc::new(EpochBoundaryRunner::new(
             Arc::clone(&duty_management),
@@ -600,6 +599,7 @@ where
             pubkey_index,
             attestation_service,
             aggregation_service,
+            #[cfg(test)]
             selection_proofs,
             sync_committee_service,
             payload_attestation_service,

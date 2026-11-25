@@ -1239,3 +1239,520 @@ async fn concurrent_passes_publish_the_owner_selection_proof() {
     );
     assert_eq!(remote.calls(), 3, "one selection proof and two aggregate signs");
 }
+
+// -- W4-E8a3: committee subscriptions share the selection-proof cache --
+
+use crate::orchestrator::selection_proofs::test_support::{abort_bounded, Competitor};
+use crate::orchestrator::selection_proofs::SelectionProofCache;
+
+const SUBSCRIBED_SLOT: Slot = 100;
+const SUBSCRIBED_EPOCH: u64 = SUBSCRIBED_SLOT / SLOTS_PER_EPOCH;
+
+type Posted = Arc<parking_lot::Mutex<Vec<beacon::BeaconCommitteeSubscription>>>;
+
+/// A committee length so large that no proof selects an aggregator (2^-60 odds per proof).
+const NO_AGGREGATOR_COMMITTEE: &str = "18446744073709551615";
+
+/// An attester duty for `pubkey_hex` at the slot offset of `slot` in `epoch`.
+fn attester_duty(
+    pubkey_hex: &str,
+    epoch: u64,
+    slot: Slot,
+    committee_length: String,
+) -> AttesterDuty {
+    AttesterDuty {
+        pubkey: pubkey_hex.to_string(),
+        validator_index: "42".to_string(),
+        committee_index: "1".to_string(),
+        committee_length,
+        committees_at_slot: "4".to_string(),
+        validator_committee_index: "0".to_string(),
+        slot: (epoch * SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH).to_string(),
+    }
+}
+
+fn duties_response(data: Vec<AttesterDuty>) -> beacon::DependentRootResponse<Vec<AttesterDuty>> {
+    beacon::DependentRootResponse {
+        dependent_root: format!("0x{}", "00".repeat(32)),
+        execution_optimistic: false,
+        data,
+    }
+}
+
+/// [`aggregator_duty_mock`] with tracked admission. It records each accepted subscription and
+/// counts the aggregate fetches; the aggregate fetch still fails.
+fn subscribing_mock(
+    pubkey_hex: &str,
+    committee: &Arc<parking_lot::Mutex<String>>,
+    posted: &Posted,
+    aggregate_fetches: &Arc<AtomicUsize>,
+    admission: &Arc<parking_lot::Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>>,
+) -> MockBeaconNodeClient {
+    let (record, fetches) = (Arc::clone(posted), Arc::clone(aggregate_fetches));
+    let mock = aggregator_duty_mock(pubkey_hex, SUBSCRIBED_SLOT)
+        .with_get_attester_duties({
+            let (pubkey_hex, committee) = (pubkey_hex.to_string(), Arc::clone(committee));
+            move |epoch, _indices| {
+                let length = committee.lock().clone();
+                Ok(duties_response(vec![attester_duty(
+                    &pubkey_hex,
+                    epoch,
+                    SUBSCRIBED_SLOT,
+                    length,
+                )]))
+            }
+        })
+        .with_get_aggregate_attestation(move |_slot, _root, _index, _fork| {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Err(beacon::BeaconError::HttpError("no aggregate in this test".into()))
+        })
+        .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+            record.lock().extend(subscriptions);
+            Ok(())
+        });
+    *admission.lock() = Some(mock.track_admission());
+    mock
+}
+
+/// An orchestrator with one aggregator duty at [`SUBSCRIBED_SLOT`] in each epoch, and the
+/// subscriptions that its beacon node accepted. The beacon node tracks its admission, so each
+/// subscription sign runs in the production admission scope.
+struct Subscribing {
+    orchestrator: Arc<MockOrchestrator>,
+    remote: CountingRemote,
+    pubkey: PublicKey,
+    posted: Posted,
+    committee: Arc<parking_lot::Mutex<String>>,
+    aggregate_fetches: Arc<AtomicUsize>,
+    admission: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Subscribing {
+    async fn new() -> Self {
+        let posted = Posted::default();
+        let committee = Arc::new(parking_lot::Mutex::new("8".to_string()));
+        let aggregate_fetches = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(parking_lot::Mutex::new(None));
+        let (orchestrator, remote, pubkey) =
+            orchestrator_with_counting_remote_key(SUBSCRIBED_EPOCH, |pubkey_hex| {
+                subscribing_mock(pubkey_hex, &committee, &posted, &aggregate_fetches, &admission)
+            })
+            .await;
+        let admission = admission.lock().take().expect("the mock tracks its admission");
+        Self { orchestrator, remote, pubkey, posted, committee, aggregate_fetches, admission }
+    }
+
+    /// The slot and the aggregator flag of each accepted subscription.
+    fn posted_flags(&self) -> Vec<(String, bool)> {
+        self.posted.lock().iter().map(|sub| (sub.slot.clone(), sub.is_aggregator)).collect()
+    }
+
+    /// Puts `proof` in the cache as the ready proof of the key at [`SUBSCRIBED_SLOT`].
+    async fn seed(&self, proof: crypto::Signature) {
+        let key = (SUBSCRIBED_SLOT, self.pubkey.to_bytes());
+        let sign = move || -> BoxFuture<'static, Result<crypto::Signature, ProbeError>> {
+            Box::pin(async move { Ok(proof) })
+        };
+        let seeded = call_bounded(&self.orchestrator.selection_proofs, key, sign).await;
+        assert!(matches!(seeded, Some(Ok(_))), "the cache holds the seeded proof: {seeded:?}");
+    }
+
+    fn cache(&self) -> &SelectionProofCache {
+        &self.orchestrator.selection_proofs
+    }
+
+    /// The slots of the accepted subscriptions that select an aggregator.
+    fn aggregator_slots(&self) -> Vec<String> {
+        let posted = self.posted.lock();
+        posted.iter().filter(|sub| sub.is_aggregator).map(|sub| sub.slot.clone()).collect()
+    }
+
+    /// One subscription pass in a task, as a production caller: a sign without an admission
+    /// scope fails.
+    fn spawn_subscriptions(&self) -> tokio::task::JoinHandle<Result<(), OrchestratorError>> {
+        let orchestrator = Arc::clone(&self.orchestrator);
+        tokio::spawn(signer::require_beacon_admission_scope(async move {
+            orchestrator.duty_management.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await
+        }))
+    }
+
+    /// One subscription pass in a task, joined with a bound. True only if it returned `Ok`.
+    async fn subscribe_bounded(&self) -> bool {
+        subscribed(self.spawn_subscriptions()).await
+    }
+
+    /// Reports the first signal after the baseline: a new remote sign or a new waiter.
+    async fn wait_for_competitor(&self, calls: usize, registrations: usize) -> Competitor {
+        for _ in 0..YIELD_ROUNDS {
+            if self.remote.calls() > calls {
+                return Competitor::Signing;
+            }
+            if self.cache().waiter_registrations() > registrations {
+                return Competitor::Waiting;
+            }
+            tokio::task::yield_now().await;
+        }
+        Competitor::Neither
+    }
+}
+
+/// True only if the subscription task finished within the bound and returned `Ok`.
+async fn subscribed(handle: tokio::task::JoinHandle<Result<(), OrchestratorError>>) -> bool {
+    let handles = [handle];
+    let _ = join_bounded(&handles).await;
+    let [handle] = handles;
+    matches!(finished_output(handle).await, Some(Ok(())))
+}
+
+/// 655-AC3: aggregation reuses the selection proof that the subscription pass signed.
+#[tokio::test(flavor = "current_thread")]
+async fn test_aggregation_reuses_subscription_selection_proof() {
+    let s = Subscribing::new().await;
+
+    assert!(s.subscribe_bounded().await, "the subscription pass sends its POST");
+    assert_eq!(s.remote.calls(), 1, "the subscription pass signs in the admission scope");
+    assert_eq!(s.aggregator_slots(), ["100"], "the subscription selects the aggregator");
+    assert!(aggregate_bounded(&s.orchestrator, SUBSCRIBED_SLOT).await, "the aggregation finishes");
+
+    assert_eq!(s.remote.calls(), 1, "aggregation reuses the subscription's selection proof");
+    assert_eq!(
+        s.aggregate_fetches.load(Ordering::SeqCst),
+        1,
+        "aggregation uses the reused proof: it goes on to the aggregate fetch"
+    );
+}
+
+/// The two services miss one key at once. The subscription pass owns it and aggregation waits.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_subscription_and_aggregation_sign_one_proof() {
+    let s = Subscribing::new().await;
+    let gate = Arc::new(Gate::new());
+    s.remote.hold_on(Arc::clone(&gate));
+
+    let subscriber = s.spawn_subscriptions();
+    let owner_entered = wait_until(|| s.remote.calls() == 1).await;
+    let registrations = s.cache().waiter_registrations();
+    let aggregation = spawn_aggregation(&s.orchestrator, SUBSCRIBED_SLOT);
+    let competitor = s.wait_for_competitor(1, registrations).await;
+    gate.open();
+    let subscriber_done = subscribed(subscriber).await;
+    let aggregation_done = joined(aggregation).await;
+
+    assert!(owner_entered, "the subscription pass enters the remote sign");
+    assert_eq!(s.remote.calls(), 1, "one signer call for the (slot, key) across both services");
+    assert_eq!(competitor, Competitor::Waiting, "aggregation waits for the subscription owner");
+    assert!(subscriber_done && aggregation_done, "both passes finish");
+    assert_eq!(s.aggregator_slots(), ["100"], "the subscription uses its own proof");
+    assert_eq!((s.cache().len(), s.cache().in_flight_len()), (1, 0), "one ready proof");
+}
+
+/// The subscription owner is cancelled while aggregation waits. Aggregation takes over and
+/// signs. A later subscription pass is a hit.
+#[tokio::test(flavor = "current_thread")]
+async fn aggregation_takes_over_when_the_subscription_pass_is_cancelled() {
+    let s = Subscribing::new().await;
+    let gate = Arc::new(Gate::new());
+    s.remote.hold_on(Arc::clone(&gate));
+
+    let subscriber = s.spawn_subscriptions();
+    let owner_entered = wait_until(|| s.remote.calls() == 1).await;
+    let registrations = s.cache().waiter_registrations();
+    let aggregation = spawn_aggregation(&s.orchestrator, SUBSCRIBED_SLOT);
+    let competitor = s.wait_for_competitor(1, registrations).await;
+    let owner_cancelled = abort_bounded(subscriber).await;
+    gate.open();
+    let aggregation_done = joined(aggregation).await;
+    let in_flight_after = s.cache().in_flight_len();
+    let calls_after_takeover = s.remote.calls();
+    let resubscribed = s.subscribe_bounded().await;
+
+    assert!(owner_entered, "the subscription pass enters the remote sign");
+    assert_eq!(competitor, Competitor::Waiting, "aggregation waits for the subscription owner");
+    assert!(owner_cancelled, "the subscription pass ends as cancelled");
+    assert!(aggregation_done, "aggregation finishes after the take-over");
+    assert_eq!(calls_after_takeover, 2, "the cancelled owner's sign and aggregation's sign");
+    assert_eq!(in_flight_after, 0, "no entry stays in flight");
+    assert!(resubscribed, "the later subscription pass sends its POST");
+    assert_eq!(s.remote.calls(), 2, "the later subscription pass is a hit");
+    assert_eq!(s.aggregator_slots(), ["100"], "only the later pass posts");
+    assert_eq!((s.cache().len(), s.cache().in_flight_len()), (1, 0));
+}
+
+/// Subscriptions wait for an aggregation owner and use its proof. A cancelled subscription
+/// waiter leaves the owner's entry, and a later pass is a hit.
+#[tokio::test(flavor = "current_thread")]
+async fn subscription_reuses_the_aggregation_selection_proof() {
+    let s = Subscribing::new().await;
+    let gate = Arc::new(Gate::new());
+    s.remote.hold_on(Arc::clone(&gate));
+
+    let owner = spawn_aggregation(&s.orchestrator, SUBSCRIBED_SLOT);
+    let owner_entered = wait_until(|| s.remote.calls() == 1).await;
+    let registrations = s.cache().waiter_registrations();
+    let dropped = s.spawn_subscriptions();
+    let first = s.wait_for_competitor(1, registrations).await;
+    let dropped_cancelled = abort_bounded(dropped).await;
+    let in_flight_after_drop = s.cache().in_flight_len();
+    let registrations = s.cache().waiter_registrations();
+    let waiter = s.spawn_subscriptions();
+    let second = s.wait_for_competitor(1, registrations).await;
+    gate.open();
+    let owner_done = joined(owner).await;
+    let waiter_done = subscribed(waiter).await;
+    let posted_after_wait = s.aggregator_slots();
+    let hit = s.subscribe_bounded().await;
+
+    assert!(owner_entered, "aggregation enters the remote sign");
+    assert_eq!((first, second), (Competitor::Waiting, Competitor::Waiting), "both passes wait");
+    assert!(dropped_cancelled, "the first subscription waiter ends as cancelled");
+    assert_eq!(in_flight_after_drop, 1, "a cancelled waiter leaves the owner's entry");
+    assert!(owner_done && waiter_done, "the owner and the second waiter finish");
+    assert_eq!(posted_after_wait, ["100"], "the waiter posts with the owner's proof");
+    assert!(hit, "the third subscription pass sends its POST");
+    assert_eq!(s.aggregator_slots(), ["100", "100"], "the ready hit posts with the proof");
+    assert_eq!(s.remote.calls(), 1, "one signer call for the (slot, key)");
+    assert_eq!((s.cache().len(), s.cache().in_flight_len()), (1, 0));
+}
+
+/// A subscription waiter that takes over from a cancelled owner checks the store gate again
+/// just before it signs. A key disabled during the wait gets no new sign.
+#[tokio::test(flavor = "current_thread")]
+async fn subscription_takeover_rechecks_the_store_gate() {
+    let s = Subscribing::new().await;
+    let gate = Arc::new(Gate::new());
+    s.remote.hold_on(Arc::clone(&gate));
+
+    let owner = spawn_aggregation(&s.orchestrator, SUBSCRIBED_SLOT);
+    let owner_entered = wait_until(|| s.remote.calls() == 1).await;
+    let registrations = s.cache().waiter_registrations();
+    let subscriber = s.spawn_subscriptions();
+    let competitor = s.wait_for_competitor(1, registrations).await;
+    s.orchestrator.validator_store.set_enabled(&s.pubkey.to_bytes(), false);
+    let owner_cancelled = abort_bounded(owner).await;
+    gate.open();
+    let subscriber_done = subscribed(subscriber).await;
+
+    assert!(owner_entered, "aggregation enters the remote sign");
+    assert_eq!(competitor, Competitor::Waiting, "the subscription pass waits for the owner");
+    assert!(owner_cancelled, "the aggregation owner ends as cancelled");
+    assert!(subscriber_done, "the subscription pass finishes with nothing to send");
+    assert_eq!(s.remote.calls(), 1, "a key disabled during the wait gets no new sign");
+    assert!(s.posted.lock().is_empty(), "no subscription for a disabled key");
+    assert_eq!((s.cache().len(), s.cache().in_flight_len()), (0, 0), "no entry stays");
+}
+
+/// The runner's first pass of the next epoch evicts the old epoch. An aggregation for a slot of
+/// the old epoch then signs nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn aggregation_below_the_runner_eviction_signs_nothing() {
+    let s = Subscribing::new().await;
+
+    s.orchestrator.epoch_boundary.run_pending((SUBSCRIBED_EPOCH + 1) * SLOTS_PER_EPOCH).await;
+    let calls_after_pass = s.remote.calls();
+    let aggregation_done = aggregate_bounded(&s.orchestrator, SUBSCRIBED_SLOT).await;
+
+    assert_eq!(calls_after_pass, 2, "the pass signs the subscription proofs of E+1 and E+2");
+    assert!(aggregation_done, "the aggregation finishes");
+    assert_eq!(s.remote.calls(), calls_after_pass, "a slot below the cutoff signs nothing");
+    assert_eq!(s.cache().len(), 2, "only the proofs of E+1 and E+2 stay");
+}
+
+/// A fixed selection proof: the signature of a fixed key over `fixed proof {tag}`.
+fn fixed_proof(tag: u32) -> crypto::Signature {
+    let key = SecretKey::from_bytes(&[0x11; 32]).expect("a fixed secret key");
+    key.sign(format!("fixed proof {tag}").as_bytes())
+}
+
+/// Harper B1 / RSA N3 (#1038 R1, R2): the subscription flag comes from the cached proof and
+/// from each pass's own `committee_length`. Two fixed proofs give opposite flags at committee
+/// 128, so a substitute for the proof (for example 96 zero bytes) fails one of them. Each one
+/// then flips at a second committee length. The proof is a cache hit: no signer call.
+#[tokio::test(flavor = "current_thread")]
+async fn subscription_recomputes_is_aggregator_for_each_committee_length() {
+    let (selects, does_not) = (fixed_proof(16), fixed_proof(0));
+    for (proof, other_raw) in [(&selects, u64::MAX), (&does_not, 8)] {
+        assert_ne!(
+            signer::is_aggregator(128, &proof.to_bytes()),
+            signer::is_aggregator(other_raw, &proof.to_bytes()),
+            "precondition: the second length flips the flag"
+        );
+    }
+    assert!(signer::is_aggregator(128, &selects.to_bytes()), "precondition: tag 16 selects");
+    assert!(!signer::is_aggregator(128, &does_not.to_bytes()), "precondition: tag 0 does not");
+
+    for (proof, other_length) in [(selects, NO_AGGREGATOR_COMMITTEE), (does_not, "8")] {
+        let s = Subscribing::new().await;
+        let want_first = signer::is_aggregator(128, &proof.to_bytes());
+        s.seed(proof).await;
+        for length in ["128", other_length] {
+            *s.committee.lock() = length.to_string();
+            s.orchestrator
+                .duty_tracker
+                .fetch_duties_for_epoch(SUBSCRIBED_EPOCH)
+                .await
+                .expect("fetch the duty");
+            assert!(s.subscribe_bounded().await, "committee {length}: the pass sends its POST");
+        }
+
+        assert_eq!(
+            s.posted_flags(),
+            [("100".to_string(), want_first), ("100".to_string(), !want_first)],
+            "each pass posts the flag of the cached proof at its own committee length"
+        );
+        assert_eq!(s.remote.calls(), 0, "both passes are cache hits with no signer call");
+    }
+}
+
+/// RSA N2 (#1038 R1): admission moves while the subscription pass waits for an aggregation
+/// owner. After the owner is cancelled, the subscription owns the key, but the signer refuses
+/// its stale admission: no new backend call and no POST.
+#[tokio::test(flavor = "current_thread")]
+async fn subscription_takeover_signs_nothing_after_a_revocation() {
+    let s = Subscribing::new().await;
+    let gate = Arc::new(Gate::new());
+    s.remote.hold_on(Arc::clone(&gate));
+
+    let owner = spawn_aggregation(&s.orchestrator, SUBSCRIBED_SLOT);
+    let owner_entered = wait_until(|| s.remote.calls() == 1).await;
+    let registrations = s.cache().waiter_registrations();
+    let subscriber = s.spawn_subscriptions();
+    let competitor = s.wait_for_competitor(1, registrations).await;
+    s.admission.fetch_add(1, Ordering::SeqCst);
+    let owner_cancelled = abort_bounded(owner).await;
+    gate.open();
+    let subscriber_done = subscribed(subscriber).await;
+
+    assert!(owner_entered, "aggregation enters the remote sign");
+    assert_eq!(competitor, Competitor::Waiting, "the subscription pass waits for the owner");
+    assert!(owner_cancelled, "the aggregation owner ends as cancelled");
+    assert!(subscriber_done, "the subscription pass finishes with nothing to send");
+    assert_eq!(s.remote.calls(), 1, "a revoked admission gets no new backend call");
+    assert!(s.posted.lock().is_empty(), "no subscription after the revocation");
+    assert_eq!((s.cache().len(), s.cache().in_flight_len()), (0, 0), "no entry stays");
+}
+
+/// RSA N4 (#1038 R1): a duty below the eviction cutoff makes no signer call and no POST, and
+/// the call is `Ok`.
+#[tokio::test(flavor = "current_thread")]
+async fn evicted_subscription_duty_is_skipped_without_a_sign() {
+    let s = Subscribing::new().await;
+    s.orchestrator.duty_management.evict_selection_proofs_before(SUBSCRIBED_SLOT + 1);
+
+    let done = s.subscribe_bounded().await;
+
+    assert!(done, "an evicted duty is nothing to send");
+    assert_eq!(s.remote.calls(), 0, "an evicted duty makes no signer call");
+    assert!(s.posted.lock().is_empty(), "an evicted duty sends no subscription");
+    assert_eq!(s.cache().len(), 0, "the cache adds no entry");
+}
+
+/// Two keys with duties at slots 100 and 101. The key at slot 100 is not in the signer yet, so
+/// its sign fails; the key at slot 101 signs through a [`CountingRemote`].
+struct TwoKeys {
+    orchestrator: Arc<MockOrchestrator>,
+    composite: Arc<CompositeSigner>,
+    failing: [u8; 48],
+    failing_remote: CountingRemote,
+    healthy_remote: CountingRemote,
+    posted: Posted,
+}
+
+impl TwoKeys {
+    async fn new() -> Self {
+        let (failing_secret, healthy_secret) = (SecretKey::generate(), SecretKey::generate());
+        let (failing, healthy) = (failing_secret.public_key(), healthy_secret.public_key());
+        let hex = |key: &PublicKey| format!("0x{}", hex::encode(key.to_bytes()));
+        let (failing_hex, healthy_hex) = (hex(&failing), hex(&healthy));
+        let posted = Posted::default();
+        let record = Arc::clone(&posted);
+        let duty_hexes = (failing_hex.clone(), healthy_hex.clone());
+        let mock = aggregator_duty_mock(&healthy_hex, SUBSCRIBED_SLOT)
+            .with_get_attester_duties(move |epoch, _indices| {
+                Ok(duties_response(vec![
+                    attester_duty(&duty_hexes.0, epoch, SUBSCRIBED_SLOT, "8".into()),
+                    attester_duty(&duty_hexes.1, epoch, SUBSCRIBED_SLOT + 1, "8".into()),
+                ]))
+            })
+            .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+                record.lock().extend(subscriptions);
+                Ok(())
+            });
+        mock.track_admission();
+        let beacon = Arc::new(mock);
+
+        let healthy_remote = CountingRemote::new(healthy_secret);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        composite.add_remote_key(healthy.to_bytes(), Arc::new(healthy_remote.clone()));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("in-memory slashing db"));
+        let signer = Arc::new(
+            SignerService::new(Arc::clone(&composite), slashing_db)
+                .with_enablement(always_enabled()),
+        );
+        let validator_store = create_mock_validator_store();
+        let mut pubkeys = HashMap::new();
+        for pubkey in [failing.clone(), healthy] {
+            validator_store
+                .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+                .expect("register the key");
+            pubkeys.insert(pubkey.to_bytes(), pubkey);
+        }
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec![failing_hex, healthy_hex]));
+        duty_tracker.fetch_duties_for_epoch(SUBSCRIBED_EPOCH).await.expect("fetch the duties");
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+            clock,
+            duty_tracker,
+            signer,
+            Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            create_test_config(),
+            Arc::new(parking_lot::RwLock::new(pubkeys)),
+        ));
+        Self {
+            orchestrator: Arc::new(orchestrator),
+            composite,
+            failing: failing.to_bytes(),
+            failing_remote: CountingRemote::new(failing_secret),
+            healthy_remote,
+            posted,
+        }
+    }
+
+    async fn subscribe_bounded(&self) -> bool {
+        let orchestrator = Arc::clone(&self.orchestrator);
+        subscribed(tokio::spawn(signer::require_beacon_admission_scope(async move {
+            orchestrator.duty_management.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await
+        })))
+        .await
+    }
+
+    fn posted_slots(&self) -> Vec<String> {
+        self.posted.lock().iter().map(|sub| sub.slot.clone()).collect()
+    }
+}
+
+/// Harper B3 (#1038 R1): a signer error skips only its own duty. The call is `Ok`, the POST
+/// carries the healthy duty, and the failed key leaves no cache entry, so it signs on a retry.
+#[tokio::test(flavor = "current_thread")]
+async fn a_signer_error_skips_only_its_duty() {
+    let k = TwoKeys::new().await;
+    let cache = &k.orchestrator.selection_proofs;
+
+    let first = k.subscribe_bounded().await;
+    let posted_first = k.posted_slots();
+    let entries_first = (cache.len(), cache.in_flight_len());
+    k.composite.add_remote_key(k.failing, Arc::new(k.failing_remote.clone()));
+    let retry = k.subscribe_bounded().await;
+
+    assert!(first, "a failed sign of one duty does not fail the call");
+    assert_eq!(posted_first, ["101"], "the POST carries only the healthy duty");
+    assert_eq!(entries_first, (1, 0), "the failed key leaves no cache entry");
+    assert!(retry, "the retry sends its POST");
+    assert_eq!(k.posted_slots(), ["101", "100", "101"], "the retry carries both duties");
+    assert_eq!(k.failing_remote.calls(), 1, "the failed key signs on the retry");
+    assert_eq!(k.healthy_remote.calls(), 1, "the healthy key's proof is a hit on the retry");
+}
