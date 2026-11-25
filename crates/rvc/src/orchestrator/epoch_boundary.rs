@@ -691,7 +691,9 @@ impl EpochBoundaryRunner {
     /// `NotReady` until the attester duties of E and E+1 are cached; then
     /// sends the subscriptions of E, then E+1, that did not go out yet in
     /// this epoch. `Failed` while one of them did not: a failed or timed-out
-    /// POST.
+    /// POST, or a call with duties that are not cached after the call. A revocation
+    /// makes the cached duties stale, and a later call can then send nothing
+    /// and return `Ok`. The next pass fetches the duties again (Harper B1).
     async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
         for duty_epoch in [epoch, epoch + 1] {
             if !self.duty_tracker.is_epoch_cached(duty_epoch).await {
@@ -705,9 +707,17 @@ impl EpochBoundaryRunner {
                 continue;
             }
             let post = self.duty_management.submit_committee_subscriptions(duty_epoch);
-            if post.await.is_ok() {
+            let sent = post.await.is_ok();
+            if sent && self.duty_tracker.is_epoch_cached(duty_epoch).await {
                 self.mark_subscribed(epoch, duty_epoch);
             } else {
+                if sent {
+                    warn!(
+                        epoch,
+                        duty_epoch,
+                        "Committee subscriptions stay pending: the duties of the epoch are no longer cached"
+                    );
+                }
                 outcome = StepOutcome::Failed;
             }
         }

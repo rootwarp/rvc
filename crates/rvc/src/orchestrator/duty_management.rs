@@ -67,6 +67,18 @@ enum SubscriptionProofSkip {
     Failed(SignerError),
 }
 
+/// The result of a subscription pass that read its duties before a
+/// revocation. It logs the WARN event first. `count` is the number of
+/// subscriptions that the call does not send.
+fn revoked_after_the_duty_read(epoch: u64, count: usize) -> OrchestratorError {
+    warn!(
+        count,
+        epoch,
+        "Committee subscriptions not sent: beacon node admission revoked after the duty read"
+    );
+    OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight)
+}
+
 /// [`PrepareOutcome::Stale`] with no POST: the indices wait for a re-check.
 fn deferred_preparation(epoch: u64) -> PrepareOutcome {
     info!(
@@ -599,8 +611,10 @@ impl DutyManagementService {
     /// POST does not stop the other POSTs.
     ///
     /// `Ok` when the epoch needs no further send: each POST went out, or there
-    /// is nothing to send (no own duty, or the store gate closed or the
-    /// admission revoked for each one). A selection proof that fails to sign
+    /// is nothing to send (no own duty, or the store gate closed for each
+    /// one). After a move of the watch, the result is
+    /// `Beacon(RevokedInFlight)`, also when there is nothing to send. Then the
+    /// runner step stays pending (Harper B1). A selection proof that fails to sign
     /// is a warn, and skips its duty. A slot below the cache's eviction cutoff
     /// skips its duty too, unless a live owner admitted before the eviction
     /// delivers its proof: the cutoff stops only a new owner. A failed POST is
@@ -740,6 +754,12 @@ impl DutyManagementService {
             .await;
 
         if subscriptions.is_empty() {
+            // A move after the duty read can skip each duty. Then the pass
+            // has nothing to send, but the epoch is not complete: the runner
+            // step must stay pending and read the duties again (Harper B1).
+            if !duties_watch.holds() {
+                return Err(revoked_after_the_duty_read(epoch, 0));
+            }
             return Ok(());
         }
 
@@ -764,12 +784,7 @@ impl DutyManagementService {
     ) -> Result<(), OrchestratorError> {
         let count = subscriptions.len();
         if !duties_watch.holds() {
-            warn!(
-                count,
-                epoch,
-                "Committee subscriptions not sent: beacon node admission revoked after the duty read"
-            );
-            return Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight));
+            return Err(revoked_after_the_duty_read(epoch, count));
         }
         match utils::timed(
             COMMITTEE_SUBSCRIPTION,
