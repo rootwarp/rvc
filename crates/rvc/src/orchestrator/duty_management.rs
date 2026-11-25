@@ -2300,4 +2300,79 @@ mod tests {
         f.assert_each_duty_once(&f.posts(), "The POST of the retry");
         assert_eq!(f.remote.started().len(), 4, "The retry must make no new sign request.");
     }
+
+    type Fields = std::collections::BTreeMap<String, String>;
+
+    /// Records the fields of each WARN event, `message` too.
+    #[derive(Clone, Default)]
+    struct Warns(Arc<parking_lot::Mutex<Vec<Fields>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut fields = Fields::new();
+                event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    fields.insert(field.name().to_string(), format!("{value:?}"));
+                });
+                self.0.lock().push(fields);
+            }
+        }
+    }
+
+    /// A duty whose public key does not parse gets no subscription. The call
+    /// must log one warn with the slot and the validator index of the duty
+    /// (self-check F7).
+    #[tokio::test]
+    async fn a_subscription_duty_with_an_invalid_public_key_logs_a_warn() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let duty = |epoch: u64| beacon::AttesterDuty {
+            pubkey: "0xzz".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: (epoch * SLOTS_PER_EPOCH + 1).to_string(),
+        };
+        let mock = bn_manager::MockBeaconNodeClient::new().with_get_attester_duties(
+            move |epoch, _indices| {
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: "0xdeproot".into(),
+                    execution_optimistic: false,
+                    data: vec![duty(epoch)],
+                })
+            },
+        );
+        let service = build_service_with_mock(Arc::new(mock), make_config());
+        let fetch = service.duty_tracker.fetch_duties_for_epoch(1).await;
+        fetch.expect("The duty fetch must return the duty.");
+        let warns = Warns::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone());
+        let _log = tracing::subscriber::set_default(subscriber);
+
+        let outcome = service.submit_committee_subscriptions(1).await;
+
+        assert!(
+            matches!(outcome, Ok(())),
+            "With nothing to send, the call must return Ok: {outcome:?}"
+        );
+        let expected = Fields::from([
+            (
+                "message".to_string(),
+                "Skipping committee subscription: the duty has an invalid public key".to_string(),
+            ),
+            ("slot".to_string(), "33".to_string()),
+            ("validator_index".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(
+            *warns.0.lock(),
+            [expected],
+            "The call must log one warn with the slot and the validator index of the duty."
+        );
+    }
 }
