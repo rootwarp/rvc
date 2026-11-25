@@ -1618,4 +1618,325 @@ mod tests {
             .count();
         assert_eq!(posts, 1, "control: the enabled key POSTs");
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // W4-E8b (#881): concurrent selection proofs and chunked subscription POSTs
+    // ──────────────────────────────────────────────────────────────────────────
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::orchestrator::dispatch::DispatchLimits;
+
+    /// The epoch of the duties in [`ManyKeys`].
+    const SUBSCRIBED_EPOCH: u64 = 1;
+
+    type SignHook = Box<dyn FnOnce() + Send>;
+
+    /// A remote BLS backend that waits 2 ms of paused time in each sign. It
+    /// records each sign when it starts, counts the signs in flight, and runs
+    /// the next queued hook at the start of a sign.
+    struct SlowRemote {
+        proof: crypto::Signature,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        started: parking_lot::Mutex<Vec<[u8; 48]>>,
+        hooks: parking_lot::Mutex<VecDeque<SignHook>>,
+    }
+
+    impl SlowRemote {
+        fn new() -> Self {
+            let key = crypto::SecretKey::from_bytes(&[0x11; 32]).expect("a fixed secret key");
+            Self {
+                proof: key.sign(b"fixed selection proof"),
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                started: parking_lot::Mutex::default(),
+                hooks: parking_lot::Mutex::default(),
+            }
+        }
+
+        /// Runs `hook` at the start of the next sign that has no hook yet.
+        fn on_sign(&self, hook: impl FnOnce() + Send + 'static) {
+            self.hooks.lock().push_back(Box::new(hook));
+        }
+
+        fn started(&self) -> Vec<[u8; 48]> {
+            self.started.lock().clone()
+        }
+
+        /// The highest number of signs in flight at the same time.
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crypto::Signer for SlowRemote {
+        async fn sign(
+            &self,
+            _signing_root: &eth_types::Root,
+            pubkey: &[u8; 48],
+        ) -> Result<crypto::Signature, crypto::SigningError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.started.lock().push(*pubkey);
+            let hook = self.hooks.lock().pop_front();
+            if let Some(hook) = hook {
+                hook();
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.proof.clone())
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            Vec::new()
+        }
+    }
+
+    type Answers = Vec<Result<(), beacon::BeaconError>>;
+
+    /// A service with `count` enabled keys that sign through one
+    /// [`SlowRemote`]. Key `i` has one attester duty at slot offset `i % 32`
+    /// of [`SUBSCRIBED_EPOCH`]. The beacon node records the size of each
+    /// subscription POST.
+    struct ManyKeys {
+        service: DutyManagementService,
+        remote: Arc<SlowRemote>,
+        keys: Vec<[u8; 48]>,
+        post_sizes: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl ManyKeys {
+        /// `answers[n]` is the answer to subscription POST `n`. A POST after
+        /// the list gets `Ok`.
+        async fn new(count: usize, config: OrchestratorConfig, answers: Answers) -> Self {
+            let pubkeys: Vec<crypto::PublicKey> =
+                (0..count).map(|_| crypto::SecretKey::generate().public_key()).collect();
+            let duties: Vec<beacon::AttesterDuty> = pubkeys
+                .iter()
+                .enumerate()
+                .map(|(i, pubkey)| beacon::AttesterDuty {
+                    pubkey: format!("0x{}", hex::encode(pubkey.to_bytes())),
+                    validator_index: i.to_string(),
+                    committee_index: "0".to_string(),
+                    committee_length: "128".to_string(),
+                    committees_at_slot: "1".to_string(),
+                    validator_committee_index: "0".to_string(),
+                    slot: (SUBSCRIBED_EPOCH * SLOTS_PER_EPOCH + i as u64 % SLOTS_PER_EPOCH)
+                        .to_string(),
+                })
+                .collect();
+            let post_sizes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let record = Arc::clone(&post_sizes);
+            let answers = parking_lot::Mutex::new(VecDeque::from(answers));
+            let mock = Arc::new(
+                bn_manager::MockBeaconNodeClient::new()
+                    .with_get_attester_duties(move |_epoch, _indices| {
+                        Ok(beacon::DependentRootResponse {
+                            dependent_root: "0xdeproot".into(),
+                            execution_optimistic: false,
+                            data: duties.clone(),
+                        })
+                    })
+                    .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+                        record.lock().push(subscriptions.len());
+                        answers.lock().pop_front().unwrap_or(Ok(()))
+                    }),
+            );
+            mock.track_admission();
+            let beacon = mock as Arc<dyn BeaconNodeClient>;
+            let indices = (0..count).map(|i| i.to_string()).collect();
+            let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
+            duty_tracker.fetch_duties_for_epoch(SUBSCRIBED_EPOCH).await.expect("seed the duties");
+            let remote = Arc::new(SlowRemote::new());
+            let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+            let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+            for pubkey in &pubkeys {
+                composite.add_remote_key(pubkey.to_bytes(), remote.clone());
+                validator_store
+                    .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+                    .expect("add validator");
+            }
+            let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+            let signer = Arc::new(
+                SignerService::new(composite, slashing_db).with_enablement(always_enabled()),
+            );
+            let keys = pubkeys.iter().map(|pubkey| pubkey.to_bytes()).collect();
+            let pubkey_map = pubkeys.into_iter().map(|pubkey| (pubkey.to_bytes(), pubkey));
+            let service = DutyManagementService::new(
+                signer,
+                beacon,
+                duty_tracker,
+                validator_store,
+                Arc::new(parking_lot::RwLock::new(pubkey_map.collect())),
+                crate::pubkey_index::PubkeyIndexRegistry::shared(),
+                config,
+                Arc::default(),
+            );
+            Self { service, remote, keys, post_sizes }
+        }
+
+        fn post_sizes(&self) -> Vec<usize> {
+            self.post_sizes.lock().clone()
+        }
+    }
+
+    fn refused(status: u16, message: &str) -> Result<(), beacon::BeaconError> {
+        Err(beacon::BeaconError::ApiError { status, message: message.to_string() })
+    }
+
+    /// 655-AC1: 2,000 own duties and a signer that waits 2 ms for each sign.
+    /// The call ends in less than 1 s of paused time and sends 4 POSTs of
+    /// 512 or fewer subscriptions.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_committee_subscriptions_for_2000_keys_finish_within_one_second() {
+        let f = ManyKeys::new(2_000, make_config(), Vec::new()).await;
+
+        let start = tokio::time::Instant::now();
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "The 2,000 subscriptions must end in less than 1 s of paused time, not {elapsed:?}."
+        );
+        assert!(matches!(outcome, Ok(())), "The beacon node accepts each POST: {outcome:?}");
+        assert_eq!(
+            f.post_sizes(),
+            [512, 512, 512, 464],
+            "The 2,000 subscriptions must go in 4 POSTs of 512 or fewer."
+        );
+        assert_eq!(f.remote.started().len(), 2_000, "Each duty must sign one selection proof.");
+        assert_eq!(f.remote.peak(), 32, "Not more than 32 signs must be in flight.");
+    }
+
+    /// The sign cap is the lower value of 32 and `dispatch_limits.concurrency`.
+    /// 40 duties sign 4 at a time with a concurrency of 4, and 32 at a time
+    /// with a concurrency of 64.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_sign_cap_is_the_lower_of_32_and_the_dispatch_concurrency() {
+        for (concurrency, peak) in [(4, 4), (64, 32)] {
+            let limits = DispatchLimits::validated(concurrency, 2).expect("non-zero limits");
+            let config = make_config().with_dispatch_limits(limits);
+            let f = ManyKeys::new(40, config, Vec::new()).await;
+
+            let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+            assert!(matches!(outcome, Ok(())), "concurrency {concurrency}: {outcome:?}");
+            assert_eq!(f.remote.started().len(), 40, "concurrency {concurrency}: 40 signs");
+            assert_eq!(
+                f.remote.peak(),
+                peak,
+                "With a concurrency of {concurrency}, the peak of signs in flight must be {peak}."
+            );
+        }
+    }
+
+    /// The store gate and the admission fence stay in each per-duty future.
+    /// Keys 0 to 3 have one duty each, in slot order, and the beacon node of
+    /// the service is a real `BnManager`:
+    /// - The first sign (key 0) disables key 1.
+    /// - The second sign (key 2) revokes the only beacon node.
+    ///
+    /// Key 1 must make no cache lookup. Key 3 reads its fence after the
+    /// revoke and must make no cache lookup. Only keys 0 and 2 sign.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_concurrent_subscriptions_keep_the_per_sign_fence_and_store_gate() {
+        let mut f = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let config = bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]);
+        let manager = Arc::new(bn_manager::BnManager::new(config).expect("bn manager"));
+        assert!(BeaconNodeClient::duty_fence(manager.as_ref()).is_ok(), "the node is admitted");
+        let (store, disabled) = (Arc::clone(&f.service.validator_store), f.keys[1]);
+        f.remote.on_sign(move || store.set_enabled(&disabled, false));
+        let revoker = Arc::clone(&manager);
+        f.remote.on_sign(move || revoker.testing_revoke_admission(0));
+        f.service.beacon = manager as Arc<dyn BeaconNodeClient>;
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(
+            f.remote.started(),
+            [f.keys[0], f.keys[2]],
+            "Only key 0 and key 2 must sign: key 1 is disabled, and key 3 is after the revoke."
+        );
+        assert_eq!(
+            f.service.selection_proofs.lookups(),
+            2,
+            "The disabled key and the key after the revoke must make no cache lookup."
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(OrchestratorError::Beacon(bn_manager::BeaconError::NoAdmittedNode))
+            ),
+            "The revoked beacon node refuses the POST of the two proofs: {outcome:?}"
+        );
+    }
+
+    /// `SUBSCRIPTION_CHUNK`: 512 subscriptions go in one POST, and 513 go in
+    /// two POSTs.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn exactly_one_chunk_at_512() {
+        for (count, sizes) in [(512, vec![512]), (513, vec![512, 1])] {
+            let f = ManyKeys::new(count, make_config(), Vec::new()).await;
+
+            let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+            assert!(matches!(outcome, Ok(())), "{count} duties: {outcome:?}");
+            assert_eq!(
+                f.post_sizes(),
+                sizes,
+                "The POST sizes for {count} duties must be {sizes:?}."
+            );
+        }
+    }
+
+    /// 2,000 duties make 4 chunks, and the second chunk gets a 503. The call
+    /// sends the other 3 chunks too, then returns the 503. The retry uses the
+    /// cached proofs, and its first and fourth chunks fail: it returns the
+    /// first failure.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_chunk_failure_tries_every_chunk_then_errs() {
+        let answers = vec![
+            Ok(()),
+            refused(503, "unavailable"),
+            Ok(()),
+            Ok(()),
+            refused(500, "first"),
+            Ok(()),
+            Ok(()),
+            refused(503, "last"),
+        ];
+        let f = ManyKeys::new(2_000, make_config(), answers).await;
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let first_posts = f.post_sizes();
+        let retry = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        assert_eq!(
+            first_posts,
+            [512, 512, 512, 464],
+            "The call must send all 4 chunks, also the 2 after the 503."
+        );
+        assert!(
+            matches!(
+                &outcome,
+                Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 503, message }))
+                    if message == "unavailable"
+            ),
+            "The call must return the 503 of the second chunk: {outcome:?}"
+        );
+        assert_eq!(f.post_sizes().len(), 8, "The retry must send all 4 chunks again.");
+        assert!(
+            matches!(
+                &retry,
+                Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 500, message }))
+                    if message == "first"
+            ),
+            "The retry must return its first failure: {retry:?}"
+        );
+        assert_eq!(f.remote.started().len(), 2_000, "The retry must sign no proof again.");
+    }
 }
