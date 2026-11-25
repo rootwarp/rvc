@@ -4975,6 +4975,29 @@ impl AttestationApi for BnManager {
         .await
     }
 
+    /// Each node attempt checks `duties_watch` when its HTTP attempt starts:
+    /// after a permit, after an earlier node and before a retry (Harper B2).
+    async fn submit_beacon_committee_subscriptions_fenced(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+        duties_watch: &DutyFence,
+    ) -> Result<(), BeaconError> {
+        self.submit(
+            "submit_beacon_committee_subscriptions",
+            self.broadcast_topics.subscriptions,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.preparation),
+            owned_attempt!((subscriptions.to_vec(), duties_watch.clone()), |client, payload| {
+                let (subscriptions, duties_watch) = payload.as_ref();
+                client
+                    .submit_beacon_committee_subscriptions_fenced(subscriptions, duties_watch)
+                    .await
+            }),
+        )
+        .await
+    }
+
     async fn submit_sync_committee_subscriptions(
         &self,
         subscriptions: &[SyncCommitteeSubscription],

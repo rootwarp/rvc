@@ -441,7 +441,9 @@ pub trait AttestationApi: Send + Sync {
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &beacon::DutyFence,
     ) -> Result<(), BeaconError> {
-        let _ = duties_watch;
+        if !duties_watch.holds() {
+            return Err(BeaconError::RevokedInFlight);
+        }
         self.submit_beacon_committee_subscriptions(subscriptions).await
     }
 

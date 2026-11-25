@@ -1690,8 +1690,10 @@ impl BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
-        let _ = duties_watch;
-        self.submit_beacon_committee_subscriptions(subscriptions).await
+        let path = "/eth/v1/validator/beacon_committee_subscriptions";
+        self.post_empty_gated(path, &subscriptions, &[], duties_watch)
+            .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
+            .await
     }
 
     /// Subscribes validators to sync-committee subnets ahead of their period
@@ -1913,6 +1915,18 @@ impl BeaconClient {
         body: &B,
         headers: &[(&str, &str)],
     ) -> Result<(), BeaconError> {
+        self.post_empty_gated(path, body, headers, &DutyFence::open()).await
+    }
+
+    /// [`Self::post_empty_with_headers`] that starts each HTTP attempt, also
+    /// each retry, only while `gate` holds.
+    async fn post_empty_gated<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+        gate: &DutyFence,
+    ) -> Result<(), BeaconError> {
         let url = self.resolve_url(path)?;
 
         // Serialize once so each retry reuses the same body bytes.
@@ -1922,9 +1936,10 @@ impl BeaconClient {
         let header_pairs: Vec<(String, String)> =
             headers.iter().map(|(n, v)| ((*n).to_string(), (*v).to_string())).collect();
 
-        self.execute_with_retry_raw(
+        self.execute_with_retry_gated(
             "POST",
             &url,
+            gate,
             || {
                 let pairs = header_pairs.clone();
                 let body_bytes = body_bytes.clone();
@@ -1971,6 +1986,28 @@ impl BeaconClient {
         H: Fn(reqwest::Response) -> HFut,
         HFut: std::future::Future<Output = Result<T, BeaconError>>,
     {
+        self.execute_with_retry_gated(http_method, url, &DutyFence::open(), request_fn, on_response)
+            .await
+    }
+
+    /// [`Self::execute_with_retry_raw`] that starts each HTTP attempt, also
+    /// each retry, only while `gate` holds. After `gate` moves, no attempt
+    /// starts, and the result is [`BeaconError::RevokedInFlight`]. An open
+    /// gate always holds.
+    async fn execute_with_retry_gated<F, Fut, H, HFut, T>(
+        &self,
+        http_method: &str,
+        url: &str,
+        gate: &DutyFence,
+        request_fn: F,
+        on_response: H,
+    ) -> Result<T, BeaconError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+        H: Fn(reqwest::Response) -> HFut,
+        HFut: std::future::Future<Output = Result<T, BeaconError>>,
+    {
         let span = tracing::info_span!(
             "beacon.http",
             http.method = %http_method,
@@ -1992,6 +2029,16 @@ impl BeaconClient {
                     "Retrying HTTP request"
                 );
                 tokio::time::sleep(backoff).await;
+            }
+
+            // The gate check comes after each wait, just before the request.
+            if !gate.holds() {
+                warn!(
+                    endpoint = %RedactedUrl(endpoint),
+                    attempt,
+                    "HTTP request not sent: beacon node admission revoked after the duty read"
+                );
+                return Err(BeaconError::RevokedInFlight);
             }
 
             let request_start = std::time::Instant::now();
