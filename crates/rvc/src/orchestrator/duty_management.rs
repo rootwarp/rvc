@@ -2437,6 +2437,34 @@ mod tests {
         f.assert_each_duty_once(&f.posts(), "The 5 POSTs");
     }
 
+    /// RSA B4 and self-check F2 (#1043 R1): 2,049 duties make 5 chunks, and
+    /// each POST takes 2 s. The admission generation moves 1 s after the call
+    /// starts, while the first 4 POSTs are in flight. The fifth chunk starts
+    /// after the move. It must start no POST, and the call must return
+    /// `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_chunk_that_waits_for_the_cap_does_not_post_after_a_revocation() {
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let f = ManyKeys::with_mock(2_049, make_config(), Vec::new(), |mock| {
+            mock.with_method_delay(method, Duration::from_secs(2))
+        })
+        .await;
+        let admission = Arc::clone(&f.admission);
+        let revoke = async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            admission.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let pass = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH);
+        let (outcome, ()) = tokio::join!(pass, revoke);
+
+        assert_eq!(f.post_starts().len(), 4, "The fifth chunk must start no POST after the move.");
+        assert!(
+            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
+            "The call must return RevokedInFlight for the fifth chunk: {outcome:?}"
+        );
+    }
+
     /// Each of the 4 duties reads and checks its own fence. Then the
     /// admission generation moves at the start of the last sign request. The
     /// 4 sign requests are in flight at the move, and their proofs must go
