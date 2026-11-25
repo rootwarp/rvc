@@ -585,7 +585,10 @@ impl DutyManagementService {
     /// The call reads the revocation watch of the beacon node before it reads
     /// the duties, and each duty checks that watch with its own fence. After
     /// a revocation, no later duty signs, because its duty can come from the
-    /// revoked node. The duty cache applies the same rule to each read.
+    /// revoked node. The duty cache applies the same rule to each read. Each
+    /// POST checks the watch again: after a move, the call sends no POST and
+    /// returns `Beacon(RevokedInFlight)`, so the runner step tries again with
+    /// current duties. Proofs signed before the move stay in the cache.
     ///
     /// A duty whose proof is in the cache, or in flight for aggregation, does
     /// not sign again. The cache signs only for the owner of the key, and the
@@ -741,17 +744,28 @@ impl DutyManagementService {
         // again in the next slot.
         let posts = subscriptions
             .chunks(SUBSCRIPTION_CHUNK)
-            .map(|chunk| self.post_subscriptions(epoch, chunk));
+            .map(|chunk| self.post_subscriptions(epoch, duties_watch, chunk));
         futures::future::join_all(posts).await.into_iter().fold(Ok(()), Result::and)
     }
 
-    /// One committee-subscription POST, under `timeouts.preparation`.
+    /// One committee-subscription POST, under `timeouts.preparation`. No POST
+    /// goes out after `duties_watch` moves, because the duties can come from
+    /// a node that lost its admission.
     async fn post_subscriptions(
         &self,
         epoch: u64,
+        duties_watch: &beacon::DutyFence,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), OrchestratorError> {
         let count = subscriptions.len();
+        if !duties_watch.holds() {
+            warn!(
+                count,
+                epoch,
+                "Committee subscriptions not sent: beacon node admission revoked after the duty read"
+            );
+            return Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight));
+        }
         match utils::timed(
             COMMITTEE_SUBSCRIPTION,
             self.config.timeouts.preparation,
