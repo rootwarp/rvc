@@ -3284,7 +3284,10 @@ mod tests {
         let sent =
             client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
 
-        assert!(matches!(sent, Ok(())), "While the watch holds, the POST must go out: {sent:?}");
+        assert!(
+            matches!(sent, Ok(())),
+            "While the watch holds, the call must send the POST: {sent:?}"
+        );
         assert_eq!(posts().await, 1, "While the watch holds, the node must get one POST.");
 
         generation.fetch_add(1, Ordering::SeqCst);

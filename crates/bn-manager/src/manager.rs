@@ -13200,8 +13200,8 @@ mod tests {
         );
     }
 
-    /// Self-check S4 (#1043): node A answers at once, and node B answers each
-    /// POST after 300 ms. The test sends 16 chunks at the same time. That is
+    /// Self-check S4 (#1043): node A answers immediately, and node B answers
+    /// each POST after 300 ms. The test sends 16 chunks at the same time. That is
     /// more than the limit of 8 subscription attempts. Each chunk must return
     /// `Ok`, and each node must get each POST. The peak number of active and
     /// queued subscription attempts must be at most 8.

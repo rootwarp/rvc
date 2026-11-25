@@ -1331,11 +1331,14 @@ mod tests {
 
         let sent = counter.submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
 
-        assert!(matches!(sent, Ok(())), "While the watch holds, the POST must go out: {sent:?}");
+        assert!(
+            matches!(sent, Ok(())),
+            "While the watch holds, the default must send the POST: {sent:?}"
+        );
         assert_eq!(
             counter.0.load(Ordering::SeqCst),
             1,
-            "While the watch holds, one POST goes out."
+            "While the watch holds, the default must send one POST."
         );
 
         generation.fetch_add(1, Ordering::SeqCst);
