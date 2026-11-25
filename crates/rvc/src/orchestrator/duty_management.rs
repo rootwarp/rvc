@@ -1720,9 +1720,10 @@ mod tests {
 
     type SignHook = Box<dyn FnOnce() + Send>;
 
-    /// A remote BLS backend that waits 2 ms of paused time in each sign. It
-    /// records each sign when it starts, counts the signs in flight, and runs
-    /// the next queued hook at the start of a sign.
+    /// A remote BLS backend that waits 2 ms of paused time in each sign
+    /// request. It records each sign request when it starts, counts the sign
+    /// requests in flight, and runs the next queued hook at the start of a
+    /// sign request.
     struct SlowRemote {
         proof: crypto::Signature,
         in_flight: AtomicUsize,
@@ -1746,12 +1747,14 @@ mod tests {
             }
         }
 
-        /// Runs `hook` at the start of the next sign that has no hook yet.
+        /// Runs `hook` at the start of the next sign request that has no hook
+        /// yet.
         fn on_sign(&self, hook: impl FnOnce() + Send + 'static) {
             self.hooks.lock().push_back(Box::new(hook));
         }
 
-        /// Holds the next sign request until the test sends on the result.
+        /// Holds the next sign request until the test sends on the returned
+        /// sender.
         fn hold_next(&self) -> tokio::sync::oneshot::Sender<()> {
             let (release, held) = tokio::sync::oneshot::channel();
             *self.held.lock() = Some(held);
@@ -1762,7 +1765,7 @@ mod tests {
             self.started.lock().clone()
         }
 
-        /// The highest number of signs in flight at the same time.
+        /// The highest number of sign requests in flight at the same time.
         fn peak(&self) -> usize {
             self.peak.load(Ordering::SeqCst)
         }
@@ -1947,8 +1950,8 @@ mod tests {
     }
 
     /// 655-AC1: 2,000 own duties sign through a signer that waits 2 ms for
-    /// each sign. The call must end in less than 1 s of paused time and send
-    /// 4 POSTs of 512 or fewer subscriptions.
+    /// each sign request. The call must end in less than 1 s of paused time
+    /// and send 4 POSTs of 512 or fewer subscriptions.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_committee_subscriptions_for_2000_keys_finish_within_one_second() {
         let f = ManyKeys::new(2_000, make_config(), Vec::new()).await;
@@ -1972,7 +1975,7 @@ mod tests {
         );
         f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
         assert_eq!(f.remote.started().len(), 2_000, "Each duty must sign one selection proof.");
-        assert_eq!(f.remote.peak(), 32, "Not more than 32 signs must be in flight.");
+        assert_eq!(f.remote.peak(), 32, "The peak number of sign requests must be 32.");
     }
 
     /// The sign cap is the lower value of 32 and `dispatch_limits.concurrency`.
@@ -2000,7 +2003,7 @@ mod tests {
             assert_eq!(
                 f.remote.peak(),
                 peak,
-                "With a concurrency of {concurrency}, the peak of signs in flight must be {peak}."
+                "With a concurrency of {concurrency}, the peak number of sign requests must be {peak}."
             );
         }
     }
@@ -2009,20 +2012,20 @@ mod tests {
     /// Keys 0 to 3 have one duty each, in slot order.
     ///
     /// Part 1 uses the mock beacon node. Key 1 is disabled, and the first
-    /// sign (key 0) moves the admission generation. The mock gives a new
-    /// fence that holds after the move, but the duties were read before it:
-    /// only key 0 signs. On the base code, the duty cache does not serve the
-    /// duties of the later slots after the move.
+    /// sign request (key 0) moves the admission generation. The mock gives a
+    /// new fence that holds after the move, but the duties were read before
+    /// it: only key 0 signs. On the base code, the duty cache does not serve
+    /// the duties of the later slots after the move.
     ///
     /// Part 2 uses a real `BnManager` as the beacon node of the service:
-    /// - The first sign (key 0) disables key 1.
-    /// - The second sign (key 2) revokes the only beacon node.
+    /// - The first sign request (key 0) disables key 1.
+    /// - The second sign request (key 2) revokes the only beacon node.
     ///
     /// Key 1 must make no cache lookup. Key 3 reads its fence after the
-    /// revoke and must make no cache lookup. Only keys 0 and 2 sign.
+    /// revocation and must make no cache lookup. Only keys 0 and 2 sign.
     ///
     /// In both parts, the generation moves after the duty read, so the call
-    /// sends no POST and returns `RevokedInFlight` (self-check F2).
+    /// must send no POST and must return `RevokedInFlight` (self-check F2).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_concurrent_subscriptions_keep_the_per_sign_fence_and_store_gate() {
         let moved = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2076,12 +2079,12 @@ mod tests {
         assert_eq!(
             f.remote.started(),
             [f.keys[0], f.keys[2]],
-            "Part 2: only key 0 and key 2 must sign: key 1 is disabled, and key 3 is after the revoke."
+            "Part 2: only key 0 and key 2 must sign: key 1 is disabled, and key 3 is after the revocation."
         );
         assert_eq!(
             f.service.selection_proofs.lookups(),
             2,
-            "Part 2: the disabled key and the key after the revoke must make no cache lookup."
+            "Part 2: the disabled key and the key after the revocation must make no cache lookup."
         );
         assert!(
             matches!(
@@ -2196,7 +2199,7 @@ mod tests {
             ),
             "The retry must return its first failure: {retry:?}"
         );
-        assert_eq!(f.remote.started().len(), 2_000, "The retry must sign no proof again.");
+        assert_eq!(f.remote.started().len(), 2_000, "The retry must make no new sign request.");
     }
 
     /// The sign request of the first duty waits until the test releases it.
@@ -2228,9 +2231,9 @@ mod tests {
     }
 
     /// The second of 4 POSTs waits for more than `timeouts.preparation`
-    /// (3 s), and the fourth POST gets a 503. The call sends each chunk. It
-    /// returns the timeout of the second chunk: the first failure in chunk
-    /// order, not the first failure in time.
+    /// (3 s), and the fourth POST gets a 503. The call must send each chunk.
+    /// It must return the timeout of the second chunk: the first failure in
+    /// chunk order, not the first failure in time.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_timed_out_subscription_chunk_does_not_stop_the_later_chunks() {
         let answers = vec![Ok(()), Ok(()), refused(503, "fourth")];
@@ -2289,7 +2292,7 @@ mod tests {
     /// moves at the start of the last sign request. The proofs go into the
     /// cache, but the duties came before the move: the call must send no
     /// POST and must return `RevokedInFlight` (self-check F2). A retry with
-    /// duties read after the move sends them with the cached proofs.
+    /// duties read after the move must send them with the cached proofs.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_subscription_post_after_a_revocation_during_the_sign_requests() {
         let f = ManyKeys::new(4, make_config(), Vec::new()).await;
