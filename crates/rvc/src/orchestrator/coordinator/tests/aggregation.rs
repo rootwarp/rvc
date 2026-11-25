@@ -1605,7 +1605,8 @@ async fn subscription_recomputes_is_aggregator_for_each_committee_length() {
 
 /// RSA N2 (#1038 R1): admission moves while the subscription pass waits for an aggregation
 /// owner. After the owner is cancelled, the subscription owns the key, but the signer refuses
-/// its stale admission: no new backend call and no POST.
+/// its stale admission: no new backend call and no POST. The pass read its duty before the
+/// move. For this reason, it must return `RevokedInFlight` (Harper B1, #1043 R1).
 #[tokio::test(flavor = "current_thread")]
 async fn subscription_takeover_signs_nothing_after_a_revocation() {
     let s = Subscribing::new().await;
@@ -1620,12 +1621,21 @@ async fn subscription_takeover_signs_nothing_after_a_revocation() {
     s.admission.fetch_add(1, Ordering::SeqCst);
     let owner_cancelled = abort_bounded(owner).await;
     gate.open();
-    let subscriber_done = subscribed(subscriber).await;
+    let handles = [subscriber];
+    let _ = join_bounded(&handles).await;
+    let [subscriber] = handles;
+    let outcome = finished_output(subscriber).await;
 
     assert!(owner_entered, "aggregation enters the remote sign");
     assert_eq!(competitor, Competitor::Waiting, "the subscription pass waits for the owner");
     assert!(owner_cancelled, "the aggregation owner ends as cancelled");
-    assert!(subscriber_done, "the subscription pass finishes with nothing to send");
+    assert!(
+        matches!(
+            outcome,
+            Some(Err(OrchestratorError::Beacon(bn_manager::BeaconError::RevokedInFlight)))
+        ),
+        "After the revocation, the pass must return RevokedInFlight: {outcome:?}"
+    );
     assert_eq!(s.remote.calls(), 1, "a revoked admission gets no new backend call");
     assert!(s.posted.lock().is_empty(), "no subscription after the revocation");
     assert_eq!((s.cache().len(), s.cache().in_flight_len()), (0, 0), "no entry stays");

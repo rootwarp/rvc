@@ -5293,4 +5293,52 @@ mod tests {
             "After the revocation, the step must be failed and pending."
         );
     }
+
+    /// Harper B1 (#1043 R1): the generation moves after the read of slot 33
+    /// in the subscription step. Slot 33 is the duty slot of E. The call for
+    /// E reads its duty before the move, and the call for E+1 starts after
+    /// the move. The step must send no subscription, and it must stay
+    /// pending. The next pass must send the subscriptions of E and E+1, and
+    /// it must finish the step.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revocation_during_the_subscription_step_keeps_it_pending() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let generation = f.mock.track_admission();
+        let (name, slot) = ("duty_tracker.get_duties_for_slot", Some(33));
+        let revoke =
+            RevokeOnClose { name, slot, generation: Arc::clone(&generation), span: Arc::default() };
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(revoke));
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            1,
+            "The generation must move one time, after the read of slot 33."
+        );
+        assert!(
+            f.subscription_slots.lock().is_empty(),
+            "The step must send no subscription for the duties read before the move."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Failed), false),
+            "After the revocation, the subscription step must be failed and pending."
+        );
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"], &["65"]]),
+            "The next pass must send the subscriptions of E and E+1."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POSTs must finish the step."
+        );
+    }
 }

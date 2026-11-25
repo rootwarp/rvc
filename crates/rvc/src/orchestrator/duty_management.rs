@@ -2082,8 +2082,10 @@ mod tests {
 
     /// Keys 0 to 3 have one duty each, in slot order. The admission
     /// generation moves after the read of the first slot (key 0). Key 0 must
-    /// not sign, because its duty was read before the move. The later slots
-    /// have no duty that the cache serves after the move.
+    /// not sign, because the call read its duty before the move. After the
+    /// move, the cache gives no duty for the later slots. The call must
+    /// return `RevokedInFlight` and not `Ok`. Then the runner step stays
+    /// pending (Harper B1, #1043 R1).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn duties_read_before_a_revocation_do_not_sign() {
         let f = ManyKeys::new(4, make_config(), Vec::new()).await;
@@ -2099,13 +2101,54 @@ mod tests {
         let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
         AFTER_SLOT_DUTIES.with(|hook| hook.borrow_mut().take());
 
-        assert!(f.remote.started().is_empty(), "No duty read before the move must sign.");
-        assert_eq!(f.service.selection_proofs.lookups(), 0, "No duty must make a cache lookup.");
         assert!(
-            matches!(outcome, Ok(())),
-            "With nothing to send, the call must return Ok: {outcome:?}"
+            f.remote.started().is_empty(),
+            "The signer must get zero requests for these duties."
         );
+        assert_eq!(f.service.selection_proofs.lookups(), 0, "No duty must make a cache lookup.");
         assert!(f.post_sizes().is_empty(), "The call must send no POST.");
+        assert!(
+            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
+            "With the duties read before the move, the call must return RevokedInFlight: {outcome:?}"
+        );
+    }
+
+    /// RSA B3 (#1043 R1): keys 0 to 3 have one duty each, in slot order. The
+    /// admission generation moves after the read of the last slot of the
+    /// epoch. The call reads all 4 duties before the move, and each duty then
+    /// fails its fence check. The call must return `RevokedInFlight` and not
+    /// the `Ok` of a pass with nothing to send.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_revocation_after_the_last_duty_read_is_not_an_empty_pass() {
+        let f = ManyKeys::new(4, make_config(), Vec::new()).await;
+        let admission = Arc::clone(&f.admission);
+        let last = (SUBSCRIBED_EPOCH + 1) * SLOTS_PER_EPOCH - 1;
+        AFTER_SLOT_DUTIES.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |slot| {
+                if slot == last {
+                    admission.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        });
+        let fences = f.mock.duty_fence_calls();
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        AFTER_SLOT_DUTIES.with(|hook| hook.borrow_mut().take());
+
+        assert_eq!(
+            f.mock.duty_fence_calls() - fences,
+            4,
+            "Each of the 4 duties must read its fence after the move."
+        );
+        assert!(
+            f.remote.started().is_empty(),
+            "The signer must get zero requests for the 4 duties."
+        );
+        assert!(f.post_starts().is_empty(), "The call must send no POST.");
+        assert!(
+            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
+            "When the move skips each duty, the call must return RevokedInFlight: {outcome:?}"
+        );
     }
 
     /// `SUBSCRIPTION_CHUNK`: 512 subscriptions go in one POST, and 513 go in
