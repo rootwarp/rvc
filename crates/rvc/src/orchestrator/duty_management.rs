@@ -789,7 +789,7 @@ impl DutyManagementService {
         match utils::timed(
             COMMITTEE_SUBSCRIPTION,
             self.config.timeouts.preparation,
-            self.beacon.submit_beacon_committee_subscriptions(subscriptions),
+            self.beacon.submit_beacon_committee_subscriptions_fenced(subscriptions, duties_watch),
         )
         .await
         {
