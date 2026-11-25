@@ -3338,4 +3338,59 @@ mod tests {
             "After the move, the call must return RevokedInFlight: {outcome:?}"
         );
     }
+
+    /// Self-check S2 (#1043): node A moves the duty watch and answers 307
+    /// with the address of node B. The fenced POST must not follow the
+    /// redirect, and node B must get no POST. A call with no watch uses the
+    /// shared client, and that client still follows the redirect.
+    #[tokio::test]
+    async fn a_fenced_subscription_post_does_not_follow_a_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        /// Moves the generation, then answers 307 to the target.
+        struct MoveThenRedirect(Arc<AtomicU64>, String);
+
+        impl Respond for MoveThenRedirect {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(307).insert_header("location", self.1.as_str())
+            }
+        }
+
+        let node_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&node_b)
+            .await;
+        let node_a = MockServer::start().await;
+        let generation = Arc::new(AtomicU64::new(0));
+        let target = format!("{}{SUBSCRIPTIONS_PATH}", node_b.uri());
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(MoveThenRedirect(Arc::clone(&generation), target))
+            .mount(&node_a)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(node_a.uri()).with_max_retries(0))
+            .expect("The client must start.");
+        let watch = DutyFence::at(0, Arc::clone(&generation));
+        let subscriptions = [committee_subscription()];
+
+        let fenced =
+            client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert_eq!(to_b.len(), 0, "Node B must get no POST from the fenced call.");
+        assert!(
+            matches!(fenced, Err(BeaconError::ApiError { status: 307, .. })),
+            "The fenced call must return the 307 of node A: {fenced:?}"
+        );
+
+        let shared = client.submit_beacon_committee_subscriptions(&subscriptions).await;
+
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert!(matches!(shared, Ok(())), "The shared client must follow the 307: {shared:?}");
+        assert_eq!(to_b.len(), 1, "The call with no watch must send one POST to node B.");
+    }
 }
