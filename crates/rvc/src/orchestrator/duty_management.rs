@@ -629,6 +629,11 @@ impl DutyManagementService {
             for duty in duties {
                 // Only subscribe for our own validators (O(1) by compressed bytes).
                 let Some(duty_bytes) = parse_pubkey_bytes(&duty.pubkey) else {
+                    warn!(
+                        slot,
+                        validator_index = duty.validator_index,
+                        "Skipping committee subscription: the duty has an invalid public key"
+                    );
                     continue;
                 };
                 let Some(pubkey) = pubkey_snapshot.get(&duty_bytes).cloned() else {
