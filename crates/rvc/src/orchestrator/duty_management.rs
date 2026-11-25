@@ -2376,6 +2376,33 @@ mod tests {
         f.assert_each_duty_once(&f.posts(), "The 4 POSTs");
     }
 
+    /// RSA B4 (#1043 R1): 2,049 duties make 5 chunks, and each POST takes
+    /// 2 s. A maximum of 4 chunk POSTs can be in flight at the same time. The
+    /// first 4 POSTs must start at the same time, and the fifth POST must
+    /// start when the first 4 POSTs end.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscription_chunk_posts_in_flight_stay_at_the_cap() {
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let f = ManyKeys::with_mock(2_049, make_config(), Vec::new(), |mock| {
+            mock.with_method_delay(method, Duration::from_secs(2))
+        })
+        .await;
+
+        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+
+        let starts = f.post_starts();
+        let first = starts.first().copied().expect("The call must start a POST.");
+        let offsets: Vec<Duration> = starts.iter().map(|start| *start - first).collect();
+        let (wave_1, wave_2) = (Duration::ZERO, Duration::from_secs(2));
+        assert_eq!(
+            offsets,
+            [wave_1, wave_1, wave_1, wave_1, wave_2],
+            "A maximum of 4 chunk POSTs must be in flight. The fifth POST must start when the first 4 end."
+        );
+        assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
+        f.assert_each_duty_once(&f.posts(), "The 5 POSTs");
+    }
+
     /// Each of the 4 duties reads and checks its own fence. Then the
     /// admission generation moves at the start of the last sign request. The
     /// 4 sign requests are in flight at the move, and their proofs must go
