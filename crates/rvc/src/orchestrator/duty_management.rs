@@ -1713,7 +1713,8 @@ mod tests {
 
     impl SlowRemote {
         fn new() -> Self {
-            let key = crypto::SecretKey::from_bytes(&[0x11; 32]).expect("a fixed secret key");
+            let key = crypto::SecretKey::from_bytes(&[0x11; 32])
+                .expect("The fixed bytes must make a valid secret key.");
             Self {
                 proof: key.sign(b"fixed selection proof"),
                 in_flight: AtomicUsize::new(0),
@@ -1817,7 +1818,10 @@ mod tests {
             let beacon = mock as Arc<dyn BeaconNodeClient>;
             let indices = (0..count).map(|i| i.to_string()).collect();
             let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
-            duty_tracker.fetch_duties_for_epoch(SUBSCRIBED_EPOCH).await.expect("seed the duties");
+            duty_tracker
+                .fetch_duties_for_epoch(SUBSCRIBED_EPOCH)
+                .await
+                .expect("The duty fetch must return the duties.");
             let remote = Arc::new(SlowRemote::new());
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
             let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
@@ -1825,9 +1829,11 @@ mod tests {
                 composite.add_remote_key(pubkey.to_bytes(), remote.clone());
                 validator_store
                     .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
-                    .expect("add validator");
+                    .expect("The store must add the key.");
             }
-            let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+            let slashing_db = Arc::new(
+                SlashingDb::open_in_memory().expect("The in-memory slashing database must open."),
+            );
             let signer = Arc::new(
                 SignerService::new(composite, slashing_db).with_enablement(always_enabled()),
             );
@@ -1855,9 +1861,9 @@ mod tests {
         Err(beacon::BeaconError::ApiError { status, message: message.to_string() })
     }
 
-    /// 655-AC1: 2,000 own duties and a signer that waits 2 ms for each sign.
-    /// The call ends in less than 1 s of paused time and sends 4 POSTs of
-    /// 512 or fewer subscriptions.
+    /// 655-AC1: 2,000 own duties sign through a signer that waits 2 ms for
+    /// each sign. The call must end in less than 1 s of paused time and send
+    /// 4 POSTs of 512 or fewer subscriptions.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_committee_subscriptions_for_2000_keys_finish_within_one_second() {
         let f = ManyKeys::new(2_000, make_config(), Vec::new()).await;
@@ -1870,7 +1876,10 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "The 2,000 subscriptions must end in less than 1 s of paused time, not {elapsed:?}."
         );
-        assert!(matches!(outcome, Ok(())), "The beacon node accepts each POST: {outcome:?}");
+        assert!(
+            matches!(outcome, Ok(())),
+            "The call must return Ok for 4 accepted POSTs: {outcome:?}"
+        );
         assert_eq!(
             f.post_sizes(),
             [512, 512, 512, 464],
@@ -1886,14 +1895,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn subscription_sign_cap_is_the_lower_of_32_and_the_dispatch_concurrency() {
         for (concurrency, peak) in [(4, 4), (64, 32)] {
-            let limits = DispatchLimits::validated(concurrency, 2).expect("non-zero limits");
+            let limits = DispatchLimits::validated(concurrency, 2)
+                .expect("The limits are not zero, so they must be valid.");
             let config = make_config().with_dispatch_limits(limits);
             let f = ManyKeys::new(40, config, Vec::new()).await;
 
             let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
-            assert!(matches!(outcome, Ok(())), "concurrency {concurrency}: {outcome:?}");
-            assert_eq!(f.remote.started().len(), 40, "concurrency {concurrency}: 40 signs");
+            assert!(
+                matches!(outcome, Ok(())),
+                "With a concurrency of {concurrency}, the call must return Ok: {outcome:?}"
+            );
+            assert_eq!(
+                f.remote.started().len(),
+                40,
+                "With a concurrency of {concurrency}, each of the 40 duties must sign."
+            );
             assert_eq!(
                 f.remote.peak(),
                 peak,
@@ -1908,7 +1925,7 @@ mod tests {
     /// Part 1 uses the mock beacon node. Key 1 is disabled, and the first
     /// sign (key 0) moves the admission generation. The mock gives a new
     /// fence that holds after the move, but the duties were read before it:
-    /// only key 0 signs. On the base code, the duty cache stops serving the
+    /// only key 0 signs. On the base code, the duty cache does not serve the
     /// duties of the later slots after the move.
     ///
     /// Part 2 uses a real `BnManager` as the beacon node of the service:
@@ -1933,14 +1950,23 @@ mod tests {
             [moved.keys[0]],
             "Part 1: only key 0 must sign: key 1 is disabled, and keys 2 and 3 are after the move."
         );
-        assert_eq!(moved.service.selection_proofs.lookups(), 1, "Part 1: one cache lookup");
-        assert!(matches!(outcome, Ok(())), "Part 1: the POST is accepted: {outcome:?}");
+        assert_eq!(
+            moved.service.selection_proofs.lookups(),
+            1,
+            "Part 1: only key 0 must make a cache lookup."
+        );
+        assert!(matches!(outcome, Ok(())), "Part 1: the call must return Ok: {outcome:?}");
         assert_eq!(moved.post_sizes(), [1], "Part 1: the POST must carry only key 0.");
 
         let mut f = ManyKeys::new(4, make_config(), Vec::new()).await;
         let config = bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".to_string()]);
-        let manager = Arc::new(bn_manager::BnManager::new(config).expect("bn manager"));
-        assert!(BeaconNodeClient::duty_fence(manager.as_ref()).is_ok(), "the node is admitted");
+        let manager = Arc::new(
+            bn_manager::BnManager::new(config).expect("The beacon node manager must start."),
+        );
+        assert!(
+            BeaconNodeClient::duty_fence(manager.as_ref()).is_ok(),
+            "Before the call, the node must be admitted."
+        );
         let (store, disabled) = (Arc::clone(&f.service.validator_store), f.keys[1]);
         f.remote.on_sign(move || store.set_enabled(&disabled, false));
         let revoker = Arc::clone(&manager);
@@ -1964,7 +1990,7 @@ mod tests {
                 outcome,
                 Err(OrchestratorError::Beacon(bn_manager::BeaconError::NoAdmittedNode))
             ),
-            "Part 2: the revoked beacon node refuses the POST of the two proofs: {outcome:?}"
+            "Part 2: the call must return NoAdmittedNode for the POST of the two proofs: {outcome:?}"
         );
     }
 
@@ -1989,7 +2015,10 @@ mod tests {
 
         assert!(f.remote.started().is_empty(), "No duty read before the move must sign.");
         assert_eq!(f.service.selection_proofs.lookups(), 0, "No duty must make a cache lookup.");
-        assert!(matches!(outcome, Ok(())), "Nothing to send is Ok: {outcome:?}");
+        assert!(
+            matches!(outcome, Ok(())),
+            "With nothing to send, the call must return Ok: {outcome:?}"
+        );
         assert!(f.post_sizes().is_empty(), "The call must send no POST.");
     }
 
@@ -2002,7 +2031,10 @@ mod tests {
 
             let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
 
-            assert!(matches!(outcome, Ok(())), "{count} duties: {outcome:?}");
+            assert!(
+                matches!(outcome, Ok(())),
+                "With {count} duties, the call must return Ok: {outcome:?}"
+            );
             assert_eq!(
                 f.post_sizes(),
                 sizes,
