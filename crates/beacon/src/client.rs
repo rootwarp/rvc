@@ -1694,7 +1694,9 @@ impl BeaconClient {
     /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
     /// `duties_watch` held. Each HTTP attempt, also a retry, starts only while
     /// the watch holds. Else the result is [`BeaconError::RevokedInFlight`].
-    /// The POST follows no redirect: a 3xx answer is an [`BeaconError::ApiError`].
+    /// An error after the watch moves is also `RevokedInFlight`. An `Ok`
+    /// stays `Ok`. The POST follows no redirect: a 3xx answer is an
+    /// [`BeaconError::ApiError`].
     pub async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -1704,6 +1706,18 @@ impl BeaconClient {
         self.post_empty_gated(&self.fenced_client, path, &subscriptions, &[], duties_watch)
             .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
+            .map_err(|err| match err {
+                BeaconError::RevokedInFlight => err,
+                err if duties_watch.holds() => err,
+                err => {
+                    warn!(
+                        bn_url = %RedactedUrl(self.endpoint()),
+                        error = %err,
+                        "Request failed after the duty watch moved: the result is RevokedInFlight"
+                    );
+                    BeaconError::RevokedInFlight
+                }
+            })
     }
 
     /// Subscribes validators to sync-committee subnets ahead of their period

@@ -433,9 +433,11 @@ pub trait AttestationApi: Send + Sync {
 
     /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
     /// `duties_watch` held. After a move, no POST may start, and the result is
-    /// [`BeaconError::RevokedInFlight`]. The default checks the watch one time.
-    /// A client that can wait before an HTTP attempt (for a permit, an earlier
-    /// node or a retry) must check the watch at the start of each attempt.
+    /// [`BeaconError::RevokedInFlight`]. An error after a move is also
+    /// `RevokedInFlight`. The default checks the watch before the POST and
+    /// after an error. A client that can wait before an HTTP attempt (for a
+    /// permit, an earlier node or a retry) must check the watch at the start
+    /// of each attempt.
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -444,7 +446,13 @@ pub trait AttestationApi: Send + Sync {
         if !duties_watch.holds() {
             return Err(BeaconError::RevokedInFlight);
         }
-        self.submit_beacon_committee_subscriptions(subscriptions).await
+        self.submit_beacon_committee_subscriptions(subscriptions).await.map_err(|err| {
+            if duties_watch.holds() {
+                err
+            } else {
+                BeaconError::RevokedInFlight
+            }
+        })
     }
 
     /// Subscribe validators to sync-committee subnets
