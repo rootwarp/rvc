@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tracing::{error, info, warn};
@@ -24,7 +24,7 @@ use doppelganger::{
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH};
 use rvc_config::TimingConfig;
-use signer::{SignerService, ValidatorSigner};
+use signer::{SignerService, SigningDuty, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
 use timing::{DeadlineBps, DeadlineSchedule, SystemSlotClock};
 
@@ -218,6 +218,22 @@ fn remove_accidental_fresh_db(path: &std::path::Path) {
 /// Builder for constructing services from configuration.
 pub struct ServiceBuilder {
     config: Config,
+    /// The first store that [`Self::build_validator_store`] builds. The signer
+    /// of [`Self::build_signer`] reads its `enabled` flag (the store gate).
+    signer_store: Arc<OnceLock<Arc<ValidatorStore>>>,
+}
+
+/// The store gate rule of the VC signer.
+///
+/// Every duty except a voluntary exit needs the `enabled` flag. The
+/// orchestrator checks that flag before each of those duties, and the builder
+/// signs registrations only for the keys of `list_enabled_pubkeys`. The
+/// keymanager exit has no store check, so an exit stays open.
+fn store_allows(store: &ValidatorStore, pubkey: &[u8; 48], duty: SigningDuty) -> bool {
+    match duty {
+        SigningDuty::VoluntaryExit => true,
+        _ => store.is_signing_enabled(pubkey),
+    }
 }
 
 /// Wall-clock length of the doppelganger store hold and import-meta re-arm.
@@ -523,7 +539,7 @@ fn open_doppelganger_holds(
 
 impl ServiceBuilder {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self { config, signer_store: Arc::new(OnceLock::new()) }
     }
 
     pub fn log_effective_config(&self) {
@@ -824,8 +840,10 @@ impl ServiceBuilder {
     /// so the signer re-checks the quiesce gate under the per-pubkey lock. The
     /// returned registry is the one the wrapper reads.
     ///
-    /// `ValidatorStore`'s `enabled` flag is a different gate and is not installed
-    /// here (SEC-2a/2b). An open doppelganger hold is applied in
+    /// The signer also gets the store gate: the `enabled` flag of the first
+    /// store that [`Self::build_validator_store`] of this builder builds, for
+    /// every duty except a voluntary exit. Until that store exists, the store
+    /// gate is open. An open doppelganger hold is applied in
     /// [`Self::build_signing_enablement`]: that key is registered with
     /// `register_for_import`, so this signer gate stays closed for voluntary
     /// exit until the forward window completes.
@@ -838,7 +856,12 @@ impl ServiceBuilder {
         let registry = Arc::new(QuiesceRegistry::new());
         let enablement: Arc<dyn SigningEnablement> =
             Arc::new(QuiescingEnablement::new(enablement, Arc::clone(&registry)));
-        let signer = SignerService::new(composite_signer, slashing_db).with_enablement(enablement);
+        let store = Arc::clone(&self.signer_store);
+        let signer = SignerService::new(composite_signer, slashing_db)
+            .with_enablement(enablement)
+            .with_store_gate(Arc::new(move |pubkey: &[u8; 48], duty: SigningDuty| {
+                store.get().is_none_or(|store| store_allows(store, pubkey, duty))
+            }));
         info!("Created signer service with signing enablement (SEC-2b)");
         (Arc::new(signer), registry)
     }
@@ -1193,6 +1216,9 @@ impl ServiceBuilder {
     /// become the store's global default after builder settings apply. A
     /// per-validator mode still wins. A builder-settings error returns before
     /// that default is published. The mode does not read the fork schedule.
+    ///
+    /// The first store that this builder returns is the store gate of the
+    /// signer from [`Self::build_signer`].
     pub fn build_validator_store(
         &self,
         validators_config: Option<&std::path::Path>,
@@ -1228,7 +1254,10 @@ impl ServiceBuilder {
         } else {
             info!("Created validator store");
         }
-        Ok(Arc::new(store))
+        let store = Arc::new(store);
+        // A second store of this builder does not replace the store gate.
+        let _ = self.signer_store.set(Arc::clone(&store));
+        Ok(store)
     }
 
     /// Registers every loaded validator pubkey in the [`ValidatorStore`] so the
