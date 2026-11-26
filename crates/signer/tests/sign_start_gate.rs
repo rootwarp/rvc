@@ -1,17 +1,19 @@
 //! W4-E8b-signer (#881, #1043 B1): the sign-start gate of `SignerService`.
 //!
-//! The gate checks the store gate and then the beacon admission just before
+//! The gate checks the beacon admission and then the store gate just before
 //! the backend call, and again when the backend returns. Each test orders its
-//! change with a parked barrier or a held backend, not with a sleep.
+//! change with a parked barrier or a held backend, not with a sleep. One event
+//! record keeps each store check, each change of the test, and the start and
+//! the end of each backend call, in sequence.
 //!
-//! - A change before the backend start stops the sign with no backend call.
+//! - A change before the backend starts stops the sign with no backend call.
 //! - A change during the backend sign lets the backend finish. The caller
 //!   gets the refusal error and no signature. A slashable row stays.
 
 mod common;
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,11 +24,15 @@ use rvc_signer::{
     with_beacon_admission, BeaconAdmission, PreReserveBarrier, SignerError, SignerService,
     SigningDuty, StoreGate, ValidatorSigner,
 };
-use slashing::SlashingDb;
+use slashing::{SigningRoot, SlashingDb};
 use tokio::sync::Notify;
+use Event::{Check, Disable, Enable, End, Revoke, Start};
 
 const GVR: Root = [0x5c; 32];
 const SLOT: u64 = 70;
+const PROOF: SigningDuty = SigningDuty::SelectionProof;
+const BLOCK: SigningDuty = SigningDuty::Block;
+const ENVELOPE: SigningDuty = SigningDuty::ExecutionPayloadEnvelope;
 
 /// Hang guard for the join of a sign task. It does not set the order of events.
 const JOIN_GUARD: Duration = Duration::from_secs(30);
@@ -66,22 +72,63 @@ impl Park {
     }
 }
 
-/// The BLS backend: it counts its calls and can hold them on a [`Park`].
+/// One entry of the event record: a store check of a duty (`Check`), a change
+/// of the test (`Disable`, `Enable`, `Revoke`), or the start or the end of a
+/// backend call (`Start`, `End`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+    Check(SigningDuty),
+    Disable,
+    Enable,
+    Revoke,
+    Start,
+    End,
+}
+
+/// The store flag, the admission generation and the event record. The store
+/// gate, the backend and the test changes share it.
+#[derive(Default)]
+struct Record {
+    disabled: AtomicBool,
+    generation: Arc<AtomicU64>,
+    events: Mutex<Vec<Event>>,
+}
+
+impl Record {
+    fn push(&self, event: Event) {
+        self.events.lock().expect("events").push(event);
+    }
+
+    fn set_store(&self, enabled: bool) {
+        self.disabled.store(!enabled, Ordering::SeqCst);
+        self.push(if enabled { Enable } else { Disable });
+    }
+
+    fn revoke_admission(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.push(Revoke);
+    }
+}
+
+/// The BLS backend: it records the start and the end of each call, and it can
+/// hold a call on a [`Park`].
 struct HeldBackend {
     inner: Arc<dyn Signer>,
-    calls: AtomicUsize,
+    record: Arc<Record>,
     hold: Mutex<Option<Arc<Park>>>,
 }
 
 #[async_trait]
 impl Signer for HeldBackend {
     async fn sign(&self, root: &Root, pubkey: &[u8; 48]) -> Result<Signature, SigningError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.record.push(Start);
         let hold = self.hold.lock().expect("hold").clone();
         if let Some(park) = hold {
             park.wait().await;
         }
-        self.inner.sign(root, pubkey).await
+        let signed = self.inner.sign(root, pubkey).await;
+        self.record.push(End);
+        signed
     }
 
     fn public_keys(&self) -> Vec<[u8; 48]> {
@@ -94,11 +141,7 @@ struct Fixture {
     service: Arc<SignerService>,
     backend: Arc<HeldBackend>,
     db: Arc<SlashingDb>,
-    /// The validator store flag that the store gate reads.
-    enabled: Arc<AtomicBool>,
-    /// Each duty that the store gate got, in sequence.
-    gate_calls: Arc<Mutex<Vec<SigningDuty>>>,
-    generation: Arc<AtomicU64>,
+    record: Arc<Record>,
 }
 
 impl Fixture {
@@ -113,19 +156,17 @@ impl Fixture {
 
     fn build(with_store_gate: bool) -> Self {
         let (pubkey, composite) = common::composite_with_key(SecretKey::generate());
+        let record = Arc::new(Record::default());
         let backend = Arc::new(HeldBackend {
             inner: Arc::clone(&composite) as Arc<dyn Signer>,
-            calls: AtomicUsize::new(0),
+            record: Arc::clone(&record),
             hold: Mutex::new(None),
         });
-        let enabled = Arc::new(AtomicBool::new(true));
-        let gate_calls = Arc::new(Mutex::new(Vec::new()));
         let store_gate: StoreGate = {
-            let enabled = Arc::clone(&enabled);
-            let gate_calls = Arc::clone(&gate_calls);
+            let record = Arc::clone(&record);
             Arc::new(move |_pubkey: &[u8; 48], duty: SigningDuty| {
-                gate_calls.lock().expect("gate calls").push(duty);
-                enabled.load(Ordering::SeqCst)
+                record.push(Check(duty));
+                !record.disabled.load(Ordering::SeqCst)
             })
         };
         let db = common::open_db();
@@ -135,16 +176,15 @@ impl Fixture {
             .with_sign_timeout(JOIN_GUARD);
         let service =
             Arc::new(if with_store_gate { service.with_store_gate(store_gate) } else { service });
-        let generation = Arc::new(AtomicU64::new(0));
-        Self { pubkey, service, backend, db, enabled, gate_calls, generation }
+        Self { pubkey, service, backend, db, record }
     }
 
     fn set_store(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::SeqCst);
+        self.record.set_store(enabled);
     }
 
     fn revoke_admission(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
+        self.record.revoke_admission();
     }
 
     fn disable_and_revoke(&self) {
@@ -152,12 +192,16 @@ impl Fixture {
         self.revoke_admission();
     }
 
-    fn backend_calls(&self) -> usize {
-        self.backend.calls.load(Ordering::SeqCst)
+    /// Compare the full event record with `want`.
+    #[track_caller]
+    fn record_is(&self, want: &[Event], rule: &str) {
+        assert_eq!(*self.record.events.lock().expect("events"), want, "{rule}");
     }
 
-    fn block_rows(&self) -> usize {
-        self.db.get_blocks(&hex::encode(self.pubkey.to_bytes())).expect("block rows").len()
+    /// The slot and the signing root of each block row of the key.
+    fn block_rows(&self) -> Vec<(u64, Option<SigningRoot>)> {
+        let rows = self.db.get_blocks(&hex::encode(self.pubkey.to_bytes())).expect("block rows");
+        rows.into_iter().map(|row| (row.slot, row.signing_root)).collect()
     }
 
     /// Hold each later backend call on a new [`Park`].
@@ -186,7 +230,7 @@ impl Fixture {
     where
         F: Future<Output = Result<Signature, SignerError>> + Send + 'static,
     {
-        let admission = BeaconAdmission::new(0, Arc::clone(&self.generation));
+        let admission = BeaconAdmission::new(0, Arc::clone(&self.record.generation));
         let fut = sign(Arc::clone(&self.service), self.pubkey.clone());
         tokio::spawn(with_beacon_admission(admission, fut))
     }
@@ -218,55 +262,58 @@ fn schedule() -> ForkSchedule {
     ForkSchedule::unscheduled_gloas()
 }
 
-/// Control: with no change, each path signs. The store gate gets the duty of
-/// the sign before and after each backend call.
+/// The block row of a sign with no change. A refusal after the reservation
+/// must keep this row.
+async fn reserved_block_row() -> Vec<(u64, Option<SigningRoot>)> {
+    let fx = Fixture::new();
+    join(fx.block()).await.expect("The control block must sign.");
+    let rows = fx.block_rows();
+    assert!(matches!(rows.as_slice(), [(SLOT, Some(_))]), "The control has one row: {rows:?}.");
+    rows
+}
+
+/// Control: with no change, each path signs. The store gate checks each duty
+/// before the backend starts and after the backend ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_path_signs_when_the_store_gate_and_the_admission_hold() {
     let fx = Fixture::new();
 
-    join(fx.selection_proof()).await.expect("the selection proof must sign");
-    join(fx.block()).await.expect("the block must sign");
+    join(fx.selection_proof()).await.expect("The selection proof must sign.");
+    join(fx.block()).await.expect("The block must sign.");
 
-    assert_eq!(fx.backend_calls(), 2, "each sign must call the backend one time");
-    assert_eq!(
-        *fx.gate_calls.lock().expect("gate calls"),
-        [
-            SigningDuty::SelectionProof,
-            SigningDuty::SelectionProof,
-            SigningDuty::Block,
-            SigningDuty::Block
-        ],
-        "the store gate must get the duty before and after each backend call"
+    fx.record_is(
+        &[Check(PROOF), Start, End, Check(PROOF), Check(BLOCK), Start, End, Check(BLOCK)],
+        "The store gate must check each duty before the backend starts and after it ends.",
     );
 }
 
 /// Non-slashable: the store disables the key after the entry check and
-/// before the backend start. The signer refuses the selection proof.
+/// before the backend starts. The signer refuses the selection proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_disabled_before_the_backend_start_gets_no_selection_proof() {
+async fn a_key_disabled_before_the_backend_starts_gets_no_selection_proof() {
     let fx = Fixture::new();
     let park = fx.park_before_the_start();
     let result = park.change_then_join(fx.selection_proof(), || fx.set_store(false)).await;
 
-    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend for a disabled key");
+    fx.record_is(&[Disable, Check(PROOF)], "The backend must not start for a disabled key.");
     assert!(
         matches!(result, Err(SignerError::BlockedByDoppelganger)),
-        "the caller must get the store refusal, got {result:?}"
+        "The caller must get the store refusal. The result was {result:?}."
     );
 }
 
 /// Non-slashable: the admission moves after the entry check and before the
-/// backend start. The signer refuses the selection proof.
+/// backend starts. The signer refuses the selection proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_admission_revoked_before_the_backend_start_gets_no_selection_proof() {
+async fn an_admission_revoked_before_the_backend_starts_gets_no_selection_proof() {
     let fx = Fixture::new();
     let park = fx.park_before_the_start();
     let result = park.change_then_join(fx.selection_proof(), || fx.revoke_admission()).await;
 
-    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after a revocation");
+    fx.record_is(&[Revoke], "The backend must not start after a revocation.");
     assert!(
         matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
-        "the caller must get the admission refusal, got {result:?}"
+        "The caller must get the admission refusal. The result was {result:?}."
     );
 }
 
@@ -278,10 +325,10 @@ async fn a_key_disabled_during_the_backend_sign_gets_no_selection_proof() {
     let park = fx.hold_backend();
     let result = park.change_then_join(fx.selection_proof(), || fx.set_store(false)).await;
 
-    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    fx.record_is(&[Check(PROOF), Start, Disable, End, Check(PROOF)], "The started sign must end.");
     assert!(
         matches!(result, Err(SignerError::BlockedByDoppelganger)),
-        "the caller must get the store refusal and no signature, got {result:?}"
+        "The caller must get the store refusal and no signature. The result was {result:?}."
     );
 }
 
@@ -293,28 +340,31 @@ async fn an_admission_revoked_during_the_backend_sign_gets_no_selection_proof() 
     let park = fx.hold_backend();
     let result = park.change_then_join(fx.selection_proof(), || fx.revoke_admission()).await;
 
-    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    fx.record_is(&[Check(PROOF), Start, Revoke, End], "The started sign must end.");
     assert!(
         matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
-        "the caller must get the admission refusal and no signature, got {result:?}"
+        "The caller must get the admission refusal and no signature. The result was {result:?}."
     );
 }
 
-/// A store refusal before the backend start releases the envelope slot. A
+/// A store refusal before the backend starts releases the envelope slot. A
 /// later sign of the slot can start when the store enables the key again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn envelope_refused_before_the_backend_start_releases_the_slot() {
+async fn envelope_refused_before_the_backend_starts_releases_the_slot() {
     let fx = Fixture::new();
     fx.set_store(false);
     let refused = join(fx.envelope(3)).await;
     assert!(
         matches!(refused, Err(SignerError::BlockedByDoppelganger)),
-        "a closed store gate must refuse the envelope, got {refused:?}"
+        "The store gate must refuse the envelope. The result was {refused:?}."
     );
 
     fx.set_store(true);
-    join(fx.envelope(3)).await.expect("the released slot must sign");
-    assert_eq!(fx.backend_calls(), 1, "only the second envelope sign must call the backend");
+    join(fx.envelope(3)).await.expect("The released slot must sign.");
+    fx.record_is(
+        &[Disable, Check(ENVELOPE), Enable, Check(ENVELOPE), Start, End, Check(ENVELOPE)],
+        "Only the second envelope sign must start the backend.",
+    );
 }
 
 /// A signature dropped after the backend returned keeps the envelope slot:
@@ -326,7 +376,7 @@ async fn envelope_dropped_after_the_backend_returned_keeps_the_slot() {
     let dropped = park.change_then_join(fx.envelope(4), || fx.set_store(false)).await;
     assert!(
         matches!(dropped, Err(SignerError::BlockedByDoppelganger)),
-        "the caller must get the store refusal and no signature, got {dropped:?}"
+        "The caller must get the store refusal and no signature. The result was {dropped:?}."
     );
 
     *fx.backend.hold.lock().expect("hold") = None;
@@ -334,26 +384,30 @@ async fn envelope_dropped_after_the_backend_returned_keeps_the_slot() {
     let again = join(fx.envelope(4)).await;
     assert!(
         matches!(again, Err(SignerError::EnvelopeSlotAlreadySigned { slot: 4 })),
-        "the slot of a dropped signature must stay reserved, got {again:?}"
+        "The slot of a dropped signature must stay reserved. The result was {again:?}."
     );
-    assert_eq!(fx.backend_calls(), 1, "the signer must not call the backend for a reserved slot");
+    fx.record_is(
+        &[Check(ENVELOPE), Start, Disable, End, Check(ENVELOPE), Enable],
+        "The signer must not call the backend for a reserved slot.",
+    );
 }
 
 /// Slashable: the store disables the key before the reservation. The check
 /// after the reservation refuses the block with no backend call, and the row
 /// stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_disabled_before_the_backend_start_gets_no_block_and_keeps_the_row() {
+async fn a_key_disabled_before_the_backend_starts_gets_no_block_and_keeps_the_row() {
     let fx = Fixture::new();
     let park = fx.park_before_the_reservation();
     let result = park.change_then_join(fx.block(), || fx.set_store(false)).await;
 
-    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend for a disabled key");
+    fx.record_is(&[Disable, Check(BLOCK)], "The backend must not start for a disabled key.");
     assert!(
         matches!(result, Err(SignerError::BlockedByDoppelganger)),
-        "the caller must get the store refusal, got {result:?}"
+        "The caller must get the store refusal. The result was {result:?}."
     );
-    assert_eq!(fx.block_rows(), 1, "the store refusal after the reservation must keep the row");
+    let reserved = reserved_block_row().await;
+    assert_eq!(fx.block_rows(), reserved, "The store refusal must keep the reserved row.");
 }
 
 /// Slashable: the store disables the key during the backend sign. The signer
@@ -364,12 +418,13 @@ async fn a_key_disabled_during_the_backend_sign_gets_no_block_and_keeps_the_row(
     let park = fx.hold_backend();
     let result = park.change_then_join(fx.block(), || fx.set_store(false)).await;
 
-    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    fx.record_is(&[Check(BLOCK), Start, Disable, End, Check(BLOCK)], "The started sign must end.");
     assert!(
         matches!(result, Err(SignerError::BlockedByDoppelganger)),
-        "the caller must get the store refusal and no signature, got {result:?}"
+        "The caller must get the store refusal and no signature. The result was {result:?}."
     );
-    assert_eq!(fx.block_rows(), 1, "a signature dropped after the backend must keep the row");
+    let reserved = reserved_block_row().await;
+    assert_eq!(fx.block_rows(), reserved, "A dropped signature must keep the reserved row.");
 }
 
 /// Slashable: the admission moves during the backend sign. The signer drops
@@ -380,12 +435,13 @@ async fn an_admission_revoked_during_the_backend_sign_gets_no_block_and_keeps_th
     let park = fx.hold_backend();
     let result = park.change_then_join(fx.block(), || fx.revoke_admission()).await;
 
-    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    fx.record_is(&[Check(BLOCK), Start, Revoke, End], "The started sign must end.");
     assert!(
         matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
-        "the caller must get the admission refusal and no signature, got {result:?}"
+        "The caller must get the admission refusal and no signature. The result was {result:?}."
     );
-    assert_eq!(fx.block_rows(), 1, "a signature dropped after the backend must keep the row");
+    let reserved = reserved_block_row().await;
+    assert_eq!(fx.block_rows(), reserved, "A dropped signature must keep the reserved row.");
 }
 
 /// Non-slashable: the store disables the key and the admission moves before
@@ -397,7 +453,7 @@ async fn a_disabled_key_with_a_revoked_admission_gets_the_admission_refusal() {
     let park = fx.park_before_the_start();
     let result = park.change_then_join(fx.selection_proof(), || fx.disable_and_revoke()).await;
 
-    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after both changes");
+    fx.record_is(&[Disable, Revoke], "The backend must not start after both changes.");
     assert!(
         matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
         "The caller must get BeaconAdmissionRevoked. The result was {result:?}."
@@ -417,8 +473,8 @@ async fn a_disabled_key_with_a_revoked_admission_gets_no_block_and_no_row() {
         matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
         "The caller must get BeaconAdmissionRevoked. The result was {result:?}."
     );
-    assert_eq!(fx.block_rows(), 0, "The admission refusal must delete the row of this call.");
-    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after both changes");
+    assert!(fx.block_rows().is_empty(), "The admission refusal must delete the row of this call.");
+    fx.record_is(&[Disable, Revoke], "The backend must not start after both changes.");
 }
 
 /// With no store gate, a service keeps the base checks: an admission that
@@ -430,7 +486,7 @@ async fn with_no_store_gate_a_revocation_after_the_entry_check_gets_a_selection_
     let result = park.change_then_join(fx.selection_proof(), || fx.revoke_admission()).await;
 
     assert!(result.is_ok(), "With no store gate, the caller must get the signature: {result:?}.");
-    assert_eq!(fx.backend_calls(), 1, "With no store gate, the signer must call the backend.");
+    fx.record_is(&[Revoke, Start, End], "With no store gate, the backend must sign.");
 }
 
 /// With no store gate, a service keeps the base checks: an admission that
@@ -442,5 +498,7 @@ async fn with_no_store_gate_a_revocation_during_the_backend_sign_gets_a_block() 
     let result = park.change_then_join(fx.block(), || fx.revoke_admission()).await;
 
     assert!(result.is_ok(), "With no store gate, the caller must get the signature: {result:?}.");
-    assert_eq!(fx.block_rows(), 1, "The signed block must keep its row.");
+    fx.record_is(&[Start, Revoke, End], "With no store gate, the backend must sign.");
+    let reserved = reserved_block_row().await;
+    assert_eq!(fx.block_rows(), reserved, "The signed block must keep its row.");
 }
