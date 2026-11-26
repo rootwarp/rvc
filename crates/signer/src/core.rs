@@ -105,11 +105,12 @@ pub enum NonSlashableFailure {
 /// The sign-start gate: the checks just before the backend call and again
 /// after the backend returns.
 ///
-/// The store gate runs first, then the beacon admission. The store gate reads
-/// the validator store under its state lock, and the admission check reads the
-/// generation atomics. When the store disables a key or an admission moves,
-/// the change writes the same state. The check and the backend call have no
-/// await between them, and the check holds no lock after it returns.
+/// The beacon admission runs first, then the store gate, so the admission
+/// rule of the base applies first. The admission check reads the generation
+/// atomics, and the store gate reads the validator store under its state lock.
+/// When an admission moves or the store disables a key, the change writes the
+/// same state. The check and the backend call have no await between them, and
+/// the check holds no lock after it returns.
 ///
 /// Only `SignerService` has one. `SigningGate` (signer-server) passes none.
 pub(crate) struct StartGate<'a> {
@@ -127,10 +128,10 @@ impl StartGate<'_> {
         pubkey: &[u8; 48],
         duty: doppelganger::SigningDuty,
     ) -> Option<SigningGateError> {
-        if !(self.store)(pubkey, duty) {
-            Some(SigningGateError::BlockedByDoppelganger)
-        } else if crate::admission_revoked_by(self.admission, duty) {
+        if crate::admission_revoked_by(self.admission, duty) {
             Some(SigningGateError::BeaconAdmissionRevoked)
+        } else if !(self.store)(pubkey, duty) {
+            Some(SigningGateError::BlockedByDoppelganger)
         } else {
             None
         }
@@ -662,15 +663,15 @@ impl SlashableSignSession {
     /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
     /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → doppelganger
-    /// → store gate → beacon admission → sign → §5.3 table. A doppelganger or
+    /// → beacon admission → store gate → sign → §5.3 table. A doppelganger or
     /// store gate refusal keeps the reserved row. An admission refusal deletes
     /// the row this call inserted
     /// (no backend has seen the root; a failed delete keeps it) and returns
     /// [`SigningGateError::BeaconAdmissionRevoked`]. `on_tx_hold_ms` keeps the
     /// ARCH-5b window (reserve-start → sign-return, or → the admission
     /// refusal). The reserve-only series is observed at reserve return.
-    /// With a store gate (the VC), the session checks the store gate and the
-    /// admission again when BLS returns a signature. A refusal drops the
+    /// With a store gate (the VC), the session checks the admission and the
+    /// store gate again when BLS returns a signature. A refusal drops the
     /// signature and keeps the row (the backend has signed).
     pub fn reserve_then_sign<F>(mut self, reserve: F) -> Result<Vec<u8>, SigningGateError>
     where
@@ -728,17 +729,7 @@ impl SlashableSignSession {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        // The store gate follows the doppelganger row rule: keep the row.
-        if self.store.as_ref().is_some_and(|allows| !allows(&self.pubkey_bytes, self.duty)) {
-            warn!(
-                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
-                op = self.op_name,
-                "reserve_then_sign: the validator store disabled the key after reserve, before BLS"
-            );
-            return Err(SigningGateError::BlockedByDoppelganger);
-        }
-
-        // Last check before BLS, on the admission captured on the caller task.
+        // The admission check before BLS, on the admission captured on the caller task.
         // No backend has seen the root, so the row this call inserted is deleted.
         if crate::admission_revoked_by(&self.admission, self.duty) {
             let reconciled = self.reconcile_reservation(&reservation);
@@ -750,6 +741,16 @@ impl SlashableSignSession {
                 "reserve_then_sign: beacon node admission revoked after reserve, before BLS"
             );
             return Err(SigningGateError::BeaconAdmissionRevoked);
+        }
+
+        // Then the store gate (the VC). It follows the doppelganger row rule: keep the row.
+        if self.store.as_ref().is_some_and(|allows| !allows(&self.pubkey_bytes, self.duty)) {
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                "reserve_then_sign: the validator store disabled the key after reserve, before BLS"
+            );
+            return Err(SigningGateError::BlockedByDoppelganger);
         }
 
         let sign_result = self.handle.block_on(tokio::time::timeout(
@@ -1146,8 +1147,8 @@ pub async fn sign_slashable(req: SignSlashableRequest<'_>) -> Result<Vec<u8>, Si
 }
 
 /// [`sign_slashable`] with the VC store gate in step 4: after the reservation
-/// it runs before BLS, and again with the admission when BLS returns. The
-/// gate passes `None` and keeps the old checks.
+/// it runs after the admission check and before BLS, and again after the
+/// admission when BLS returns. The gate passes `None` and keeps the old checks.
 pub(crate) async fn sign_slashable_with_store_gate(
     req: SignSlashableRequest<'_>,
     store: Option<crate::StoreGate>,

@@ -1024,10 +1024,11 @@ impl SignerService {
     /// # Sign-start gate
     ///
     /// Just before the backend call, with no await between them, the signer
-    /// checks the store gate ([`Self::with_store_gate`]) and then the
-    /// admission. A slashable sign runs them after the reservation and the
-    /// doppelganger check. A store refusal keeps the row, as a doppelganger
-    /// refusal does. `SigningGate` (signer-server) has no sign-start gate.
+    /// checks the admission and then the store gate ([`Self::with_store_gate`]).
+    /// A slashable sign runs them after the reservation and the doppelganger
+    /// check, so an admission refusal deletes the row that this call inserted.
+    /// A store refusal keeps the row, as a doppelganger refusal does.
+    /// `SigningGate` (signer-server) has no sign-start gate.
     ///
     /// - When the store disables the key or the admission moves before that
     ///   check, the sign stops with no backend call.
