@@ -5058,12 +5058,18 @@ impl AttestationApi for BnManager {
     /// [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`] permits. In a broadcast, it then
     /// takes a broadcast permit of its node. It keeps both until it ends, also
     /// on the drain after the first `Ok` (1044-B1). One attempt budget bounds
-    /// the waits and the POST of a broadcast attempt. Each HTTP attempt checks
-    /// `duties_watch` when it starts: after each wait and before a retry
-    /// (Harper B2). After the watch moves, an error of an attempt, also a
+    /// the waits and the POST of a broadcast attempt. The send gate of each
+    /// HTTP attempt checks `duties_watch` and the admission stamp of the node
+    /// when the attempt starts: after each wait and before a retry (Harper B2,
+    /// 1044-B4). After the gate fails, an error of the attempt, also a
     /// timeout, is [`BeaconError::RevokedInFlight`] and adds no health sample
-    /// (1044-B2). The call has the same rule, also when an earlier node or a
-    /// higher node index gave a different error.
+    /// (1044-B2). The call maps an error after a move of `duties_watch` in the
+    /// same way, also when an earlier node or a higher node index gave a
+    /// different error.
+    ///
+    /// Thus `RevokedInFlight` has two causes: a move of `duties_watch`, or a
+    /// move of the admission stamp of the node while `duties_watch` holds. An
+    /// `Ok` stays `Ok` while the stamp of its node holds (D7, RSA N4).
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -5072,9 +5078,24 @@ impl AttestationApi for BnManager {
         const OP: &str = "submit_beacon_committee_subscriptions";
         let broadcast = self.broadcast_topics.subscriptions;
         let budget = self.op_timeout(|t| t.preparation);
-        let payload = Arc::new((subscriptions.to_vec(), duties_watch.clone()));
+        let subscriptions = Arc::new(subscriptions.to_vec());
         let attempt = |client: &BeaconClient| {
-            let (client, payload) = (client.clone(), Arc::clone(&payload));
+            let index = self.clients.iter().position(|node| std::ptr::eq(node, client));
+            let stamp = self.admission_stamp(index.unwrap_or(usize::MAX));
+            let (admitted, generations) =
+                (Arc::clone(&self.admitted), Arc::clone(&self.admission_generation));
+            let (locks, watch) = (Arc::clone(&self.admission_gate), duties_watch.clone());
+            // 1044-B4: the send gate reads the duty watch and the stamp of the node
+            // under the admission lock of the node. `revoke_at` moves the stamp and
+            // then the duty generation under that lock, so one check sees both moves
+            // or neither. The lock is held only for this synchronous check.
+            let gate = move || {
+                let _lock = locks
+                    .get(stamp.index)
+                    .map(|lock| lock.lock().unwrap_or_else(|err| err.into_inner()));
+                watch.holds() && crate::admission::stamp_still_holds(&admitted, &generations, stamp)
+            };
+            let (client, subscriptions) = (client.clone(), Arc::clone(&subscriptions));
             let permits = Arc::clone(&self.subscription_attempts);
             let node_permits = self.inflight.semaphore(client.endpoint()).filter(|_| broadcast);
             #[cfg(test)]
@@ -5092,13 +5113,11 @@ impl AttestationApi for BnManager {
                         }
                         None => None,
                     };
-                    client
-                        .submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1)
-                        .await
+                    client.submit_beacon_committee_subscriptions_gated(&subscriptions, &gate).await
                 })
                 .await;
                 match sent {
-                    Err(_) if !payload.1.holds() => Err(BeaconError::RevokedInFlight),
+                    Err(_) if !gate() => Err(BeaconError::RevokedInFlight),
                     sent => sent,
                 }
             }) as BoxFut<'static, ()>

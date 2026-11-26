@@ -1692,23 +1692,34 @@ impl BeaconClient {
     }
 
     /// [`Self::submit_beacon_committee_subscriptions`] for duties read while
-    /// `duties_watch` held. Each HTTP attempt, also a retry, starts only while
-    /// the watch holds. Else the result is [`BeaconError::RevokedInFlight`].
-    /// An error after the watch moves is also `RevokedInFlight`. An `Ok`
-    /// stays `Ok`. The POST follows no redirect: a 3xx answer is an
-    /// [`BeaconError::ApiError`].
+    /// `duties_watch` held: [`Self::submit_beacon_committee_subscriptions_gated`]
+    /// with the watch as the send gate.
     pub async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
+        self.submit_beacon_committee_subscriptions_gated(subscriptions, &|| duties_watch.holds())
+            .await
+    }
+
+    /// [`Self::submit_beacon_committee_subscriptions`] with a send gate. Each
+    /// HTTP attempt, also a retry, starts only while `gate` holds. Else the
+    /// result is [`BeaconError::RevokedInFlight`]. An error after `gate` fails
+    /// is also `RevokedInFlight`. An `Ok` stays `Ok`. The POST follows no
+    /// redirect: a 3xx response is an [`BeaconError::ApiError`].
+    pub async fn submit_beacon_committee_subscriptions_gated(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+        gate: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), BeaconError> {
         let path = "/eth/v1/validator/beacon_committee_subscriptions";
-        self.post_empty_gated(&self.fenced_client, path, &subscriptions, &[], duties_watch)
+        self.post_empty_gated(&self.fenced_client, path, &subscriptions, &[], Some(gate))
             .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
             .map_err(|err| match err {
                 BeaconError::RevokedInFlight => err,
-                err if duties_watch.holds() => err,
+                err if gate() => err,
                 err => {
                     warn!(
                         bn_url = %RedactedUrl(self.endpoint()),
@@ -1939,7 +1950,7 @@ impl BeaconClient {
         body: &B,
         headers: &[(&str, &str)],
     ) -> Result<(), BeaconError> {
-        self.post_empty_gated(&self.client, path, body, headers, &DutyFence::open()).await
+        self.post_empty_gated(&self.client, path, body, headers, None).await
     }
 
     /// [`Self::post_empty_with_headers`] on `http` that starts each HTTP
@@ -1950,7 +1961,7 @@ impl BeaconClient {
         path: &str,
         body: &B,
         headers: &[(&str, &str)],
-        gate: &DutyFence,
+        gate: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<(), BeaconError> {
         let url = self.resolve_url(path)?;
 
@@ -2010,19 +2021,18 @@ impl BeaconClient {
         H: Fn(reqwest::Response) -> HFut,
         HFut: std::future::Future<Output = Result<T, BeaconError>>,
     {
-        self.execute_with_retry_gated(http_method, url, &DutyFence::open(), request_fn, on_response)
-            .await
+        self.execute_with_retry_gated(http_method, url, None, request_fn, on_response).await
     }
 
     /// [`Self::execute_with_retry_raw`] that starts each HTTP attempt, also
-    /// each retry, only while `gate` holds. After `gate` moves, no attempt
-    /// starts, and the result is [`BeaconError::RevokedInFlight`]. An open
-    /// gate always holds.
+    /// each retry, only while `gate` holds. After `gate` fails, no attempt
+    /// starts, and the result is [`BeaconError::RevokedInFlight`]. `None` is
+    /// the open gate of a call with no watch.
     async fn execute_with_retry_gated<F, Fut, H, HFut, T>(
         &self,
         http_method: &str,
         url: &str,
-        gate: &DutyFence,
+        gate: Option<&(dyn Fn() -> bool + Sync)>,
         request_fn: F,
         on_response: H,
     ) -> Result<T, BeaconError>
@@ -2056,7 +2066,7 @@ impl BeaconClient {
             }
 
             // The gate check comes after each wait, just before the request.
-            if !gate.holds() {
+            if gate.is_some_and(|holds| !holds()) {
                 warn!(
                     endpoint = %RedactedUrl(endpoint),
                     attempt,
