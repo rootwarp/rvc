@@ -3556,7 +3556,10 @@ mod tests {
 
     /// Hand mutants E6 to E12 (RSA R1): one function builds the shared client
     /// and the fenced subscription client. The two clients must have the same
-    /// settings. Only the redirect policy may be different.
+    /// settings. Only the redirect policy may be different. A source check
+    /// covers the settings that `Debug` does not show: the builder sets only
+    /// the timeout and the redirect policy, and both calls give it the same
+    /// config (self-check F8, E21).
     #[tokio::test]
     async fn the_subscription_client_differs_from_the_shared_client_only_in_redirects() {
         let client = BeaconClient::new(BeaconClientConfig::new("http://127.0.0.1:9"))
@@ -3572,8 +3575,18 @@ mod tests {
         let redirect = format!("{fenced:?}");
         assert!(redirect.contains("Policy(None)"), "The fenced client must follow no redirect.");
         assert_eq!(settings(fenced), settings(shared), "The clients must have the same settings.");
-        let builders = include_str!("client.rs").matches(concat!("Client", "::builder()")).count();
+        let source = include_str!("client.rs");
+        let builders = source.matches(concat!("Client", "::builder()")).count();
         assert_eq!(builders, 1, "One function must build both reqwest clients.");
+        let body = source.split(concat!("Client", "::builder()")).nth(1).unwrap_or_default();
+        let in_builder: Vec<&str> =
+            body.split(".build()").next().unwrap_or_default().split_whitespace().collect();
+        let only = [".timeout(config.timeout)", ".redirect(redirect)"];
+        assert_eq!(in_builder, only, "The builder must set only these settings.");
+        for policy in ["default", "none"] {
+            let call = format!("http_client(&config, reqwest::redirect::Policy::{policy}())?");
+            assert_eq!(source.matches(&call).count(), 1, "Both calls must give the same config.");
+        }
     }
 
     /// 1044-B3 (RSA R1): the fenced POST logs only the HTTP status and the
