@@ -430,10 +430,13 @@ impl SigningGate {
             signing_root,
             self.sign_timeout,
             duty,
+            None,
         )
         .await
         {
             Ok(sig) => Ok(sig.to_bytes().to_vec()),
+            // The gate passes no start gate, so the core does not return these.
+            Err(NonSlashableFailure::Refused(e)) => Err(e),
             Err(NonSlashableFailure::Blocked) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),

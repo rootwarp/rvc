@@ -94,6 +94,42 @@ pub enum NonSlashableFailure {
     Backend(SigningError),
     /// [`SigningEnablement::is_signing_enabled`] returned `false`.
     Blocked,
+    /// The sign-start gate refused just before the backend call. The backend
+    /// was not called.
+    Refused(SigningGateError),
+}
+
+/// The sign-start gate: the checks just before the backend call.
+///
+/// The store gate runs first, then the beacon admission. The store gate reads
+/// the validator store under its state lock, and the admission check reads the
+/// generation atomics. A store disable and an admission revoke write the same
+/// state. The check and the backend call have no await between them, and the
+/// check holds no lock after it returns.
+///
+/// Only `SignerService` has one. `SigningGate` (signer-server) passes none.
+pub(crate) struct StartGate<'a> {
+    /// The store gate of the service.
+    pub(crate) store: &'a crate::StoreGate,
+    /// The admission of the caller task.
+    pub(crate) admission: &'a crate::CapturedAdmission,
+}
+
+impl StartGate<'_> {
+    /// The refusal for `duty`, or `None` when the sign can start.
+    pub(crate) fn refusal(
+        &self,
+        pubkey: &[u8; 48],
+        duty: doppelganger::SigningDuty,
+    ) -> Option<SigningGateError> {
+        if !(self.store)(pubkey, duty) {
+            Some(SigningGateError::BlockedByDoppelganger)
+        } else if crate::admission_revoked_by(self.admission, duty) {
+            Some(SigningGateError::BeaconAdmissionRevoked)
+        } else {
+            None
+        }
+    }
 }
 
 /// Shared non-slashable signing flow: enablement → BLS sign with timeout.
@@ -123,6 +159,9 @@ pub enum NonSlashableFailure {
 /// already started, including a request already sent to a remote signer, still
 /// finishes inside the timeout.
 ///
+/// For `SignerService`, the store gate and the beacon admission have a
+/// different boundary, the [`StartGate`] just before the backend call.
+///
 /// [`signing_allowed`]: doppelganger::signing_allowed
 pub(crate) async fn sign_nonslashable_core(
     enablement: &dyn SigningEnablement,
@@ -131,6 +170,7 @@ pub(crate) async fn sign_nonslashable_core(
     signing_root: Root,
     sign_timeout: Duration,
     duty: doppelganger::SigningDuty,
+    gate: Option<StartGate<'_>>,
 ) -> Result<Signature, NonSlashableFailure> {
     #[cfg(any(test, feature = "test-utils"))]
     {
@@ -141,28 +181,32 @@ pub(crate) async fn sign_nonslashable_core(
             signing_root,
             sign_timeout,
             duty,
+            gate,
             None,
         )
         .await;
     }
     #[cfg(not(any(test, feature = "test-utils")))]
     {
-        sign_nonslashable_inner(enablement, signer, pubkey, signing_root, sign_timeout, duty).await
+        sign_nonslashable_inner(enablement, signer, pubkey, signing_root, sign_timeout, duty, gate)
+            .await
     }
 }
 
 /// Same flow as [`sign_nonslashable_core`], parking after the enablement check.
 ///
-/// The barrier is the accepted gap after admission and before the backend runs.
+/// The barrier is after the doppelganger check and before the [`StartGate`].
 /// Test builds only.
 #[cfg(any(test, feature = "test-utils"))]
-pub async fn sign_nonslashable_core_paused(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sign_nonslashable_core_paused(
     enablement: &dyn SigningEnablement,
     signer: &dyn Signer,
     pubkey: &PublicKey,
     signing_root: Root,
     sign_timeout: Duration,
     duty: doppelganger::SigningDuty,
+    gate: Option<StartGate<'_>>,
     after_check: Option<Arc<dyn PreReserveBarrier>>,
 ) -> Result<Signature, NonSlashableFailure> {
     sign_nonslashable_inner(
@@ -172,11 +216,13 @@ pub async fn sign_nonslashable_core_paused(
         signing_root,
         sign_timeout,
         duty,
+        gate,
         after_check,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sign_nonslashable_inner(
     enablement: &dyn SigningEnablement,
     signer: &dyn Signer,
@@ -184,6 +230,7 @@ async fn sign_nonslashable_inner(
     signing_root: Root,
     sign_timeout: Duration,
     duty: doppelganger::SigningDuty,
+    gate: Option<StartGate<'_>>,
     #[cfg(any(test, feature = "test-utils"))] after_check: Option<Arc<dyn PreReserveBarrier>>,
 ) -> Result<Signature, NonSlashableFailure> {
     // `duty` is matched exhaustively in `signing_allowed`. Only
@@ -198,6 +245,11 @@ async fn sign_nonslashable_inner(
     }
 
     let pubkey_bytes = pubkey.to_bytes();
+    // There is no await between this check and the backend call below.
+    let check = || gate.as_ref().and_then(|gate| gate.refusal(&pubkey_bytes, duty));
+    if let Some(refusal) = check() {
+        return Err(NonSlashableFailure::Refused(refusal));
+    }
     let sign_result =
         tokio::time::timeout(sign_timeout, signer.sign(&signing_root, &pubkey_bytes)).await;
 

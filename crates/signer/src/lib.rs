@@ -904,8 +904,8 @@ impl SignerService {
 
     /// Park after the non-slashable enablement check and before the backend.
     ///
-    /// That is the accepted window: the check has admitted the sign, and the
-    /// backend has not run. `None` clears it.
+    /// The entry and doppelganger checks have admitted the sign, and the
+    /// sign-start gate and the backend have not run. `None` clears it.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_nonslashable_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
         *self.nonslashable_barrier.lock() = barrier;
@@ -1189,6 +1189,8 @@ impl SignerService {
         signing_root: Root,
         duty: SigningDuty,
     ) -> Result<Signature, NonSlashableFailure> {
+        let admission = capture_admission();
+        let gate = Some(core::StartGate { store: &self.store_gate, admission: &admission });
         #[cfg(any(test, feature = "test-utils"))]
         {
             return core::sign_nonslashable_core_paused(
@@ -1198,6 +1200,7 @@ impl SignerService {
                 signing_root,
                 self.sign_timeout,
                 duty,
+                gate,
                 self.nonslashable_barrier(),
             )
             .await;
@@ -1211,6 +1214,7 @@ impl SignerService {
                 signing_root,
                 self.sign_timeout,
                 duty,
+                gate,
             )
             .await
         }
@@ -1255,6 +1259,15 @@ impl SignerService {
                 Ok(sig)
             }
             Err(NonSlashableFailure::Blocked) => Err(SignerError::BlockedByDoppelganger),
+            Err(NonSlashableFailure::Refused(e)) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    signing_type = op_name,
+                    error = %e,
+                    "SignerService: sign refused just before the backend call"
+                );
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
             Err(NonSlashableFailure::TimedOut { after }) => {
                 error!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
