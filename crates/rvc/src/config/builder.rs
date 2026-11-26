@@ -2884,6 +2884,47 @@ mod tests {
         );
     }
 
+    /// W4-E8b-signer (#881): the signer of `build_signer` reads the `enabled`
+    /// flag of the store that `build_validator_store` of the same builder
+    /// builds. A voluntary exit does not read it.
+    #[tokio::test]
+    async fn build_signer_reads_the_enabled_flag_of_the_built_store() {
+        let sk = crypto::SecretKey::generate();
+        let pubkey = sk.public_key();
+        let (gvr, schedule) = ([0x5a; 32], ForkSchedule::unscheduled_gloas());
+        let builder = ServiceBuilder::new(create_minimal_config());
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let open: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let (signer, _registry) = builder.build_signer(composite_with(vec![sk]), db, open);
+        let proof = || {
+            signer::with_beacon_admission(
+                signer::BeaconAdmission::unbound(),
+                signer.sign_selection_proof(5, &pubkey, &schedule, &gvr),
+            )
+        };
+        proof().await.expect("with no built store, the store gate must stay open");
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let toml = "[defaults]\nfee_recipient = \"0x00000000000000000000000000000000000000aa\"\n";
+        std::fs::write(&config_path, toml).unwrap();
+        let store = builder.build_validator_store(Some(&config_path)).unwrap();
+        store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes())).unwrap();
+        proof().await.expect("an enabled key in the built store must sign");
+
+        store.set_enabled(&pubkey.to_bytes(), false);
+        let refused = proof().await;
+        assert!(
+            matches!(refused, Err(signer::SignerError::BlockedByDoppelganger)),
+            "a disabled key in the built store must not sign, got {refused:?}"
+        );
+        let exit = eth_types::VoluntaryExit { epoch: 1, validator_index: 1 };
+        signer
+            .sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr)
+            .await
+            .expect("the store gate must not refuse a voluntary exit");
+    }
+
     /// Production builder service over `keys` signable builder keys and the two batch knobs.
     fn builder_service_with_knobs(
         keys: usize,
