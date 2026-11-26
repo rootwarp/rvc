@@ -261,15 +261,8 @@ impl BeaconClient {
             )));
         }
 
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
-        let fenced_client = Client::builder()
-            .timeout(config.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
+        let client = Self::http_client(&config, reqwest::redirect::Policy::default())?;
+        let fenced_client = Self::http_client(&config, reqwest::redirect::Policy::none())?;
 
         let config = BeaconClientConfig { endpoint: endpoint.to_string(), ..config };
 
@@ -280,6 +273,19 @@ impl BeaconClient {
             node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
             admission_generation: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Builds a reqwest client. The shared client and the fenced client use
+    /// these settings, and only `redirect` is different (RSA R1, E6 to E12).
+    fn http_client(
+        config: &BeaconClientConfig,
+        redirect: reqwest::redirect::Policy,
+    ) -> Result<Client, BeaconError> {
+        Client::builder()
+            .timeout(config.timeout)
+            .redirect(redirect)
+            .build()
+            .map_err(|e| BeaconError::HttpError(e.to_string()))
     }
 
     /// Install a holding duty-fence generation on this client.
