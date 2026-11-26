@@ -10155,8 +10155,8 @@ mod tests {
         let calls = with_op_timeout_calls(production);
         assert_eq!(
             calls.len(),
-            12,
-            "expected the broadcast arm, query_best, query_failover, and nine broadcast wrappers"
+            13,
+            "The production code must have 13 calls: the broadcast arm, query_best, query_failover, nine broadcast wrappers and the fenced subscription broadcast."
         );
         for call in &calls {
             assert!(
