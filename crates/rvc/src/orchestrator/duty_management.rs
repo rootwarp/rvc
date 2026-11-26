@@ -2044,8 +2044,15 @@ mod tests {
             let slashing_db = Arc::new(
                 SlashingDb::open_in_memory().expect("The in-memory slashing database must open."),
             );
+            // The store gate of `build_signer` (PR #1046). The signer reads the
+            // store just before each backend call and again after it.
+            let store = Arc::clone(&validator_store);
             let signer = Arc::new(
-                SignerService::new(composite, slashing_db).with_enablement(always_enabled()),
+                SignerService::new(composite, slashing_db)
+                    .with_enablement(always_enabled())
+                    .with_store_gate(Arc::new(move |pubkey: &[u8; 48], _: signer::SigningDuty| {
+                        store.is_signing_enabled(pubkey)
+                    })),
             );
             let keys = pubkeys.iter().map(|pubkey| pubkey.to_bytes()).collect();
             let pubkey_map = pubkeys.into_iter().map(|pubkey| (pubkey.to_bytes(), pubkey));
