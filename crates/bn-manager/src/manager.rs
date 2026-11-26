@@ -13303,4 +13303,60 @@ mod tests {
         let free = manager.subscription_attempts.available_permits();
         assert_eq!(free, 8, "Each node attempt must release its permit.");
     }
+
+    /// 1044-B2 (RSA R1): node A and node B have the submission role, and each
+    /// one holds the POST. The duty watch moves after both POSTs start. Then
+    /// each attempt gets to its timeout. For a broadcast and for
+    /// `query_first`, the call must return `RevokedInFlight`, and no node may
+    /// get an error sample for a timeout after the move.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subscription_timeout_after_a_revocation_adds_no_error_sample() {
+        use std::collections::HashSet;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let nodes = futures::future::join_all((0..2).map(|_| MockServer::start())).await;
+        for node in &nodes {
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                .mount(node)
+                .await;
+        }
+        for broadcast in [true, false] {
+            let mut endpoints: Vec<String> = nodes.iter().map(MockServer::uri).collect();
+            endpoints.push("http://127.0.0.1:9".to_string());
+            let mut config = BnManagerConfig::new(endpoints);
+            let send = HashSet::from([BnRole::Submission]);
+            config.roles = vec![send.clone(), send, HashSet::from([BnRole::Aggregation])];
+            config.broadcast_topics.subscriptions = broadcast;
+            let preparation = Duration::from_millis(200);
+            let manager = BnManager::new(config)
+                .expect("The beacon node manager must start.")
+                .with_operation_timeouts(OperationTimeouts { preparation, ..Default::default() });
+            let watch = BeaconNodeClient::revocation_watch(&manager);
+            let applied = fan_out::health_samples_applied();
+
+            let subs = [committee_subscription()];
+            let mut call = manager.submit_beacon_committee_subscriptions_fenced(&subs, &watch);
+            assert!(futures::poll!(call.as_mut()).is_pending(), "The POSTs must wait.");
+            manager.revoke_admission(2);
+            let outcome = call.await;
+            if broadcast {
+                fan_out::wait_until_health_applied(applied + 2).await;
+            }
+
+            assert!(
+                matches!(outcome, Err(BeaconError::RevokedInFlight)),
+                "After the move, the call must return RevokedInFlight (broadcast {broadcast}): {outcome:?}"
+            );
+            let errors: Vec<f64> =
+                manager.health_scores().await.iter().map(|score| score.error_rate).collect();
+            assert_eq!(
+                errors,
+                [0.0, 0.0, 0.0],
+                "A timeout after the move must add no error sample (broadcast {broadcast})."
+            );
+        }
+    }
 }
