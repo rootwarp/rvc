@@ -3505,6 +3505,28 @@ mod tests {
         assert_eq!(to_b.len(), 1, "The call with no watch must send one POST to node B.");
     }
 
+    /// Hand mutants E6 to E12 (RSA R1): one function builds the shared client
+    /// and the fenced subscription client. The two clients must have the same
+    /// settings. Only the redirect policy may be different.
+    #[tokio::test]
+    async fn the_subscription_client_differs_from_the_shared_client_only_in_redirects() {
+        let client = BeaconClient::new(BeaconClientConfig::new("http://127.0.0.1:9"))
+            .expect("The client must start.");
+        let settings = |http: &Client| {
+            let shown = format!("{http:?}");
+            let kept: Vec<&str> =
+                shown.split(", ").filter(|field| !field.starts_with("redirect_policy")).collect();
+            kept.join(", ")
+        };
+
+        let (fenced, shared) = (&client.fenced_client, &client.client);
+        let redirect = format!("{fenced:?}");
+        assert!(redirect.contains("Policy(None)"), "The fenced client must follow no redirect.");
+        assert_eq!(settings(fenced), settings(shared), "The clients must have the same settings.");
+        let builders = include_str!("client.rs").matches(concat!("Client", "::builder()")).count();
+        assert_eq!(builders, 1, "One function must build both reqwest clients.");
+    }
+
     /// 1044-B3 (RSA R1): the fenced POST logs only the HTTP status and the
     /// error class. The test records the log lines, with the fields of their
     /// spans, of four fenced calls:
