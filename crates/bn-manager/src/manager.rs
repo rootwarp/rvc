@@ -5089,7 +5089,7 @@ impl AttestationApi for BnManager {
             // 1044-B4: the send gate reads the duty watch and the stamp of the node
             // under the admission lock of the node. `revoke_at` moves the stamp and
             // then the duty generation under that lock, so one check sees both moves
-            // or neither. The lock is held only for this synchronous check.
+            // or no move. The lock is held only for this synchronous check.
             let gate = move || {
                 let _lock = locks
                     .get(stamp.index)
