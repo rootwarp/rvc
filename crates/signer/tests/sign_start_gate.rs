@@ -72,6 +72,18 @@ impl Park {
     }
 }
 
+/// Disables the key just after the start check, before the backend call.
+struct DisableAfterStartCheck(Arc<Record>);
+
+#[async_trait]
+impl PreReserveBarrier for DisableAfterStartCheck {
+    async fn wait(&self) {}
+
+    fn after_start_check(&self) {
+        self.0.set_store(false);
+    }
+}
+
 /// One entry of the event record: a store check of a duty (`Check`), a change
 /// of the test (`Disable`, `Enable`, `Revoke`), or the start or the end of a
 /// backend call (`Start`, `End`).
@@ -501,4 +513,38 @@ async fn with_no_store_gate_a_revocation_during_the_backend_sign_gets_a_block() 
     fx.record_is(&[Start, Revoke, End], "With no store gate, the backend must sign.");
     let reserved = reserved_block_row().await;
     assert_eq!(fx.block_rows(), reserved, "The signed block must keep its row.");
+}
+
+/// The start boundary (D1, D2): the store disables the key just after the
+/// start check. This is a change during the backend call. The backend gets
+/// the call, and the check after the backend returns drops the signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_disabled_just_after_the_start_check_gets_no_selection_proof() {
+    let fx = Fixture::new();
+    let hook = DisableAfterStartCheck(Arc::clone(&fx.record));
+    fx.service.set_nonslashable_barrier(Some(Arc::new(hook)));
+    let result = join(fx.selection_proof()).await;
+
+    fx.record_is(&[Check(PROOF), Disable, Start, End, Check(PROOF)], "The backend must sign.");
+    assert!(
+        matches!(result, Err(SignerError::BlockedByDoppelganger)),
+        "The caller must get the store refusal and no signature. The result was {result:?}."
+    );
+}
+
+/// The documented limit (D2): the check after the backend returns reads the
+/// store flag at that time. A disable and an enable before the backend
+/// returns do not drop the signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_disabled_and_enabled_during_the_backend_sign_gets_a_selection_proof() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let flip = || [false, true].into_iter().for_each(|enabled| fx.set_store(enabled));
+    let result = park.change_then_join(fx.selection_proof(), flip).await;
+
+    fx.record_is(
+        &[Check(PROOF), Start, Disable, Enable, End, Check(PROOF)],
+        "The check after the backend returns must read the store flag at that time.",
+    );
+    assert!(result.is_ok(), "The caller must get the signature. The result was {result:?}.");
 }

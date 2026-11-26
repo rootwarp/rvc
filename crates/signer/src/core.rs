@@ -205,7 +205,7 @@ pub(crate) async fn sign_nonslashable_core(
 /// Same flow as [`sign_nonslashable_core`], parking after the enablement check.
 ///
 /// The barrier is after the doppelganger check and before the [`StartGate`].
-/// Test builds only.
+/// Its `after_start_check` runs just after the [`StartGate`]. Test builds only.
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sign_nonslashable_core_paused(
@@ -249,7 +249,7 @@ async fn sign_nonslashable_inner(
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    if let Some(barrier) = after_check {
+    if let Some(barrier) = &after_check {
         barrier.wait().await;
     }
 
@@ -258,6 +258,10 @@ async fn sign_nonslashable_inner(
     let check = || gate.as_ref().and_then(|gate| gate.refusal(&pubkey_bytes, duty));
     if let Some(refusal) = check() {
         return Err(NonSlashableFailure::Refused(refusal));
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(barrier) = &after_check {
+        barrier.after_start_check();
     }
     let sign_result =
         tokio::time::timeout(sign_timeout, signer.sign(&signing_root, &pubkey_bytes)).await;
@@ -1116,6 +1120,10 @@ pub struct SignSlashableRequest<'a> {
 pub trait PreReserveBarrier: Send + Sync {
     /// Called while the slashable per-pubkey lock is held.
     async fn wait(&self);
+
+    /// Non-slashable only: called on the sign task just after the sign-start
+    /// check and before the backend call, with no await between them.
+    fn after_start_check(&self) {}
 }
 
 /// Shared slashable-signing core.
