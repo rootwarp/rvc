@@ -13090,7 +13090,7 @@ mod tests {
 
     /// Harper B2 (#1043 R1): with the subscriptions topic off, the call asks
     /// one node at a time. The first node that gets the POST loses its
-    /// admission while it answers, and the duty watch moves. The call must not
+    /// admission in its response, and the duty watch moves. The call must not
     /// start a POST on the next node, and it must return `RevokedInFlight`.
     #[tokio::test(flavor = "current_thread")]
     async fn a_query_first_subscription_fallback_does_not_post_after_a_revocation() {
@@ -13099,7 +13099,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-        /// Counts the POST, revokes its own node, and then answers 200.
+        /// Counts the POST, revokes its own node, and then sends a 200 response.
         struct RevokeOnPost {
             manager: Arc<OnceLock<Arc<BnManager>>>,
             index: usize,
@@ -13132,7 +13132,7 @@ mod tests {
         config.broadcast_topics.subscriptions = false;
         let manager =
             Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
-        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The responders must get the manager.");
+        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The mock nodes must get the manager.");
         let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
 
         let outcome = manager
@@ -13151,10 +13151,10 @@ mod tests {
     }
 
     /// Self-check S6 (#1043): with the subscriptions topic off, the call asks
-    /// one node at a time, and each node answers 503. While the duty watch
-    /// holds, the call returns the 503. In the second call, the first node
-    /// answers 503 while the watch holds. Then the second node moves the watch
-    /// in its answer: it revokes node D, which has no submission role. The
+    /// one node at a time, and each node sends a 503 response. While the duty
+    /// watch holds, the call returns the 503. In the second call, the first
+    /// node sends a 503 while the watch holds. Then the second node moves the
+    /// watch in its response: it revokes node D, which has no submission role. The
     /// third node must get no POST, and the call must return
     /// `RevokedInFlight`, not the earlier 503 (self-check A1).
     #[tokio::test(flavor = "current_thread")]
@@ -13165,7 +13165,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-        /// Counts the POST, revokes node D at POST 5, then answers 503.
+        /// Counts the POST, revokes node D at POST 5, then sends a 503 response.
         struct UnavailableThenRevoke {
             manager: Arc<OnceLock<Arc<BnManager>>>,
             posts: Arc<AtomicUsize>,
@@ -13206,7 +13206,7 @@ mod tests {
         config.broadcast_topics.subscriptions = false;
         let manager =
             Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
-        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The responders must get the manager.");
+        assert!(cell.set(Arc::clone(&manager)).is_ok(), "The mock nodes must get the manager.");
         let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
         let subscriptions = [committee_subscription()];
 
@@ -13241,7 +13241,7 @@ mod tests {
     /// Self-check S6 (#1043): node A has the submission and proposal roles,
     /// node B has the submission role, and node C has the aggregation role.
     /// Four held broadcasts take the four permits of node A, and the
-    /// subscription attempt of node A waits. Node B answers 503 while the
+    /// subscription attempt of node A waits. Node B sends a 503 while the
     /// duty watch holds. Then the test revokes node C, and node A gets its
     /// permit after the move. Each attempt fails. The call must return
     /// `RevokedInFlight`, not the 503 of the highest node index (self-check
@@ -13300,11 +13300,11 @@ mod tests {
         );
     }
 
-    /// Self-check S4 (#1043): node A answers immediately, and node B answers
-    /// each POST after 300 ms. The test sends 16 chunks at the same time. That is
-    /// more than the limit of 8 subscription attempts. Each chunk must return
-    /// `Ok`, and each node must get each POST. The peak number of active and
-    /// queued subscription attempts must be at most 8.
+    /// Self-check S4 (#1043): node A sends its response immediately, and node B
+    /// sends each response after 300 ms. The test sends 16 chunks at the same
+    /// time: more than the limit of 8 subscription attempts. Each chunk must
+    /// return `Ok`, and each node must get each POST. The maximum number of
+    /// active and queued subscription attempts must be 8.
     #[tokio::test(flavor = "current_thread")]
     async fn subscription_attempts_with_a_slow_node_stay_at_the_limit() {
         use wiremock::matchers::{method, path};
@@ -13339,7 +13339,7 @@ mod tests {
             assert_eq!(posts.len(), chunks, "Each node must get the POST of each chunk.");
         }
         let peak = manager.subscription_gauge.peak.load(Ordering::SeqCst);
-        assert!(peak <= limit, "The peak of active and queued attempts must be at most 8: {peak}");
+        assert!(peak <= limit, "Active and queued attempts must be 8 or less: {peak}");
         assert_eq!(peak, limit, "The 16 chunks must use all 8 attempt permits.");
         let live = manager.subscription_gauge.live.load(Ordering::SeqCst);
         assert_eq!(live, 0, "Each subscription attempt must end.");
@@ -13437,5 +13437,87 @@ mod tests {
                 "A timeout after the move must add no error sample (broadcast {broadcast})."
             );
         }
+    }
+
+    /// Hand mutants E1 to E5 (RSA R1). The subscriptions topic is off. The
+    /// test does four steps:
+    /// - The test holds the 8 subscription permits. A genesis query must not
+    ///   wait for them.
+    /// - A chunk waits for a free permit, and node B loses its admission. The
+    ///   chunk must send no POST, and it must release its permit.
+    /// - A chunk waits for the node selection, and node C loses its
+    ///   admission. The chunk must send no POST.
+    /// - The caller drops a call during its POST. The call must release its
+    ///   permit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subscription_attempt_checks_the_watch_after_each_wait() {
+        use std::collections::HashSet;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let node = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&node)
+            .await;
+        let genesis = serde_json::json!({ "data": {
+            "genesis_time": "1606824023",
+            "genesis_validators_root": format!("0x{}", "11".repeat(32)),
+            "genesis_fork_version": "0x00000000",
+        }});
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(genesis))
+            .mount(&node)
+            .await;
+        let endpoints = [node.uri(), "http://127.0.0.1:9".into(), "http://127.0.0.1:19".into()];
+        let mut config = BnManagerConfig::new(endpoints.to_vec());
+        let aggregation = HashSet::from([BnRole::Aggregation]);
+        config.roles = vec![HashSet::from([BnRole::All]), aggregation.clone(), aggregation];
+        config.broadcast_topics.subscriptions = false;
+        let manager = BnManager::new(config).expect("The beacon node manager must start.");
+        let permits = Arc::clone(&manager.subscription_attempts);
+        let subs = [committee_subscription()];
+        let posts = || async {
+            let seen = node.received_requests().await.expect("The node must record its requests.");
+            seen.iter().filter(|request| request.url.path() == SUBSCRIPTIONS_PATH).count()
+        };
+
+        let held = permits.clone().acquire_many_owned(8).await;
+        let held = held.expect("The test must get the 8 permits.");
+        let genesis = tokio::time::timeout(Duration::from_secs(10), manager.get_genesis()).await;
+        assert!(matches!(genesis, Ok(Ok(_))), "A genesis query must not wait for a permit.");
+        let watch = BeaconNodeClient::revocation_watch(&manager);
+        let mut chunk = manager.submit_beacon_committee_subscriptions_fenced(&subs, &watch);
+        assert!(futures::poll!(chunk.as_mut()).is_pending(), "The chunk must wait for a permit.");
+        manager.revoke_admission(1);
+        drop(held);
+        let refused = chunk.await;
+        assert_eq!(posts().await, 0, "After a move in the permit wait, the chunk must not POST.");
+        assert!(
+            matches!(refused, Err(BeaconError::RevokedInFlight)),
+            "After a move in the permit wait, the chunk must return RevokedInFlight: {refused:?}"
+        );
+        assert_eq!(permits.available_permits(), 8, "The refused attempt must release its permit.");
+
+        let watch = BeaconNodeClient::revocation_watch(&manager);
+        let sync = manager.sync_statuses.write().await;
+        let mut chunk = manager.submit_beacon_committee_subscriptions_fenced(&subs, &watch);
+        assert!(futures::poll!(chunk.as_mut()).is_pending(), "The chunk must wait for a node.");
+        manager.revoke_admission(2);
+        drop(sync);
+        let refused = chunk.await;
+        assert_eq!(posts().await, 0, "After a move in the selection, the chunk must not POST.");
+        assert!(
+            matches!(refused, Err(BeaconError::RevokedInFlight)),
+            "After a move in the node selection, the chunk must return RevokedInFlight: {refused:?}"
+        );
+
+        let watch = BeaconNodeClient::revocation_watch(&manager);
+        let mut dropped = manager.submit_beacon_committee_subscriptions_fenced(&subs, &watch);
+        assert!(futures::poll!(dropped.as_mut()).is_pending(), "The POST must wait for the node.");
+        drop(dropped);
+        assert_eq!(permits.available_permits(), 8, "A dropped call must release its permit.");
     }
 }

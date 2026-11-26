@@ -3310,7 +3310,7 @@ mod tests {
         }
     }
 
-    /// Moves the generation, then gives its answer.
+    /// Moves the generation, then sends its response.
     struct MoveThen(Arc<AtomicU64>, wiremock::ResponseTemplate);
 
     impl wiremock::Respond for MoveThen {
@@ -3370,9 +3370,10 @@ mod tests {
         assert_eq!(posts().await, 2, "A call with no watch must send one POST.");
     }
 
-    /// RSA B2 (#1043 R1): the first subscription POST gets a 503. The duty
-    /// watch moves while the client waits for its retry (self-check A2). The
-    /// client must not send the retry, and it must return `RevokedInFlight`.
+    /// RSA B2 (#1043 R1) and E16 (RSA R1): the first subscription POST gets a
+    /// 429 response. The duty watch moves while the client waits for its retry
+    /// (self-check A2). The client must not send the retry, and it must return
+    /// `RevokedInFlight`.
     #[tokio::test(flavor = "current_thread")]
     async fn a_subscription_retry_does_not_post_after_a_revocation() {
         use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -3394,12 +3395,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(SUBSCRIPTIONS_PATH))
-            .respond_with(ResponseTemplate::new(503))
+            .respond_with(ResponseTemplate::new(429))
             .mount(&server)
             .await;
         let config = BeaconClientConfig::new(server.uri())
             .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(50));
+            .with_initial_backoff(Duration::from_millis(500));
         let client = BeaconClient::new(config).expect("The client must start.");
         let generation = Arc::new(AtomicU64::new(0));
         let watch = DutyFence::at(0, Arc::clone(&generation));
@@ -3426,8 +3427,8 @@ mod tests {
     }
 
     /// Self-check A1 (PR-A): the client has no retry. The node moves the duty
-    /// watch and answers 503. The call must return `RevokedInFlight`, not the
-    /// 503.
+    /// watch and sends a 503 response. The call must return `RevokedInFlight`,
+    /// not the 503. A 200 response after a move must stay `Ok` (D7, E14).
     #[tokio::test]
     async fn a_final_subscription_error_after_a_revocation_is_revoked_in_flight() {
         use wiremock::matchers::{method, path};
@@ -3454,14 +3455,29 @@ mod tests {
             matches!(outcome, Err(BeaconError::RevokedInFlight)),
             "After the move, the final 503 must be RevokedInFlight: {outcome:?}"
         );
+
+        let accepted = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(MoveThen(Arc::clone(&generation), ResponseTemplate::new(200)))
+            .mount(&accepted)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(accepted.uri()).with_max_retries(0))
+            .expect("The client must start.");
+        let watch = DutyFence::at(1, Arc::clone(&generation));
+        let sent = client
+            .submit_beacon_committee_subscriptions_fenced(&[committee_subscription()], &watch)
+            .await;
+        assert!(matches!(sent, Ok(())), "A POST sent before the move must keep its Ok: {sent:?}");
     }
 
-    /// Self-check S2 (#1043): node A moves the duty watch and answers 307
-    /// with the address of node B. The fenced POST must not follow the
-    /// redirect, and node B must get no POST. After the move, the result must
-    /// be `RevokedInFlight`. While a watch holds, the result is the 307
+    /// Self-check S2 (#1043): node A moves the duty watch and sends a 307
+    /// response to node B. The fenced POST must not follow the redirect, and
+    /// node B must get no POST. After the move, the result must be
+    /// `RevokedInFlight`. While a watch holds, the result is the 307
     /// (self-check A1). A call with no watch uses the shared client, and that
-    /// client still follows the redirect.
+    /// client follows the redirect. A 308 response must also stop the fenced
+    /// POST (E15, RSA R1).
     #[tokio::test]
     async fn a_fenced_subscription_post_does_not_follow_a_redirect() {
         use wiremock::matchers::{method, path};
@@ -3509,6 +3525,24 @@ mod tests {
         let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
         assert!(matches!(shared, Ok(())), "The shared client must follow the 307: {shared:?}");
         assert_eq!(to_b.len(), 1, "The call with no watch must send one POST to node B.");
+
+        let node_c = MockServer::start().await;
+        let permanent = ResponseTemplate::new(308).insert_header("location", target.as_str());
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(permanent)
+            .mount(&node_c)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(node_c.uri()).with_max_retries(0))
+            .expect("The client must start.");
+        let stopped =
+            client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &other_watch).await;
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert_eq!(to_b.len(), 1, "After a 308, node B must get no POST from the fenced call.");
+        assert!(
+            matches!(stopped, Err(BeaconError::ApiError { status: 308, .. })),
+            "The fenced call must return the 308: {stopped:?}"
+        );
     }
 
     /// Hand mutants E6 to E12 (RSA R1): one function builds the shared client
@@ -3544,7 +3578,8 @@ mod tests {
     /// - The endpoint has a password, and it is not a valid URL.
     ///
     /// No line may contain the payload, the response text or the password.
-    /// The errors must keep only the status and the error class.
+    /// The errors must keep only the status and the error class. A call with
+    /// no watch must keep at most 16 KiB of response text (E22, RSA R1).
     #[tokio::test(flavor = "current_thread")]
     #[tracing_test::traced_test]
     async fn a_fenced_subscription_post_logs_no_response_text_and_no_payload() {
@@ -3606,6 +3641,21 @@ mod tests {
         assert!(
             !logs_contain("424242"),
             "No line may contain the payload, the response text or the password."
+        );
+
+        let long = MockServer::start().await;
+        let text = ResponseTemplate::new(400).set_body_string("x".repeat(16 * 1024 + 1));
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(text)
+            .mount(&long)
+            .await;
+        let shared =
+            BeaconClient::new(BeaconClientConfig::new(long.uri())).expect("The client must start.");
+        let kept = shared.submit_beacon_committee_subscriptions(payload).await;
+        assert!(
+            matches!(&kept, Err(BeaconError::ApiError { status: 400, message }) if message.len() <= 16 * 1024),
+            "A call with no watch must keep at most 16 KiB of response text."
         );
     }
 }
