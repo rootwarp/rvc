@@ -3483,4 +3483,80 @@ mod tests {
         assert!(matches!(shared, Ok(())), "The shared client must follow the 307: {shared:?}");
         assert_eq!(to_b.len(), 1, "The call with no watch must send one POST to node B.");
     }
+
+    /// 1044-B3 (RSA R1): the fenced POST logs only the HTTP status and the
+    /// error class. The test records the log lines, with the fields of their
+    /// spans, of four fenced calls:
+    /// - The node moves the duty watch and sends a 400 response with text
+    ///   that contains the payload.
+    /// - The node sends a 503 response with that text, and the client has one
+    ///   retry.
+    /// - The endpoint has a password, and the node is not reachable.
+    /// - The endpoint has a password, and it is not a valid URL.
+    ///
+    /// No line may contain the payload, the response text or the password.
+    /// The errors must keep only the status and the error class.
+    #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
+    async fn a_fenced_subscription_post_logs_no_response_text_and_no_payload() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let text = "the node keeps validator 424242";
+        let generation = Arc::new(AtomicU64::new(0));
+        let rejected = MockServer::start().await;
+        let refusal = ResponseTemplate::new(400).set_body_string(text);
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(MoveThen(Arc::clone(&generation), refusal))
+            .mount(&rejected)
+            .await;
+        let unavailable = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(503).set_body_string(text))
+            .mount(&unavailable)
+            .await;
+        let payload = [BeaconCommitteeSubscription {
+            validator_index: "424242".to_string(),
+            ..committee_subscription()
+        }];
+        let payload = &payload;
+        let fenced = |endpoint: String, watch: DutyFence| async move {
+            let retry = BeaconClientConfig::new(endpoint).with_max_retries(1);
+            let config = retry.with_initial_backoff(Duration::from_millis(1));
+            let client = BeaconClient::new(config).expect("The client must start.");
+            client.submit_beacon_committee_subscriptions_fenced(payload, &watch).await
+        };
+
+        let moved = fenced(rejected.uri(), DutyFence::at(0, Arc::clone(&generation))).await;
+        let held = fenced(unavailable.uri(), DutyFence::open()).await;
+        let unreachable =
+            fenced("http://user:424242@127.0.0.1:9".to_string(), DutyFence::open()).await;
+        let invalid = fenced("http://user:424242@[::1".to_string(), DutyFence::open()).await;
+
+        assert!(
+            matches!(moved, Err(BeaconError::RevokedInFlight)),
+            "After the move, the 400 must be RevokedInFlight: {moved:?}"
+        );
+        assert!(
+            matches!(&held, Err(BeaconError::ApiError { status: 503, message }) if message.is_empty()),
+            "The fenced error must keep only the status: {held:?}"
+        );
+        assert!(
+            matches!(&unreachable, Err(BeaconError::HttpError(class)) if class == "transport error"),
+            "The fenced error must keep only the error class: {unreachable:?}"
+        );
+        assert!(
+            matches!(&invalid, Err(BeaconError::InvalidUrl(class)) if class == "endpoint"),
+            "The fenced error must not keep the endpoint: {invalid:?}"
+        );
+        assert!(logs_contain("duty watch moved"), "The test must record the fenced warn.");
+        assert!(logs_contain("retries exhausted"), "The test must record the retry log.");
+        assert!(logs_contain("total_attempts=2"), "The retry log must count 2 attempts.");
+        assert!(
+            !logs_contain("424242"),
+            "No line may contain the payload, the response text or the password."
+        );
+    }
 }
