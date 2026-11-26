@@ -2284,8 +2284,11 @@ mod tests {
 
     /// 2,000 duties make 4 chunks, and the second chunk gets a 503. The call
     /// also sends the other 3 chunks, and then it returns the 503. The retry
-    /// uses the cached proofs. The first and fourth chunks of the retry fail,
-    /// and the retry returns the first failure.
+    /// uses the cached proofs. It must send only the refused chunk, because
+    /// the beacon node accepted the other 3 chunks (self-check S5). The
+    /// retry gets a 500 and returns it. After an eviction, and again after a
+    /// move of the generation, a pass must send each chunk. The third chunk
+    /// of the pass after the eviction gets a 503.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn subscription_chunk_failure_tries_every_chunk_then_errs() {
         let answers = vec![
@@ -2326,17 +2329,97 @@ mod tests {
             (2_000, 0),
             "After the failed pass, the cache must hold 2,000 ready proofs and no proof in flight."
         );
-        assert_eq!(f.post_sizes().len(), 8, "The retry must send all 4 chunks again.");
-        f.assert_each_duty_once(&f.posts()[4..], "The 4 POSTs of the retry");
+        let mut resent = f.posts()[4..].concat();
+        resent.sort();
+        let mut refused_chunk = first_posts[1].clone();
+        refused_chunk.sort();
+        assert!(
+            resent == refused_chunk,
+            "The retry must send only the 512 duties of the refused chunk (self-check S5)."
+        );
         assert!(
             matches!(
                 &retry,
                 Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 500, message }))
                     if message == "first"
             ),
-            "The retry must return its first failure: {retry:?}"
+            "The retry must return the 500 of its POST: {retry:?}"
         );
-        assert_eq!(f.remote.started().len(), 2_000, "The retry must make no new sign request.");
+
+        f.service.evict_selection_proofs_before(SUBSCRIBED_EPOCH * SLOTS_PER_EPOCH);
+        let evicted = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        f.assert_each_duty_once(&f.posts()[5..], "After the eviction, the 4 POSTs");
+        assert!(
+            matches!(
+                &evicted,
+                Err(OrchestratorError::Beacon(beacon::BeaconError::ApiError { status: 503, message }))
+                    if message == "last"
+            ),
+            "After the eviction, the call must return the 503 of the third chunk: {evicted:?}"
+        );
+
+        f.admission.fetch_add(1, Ordering::SeqCst);
+        let fetch = f.service.duty_tracker.fetch_duties_for_epoch(SUBSCRIBED_EPOCH).await;
+        fetch.expect("The duty fetch after the move must return the duties.");
+        let moved = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        f.assert_each_duty_once(&f.posts()[9..], "After the move, the 4 POSTs");
+        assert!(matches!(moved, Ok(())), "After the move, the call must return Ok: {moved:?}");
+        assert_eq!(f.remote.started().len(), 2_000, "The retries must make no new sign request.");
+    }
+
+    /// Self-check S5 (#1043 R1): 8,193 duties make 17 chunks in 5 groups of
+    /// a maximum of 4, and each POST takes 2.9 s. The runner bound
+    /// `timeouts.duty_fetch` (10 s) stops the first pass of the subscription
+    /// step after the beacon node accepts 12 chunks. The next pass must send
+    /// only the other 2,049 subscriptions, in 5 chunks. Then the last chunk
+    /// gets to the beacon node, and a third pass sends no POST.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_runner_retry_sends_the_chunks_after_the_runner_bound() {
+        let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
+        let f = ManyKeys::with_mock(8_193, make_config(), Vec::new(), |mock| {
+            mock.with_method_delay(method, Duration::from_millis(2_900))
+        })
+        .await;
+        let ManyKeys { service, posts, .. } = f;
+        let service = Arc::new(service);
+        let runner = crate::orchestrator::epoch_boundary::EpochBoundaryRunner::new(
+            Arc::clone(&service),
+            Arc::new(signer::CircuitBreakerState::new(3, 5)),
+            Arc::clone(&service.duty_tracker),
+            service.config.timeouts.clone(),
+            None,
+            Arc::clone(&service.config.fork_schedule),
+            Arc::clone(&service.pubkey_map),
+            Arc::clone(&service.validator_store),
+            service.config.genesis_validators_root,
+        );
+        let sizes = |from: usize| -> Vec<usize> {
+            let mut sizes: Vec<usize> = posts.lock()[from..].iter().map(Vec::len).collect();
+            sizes.sort_unstable();
+            sizes
+        };
+
+        runner.run_pending(32).await;
+        assert_eq!(
+            sizes(0),
+            [512; 12],
+            "The runner bound must stop the first pass after 12 accepted chunks."
+        );
+        runner.run_pending(33).await;
+        assert_eq!(
+            sizes(12),
+            [1, 512, 512, 512, 512],
+            "The next pass must send only the other 2,049 subscriptions, in 5 chunks."
+        );
+        runner.run_pending(34).await;
+
+        let sent: Vec<(String, String)> = posts.lock().iter().flatten().cloned().collect();
+        let duties: std::collections::HashSet<&(String, String)> = sent.iter().collect();
+        assert_eq!(
+            (sent.len(), duties.len()),
+            (8_193, 8_193),
+            "After the third pass, the POSTs must contain each of the 8,193 duties one time."
+        );
     }
 
     /// The sign request of the first duty waits until the test releases it.
