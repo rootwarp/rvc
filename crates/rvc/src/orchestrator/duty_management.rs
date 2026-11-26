@@ -594,6 +594,21 @@ impl DutyManagementService {
         pubkeys.iter().filter(|pubkey| index_registry.index_of(pubkey).is_some()).count()
     }
 
+    /// The revocation watch of the beacon node. The runner reads it before
+    /// its first duty-cache check (self-check S1).
+    pub(crate) fn revocation_watch(&self) -> beacon::DutyFence {
+        self.beacon.revocation_watch()
+    }
+
+    /// [`Self::submit_committee_subscriptions_under`] with a watch that the
+    /// call reads first.
+    pub(crate) async fn submit_committee_subscriptions(
+        &self,
+        epoch: u64,
+    ) -> Result<(), OrchestratorError> {
+        self.submit_committee_subscriptions_under(epoch, &self.beacon.revocation_watch()).await
+    }
+
     /// Gets a selection proof for each local attester duty of `epoch` from
     /// the shared cache, and POSTs the epoch's committee subscriptions.
     ///
@@ -602,10 +617,12 @@ impl DutyManagementService {
     /// fence, and then gets its proof from the cache, so the concurrency does
     /// not change which duties can sign.
     ///
-    /// The call reads the revocation watch of the beacon node before it reads
-    /// the duties, and each duty checks that watch with its own fence. After
-    /// a revocation, no later duty signs, because its duty can come from the
-    /// revoked node. The duty cache applies the same rule to each read. Each
+    /// `duties_watch` is the revocation watch of the beacon node. The caller
+    /// reads it before the duty reads, and each duty checks that watch with
+    /// its own fence. The runner reads it before its first duty-cache check
+    /// (self-check S1). After a revocation, no later duty signs, because its
+    /// duty can come from the revoked node. The duty cache applies the same
+    /// rule to each read. Each
     /// POST checks the watch again when it starts, and the beacon node checks
     /// it again before each HTTP attempt (Harper B2). After a move, the call
     /// sends no POST and returns `Beacon(RevokedInFlight)`. Then the runner
@@ -638,11 +655,11 @@ impl DutyManagementService {
     /// is [`OrchestratorError::OperationTimedOut`]. After more than one failed
     /// POST, the result is the first failure in chunk order.
     #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
-    pub(crate) async fn submit_committee_subscriptions(
+    pub(crate) async fn submit_committee_subscriptions_under(
         &self,
         epoch: u64,
+        duties_watch: &beacon::DutyFence,
     ) -> Result<(), OrchestratorError> {
-        let duties_watch = self.beacon.revocation_watch();
         let mut own_duties = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
 
@@ -674,7 +691,6 @@ impl DutyManagementService {
         }
 
         let signs = SUBSCRIPTION_SIGNS.min(self.config.dispatch_limits.concurrency as usize);
-        let duties_watch = &duties_watch;
         let subscriptions: Vec<BeaconCommitteeSubscription> = stream::iter(own_duties)
             .map(|(slot, duty_bytes, pubkey, duty)| async move {
                 // Same store gate as aggregate production: doppelganger-off

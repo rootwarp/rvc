@@ -692,9 +692,12 @@ impl EpochBoundaryRunner {
     /// sends the subscriptions of E, then E+1, that did not go out yet in
     /// this epoch. `Failed` while one of them did not: a failed or timed-out
     /// POST, or a call with duties that are not cached after the call. A revocation
-    /// makes the cached duties stale, and a later call can then send nothing
-    /// and return `Ok`. The next pass fetches the duties again (Harper B1).
+    /// makes the cached duties stale, and the next pass fetches the duties
+    /// again (Harper B1). The step reads the revocation watch before its first
+    /// cache check, and each call uses that watch. Thus a call after a move
+    /// returns `RevokedInFlight`, also when it reads no duty (self-check S1).
     async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
+        let duties_watch = self.duty_management.revocation_watch();
         for duty_epoch in [epoch, epoch + 1] {
             if !self.duty_tracker.is_epoch_cached(duty_epoch).await {
                 debug!(epoch, duty_epoch, "Committee subscriptions wait for cached duties");
@@ -706,7 +709,9 @@ impl EpochBoundaryRunner {
             if self.subscribed(epoch, duty_epoch) {
                 continue;
             }
-            let post = self.duty_management.submit_committee_subscriptions(duty_epoch);
+            let post = self
+                .duty_management
+                .submit_committee_subscriptions_under(duty_epoch, &duties_watch);
             let sent = post.await.is_ok();
             if sent && self.duty_tracker.is_epoch_cached(duty_epoch).await {
                 self.mark_subscribed(epoch, duty_epoch);
