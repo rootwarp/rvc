@@ -5488,8 +5488,9 @@ mod tests {
     /// returns `Ok`. When the call ends, before the step marks E, the test
     /// makes one of these changes:
     ///
-    /// - The generation moves, and the test fetches the duties of E again,
-    ///   as a slot task can do. Thus the duties of E are in the cache again.
+    /// - The generation moves, and the test fetches the duties of E and E+1
+    ///   again, as a slot task can do. Thus these duties are in the cache
+    ///   again, and the call for E+1 must still use the watch of the step.
     /// - The test removes the duties of E from the cache, with no move.
     ///
     /// In each case, the step must keep E pending, and the next pass must
@@ -5504,9 +5505,12 @@ mod tests {
             let act = move || {
                 if moved {
                     moves.fetch_add(1, Ordering::AcqRel);
-                    let fetch = duty_tracker.fetch_duties_for_epoch(1);
-                    let fetched = futures::executor::block_on(tokio::task::unconstrained(fetch));
-                    fetched.expect("The second fetch must return the duties.");
+                    for epoch in [1, 2] {
+                        let fetch = duty_tracker.fetch_duties_for_epoch(epoch);
+                        let fetched =
+                            futures::executor::block_on(tokio::task::unconstrained(fetch));
+                        fetched.expect("The second fetch must return the duties.");
+                    }
                 } else {
                     let clear = duty_tracker.clear_epoch_cache(1);
                     futures::executor::block_on(tokio::task::unconstrained(clear));
