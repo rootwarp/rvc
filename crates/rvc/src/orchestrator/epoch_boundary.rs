@@ -5450,4 +5450,104 @@ mod tests {
             "The accepted POSTs must finish the step."
         );
     }
+
+    /// This layer runs `act` one time, when the first span with the name
+    /// `name` closes.
+    struct ActOnClose {
+        name: &'static str,
+        span: parking_lot::Mutex<Option<tracing::span::Id>>,
+        done: AtomicBool,
+        act: Box<dyn Fn() + Send + Sync>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ActOnClose {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == self.name && !self.done.load(Ordering::Acquire) {
+                self.span.lock().get_or_insert_with(|| id.clone());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if self.span.lock().take_if(|span| *span == id).is_some() {
+                self.done.store(true, Ordering::Release);
+                (self.act)();
+            }
+        }
+    }
+
+    /// Self-check T2 (#1043 phase C): the call for E sends its POST and
+    /// returns `Ok`. When the call ends, before the step marks E, the test
+    /// makes one of these changes:
+    ///
+    /// - The generation moves, and the test fetches the duties of E again,
+    ///   as a slot task can do. Thus the duties of E are in the cache again.
+    /// - The test removes the duties of E from the cache, with no move.
+    ///
+    /// In each case, the step must keep E pending, and the next pass must
+    /// send the subscription of E again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_change_after_the_subscription_call_for_e_keeps_e_pending() {
+        use BoundaryStep::CommitteeSubscriptions;
+        for (case, moved) in [("move and fetch", true), ("cache clear", false)] {
+            let f = fixture(proposer_duties_at(ROOT_A)).await;
+            let generation = f.mock.track_admission();
+            let (moves, duty_tracker) = (Arc::clone(&generation), Arc::clone(&f.duty_tracker));
+            let act = move || {
+                if moved {
+                    moves.fetch_add(1, Ordering::AcqRel);
+                    let fetch = duty_tracker.fetch_duties_for_epoch(1);
+                    let fetched = futures::executor::block_on(tokio::task::unconstrained(fetch));
+                    fetched.expect("The second fetch must return the duties.");
+                } else {
+                    let clear = duty_tracker.clear_epoch_cache(1);
+                    futures::executor::block_on(tokio::task::unconstrained(clear));
+                }
+            };
+            let layer = ActOnClose {
+                name: "orchestrator.submit_committee_subscriptions",
+                span: parking_lot::Mutex::default(),
+                done: AtomicBool::new(false),
+                act: Box::new(act),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let _default = tracing::subscriber::set_default(subscriber);
+
+            f.runner.run_pending(32).await;
+
+            assert_eq!(
+                (generation.load(Ordering::Acquire), f.duty_tracker.is_epoch_cached(1).await),
+                (u64::from(moved), moved),
+                "{case}: the test must make its change one time, when the call for E ends."
+            );
+            let first = if moved { slots(&[&["33"]]) } else { slots(&[&["33"], &["65"]]) };
+            assert_eq!(
+                *f.subscription_slots.lock(),
+                first,
+                "{case}: the first pass must send E, and E+1 only when the generation stays."
+            );
+
+            f.runner.run_pending(33).await;
+
+            let expected = if moved {
+                slots(&[&["33"], &["33"], &["65"]])
+            } else {
+                slots(&[&["33"], &["65"], &["33"]])
+            };
+            assert_eq!(
+                *f.subscription_slots.lock(),
+                expected,
+                "{case}: the next pass must send the subscription of E again."
+            );
+            assert_eq!(
+                step_state(&f.runner, CommitteeSubscriptions),
+                (Some(StepOutcome::Done), true),
+                "{case}: the accepted POSTs must finish the step."
+            );
+        }
+    }
 }
