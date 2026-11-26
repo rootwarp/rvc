@@ -139,6 +139,11 @@ impl Fixture {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
+    fn disable_and_revoke(&self) {
+        self.set_store(false);
+        self.revoke_admission();
+    }
+
     fn backend_calls(&self) -> usize {
         self.backend.calls.load(Ordering::SeqCst)
     }
@@ -373,4 +378,37 @@ async fn an_admission_revoked_during_the_backend_sign_gets_no_block_and_keeps_th
         "the caller must get the admission refusal and no signature, got {result:?}"
     );
     assert_eq!(fx.block_rows(), 1, "a signature dropped after the backend must keep the row");
+}
+
+/// Non-slashable: the store disables the key and the admission moves before
+/// the backend starts. The admission check comes first, so the caller gets
+/// the admission refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_key_with_a_revoked_admission_gets_the_admission_refusal() {
+    let fx = Fixture::new();
+    let park = fx.park_before_the_start();
+    let result = park.change_then_join(fx.selection_proof(), || fx.disable_and_revoke()).await;
+
+    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after both changes");
+    assert!(
+        matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+        "The caller must get BeaconAdmissionRevoked. The result was {result:?}."
+    );
+}
+
+/// Slashable: the store disables the key and the admission moves after the
+/// under-lock check. The admission check comes first, so the signer deletes
+/// the row that this call inserted, as the base admission rule does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_key_with_a_revoked_admission_gets_no_block_and_no_row() {
+    let fx = Fixture::new();
+    let park = fx.park_before_the_reservation();
+    let result = park.change_then_join(fx.block(), || fx.disable_and_revoke()).await;
+
+    assert!(
+        matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+        "The caller must get BeaconAdmissionRevoked. The result was {result:?}."
+    );
+    assert_eq!(fx.block_rows(), 0, "The admission refusal must delete the row of this call.");
+    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after both changes");
 }
