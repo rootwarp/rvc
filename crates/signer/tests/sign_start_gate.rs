@@ -205,6 +205,28 @@ fn schedule() -> ForkSchedule {
     ForkSchedule::unscheduled_gloas()
 }
 
+/// Control: with no change, each path signs. The store gate gets the duty of
+/// the sign before and after each backend call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_path_signs_when_the_store_gate_and_the_admission_hold() {
+    let fx = Fixture::new();
+
+    join(fx.selection_proof()).await.expect("the selection proof must sign");
+    join(fx.block()).await.expect("the block must sign");
+
+    assert_eq!(fx.backend_calls(), 2, "each sign must call the backend one time");
+    assert_eq!(
+        *fx.gate_calls.lock().expect("gate calls"),
+        [
+            SigningDuty::SelectionProof,
+            SigningDuty::SelectionProof,
+            SigningDuty::Block,
+            SigningDuty::Block
+        ],
+        "the store gate must get the duty before and after each backend call"
+    );
+}
+
 /// Non-slashable: the store disables the key after the entry check and
 /// before the backend start. The signer refuses the selection proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -302,4 +324,53 @@ async fn envelope_dropped_after_the_backend_returned_keeps_the_slot() {
         "the slot of a dropped signature must stay reserved, got {again:?}"
     );
     assert_eq!(fx.backend_calls(), 1, "the signer must not call the backend for a reserved slot");
+}
+
+/// Slashable: the store disables the key before the reservation. The check
+/// after the reservation refuses the block with no backend call, and the row
+/// stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_disabled_before_the_backend_start_gets_no_block_and_keeps_the_row() {
+    let fx = Fixture::new();
+    let park = fx.park_before_the_reservation();
+    let result = park.change_then_join(fx.block(), || fx.set_store(false)).await;
+
+    assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend for a disabled key");
+    assert!(
+        matches!(result, Err(SignerError::BlockedByDoppelganger)),
+        "the caller must get the store refusal, got {result:?}"
+    );
+    assert_eq!(fx.block_rows(), 1, "the store refusal after the reservation must keep the row");
+}
+
+/// Slashable: the store disables the key during the backend sign. The signer
+/// drops the block signature, and the row stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_disabled_during_the_backend_sign_gets_no_block_and_keeps_the_row() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let result = park.change_then_join(fx.block(), || fx.set_store(false)).await;
+
+    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    assert!(
+        matches!(result, Err(SignerError::BlockedByDoppelganger)),
+        "the caller must get the store refusal and no signature, got {result:?}"
+    );
+    assert_eq!(fx.block_rows(), 1, "a signature dropped after the backend must keep the row");
+}
+
+/// Slashable: the admission moves during the backend sign. The signer drops
+/// the block signature, and the row stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_revoked_during_the_backend_sign_gets_no_block_and_keeps_the_row() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let result = park.change_then_join(fx.block(), || fx.revoke_admission()).await;
+
+    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    assert!(
+        matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+        "the caller must get the admission refusal and no signature, got {result:?}"
+    );
+    assert_eq!(fx.block_rows(), 1, "a signature dropped after the backend must keep the row");
 }
