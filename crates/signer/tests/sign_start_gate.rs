@@ -103,6 +103,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// A service that gets no `with_store_gate`.
+    fn without_store_gate() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_store_gate: bool) -> Self {
         let (pubkey, composite) = common::composite_with_key(SecretKey::generate());
         let backend = Arc::new(HeldBackend {
             inner: Arc::clone(&composite) as Arc<dyn Signer>,
@@ -120,13 +129,12 @@ impl Fixture {
             })
         };
         let db = common::open_db();
-        let service = Arc::new(
-            SignerService::new(composite, Arc::clone(&db))
-                .with_enablement(common::always_allowed())
-                .with_sign_backend(Arc::clone(&backend) as Arc<dyn Signer>)
-                .with_sign_timeout(JOIN_GUARD)
-                .with_store_gate(store_gate),
-        );
+        let service = SignerService::new(composite, Arc::clone(&db))
+            .with_enablement(common::always_allowed())
+            .with_sign_backend(Arc::clone(&backend) as Arc<dyn Signer>)
+            .with_sign_timeout(JOIN_GUARD);
+        let service =
+            Arc::new(if with_store_gate { service.with_store_gate(store_gate) } else { service });
         let generation = Arc::new(AtomicU64::new(0));
         Self { pubkey, service, backend, db, enabled, gate_calls, generation }
     }
@@ -411,4 +419,28 @@ async fn a_disabled_key_with_a_revoked_admission_gets_no_block_and_no_row() {
     );
     assert_eq!(fx.block_rows(), 0, "The admission refusal must delete the row of this call.");
     assert_eq!(fx.backend_calls(), 0, "the signer must not call the backend after both changes");
+}
+
+/// With no store gate, a service keeps the base checks: an admission that
+/// moves after the entry check does not stop a non-slashable sign.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_store_gate_a_revocation_after_the_entry_check_gets_a_selection_proof() {
+    let fx = Fixture::without_store_gate();
+    let park = fx.park_before_the_start();
+    let result = park.change_then_join(fx.selection_proof(), || fx.revoke_admission()).await;
+
+    assert!(result.is_ok(), "With no store gate, the caller must get the signature: {result:?}.");
+    assert_eq!(fx.backend_calls(), 1, "With no store gate, the signer must call the backend.");
+}
+
+/// With no store gate, a service keeps the base checks: an admission that
+/// moves during the backend sign does not drop a block signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_store_gate_a_revocation_during_the_backend_sign_gets_a_block() {
+    let fx = Fixture::without_store_gate();
+    let park = fx.hold_backend();
+    let result = park.change_then_join(fx.block(), || fx.revoke_admission()).await;
+
+    assert!(result.is_ok(), "With no store gate, the caller must get the signature: {result:?}.");
+    assert_eq!(fx.block_rows(), 1, "The signed block must keep its row.");
 }
