@@ -604,14 +604,15 @@ struct BestSelect<T> {
 const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
 
 /// Subscription node attempts that can be active or wait for a broadcast
-/// permit at one time, for all calls and all nodes: two waves of the
-/// broadcast permits of one node. The number of nodes does not change it
-/// (1044-B1).
+/// permit at one time, for all calls and all nodes: two waves of the 4
+/// broadcast permits of one node ([`fan_out::MAX_INFLIGHT_PER_BN`]). The value
+/// is a literal, so the number of nodes and the node limit do not change it
+/// (1044-B1, RSA N3).
 ///
 /// Each attempt takes one permit before it waits for the broadcast permit of
 /// its node. It keeps the permit until it ends, also on the drain after the
 /// first `Ok`. An attempt with no free permit waits for one and sends nothing.
-const SUBSCRIPTION_ATTEMPTS_IN_FLIGHT: usize = 2 * fan_out::MAX_INFLIGHT_PER_BN;
+const SUBSCRIPTION_ATTEMPTS_IN_FLIGHT: usize = 8;
 
 /// A budget `tokio::time::timeout` can add to `now`, including the 250 ms backstop.
 ///
@@ -13484,8 +13485,10 @@ mod tests {
             seen.iter().filter(|request| request.url.path() == SUBSCRIPTIONS_PATH).count()
         };
 
-        let held = permits.clone().acquire_many_owned(8).await;
-        let held = held.expect("The test must get the 8 permits.");
+        let take = permits.clone().acquire_many_owned(8);
+        let held = tokio::time::timeout(Duration::from_secs(10), take).await;
+        let held = held.expect("The test must get the 8 permits in 10 s.");
+        let held = held.expect("The permits must stay open.");
         let genesis = tokio::time::timeout(Duration::from_secs(10), manager.get_genesis()).await;
         assert!(matches!(genesis, Ok(Ok(_))), "A genesis query must not wait for a permit.");
         let watch = BeaconNodeClient::revocation_watch(&manager);
