@@ -300,13 +300,15 @@ pub enum SignerError {
     ///
     /// Either the validator is not yet cleared through the monitoring window, or
     /// the pubkey is unknown to the enablement implementation (fail-closed).
-    /// No slashing-DB row was staged or committed.
+    /// The store gate ([`SignerService::with_store_gate`]) also refuses with
+    /// this variant. No signature; a refusal after a reservation keeps the row.
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
 
     /// Beacon-node revocation after this duty captured chain data. No
     /// signature. A refusal after the slashing reservation deletes the row
-    /// this call inserted; if that delete fails, the row is kept.
+    /// this call inserted; if that delete fails, the row is kept. A refusal
+    /// after BLS returned drops the signature and keeps the row.
     #[error("signing blocked: beacon node admission revoked")]
     BeaconAdmissionRevoked,
 
@@ -1018,11 +1020,24 @@ impl SignerService {
     /// per-validator lock (after the lock wait) and after the slashing
     /// reservation. A doppelganger refusal after the reservation keeps the
     /// row; an admission refusal there deletes the row this call inserted.
-    /// The last check before BLS is the boundary: the after-reservation check
-    /// for a slashable sign, this entry check for a non-slashable one (its
-    /// core re-checks doppelganger only). It is not atomic with the backend:
-    /// a BLS call already started, including a remote request, finishes or
-    /// hits the sign timeout.
+    ///
+    /// # Sign-start gate
+    ///
+    /// Just before the backend call, with no await between them, the signer
+    /// checks the store gate ([`Self::with_store_gate`]) and then the
+    /// admission. A slashable sign runs them after the reservation and the
+    /// doppelganger check. A store refusal keeps the row, as a doppelganger
+    /// refusal does. `SigningGate` (signer-server) has no sign-start gate.
+    ///
+    /// - A store disable or an admission revoke that completes before that
+    ///   check stops the sign with no backend call.
+    /// - A change after that check cannot stop a BLS call that has started,
+    ///   including a request that a remote signer already received. That call
+    ///   finishes or hits the sign timeout.
+    /// - When the backend returns a signature, the signer checks both again.
+    ///   A refusal drops the signature, returns the refusal error and keeps a
+    ///   reserved row, because the backend can have signed. A change after
+    ///   that second check is after the sign.
     ///
     /// `duty` is the typed operation. An exit-only enablement stays closed
     /// for every variant except [`SigningDuty::VoluntaryExit`].
@@ -1126,7 +1141,7 @@ impl SignerService {
         #[cfg(any(test, feature = "test-utils"))]
         let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(SignSlashableRequest {
+        let request = SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
             enablement: Arc::clone(&self.enablement),
@@ -1143,8 +1158,9 @@ impl SignerService {
             fork_name: Some(req.fork_name),
             #[cfg(any(test, feature = "test-utils"))]
             pre_reserve_barrier,
-        })
-        .await;
+        };
+        let store = Some(Arc::clone(&self.store_gate));
+        let result = core::sign_slashable_with_store_gate(request, store).await;
 
         match result {
             Ok(bytes) => {

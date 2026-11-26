@@ -504,6 +504,8 @@ pub struct SlashableSignSession {
     admission: crate::CapturedAdmission,
     /// Duty `admission` is checked for.
     duty: doppelganger::SigningDuty,
+    /// The VC store gate. `None` (`SigningGate`) has no sign-start gate.
+    store: Option<crate::StoreGate>,
 }
 
 impl SlashableSignSession {
@@ -543,6 +545,7 @@ impl SlashableSignSession {
             enablement: Arc::new(crate::AlwaysEnabled),
             admission: crate::CapturedAdmission::Missing { revokes: false },
             duty: doppelganger::SigningDuty::Block,
+            store: None,
         }
     }
 
@@ -659,12 +662,16 @@ impl SlashableSignSession {
     /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
     /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → doppelganger
-    /// → beacon admission → sign → §5.3 table. A doppelganger refusal keeps the
-    /// reserved row. An admission refusal deletes the row this call inserted
+    /// → store gate → beacon admission → sign → §5.3 table. A doppelganger or
+    /// store gate refusal keeps the reserved row. An admission refusal deletes
+    /// the row this call inserted
     /// (no backend has seen the root; a failed delete keeps it) and returns
     /// [`SigningGateError::BeaconAdmissionRevoked`]. `on_tx_hold_ms` keeps the
     /// ARCH-5b window (reserve-start → sign-return, or → the admission
     /// refusal). The reserve-only series is observed at reserve return.
+    /// With a store gate (the VC), the session checks the store gate and the
+    /// admission again when BLS returns a signature. A refusal drops the
+    /// signature and keeps the row (the backend has signed).
     pub fn reserve_then_sign<F>(mut self, reserve: F) -> Result<Vec<u8>, SigningGateError>
     where
         F: FnOnce() -> Result<CommittedReservation, SlashingError>,
@@ -721,6 +728,16 @@ impl SlashableSignSession {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
+        // The store gate follows the doppelganger row rule: keep the row.
+        if self.store.as_ref().is_some_and(|allows| !allows(&self.pubkey_bytes, self.duty)) {
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                "reserve_then_sign: validator store disabled signing after reserve, before BLS"
+            );
+            return Err(SigningGateError::BlockedByDoppelganger);
+        }
+
         // Last check before BLS, on the admission captured on the caller task.
         // No backend has seen the root, so the row this call inserted is deleted.
         if crate::admission_revoked_by(&self.admission, self.duty) {
@@ -748,6 +765,18 @@ impl SlashableSignSession {
             // Sign succeeded — the row is already committed; nothing to persist.
             Ok(Ok(sig)) => {
                 self.hooks.on_tx_hold_ms(tx_hold_ms);
+                let admission = &self.admission;
+                let gate = self.store.as_ref().map(|store| StartGate { store, admission });
+                let refusal = gate.and_then(|gate| gate.refusal(&self.pubkey_bytes, self.duty));
+                if let Some(refusal) = refusal {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                        op = self.op_name,
+                        error = %refusal,
+                        "reserve_then_sign: signature dropped after BLS; reserved row retained"
+                    );
+                    return Err(refusal);
+                }
                 Ok(sig.to_bytes().to_vec())
             }
 
@@ -1113,9 +1142,19 @@ pub trait PreReserveBarrier: Send + Sync {
 /// reconcile, and join failures. On success, records `hooks.on_success` with
 /// the full wall-clock duration of the operation.
 pub async fn sign_slashable(req: SignSlashableRequest<'_>) -> Result<Vec<u8>, SigningGateError> {
+    sign_slashable_with_store_gate(req, None).await
+}
+
+/// [`sign_slashable`] with the VC store gate in step 4: after the reservation
+/// it runs before BLS, and again with the admission when BLS returns. The
+/// gate passes `None` and keeps the old checks.
+pub(crate) async fn sign_slashable_with_store_gate(
+    req: SignSlashableRequest<'_>,
+    store: Option<crate::StoreGate>,
+) -> Result<Vec<u8>, SigningGateError> {
     let kind = req.kind;
     let span = tracing::Span::current();
-    sign_slashable_with_body(req, move |session| {
+    sign_slashable_with_body(req, store, move |session| {
         let _enter = span.enter();
         reserve_then_sign_duty(session, kind)
     })
@@ -1244,6 +1283,7 @@ fn log_stage_rejected(pubkey_hex: &str, kind: SlashableKind, err: SlashingError)
 /// Lock → enablement and admission re-check → policy resolve → `spawn_blocking(body)`.
 async fn sign_slashable_with_body<F>(
     req: SignSlashableRequest<'_>,
+    store: Option<crate::StoreGate>,
     body: F,
 ) -> Result<Vec<u8>, SigningGateError>
 where
@@ -1324,6 +1364,7 @@ where
         enablement: Arc::clone(&req.enablement),
         admission,
         duty: req.kind.signing_duty(),
+        store,
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -2588,6 +2629,7 @@ mod tests {
             enablement: Arc::new(crate::AlwaysEnabled),
             admission: crate::CapturedAdmission::Missing { revokes: false },
             duty: doppelganger::SigningDuty::Block,
+            store: None,
         }
     }
 
