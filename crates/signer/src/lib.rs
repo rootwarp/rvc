@@ -213,6 +213,16 @@ const fn missing_admission_scope_revokes() -> bool {
 // binaries, `cargo check -p rvc-signer`, and the `rvc-signer-server` test build.
 #[cfg(not(feature = "test-utils"))]
 const _: () = assert!(missing_admission_scope_revokes(), "a missing admission scope must refuse");
+
+/// The store gate of a [`SignerService`]: `true` when the validator store
+/// lets `pubkey` sign `duty`.
+///
+/// The VC installs the `enabled` flag of its `ValidatorStore` with
+/// [`SignerService::with_store_gate`]. The signer calls it just before each
+/// backend sign and again when the backend returns. The default store gate
+/// lets every key sign (test fixtures). `SigningGate` has no store gate.
+pub type StoreGate = std::sync::Arc<dyn Fn(&[u8; 48], SigningDuty) -> bool + Send + Sync>;
+
 pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
@@ -490,6 +500,8 @@ pub struct SignerService {
     /// Test-only park after the non-slashable enablement check, before the backend.
     #[cfg(any(test, feature = "test-utils"))]
     nonslashable_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+    /// The validator store gate. The default lets every key sign.
+    store_gate: StoreGate,
 }
 
 /// Per-slot envelope reservation. In-flight is refused the same as signed so
@@ -858,6 +870,7 @@ impl SignerService {
             admission_barrier: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             nonslashable_barrier: parking_lot::Mutex::new(None),
+            store_gate: Arc::new(|_: &[u8; 48], _: SigningDuty| true),
         }
     }
 
@@ -911,6 +924,18 @@ impl SignerService {
     #[must_use]
     pub fn with_enablement(mut self, enablement: Arc<dyn SigningEnablement>) -> Self {
         self.enablement = enablement;
+        self
+    }
+
+    /// Install the validator store gate (builder style).
+    ///
+    /// The sign-start gate calls it just before each backend sign, and again
+    /// when the backend returns. A refusal is
+    /// [`SignerError::BlockedByDoppelganger`], the error of the other
+    /// enablement gates. The default store gate lets every key sign.
+    #[must_use]
+    pub fn with_store_gate(mut self, gate: StoreGate) -> Self {
+        self.store_gate = gate;
         self
     }
 
