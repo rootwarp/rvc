@@ -12925,7 +12925,7 @@ mod tests {
             Self { gate, holders }
         }
 
-        /// Gives the permits back. Each held broadcast must return `Ok`.
+        /// Releases the permits. Each held broadcast must return `Ok`.
         async fn release(self) {
             self.gate.add_permits(fan_out::MAX_INFLIGHT_PER_BN);
             for holder in self.holders {
@@ -12962,16 +12962,21 @@ mod tests {
         let held = HeldPermits::take(&manager, BnRole::Submission).await;
 
         let subscriptions = [committee_subscription()];
+        let label = crate::metrics::endpoint_label(manager.clients[1].endpoint());
+        let waits = crate::metrics::RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL
+            .with_label_values(&[label.as_str()]);
+        let waits_before = waits.get();
         let mut chunk =
             manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch);
         assert!(futures::poll!(chunk.as_mut()).is_pending(), "The chunk must wait for a permit.");
+        assert_eq!(waits.get(), waits_before + 1, "The chunk must wait for a permit of node B.");
         manager.revoke_admission(0);
         assert!(!watch.holds(), "The revocation of node A must move the duty watch.");
         held.release().await;
         let outcome = chunk.await;
 
-        let posts = node_b.received_requests().await.unwrap_or_default().len();
-        assert_eq!(posts, 0, "The chunk must not start its POST to node B after the move.");
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert_eq!(to_b.len(), 0, "The chunk must not start its POST to node B after the move.");
         assert!(
             matches!(outcome, Err(BeaconError::RevokedInFlight)),
             "After the move, the chunk must return RevokedInFlight: {outcome:?}"

@@ -3333,43 +3333,55 @@ mod tests {
         assert_eq!(posts().await, 2, "A call with no watch must send one POST.");
     }
 
-    /// RSA B2 (#1043 R1): the first subscription POST gets a 503, and the
-    /// duty watch moves while the node answers. The client must not send a
-    /// retry after the move, and it must return `RevokedInFlight`.
-    #[tokio::test]
+    /// RSA B2 (#1043 R1): the first subscription POST gets a 503. The duty
+    /// watch moves while the client waits for its retry (self-check A2). The
+    /// client must not send the retry, and it must return `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread")]
     async fn a_subscription_retry_does_not_post_after_a_revocation() {
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// Moves the generation, then answers 503.
-        struct MoveThenUnavailable(Arc<AtomicU64>);
+        /// Tells the test that the client logged its retry. The retry wait
+        /// comes next, on the same task.
+        struct RetrySignal(Arc<tokio::sync::Notify>);
 
-        impl Respond for MoveThenUnavailable {
-            fn respond(&self, _request: &Request) -> ResponseTemplate {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                ResponseTemplate::new(503)
+        impl<S: tracing::Subscriber> Layer<S> for RetrySignal {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().fields().field("backoff_ms").is_some() {
+                    self.0.notify_one();
+                }
             }
         }
 
         let server = MockServer::start().await;
-        let generation = Arc::new(AtomicU64::new(0));
         Mock::given(method("POST"))
             .and(path(SUBSCRIPTIONS_PATH))
-            .respond_with(MoveThenUnavailable(Arc::clone(&generation)))
+            .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
         let config = BeaconClientConfig::new(server.uri())
             .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(1));
+            .with_initial_backoff(Duration::from_millis(50));
         let client = BeaconClient::new(config).expect("The client must start.");
+        let generation = Arc::new(AtomicU64::new(0));
         let watch = DutyFence::at(0, Arc::clone(&generation));
+        let retry = Arc::new(tokio::sync::Notify::new());
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(RetrySignal(Arc::clone(&retry))),
+        );
 
-        let outcome = client
-            .submit_beacon_committee_subscriptions_fenced(&[committee_subscription()], &watch)
-            .await;
+        let subscriptions = [committee_subscription()];
+        let call = tokio::spawn(async move {
+            client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(10), retry.notified()).await;
+        assert!(waited.is_ok(), "The client must start its retry wait in 10 s.");
+        generation.fetch_add(1, Ordering::SeqCst);
+        let outcome = call.await.expect("The call must end.");
 
-        let posts = server.received_requests().await.unwrap_or_default().len();
-        assert_eq!(posts, 1, "After the move, the client must not send a retry.");
+        let posts = server.received_requests().await.expect("The node must record its requests.");
+        assert_eq!(posts.len(), 1, "After the move, the client must not send a retry.");
         assert!(
             matches!(outcome, Err(BeaconError::RevokedInFlight)),
             "After the move, the call must return RevokedInFlight: {outcome:?}"
