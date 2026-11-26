@@ -107,9 +107,9 @@ pub enum NonSlashableFailure {
 ///
 /// The store gate runs first, then the beacon admission. The store gate reads
 /// the validator store under its state lock, and the admission check reads the
-/// generation atomics. A store disable and an admission revoke write the same
-/// state. The check and the backend call have no await between them, and the
-/// check holds no lock after it returns.
+/// generation atomics. When the store disables a key or an admission moves,
+/// the change writes the same state. The check and the backend call have no
+/// await between them, and the check holds no lock after it returns.
 ///
 /// Only `SignerService` has one. `SigningGate` (signer-server) passes none.
 pub(crate) struct StartGate<'a> {
@@ -733,7 +733,7 @@ impl SlashableSignSession {
             warn!(
                 pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
                 op = self.op_name,
-                "reserve_then_sign: validator store disabled signing after reserve, before BLS"
+                "reserve_then_sign: the validator store disabled the key after reserve, before BLS"
             );
             return Err(SigningGateError::BlockedByDoppelganger);
         }

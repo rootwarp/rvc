@@ -1029,11 +1029,11 @@ impl SignerService {
     /// doppelganger check. A store refusal keeps the row, as a doppelganger
     /// refusal does. `SigningGate` (signer-server) has no sign-start gate.
     ///
-    /// - A store disable or an admission revoke that completes before that
-    ///   check stops the sign with no backend call.
+    /// - When the store disables the key or the admission moves before that
+    ///   check, the sign stops with no backend call.
     /// - A change after that check cannot stop a BLS call that has started,
-    ///   including a request that a remote signer already received. That call
-    ///   finishes or hits the sign timeout.
+    ///   for example a request that a remote signer already received. That
+    ///   call finishes or hits the sign timeout.
     /// - When the backend returns a signature, the signer checks both again.
     ///   A refusal drops the signature, returns the refusal error and keeps a
     ///   reserved row, because the backend can have signed. A change after
