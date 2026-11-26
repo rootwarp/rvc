@@ -13,7 +13,7 @@
 mod common;
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use rvc_signer::{
     SigningDuty, StoreGate, ValidatorSigner,
 };
 use slashing::{SigningRoot, SlashingDb};
-use tokio::sync::Notify;
+use tokio::{runtime::Handle, sync::Notify};
 use Event::{Check, Disable, Enable, End, Revoke, Start};
 
 const GVR: Root = [0x5c; 32];
@@ -108,6 +108,10 @@ struct Record {
     disabled: AtomicBool,
     generation: Arc<AtomicU64>,
     events: Mutex<Vec<Event>>,
+    checks: AtomicUsize,
+    /// The store lock: the store check with this index (0 is the start check, 1
+    /// is the check after the backend returns) waits on the park.
+    store_lock: Mutex<Option<(usize, Arc<Park>)>>,
 }
 
 impl Record {
@@ -181,6 +185,11 @@ impl Fixture {
         let store_gate: StoreGate = {
             let record = Arc::clone(&record);
             Arc::new(move |_pubkey: &[u8; 48], duty: SigningDuty| {
+                let at = record.checks.fetch_add(1, Ordering::SeqCst);
+                let held = record.store_lock.lock().expect("lock").take_if(|(n, _)| *n == at);
+                if let Some((_, park)) = held {
+                    tokio::task::block_in_place(|| Handle::current().block_on(park.wait()));
+                }
                 record.push(Check(duty));
                 !record.disabled.load(Ordering::SeqCst)
             })
@@ -551,4 +560,31 @@ async fn a_key_disabled_and_enabled_during_the_backend_sign_gets_a_selection_pro
         "The check after the backend returns must read the store flag at that time.",
     );
     assert!(result.is_ok(), "The caller must get the signature. The result was {result:?}.");
+}
+
+/// The admission moves while a store check waits for the store lock. At the
+/// start check, the backend gets no call, and a slashable sign deletes its row.
+/// After the backend returns, the caller gets no signature, and the row stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_revoked_during_a_store_read_gets_no_signature() {
+    let mut seen = Vec::new();
+    for (at, duty) in [(0, PROOF), (0, BLOCK), (1, PROOF), (1, BLOCK)] {
+        let (fx, park) = (Fixture::new(), Arc::new(Park::default()));
+        *fx.record.store_lock.lock().expect("lock") = Some((at, Arc::clone(&park)));
+        let sign = if duty == PROOF { fx.selection_proof() } else { fx.block() };
+        let result = park.change_then_join(sign, || fx.revoke_admission()).await;
+        let refused = matches!(result, Err(SignerError::BeaconAdmissionRevoked));
+        let events = fx.record.events.lock().expect("events").clone();
+        seen.push((at, duty, events, refused, fx.block_rows().len()));
+    }
+    assert_eq!(
+        seen,
+        [
+            (0, PROOF, vec![Revoke, Check(PROOF)], true, 0),
+            (0, BLOCK, vec![Revoke, Check(BLOCK)], true, 0),
+            (1, PROOF, vec![Check(PROOF), Start, End, Revoke, Check(PROOF)], true, 0),
+            (1, BLOCK, vec![Check(BLOCK), Start, End, Revoke, Check(BLOCK)], true, 1),
+        ],
+        "The signer must read the admission again after each store read."
+    );
 }
