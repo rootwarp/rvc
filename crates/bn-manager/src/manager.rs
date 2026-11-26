@@ -1529,7 +1529,10 @@ impl BnManager {
             let start = tokio::time::Instant::now();
             let fut = fut.instrument(attempt_span);
             let answer = match await_attempt(op_name, bound, fut).await {
-                Err(_) if !watch.holds() => Err(BeaconError::RevokedInFlight),
+                Err(_) if !watch.holds() => {
+                    warn!(op = op_name, bn_index = i, "Attempt failed after the duty watch moved");
+                    Err(BeaconError::RevokedInFlight)
+                }
                 answer => answer,
             };
             match self.unless_revoked(stamp, answer) {
