@@ -109,8 +109,12 @@ fn is_v4_capability_gap(op_name: &str, err: &BeaconError) -> bool {
         && matches!(err, BeaconError::ApiError { status: 404 | 405 | 501, .. })
 }
 
+/// The health outcome of an attempt error. A result after an admission move
+/// ([`BeaconError::RevokedInFlight`]) does not move the score (1044-B2).
 pub(crate) fn error_outcome(op_name: &str, err: &BeaconError) -> TrackerOutcome {
-    if is_unrecognised_fork(err) {
+    if matches!(err, BeaconError::RevokedInFlight) {
+        TrackerOutcome::Rejected
+    } else if is_unrecognised_fork(err) {
         TrackerOutcome::Incapable { unrecognised_fork: true }
     } else if is_v4_capability_gap(op_name, err) {
         TrackerOutcome::Incapable { unrecognised_fork: false }
@@ -1450,6 +1454,25 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        self.query_first_watched(op_name, role, min_tier, deadline, &DutyFence::open(), op).await
+    }
+
+    /// [`Self::query_first_inner`] for a fenced call. After `watch` moves, an
+    /// attempt error, also its timeout, is [`BeaconError::RevokedInFlight`],
+    /// and it adds no health sample (1044-B2).
+    async fn query_first_watched<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
+        watch: &DutyFence,
+        op: &F,
+    ) -> Result<(String, T), BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
         self.ensure_duty_admission()?;
         let indices = self.synced_indices(role, min_tier, op_name).await;
         if indices.is_empty() {
@@ -1483,7 +1506,11 @@ impl BnManager {
             // Build the future only after the deadline check. A zero timeout
             // still polls once and would send the request.
             let fut = op(client).instrument(attempt_span);
-            match self.unless_revoked(stamp, await_attempt(op_name, bound, fut).await) {
+            let answer = match await_attempt(op_name, bound, fut).await {
+                Err(_) if !watch.holds() => Err(BeaconError::RevokedInFlight),
+                answer => answer,
+            };
+            match self.unless_revoked(stamp, answer) {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
@@ -5033,9 +5060,10 @@ impl AttestationApi for BnManager {
     /// on the drain after the first `Ok` (1044-B1). One attempt budget bounds
     /// the waits and the POST of a broadcast attempt. Each HTTP attempt checks
     /// `duties_watch` when it starts: after each wait and before a retry
-    /// (Harper B2). An error after the watch moves is
-    /// [`BeaconError::RevokedInFlight`], also when an earlier node or a higher
-    /// node index gave a different error.
+    /// (Harper B2). After the watch moves, an error of an attempt, also a
+    /// timeout, is [`BeaconError::RevokedInFlight`] and adds no health sample
+    /// (1044-B2). The call has the same rule, also when an earlier node or a
+    /// higher node index gave a different error.
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -5052,7 +5080,7 @@ impl AttestationApi for BnManager {
             #[cfg(test)]
             let gauge = Arc::clone(&self.subscription_gauge);
             Box::pin(async move {
-                await_attempt(OP, budget.filter(|_| broadcast), async {
+                let sent = await_attempt(OP, budget.filter(|_| broadcast), async {
                     let _permit = permits.acquire_owned().await.map_err(|_| {
                         BeaconError::HttpError("subscription permits closed".to_string())
                     })?;
@@ -5068,7 +5096,11 @@ impl AttestationApi for BnManager {
                         .submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1)
                         .await
                 })
-                .await
+                .await;
+                match sent {
+                    Err(_) if !payload.1.holds() => Err(BeaconError::RevokedInFlight),
+                    sent => sent,
+                }
             }) as BoxFut<'static, ()>
         };
         let sent = if broadcast {
@@ -5085,10 +5117,16 @@ impl AttestationApi for BnManager {
             self.with_op_timeout(OP, fan_out::broadcast_backstop(budget), fan).await.map(|_| ())
         } else {
             let deadline = budget.map(|b| checked_deadline(tokio::time::Instant::now(), b));
-            self.query_first(OP, BnRole::Submission, HealthTier::LargeLag, deadline, |client| {
-                attempt(client)
-            })
-            .await
+            let span = tracing::info_span!(
+                "bn.strategy.first",
+                strategy = "first",
+                tried = tracing::field::Empty
+            );
+            let (role, tier) = (BnRole::Submission, HealthTier::LargeLag);
+            self.query_first_watched(OP, role, tier, deadline, duties_watch, &|c| attempt(c))
+                .instrument(span)
+                .await
+                .map(|_| ())
         };
         sent.map_err(|err| if duties_watch.holds() { err } else { BeaconError::RevokedInFlight })
     }
