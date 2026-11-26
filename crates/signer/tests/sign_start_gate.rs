@@ -235,6 +235,36 @@ async fn an_admission_revoked_before_the_backend_start_gets_no_selection_proof()
     );
 }
 
+/// Non-slashable: the store disables the key during the backend sign. The
+/// backend finishes, and the caller gets no signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_disabled_during_the_backend_sign_gets_no_selection_proof() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let result = park.change_then_join(fx.selection_proof(), || fx.set_store(false)).await;
+
+    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    assert!(
+        matches!(result, Err(SignerError::BlockedByDoppelganger)),
+        "the caller must get the store refusal and no signature, got {result:?}"
+    );
+}
+
+/// Non-slashable: the admission moves during the backend sign. The backend
+/// finishes, and the caller gets no signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_revoked_during_the_backend_sign_gets_no_selection_proof() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let result = park.change_then_join(fx.selection_proof(), || fx.revoke_admission()).await;
+
+    assert_eq!(fx.backend_calls(), 1, "the backend sign in progress must finish");
+    assert!(
+        matches!(result, Err(SignerError::BeaconAdmissionRevoked)),
+        "the caller must get the admission refusal and no signature, got {result:?}"
+    );
+}
+
 /// A store refusal before the backend start releases the envelope slot. A
 /// later sign of the slot can start when the store enables the key again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -250,4 +280,26 @@ async fn envelope_refused_before_the_backend_start_releases_the_slot() {
     fx.set_store(true);
     join(fx.envelope(3)).await.expect("the released slot must sign");
     assert_eq!(fx.backend_calls(), 1, "only the second envelope sign must call the backend");
+}
+
+/// A signature dropped after the backend returned keeps the envelope slot:
+/// the backend has signed for that slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn envelope_dropped_after_the_backend_returned_keeps_the_slot() {
+    let fx = Fixture::new();
+    let park = fx.hold_backend();
+    let dropped = park.change_then_join(fx.envelope(4), || fx.set_store(false)).await;
+    assert!(
+        matches!(dropped, Err(SignerError::BlockedByDoppelganger)),
+        "the caller must get the store refusal and no signature, got {dropped:?}"
+    );
+
+    *fx.backend.hold.lock().expect("hold") = None;
+    fx.set_store(true);
+    let again = join(fx.envelope(4)).await;
+    assert!(
+        matches!(again, Err(SignerError::EnvelopeSlotAlreadySigned { slot: 4 })),
+        "the slot of a dropped signature must stay reserved, got {again:?}"
+    );
+    assert_eq!(fx.backend_calls(), 1, "the signer must not call the backend for a reserved slot");
 }
