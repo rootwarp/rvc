@@ -13238,4 +13238,42 @@ mod tests {
         let live = manager.subscription_gauge.live.load(Ordering::SeqCst);
         assert_eq!(live, 0, "Each subscription attempt must end.");
     }
+
+    /// 1044-B1 (RSA R1): 12 nodes have the submission role, and the call
+    /// sends one broadcast. The pool has more nodes than the 8 subscription
+    /// permits. At most 8 node attempts may hold a permit at one time. The
+    /// other attempts must wait for a free permit, and each node must get the
+    /// POST.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subscription_broadcast_to_12_nodes_starts_8_attempts_at_one_time() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let nodes = futures::future::join_all((0..12).map(|_| MockServer::start())).await;
+        for node in &nodes {
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(node)
+                .await;
+        }
+        let config = BnManagerConfig::new(nodes.iter().map(MockServer::uri).collect());
+        let manager = BnManager::new(config).expect("The beacon node manager must start.");
+        let watch = BeaconNodeClient::revocation_watch(&manager);
+
+        let sent = manager
+            .submit_beacon_committee_subscriptions_fenced(&[committee_subscription()], &watch)
+            .await;
+        manager.wait_for_broadcast_drains(Duration::ZERO).await;
+
+        assert!(matches!(sent, Ok(())), "The broadcast must return Ok: {sent:?}");
+        let most = manager.subscription_gauge.peak.load(Ordering::SeqCst);
+        assert_eq!(most, 8, "At most 8 node attempts may hold a permit at one time.");
+        for node in &nodes {
+            let posts = node.received_requests().await.expect("A node must record its requests.");
+            assert_eq!(posts.len(), 1, "Each node must get the POST of the broadcast.");
+        }
+        let free = manager.subscription_attempts.available_permits();
+        assert_eq!(free, 8, "Each node attempt must release its permit.");
+    }
 }
