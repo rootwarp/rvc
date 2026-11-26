@@ -13410,11 +13410,13 @@ mod tests {
     }
 
     /// 1044-B2 (RSA R1): node A and node B have the submission role, and each
-    /// one holds the POST. The duty watch moves after both POSTs start. Then
-    /// each attempt gets to its timeout. For a broadcast and for
-    /// `query_first`, the call must return `RevokedInFlight`, and no node may
-    /// get an error sample for a timeout after the move.
+    /// one holds the POST. The duty watch moves after the first poll of the
+    /// call. Then each attempt gets to its timeout. For a broadcast and for
+    /// `query_first`, the call must return `RevokedInFlight`, no node may get
+    /// an error sample for a timeout after the move, and `query_first` must log
+    /// an event with no error text (self-check F5).
     #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
     async fn a_subscription_timeout_after_a_revocation_adds_no_error_sample() {
         use std::collections::HashSet;
         use wiremock::matchers::{method, path};
@@ -13455,6 +13457,8 @@ mod tests {
                 matches!(outcome, Err(BeaconError::RevokedInFlight)),
                 "After the move, the call must return RevokedInFlight (broadcast {broadcast}): {outcome:?}"
             );
+            let logged = logs_contain("Attempt failed after the duty watch moved");
+            assert!(broadcast || logged, "query_first must log the RevokedInFlight result.");
             let errors: Vec<f64> =
                 manager.health_scores().await.iter().map(|score| score.error_rate).collect();
             assert_eq!(
