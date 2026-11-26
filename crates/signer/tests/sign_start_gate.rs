@@ -59,13 +59,17 @@ impl PreReserveBarrier for Park {
 }
 
 impl Park {
-    /// Wait for the parked caller, run `change`, then release the caller.
+    /// Wait for the parked caller, run `change`, then release the caller. A
+    /// sign that ends before it parks fails the test at once.
     async fn change_then_join(
         &self,
-        sign: Sign,
+        mut sign: Sign,
         change: impl FnOnce(),
     ) -> Result<Signature, SignerError> {
-        self.entered.notified().await;
+        tokio::select! {
+            () = self.entered.notified() => {}
+            ended = &mut sign => panic!("The sign must park, but it ended: {ended:?}."),
+        }
         change();
         self.release.notify_one();
         join(sign).await
