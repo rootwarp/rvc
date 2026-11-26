@@ -696,6 +696,9 @@ impl EpochBoundaryRunner {
     /// again (Harper B1). The step reads the revocation watch before its first
     /// cache check, and each call uses that watch. Thus a call after a move
     /// returns `RevokedInFlight`, also when it reads no duty (self-check S1).
+    /// After the cache check, the step checks the watch again before it marks
+    /// the epoch, because a slot task can fetch the duties again after a move
+    /// (self-check T2).
     async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
         let duties_watch = self.duty_management.revocation_watch();
         for duty_epoch in [epoch, epoch + 1] {
@@ -713,14 +716,15 @@ impl EpochBoundaryRunner {
                 .duty_management
                 .submit_committee_subscriptions_under(duty_epoch, &duties_watch);
             let sent = post.await.is_ok();
-            if sent && self.duty_tracker.is_epoch_cached(duty_epoch).await {
+            let cached = sent && self.duty_tracker.is_epoch_cached(duty_epoch).await;
+            if cached && duties_watch.holds() {
                 self.mark_subscribed(epoch, duty_epoch);
             } else {
                 if sent {
                     warn!(
                         epoch,
                         duty_epoch,
-                        "Committee subscriptions stay pending: the duties of the epoch are no longer cached"
+                        "Committee subscriptions stay pending: the duties of the epoch are no longer cached, or the admission generation moved"
                     );
                 }
                 outcome = StepOutcome::Failed;
