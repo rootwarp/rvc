@@ -606,15 +606,16 @@ struct BestSelect<T> {
 /// instant itself drops the held block as `OperationTimeout`.
 const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
 
-/// Subscription node attempts that can be active or wait for a broadcast
-/// permit at one time, for all calls and all nodes: two waves of the 4
-/// broadcast permits of one node ([`fan_out::MAX_INFLIGHT_PER_BN`]). The value
-/// is a literal, so the number of nodes and the node limit do not change it
-/// (1044-B1, RSA N3).
+/// Subscription node attempts that can be active at one time, for all calls
+/// and all nodes: two waves of the 4 broadcast permits of one node
+/// ([`fan_out::MAX_INFLIGHT_PER_BN`]). The value is a literal, so the number
+/// of nodes and the node limit do not change it (1044-B1, RSA N3).
 ///
-/// Each attempt takes one permit before it waits for the broadcast permit of
-/// its node. It keeps the permit until it ends, also on the drain after the
-/// first `Ok`. An attempt with no free permit waits for one and sends nothing.
+/// An attempt is active from its permit to its end: it waits for the broadcast
+/// permit of its node or sends its POST, also on the drain after the first
+/// `Ok`. The other attempts of all calls wait in the FIFO queue of the
+/// semaphore, which has no length limit. A waiting attempt holds no node
+/// permit and no socket, and it sends nothing (lead ruling on 1044-B1).
 const SUBSCRIPTION_ATTEMPTS_IN_FLIGHT: usize = 8;
 
 /// A budget `tokio::time::timeout` can add to `now`, including the 250 ms backstop.
@@ -13329,7 +13330,7 @@ mod tests {
     /// sends each response after 300 ms. The test sends 16 chunks at the same
     /// time: more than the limit of 8 subscription attempts. Each chunk must
     /// return `Ok`, and each node must get each POST. The maximum number of
-    /// active and queued subscription attempts must be 8.
+    /// active subscription attempts must be 8.
     #[tokio::test(flavor = "current_thread")]
     async fn subscription_attempts_with_a_slow_node_stay_at_the_limit() {
         use wiremock::matchers::{method, path};
@@ -13364,7 +13365,7 @@ mod tests {
             assert_eq!(posts.len(), chunks, "Each node must get the POST of each chunk.");
         }
         let peak = manager.subscription_gauge.peak.load(Ordering::SeqCst);
-        assert!(peak <= limit, "Active and queued attempts must be 8 or less: {peak}");
+        assert!(peak <= limit, "Active attempts must be 8 or less: {peak}");
         assert_eq!(peak, limit, "The 16 chunks must use all 8 attempt permits.");
         let live = manager.subscription_gauge.live.load(Ordering::SeqCst);
         assert_eq!(live, 0, "Each subscription attempt must end.");
