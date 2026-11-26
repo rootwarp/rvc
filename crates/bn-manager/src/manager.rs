@@ -488,6 +488,9 @@ pub struct BnManager {
     after_stamp_recheck: tokio::sync::Notify,
     #[cfg(test)]
     subscription_gauge: Arc<AttemptGauge>,
+    /// Arms [`Self::after_selection`] for one node selection.
+    #[cfg(test)]
+    regrant_after_selection: AtomicBool,
     /// Fires after each sync-monitor admission re-check.
     #[cfg(any(test, feature = "test-utils"))]
     sync_polled: Arc<tokio::sync::Notify>,
@@ -805,6 +808,8 @@ impl BnManager {
             after_stamp_recheck: tokio::sync::Notify::new(),
             #[cfg(test)]
             subscription_gauge: Arc::default(),
+            #[cfg(test)]
+            regrant_after_selection: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             sync_polled: Arc::new(tokio::sync::Notify::new()),
         })
@@ -1130,6 +1135,17 @@ impl BnManager {
             &self.revocation_commit,
             index,
         );
+    }
+
+    /// Test hook after the stamp read of a node selection. When a test arms
+    /// it, it revokes and grants the node one time (self-check F4).
+    #[cfg(test)]
+    fn after_selection(&self, index: usize) {
+        if self.regrant_after_selection.swap(false, Ordering::SeqCst) {
+            self.revoke_admission(index);
+            let seen = self.admission_stamp(index).generation;
+            grant_at(&self.admitted, &self.admission_generation, &self.admission_gate, index, seen);
+        }
     }
 
     fn admission_watch(&self) -> AdmissionWatch {
@@ -1499,6 +1515,8 @@ impl BnManager {
                 continue;
             }
             tried += 1;
+            #[cfg(test)]
+            self.after_selection(i);
             let attempt_span = tracing::info_span!(
                 "bn.attempt",
                 bn_url = %RedactedUrl(client.endpoint()),
@@ -2573,6 +2591,8 @@ impl BnManager {
                 if !self.stamp_holds(stamp) {
                     return None;
                 }
+                #[cfg(test)]
+                self.after_selection(index);
                 let client = &self.clients[index];
                 let admitted = Arc::clone(&admitted);
                 let generations = Arc::clone(&generations);
@@ -13522,5 +13542,45 @@ mod tests {
         assert!(futures::poll!(dropped.as_mut()).is_pending(), "The POST must wait for the node.");
         drop(dropped);
         assert_eq!(permits.available_permits(), 8, "A dropped call must release its permit.");
+    }
+
+    /// 1044-B4 (self-check F4): after the stamp read of the node selection, a
+    /// test hook revokes and grants the node. The supplied watch holds. For a
+    /// broadcast and for `query_first`, the send gate must use the stamp of
+    /// the selection: the node must get no POST, and the call must return
+    /// `RevokedInFlight`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_subscription_attempt_uses_the_stamp_of_its_node_selection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let node = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(SUBSCRIPTIONS_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&node)
+            .await;
+        for broadcast in [true, false] {
+            let mut config = BnManagerConfig::new(vec![node.uri()]);
+            config.broadcast_topics.subscriptions = broadcast;
+            let manager = BnManager::new(config).expect("The beacon node manager must start.");
+            manager.regrant_after_selection.store(true, Ordering::SeqCst);
+            let (subs, watch) = ([committee_subscription()], DutyFence::open());
+            let outcome = manager.submit_beacon_committee_subscriptions_fenced(&subs, &watch).await;
+            manager.wait_for_broadcast_drains(Duration::ZERO).await;
+
+            let hooked = !manager.regrant_after_selection.load(Ordering::SeqCst);
+            assert!(hooked, "The hook must revoke and grant the node (broadcast {broadcast}).");
+            let posts = node.received_requests().await.expect("The node must record its requests.");
+            assert_eq!(
+                posts.len(),
+                0,
+                "After a revocation and a new grant, the node must get no POST (broadcast {broadcast})."
+            );
+            assert!(
+                matches!(outcome, Err(BeaconError::RevokedInFlight)),
+                "The call must return RevokedInFlight (broadcast {broadcast}): {outcome:?}"
+            );
+        }
     }
 }
