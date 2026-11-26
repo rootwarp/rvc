@@ -3576,6 +3576,9 @@ mod tests {
     ///   retry.
     /// - The endpoint has a password, and the node is not reachable.
     /// - The endpoint has a password, and it is not a valid URL.
+    /// - The duty watch moved before the call, and the endpoint has secret
+    ///   values in its path, its query and its fragment, or it is not a valid
+    ///   URL. The 2 fenced WARN events must not log these values (self-check F3).
     ///
     /// No line may contain the payload, the response text or the password.
     /// The errors must keep only the status and the error class. A call with
@@ -3618,6 +3621,11 @@ mod tests {
         let unreachable =
             fenced("http://user:424242@127.0.0.1:9".to_string(), DutyFence::open()).await;
         let invalid = fenced("http://user:424242@[::1".to_string(), DutyFence::open()).await;
+        let moved_watch = || DutyFence::at(0, Arc::new(AtomicU64::new(1)));
+        let secrets = "http://127.0.0.1:9/p-secret/?q-secret#f-secret".to_string();
+        let refused = fenced(secrets, moved_watch()).await;
+        let not_a_url = "http://[::1/p-secret?q-secret#f-secret".to_string();
+        let not_a_url = fenced(not_a_url, moved_watch()).await;
 
         assert!(
             matches!(moved, Err(BeaconError::RevokedInFlight)),
@@ -3642,6 +3650,15 @@ mod tests {
             !logs_contain("424242"),
             "No line may contain the payload, the response text or the password."
         );
+        let refusals = [&refused, &not_a_url];
+        assert!(
+            refusals.iter().all(|refusal| matches!(refusal, Err(BeaconError::RevokedInFlight))),
+            "After the move, each refusal must be RevokedInFlight: {refusals:?}"
+        );
+        assert!(logs_contain("request not sent"), "The test must record the warn of a refusal.");
+        for secret in ["p-secret", "q-secret", "f-secret"] {
+            assert!(!logs_contain(secret), "The WARN events must not log the endpoint: {secret}");
+        }
 
         let long = MockServer::start().await;
         let text = ResponseTemplate::new(400).set_body_string("x".repeat(16 * 1024 + 1));
