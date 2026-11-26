@@ -63,15 +63,11 @@ pub(crate) enum PrepareOutcome {
     Stale,
 }
 
-/// Why the owner of a subscription's selection proof did not sign, or did
-/// not keep its proof.
+/// Why the owner of a subscription's selection proof did not sign.
 enum SubscriptionProofSkip {
     /// The store gate closed after the first check, for example while the
-    /// caller waited for another owner or during the sign.
+    /// caller waited for another owner.
     Disabled,
-    /// The fence or the pass watch moved after the first check, for example
-    /// while the caller waited for another owner or during the sign.
-    Revoked,
     Failed(SignerError),
 }
 
@@ -650,13 +646,12 @@ impl DutyManagementService {
     /// step tries again with current duties.
     ///
     /// A duty whose proof is in the cache, or in flight for aggregation, does
-    /// not sign again. The cache signs only for the owner of the key. The
-    /// owner checks the store gate, its fence and the watch just before the
-    /// signer call, with no await between them, and again after the sign
-    /// (RSA B1). A proof from a sign that is in flight at a store disable or
-    /// at a revocation goes into no cache entry and no POST. When the sign of
-    /// a proof stops before the move, the proof stays in the cache. The
-    /// signer bounds each sign with its own sign timeout.
+    /// not sign again. The cache signs only for the owner of the key, and the
+    /// owner checks the store gate again before the signer call. The signer
+    /// checks the store gate and the admission of the fence just before the
+    /// backend call, and again after the backend returns (PR #1046, RSA B1).
+    /// A proof from a sign that is in flight at a store disable or at a
+    /// revocation goes into no cache entry and no POST.
     ///
     /// The subscriptions go in POSTs with a maximum of 512 subscriptions in
     /// each POST. A maximum of `SUBSCRIPTION_CHUNKS_IN_FLIGHT` (4) POSTs are
@@ -754,10 +749,10 @@ impl DutyManagementService {
                     }
                 };
                 let lookup = self.selection_proofs.get_or_sign((slot, duty_bytes), || async {
-                    // RSA B1: the last check before the sign. The signer call
-                    // comes next, with no await between them.
-                    self.subscription_sign_allowed(&pk_bytes, &fence, duties_watch)?;
-                    let signed = super::slot_context::under_admission(
+                    if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                        return Err(SubscriptionProofSkip::Disabled);
+                    }
+                    super::slot_context::under_admission(
                         &fence,
                         self.signer.sign_selection_proof(
                             slot,
@@ -766,15 +761,8 @@ impl DutyManagementService {
                             &self.config.genesis_validators_root,
                         ),
                     )
-                    .await;
-                    let proof = match signed {
-                        Ok(proof) => proof,
-                        Err(error) => return Err(SubscriptionProofSkip::Failed(error)),
-                    };
-                    // RSA B1: a store disable or a revocation during the sign
-                    // gives no proof. The cache keeps no entry for it, and the
-                    // duty gets no subscription.
-                    self.subscription_sign_allowed(&pk_bytes, &fence, duties_watch).map(|()| proof)
+                    .await
+                    .map_err(SubscriptionProofSkip::Failed)
                 });
                 let selection_proof = match lookup.await {
                     Ok(sig) => sig,
@@ -790,13 +778,6 @@ impl DutyManagementService {
                             pubkey = %TruncatedPubkey::new(&duty.pubkey),
                             slot,
                             "Skipping committee subscription: validator signing is disabled"
-                        );
-                        return None;
-                    }
-                    Err(SelectionProofError::Sign(SubscriptionProofSkip::Revoked)) => {
-                        warn!(
-                            slot,
-                            "skipping committee subscription: beacon node admission revoked"
                         );
                         return None;
                     }
@@ -916,27 +897,6 @@ impl DutyManagementService {
         accepted.retain(|_, (watch, _)| watch.holds());
         let entry = accepted.entry(epoch).or_insert_with(|| (duties_watch.clone(), HashSet::new()));
         apply(&mut entry.1);
-    }
-
-    /// `Ok` while the store gate of `pk_bytes` is open, and `fence` and
-    /// `duties_watch` hold. The owner of a subscription proof checks this
-    /// just before its sign and again after it (RSA B1).
-    fn subscription_sign_allowed(
-        &self,
-        pk_bytes: &[u8; 48],
-        fence: &beacon::DutyFence,
-        duties_watch: &beacon::DutyFence,
-    ) -> Result<(), SubscriptionProofSkip> {
-        if !self.validator_store.is_signing_enabled(pk_bytes) {
-            return Err(SubscriptionProofSkip::Disabled);
-        }
-        if super::slot_context::admission_blocks(
-            signer::SigningDuty::SelectionProof,
-            &[fence, duties_watch],
-        ) {
-            return Err(SubscriptionProofSkip::Revoked);
-        }
-        Ok(())
     }
 
     /// Count attester/proposer/sync duties for the epoch and emit the
@@ -2628,9 +2588,11 @@ mod tests {
 
     /// Each of the 4 duties reads and checks its own fence. Then the
     /// admission generation moves at the start of the last sign request. The
-    /// 4 sign requests are in flight at the move, and their proofs must go
-    /// into no cache entry (RSA B1, #1043 R1). The call must send no POST,
-    /// and it must return `RevokedInFlight` (self-check F2). A retry with
+    /// 4 sign requests are in flight at the move. The signer checks the
+    /// admission again after each backend sign (PR #1046). For this reason,
+    /// their proofs must go into no cache entry (RSA B1, #1043 R1). The call
+    /// must send no POST, and it must return `RevokedInFlight` (self-check
+    /// F2). A retry with
     /// duties read after the move must sign the 4 proofs again and send
     /// them. Part 2 does the same move with a real `BnManager`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2702,11 +2664,11 @@ mod tests {
     }
 
     /// RSA B1 (#1043 R1): Keys 0 to 3 have one duty each. The test reads the
-    /// slots in sequence. The store disables key 1 at the start of the sign
-    /// request of key 1, after
-    /// its last gate check. The proof of key 1 must go into no cache entry and
-    /// no POST. The POST contains the other 3 duties. For a revocation during
-    /// the sign requests, see
+    /// slots in sequence. The store disables key 1 at the start of the
+    /// backend sign of key 1, after the start check of the signer (PR #1046).
+    /// The proof of key 1 must go into no cache entry and no POST. The POST
+    /// contains the other 3 duties. For a revocation during the sign
+    /// requests, see
     /// `no_subscription_post_after_a_revocation_during_the_sign_requests`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_sign_in_flight_at_a_store_disable_gives_no_proof() {
@@ -2732,61 +2694,6 @@ mod tests {
             "The cache must hold the proofs of keys 0, 2 and 3, and no proof of key 1."
         );
         assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
-    }
-
-    /// RSA B1 (#1043 R1): the duty of key 0 passes its fence check, and then
-    /// it waits for another owner of its selection proof. The admission
-    /// generation moves during the wait, and then the other owner fails. The
-    /// duty becomes the owner. Its last check before the sign must stop the
-    /// sign before the signer call. The call must return `RevokedInFlight`.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_subscription_owner_checks_the_fence_again_before_its_sign() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let f = ManyKeys::new(1, make_config(), Vec::new()).await;
-        let warns = Warns::default();
-        let subscriber = tracing_subscriber::registry().with(warns.clone());
-        let _log = tracing::subscriber::set_default(subscriber);
-        let (release, held) = tokio::sync::oneshot::channel::<()>();
-        let cache = Arc::clone(&f.service.selection_proofs);
-        let mut other =
-            std::pin::pin!(cache.get_or_sign((duty_slot(0), f.keys[0]), || async move {
-                let _ = held.await;
-                Err::<crypto::Signature, ()>(())
-            }));
-        assert!(futures::poll!(other.as_mut()).is_pending(), "The other owner must hold the key.");
-        let mut pass = std::pin::pin!(f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH));
-        for _ in 0..1_000 {
-            if cache.waiter_registrations() == 1 {
-                break;
-            }
-            assert!(futures::poll!(pass.as_mut()).is_pending(), "The call must wait.");
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(cache.waiter_registrations(), 1, "The duty must wait for the other owner.");
-
-        f.admission.fetch_add(1, Ordering::SeqCst);
-        release.send(()).expect("The other owner must wait for the release.");
-        let other = other.await;
-        let outcome = pass.await;
-
-        assert!(
-            matches!(other, Err(SelectionProofError::Sign(()))),
-            "The other owner must fail: {other:?}"
-        );
-        let messages: Vec<String> =
-            warns.0.lock().iter().filter_map(|fields| fields.get("message").cloned()).collect();
-        assert!(
-            !messages
-                .iter()
-                .any(|message| message == "SignerService: beacon node admission revoked"),
-            "The new owner must stop the sign before the signer call: {messages:?}"
-        );
-        assert!(f.remote.started().is_empty(), "The signer backend must get no request.");
-        assert!(
-            matches!(outcome, Err(OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight))),
-            "The call must return RevokedInFlight: {outcome:?}"
-        );
     }
 
     /// Harper B2 and self-check S7 (#1043 R1): each chunk POST must give the
