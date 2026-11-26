@@ -13002,10 +13002,10 @@ mod tests {
 
     impl HeldPermits {
         /// Starts one held broadcast for each permit and waits until each one
-        /// holds its permit.
+        /// holds its permit: each one adds a permit to `entered` (a task signal).
         async fn take(manager: &Arc<BnManager>, role: BnRole) -> Self {
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
             let holders = (0..fan_out::MAX_INFLIGHT_PER_BN)
                 .map(|_| {
                     let (manager, gate, entered) =
@@ -13014,7 +13014,7 @@ mod tests {
                         let hold = move |_client: &BeaconClient| {
                             let (gate, entered) = (Arc::clone(&gate), Arc::clone(&entered));
                             Box::pin(async move {
-                                entered.fetch_add(1, Ordering::SeqCst);
+                                entered.add_permits(1);
                                 let _permit = gate.acquire().await;
                                 Ok::<(), BeaconError>(())
                             }) as BoxFut<'static, ()>
@@ -13023,17 +13023,9 @@ mod tests {
                     })
                 })
                 .collect();
-            for _ in 0..1_000 {
-                if entered.load(Ordering::SeqCst) == fan_out::MAX_INFLIGHT_PER_BN {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                entered.load(Ordering::SeqCst),
-                fan_out::MAX_INFLIGHT_PER_BN,
-                "The held broadcasts must take each permit."
-            );
+            let all = entered.acquire_many(fan_out::MAX_INFLIGHT_PER_BN as u32);
+            let all = tokio::time::timeout(Duration::from_secs(10), all).await;
+            assert!(matches!(all, Ok(Ok(_))), "The held broadcasts must take each permit in 10 s.");
             Self { gate, holders }
         }
 
