@@ -1707,7 +1707,9 @@ impl BeaconClient {
     /// HTTP attempt, also a retry, starts only while `gate` holds. Else the
     /// result is [`BeaconError::RevokedInFlight`]. An error after `gate` fails
     /// is also `RevokedInFlight`. An `Ok` stays `Ok`. The POST follows no
-    /// redirect: a 3xx response is an [`BeaconError::ApiError`].
+    /// redirect: a 3xx response is an [`BeaconError::ApiError`]. Its errors
+    /// and its logs keep only the HTTP status and the error class, with no
+    /// response text and no endpoint (1044-B3).
     pub async fn submit_beacon_committee_subscriptions_gated(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -1717,8 +1719,8 @@ impl BeaconClient {
         self.post_empty_gated(&self.fenced_client, path, &subscriptions, &[], Some(gate))
             .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
-            .map_err(|err| match err {
-                BeaconError::RevokedInFlight => err,
+            .map_err(|err| match without_text(err) {
+                err @ BeaconError::RevokedInFlight => err,
                 err if gate() => err,
                 err => {
                     warn!(
@@ -2170,7 +2172,11 @@ impl BeaconClient {
 
                     if e.is_connect() || e.is_request() {
                         last_error = Some(BeaconError::HttpError(e.to_string()));
-                        warn!(attempt = attempt, error = %e, "Connection error, will retry");
+                        if gate.is_some() {
+                            warn!(attempt = attempt, "Connection error, will retry");
+                        } else {
+                            warn!(attempt = attempt, error = %e, "Connection error, will retry");
+                        }
                         continue;
                     }
 
@@ -2180,10 +2186,11 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        let err = if gate.is_some() { without_text(err) } else { err };
         span.in_scope(|| {
             error!(
                 endpoint = %RedactedUrl(endpoint),
-                total_attempts = policy.max_retries + 1,
+                total_attempts = u64::from(policy.max_retries) + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
             )
@@ -2207,6 +2214,20 @@ impl BeaconClient {
         } else {
             Err(Self::api_error_from_response(response).await)
         }
+    }
+}
+
+/// `err` with no response text, no transport message and no endpoint. The
+/// fenced POST returns and logs only this form: the HTTP status and the error
+/// class (1044-B3).
+fn without_text(err: BeaconError) -> BeaconError {
+    match err {
+        BeaconError::ApiError { status, .. } => {
+            BeaconError::ApiError { status, message: String::new() }
+        }
+        BeaconError::HttpError(_) => BeaconError::HttpError("transport error".to_string()),
+        BeaconError::InvalidUrl(_) => BeaconError::InvalidUrl("endpoint".to_string()),
+        err => err,
     }
 }
 
