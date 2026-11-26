@@ -37,7 +37,7 @@ use crate::admission::{
     classify_identity, AdmissionStamp, ChainIdentity, IdentityClass, IdentityField,
 };
 use crate::broadcast::BroadcastResult;
-use crate::fan_out::{self, BnAttempt};
+use crate::fan_out::{self, acquire_inflight_permit, BnAttempt};
 use crate::header_quorum::{wrong_requested_slot, CheckedHeader, HeaderTally};
 use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
@@ -451,8 +451,8 @@ pub struct BnManager {
     health_trackers: SharedHealthTrackers,
     /// Per-endpoint broadcast permits. See [`fan_out::MAX_INFLIGHT_PER_BN`].
     inflight: fan_out::InflightGate,
-    /// [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`] permits, or one for each node when
-    /// there are more nodes. Thus one call can always take its permits.
+    /// [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`] permits for the subscription node
+    /// attempts of all calls and all nodes (1044-B1).
     subscription_attempts: Arc<tokio::sync::Semaphore>,
     operation_timeouts: Option<OperationTimeouts>,
     broadcast_topics: crate::traits::BroadcastTopics,
@@ -599,13 +599,14 @@ struct BestSelect<T> {
 /// instant itself drops the held block as `OperationTimeout`.
 const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
 
-/// Subscription node attempts that can be active or queued at one time, for
-/// all chunks and all nodes: two waves of the broadcast permits of one node.
+/// Subscription node attempts that can be active or wait for a broadcast
+/// permit at one time, for all calls and all nodes: two waves of the
+/// broadcast permits of one node. The number of nodes does not change it
+/// (1044-B1).
 ///
-/// A call takes one permit for each beacon node before it makes its attempts.
-/// Each attempt keeps its permit until the attempt ends, also on the drain
-/// after the first `Ok`. When the call returns, it gives back the permits
-/// that no attempt took. A later call waits on its own task for its permits.
+/// Each attempt takes one permit before it waits for the broadcast permit of
+/// its node. It keeps the permit until it ends, also on the drain after the
+/// first `Ok`. An attempt with no free permit waits for one and sends nothing.
 const SUBSCRIPTION_ATTEMPTS_IN_FLIGHT: usize = 2 * fan_out::MAX_INFLIGHT_PER_BN;
 
 /// A budget `tokio::time::timeout` can add to `now`, including the 250 ms backstop.
@@ -773,9 +774,8 @@ impl BnManager {
         let admission_generation =
             Arc::new((0..clients.len()).map(|_| AtomicU64::new(0)).collect());
         let admission_gate = Arc::new((0..clients.len()).map(|_| Mutex::new(())).collect());
-        let subscription_attempts = Arc::new(tokio::sync::Semaphore::new(
-            SUBSCRIPTION_ATTEMPTS_IN_FLIGHT.max(clients.len()),
-        ));
+        let subscription_attempts =
+            Arc::new(tokio::sync::Semaphore::new(SUBSCRIPTION_ATTEMPTS_IN_FLIGHT));
         Ok(Self {
             clients,
             sync_statuses,
@@ -2596,6 +2596,7 @@ impl BnManager {
             op_name,
             role,
             budget,
+            &self.inflight,
             fan_out::PublishPolicy::any_ok(),
             op,
         )
@@ -2611,11 +2612,13 @@ impl BnManager {
     /// only a full acceptance as complete: a 400 that lists failed attestations
     /// waits for another node's full acceptance until the attempts finish, and
     /// the partial with the fewest failures is kept if none arrives.
+    /// `inflight` gives the broadcast permits that fan-out takes for each attempt.
     async fn broadcast_with_result_attributed<T, F>(
         &self,
         op_name: &str,
         role: BnRole,
         budget: Option<Duration>,
+        inflight: &fan_out::InflightGate,
         policy: fan_out::PublishPolicy<T>,
         op: F,
     ) -> Result<(String, T), BeaconError>
@@ -2640,7 +2643,7 @@ impl BnManager {
                 &self.health_trackers,
                 fan_out::global_drain_pool(),
                 policy,
-                &self.inflight,
+                inflight,
             )
             .await
         }
@@ -4931,6 +4934,7 @@ impl AttestationApi for BnManager {
                     "submit_attestation",
                     BnRole::Attestation,
                     budget,
+                    &self.inflight,
                     fan_out::PublishPolicy::attestation(),
                     owned_attempt!(attestations.clone(), |client, payload| client
                         .submit_attestation(payload.as_ref())
@@ -5023,48 +5027,70 @@ impl AttestationApi for BnManager {
         .await
     }
 
-    /// Each node attempt checks `duties_watch` when its HTTP attempt starts:
-    /// after a permit, after an earlier node and before a retry (Harper B2).
-    /// An error after the watch moves is [`BeaconError::RevokedInFlight`], also
-    /// when an earlier node or a higher node index gave a different error.
-    /// Each node attempt keeps one permit of [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`]
-    /// until it ends (self-check S4).
+    /// Each node attempt first takes one of the
+    /// [`SUBSCRIPTION_ATTEMPTS_IN_FLIGHT`] permits. In a broadcast, it then
+    /// takes a broadcast permit of its node. It keeps both until it ends, also
+    /// on the drain after the first `Ok` (1044-B1). One attempt budget bounds
+    /// the waits and the POST of a broadcast attempt. Each HTTP attempt checks
+    /// `duties_watch` when it starts: after each wait and before a retry
+    /// (Harper B2). An error after the watch moves is
+    /// [`BeaconError::RevokedInFlight`], also when an earlier node or a higher
+    /// node index gave a different error.
     async fn submit_beacon_committee_subscriptions_fenced(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
         duties_watch: &DutyFence,
     ) -> Result<(), BeaconError> {
-        let nodes = u32::try_from(self.clients.len()).unwrap_or(u32::MAX);
-        let reserved = Arc::clone(&self.subscription_attempts)
-            .acquire_many_owned(nodes)
-            .await
-            .map_err(|_| BeaconError::HttpError("subscription permits closed".to_string()))?;
-        let permits = Mutex::new(reserved);
+        const OP: &str = "submit_beacon_committee_subscriptions";
+        let broadcast = self.broadcast_topics.subscriptions;
+        let budget = self.op_timeout(|t| t.preparation);
         let payload = Arc::new((subscriptions.to_vec(), duties_watch.clone()));
-        #[cfg(test)]
-        let gauge = Arc::clone(&self.subscription_gauge);
-        let attempt = move |client: &BeaconClient| {
+        let attempt = |client: &BeaconClient| {
             let (client, payload) = (client.clone(), Arc::clone(&payload));
-            let permit = permits.lock().unwrap_or_else(std::sync::PoisonError::into_inner).split(1);
+            let permits = Arc::clone(&self.subscription_attempts);
+            let node_permits = self.inflight.semaphore(client.endpoint()).filter(|_| broadcast);
             #[cfg(test)]
-            let live = LiveAttempt::new(&gauge);
+            let gauge = Arc::clone(&self.subscription_gauge);
             Box::pin(async move {
-                let _permit = permit;
-                #[cfg(test)]
-                let _live = live;
-                client.submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1).await
+                await_attempt(OP, budget.filter(|_| broadcast), async {
+                    let _permit = permits.acquire_owned().await.map_err(|_| {
+                        BeaconError::HttpError("subscription permits closed".to_string())
+                    })?;
+                    #[cfg(test)]
+                    let _live = LiveAttempt::new(&gauge);
+                    let _node_permit = match &node_permits {
+                        Some(sem) => {
+                            Some(acquire_inflight_permit(OP, client.endpoint(), sem, None).await?)
+                        }
+                        None => None,
+                    };
+                    client
+                        .submit_beacon_committee_subscriptions_fenced(&payload.0, &payload.1)
+                        .await
+                })
+                .await
             }) as BoxFut<'static, ()>
         };
-        self.submit(
-            "submit_beacon_committee_subscriptions",
-            self.broadcast_topics.subscriptions,
-            BnRole::Submission,
-            HealthTier::LargeLag,
-            self.op_timeout(|t| t.preparation),
-            attempt,
-        )
-        .await
-        .map_err(|err| if duties_watch.holds() { err } else { BeaconError::RevokedInFlight })
+        let sent = if broadcast {
+            // Each attempt takes its node permit itself, after its subscription permit.
+            let no_permits = fan_out::InflightGate::unbounded();
+            let fan = self.broadcast_with_result_attributed(
+                OP,
+                BnRole::Submission,
+                None,
+                &no_permits,
+                fan_out::PublishPolicy::any_ok(),
+                attempt,
+            );
+            self.with_op_timeout(OP, fan_out::broadcast_backstop(budget), fan).await.map(|_| ())
+        } else {
+            let deadline = budget.map(|b| checked_deadline(tokio::time::Instant::now(), b));
+            self.query_first(OP, BnRole::Submission, HealthTier::LargeLag, deadline, |client| {
+                attempt(client)
+            })
+            .await
+        };
+        sent.map_err(|err| if duties_watch.holds() { err } else { BeaconError::RevokedInFlight })
     }
 
     async fn submit_sync_committee_subscriptions(
@@ -13175,6 +13201,7 @@ mod tests {
         assert_eq!(live(), 2, "The attempts of node A and node B must start.");
         let ended = tokio::time::timeout(Duration::from_secs(10), async {
             while live() != 1 {
+                assert!(futures::poll!(call.as_mut()).is_pending(), "Node A must wait.");
                 tokio::task::yield_now().await;
             }
         })

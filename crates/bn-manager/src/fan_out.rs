@@ -250,7 +250,7 @@ impl InflightGate {
         Self { permits }
     }
 
-    fn semaphore(&self, endpoint: &str) -> Option<Arc<Semaphore>> {
+    pub(crate) fn semaphore(&self, endpoint: &str) -> Option<Arc<Semaphore>> {
         self.permits.get(endpoint).cloned()
     }
 
@@ -1439,7 +1439,7 @@ fn arm_overflow<T>(tracked: Tracked<T>) -> Tracked<T> {
 /// Take a broadcast permit. A free permit does not increment the wait counter.
 /// A full semaphore waits up to `budget` (`None` waits without a timeout).
 /// The HTTP future is not polled by this function.
-fn acquire_inflight_permit(
+pub(crate) fn acquire_inflight_permit(
     op_name: &str,
     endpoint: &str,
     sem: &Arc<Semaphore>,
