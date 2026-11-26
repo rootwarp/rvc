@@ -2170,7 +2170,7 @@ mod tests {
     }
 
     /// The store gate and the admission fences stay in each per-duty future.
-    /// Keys 0 to 3 have one duty each, in slot order.
+    /// Keys 0 to 3 have one duty each. The test reads the slots in sequence.
     ///
     /// Part 1 uses the mock beacon node. Key 1 is disabled, and the first
     /// sign request (key 0) moves the admission generation. After the move,
@@ -2242,8 +2242,9 @@ mod tests {
         );
     }
 
-    /// Keys 0 to 3 have one duty each, in slot order. The admission
-    /// generation moves after the read of the first slot (key 0). Key 0 must
+    /// Keys 0 to 3 have one duty each. The test reads the slots in sequence.
+    /// The admission generation moves after the read of the first slot
+    /// (key 0). Key 0 must
     /// not sign, because the call read its duty before the move. After the
     /// move, the cache gives no duty for the later slots. The call must
     /// return `RevokedInFlight` and not `Ok`. Then the runner step stays
@@ -2275,8 +2276,9 @@ mod tests {
         );
     }
 
-    /// RSA B3 (#1043 R1): keys 0 to 3 have one duty each, in slot order. The
-    /// admission generation moves after the read of the last slot of the
+    /// RSA B3 (#1043 R1): Keys 0 to 3 have one duty each. The test reads the
+    /// slots in sequence. The admission generation moves after the read of
+    /// the last slot of the
     /// epoch. The call reads all 4 duties before the move, and each duty then
     /// fails its fence check. The call must return `RevokedInFlight` and not
     /// the `Ok` of a pass with nothing to send.
@@ -2692,8 +2694,9 @@ mod tests {
         );
     }
 
-    /// RSA B1 (#1043 R1): keys 0 to 3 have one duty each, in slot order. The
-    /// store disables key 1 at the start of the sign request of key 1, after
+    /// RSA B1 (#1043 R1): Keys 0 to 3 have one duty each. The test reads the
+    /// slots in sequence. The store disables key 1 at the start of the sign
+    /// request of key 1, after
     /// its last gate check. The proof of key 1 must go into no cache entry and
     /// no POST. The POST contains the other 3 duties. For a revocation during
     /// the sign requests, see
@@ -2779,17 +2782,21 @@ mod tests {
         );
     }
 
-    /// Harper B2 (#1043 R1): each chunk POST must give the beacon node the
-    /// watch that the call read before the duty reads. The beacon node then
-    /// checks that watch again before each HTTP attempt. 513 duties make 2
-    /// chunks.
+    /// Harper B2 and self-check S7 (#1043 R1): each chunk POST must give the
+    /// beacon node the watch that the caller read before the duty reads. The
+    /// beacon node then checks that watch again before each HTTP attempt.
+    /// The test gives the call a watch on its own generation counter, and the
+    /// beacon node does not know that counter. A new watch from the beacon
+    /// node for each chunk fails the check. 513 duties make 2 chunks.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn each_subscription_chunk_post_gives_the_pass_watch_to_the_beacon_node() {
         let f = ManyKeys::new(513, make_config(), Vec::new()).await;
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pass_watch = beacon::DutyFence::at(0, Arc::clone(&generation));
 
-        let outcome = f.service.submit_committee_subscriptions(SUBSCRIBED_EPOCH).await;
+        let pass = f.service.submit_committee_subscriptions_under(SUBSCRIBED_EPOCH, &pass_watch);
+        let outcome = pass.await;
         let watches = f.mock.subscription_watches();
-        f.admission.fetch_add(1, Ordering::SeqCst);
 
         assert!(matches!(outcome, Ok(())), "The call must return Ok: {outcome:?}");
         assert_eq!(
@@ -2798,8 +2805,10 @@ mod tests {
             "Each of the 2 chunk POSTs must give a duty watch to the beacon node."
         );
         assert!(
-            watches.iter().all(|watch| watch.seen() == 0 && !watch.holds()),
-            "Each chunk POST must give the watch of the pass, and a revocation must move it."
+            watches.iter().all(|watch| watch
+                .generation()
+                .is_some_and(|counter| Arc::ptr_eq(&counter, &generation))),
+            "Each chunk POST must give the watch that the caller read before the duty reads."
         );
     }
 
@@ -2878,16 +2887,19 @@ mod tests {
         );
     }
 
-    /// Harper N3 (#1043 R1): one subscription POST takes exactly
-    /// `timeouts.preparation` (3 s) in the first pass. The same POST takes
-    /// 1 ms more in the second pass. The first POST must not time out, and
-    /// the second POST must time out.
+    /// Harper N3 and self-check S7 (#1043 R1): `timeouts.preparation` is
+    /// 5 s, and not the default of 3 s. One subscription POST takes exactly
+    /// 5 s in the first pass. The same POST takes 1 ms more in the second
+    /// pass. The first POST must not time out, and the second POST must time
+    /// out.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn subscription_post_uses_the_configured_preparation_timeout() {
-        let bound = make_config().timeouts.preparation;
+        let bound = Duration::from_secs(5);
+        let timeouts = bn_manager::OperationTimeouts { preparation: bound, ..Default::default() };
+        let config = make_config().with_timeouts(timeouts);
         let method = bn_manager::MockMethod::SubmitBeaconCommitteeSubscriptions;
         let delays = [bound, bound + Duration::from_millis(1)];
-        let f = ManyKeys::with_mock(1, make_config(), Vec::new(), |mock| {
+        let f = ManyKeys::with_mock(1, config, Vec::new(), |mock| {
             mock.with_call_delays(method, delays)
         })
         .await;
