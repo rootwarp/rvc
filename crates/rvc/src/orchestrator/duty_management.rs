@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +87,19 @@ fn revoked_after_the_duty_read(epoch: u64, count: usize) -> OrchestratorError {
     OrchestratorError::Beacon(beacon::BeaconError::RevokedInFlight)
 }
 
+/// The fields of a committee subscription that a beacon node accepted.
+/// `BeaconCommitteeSubscription` has no `Hash`.
+type SubscriptionKey = (String, String, String, String, bool);
+
+/// For each epoch: the revocation watch of the pass that made the entry, and
+/// the subscriptions that a beacon node accepted (self-check S5).
+type AcceptedSubscriptions = HashMap<u64, (beacon::DutyFence, HashSet<SubscriptionKey>)>;
+
+fn subscription_key(subscription: &BeaconCommitteeSubscription) -> SubscriptionKey {
+    let s = subscription.clone();
+    (s.validator_index, s.committee_index, s.committees_at_slot, s.slot, s.is_aggregator)
+}
+
 /// [`PrepareOutcome::Stale`] with no POST: the indices wait for a re-check.
 fn deferred_preparation(epoch: u64) -> PrepareOutcome {
     info!(
@@ -109,6 +122,9 @@ pub(crate) struct DutyManagementService {
     prefetched_periods: RwLock<HashSet<u64>>,
     /// The selection proofs that aggregation uses too.
     selection_proofs: Arc<SelectionProofCache>,
+    /// The accepted subscriptions of each epoch whose last pass did not
+    /// complete. A retry sends only the other subscriptions (self-check S5).
+    accepted_subscriptions: parking_lot::Mutex<AcceptedSubscriptions>,
 }
 
 impl DutyManagementService {
@@ -133,12 +149,17 @@ impl DutyManagementService {
             config,
             prefetched_periods: RwLock::new(HashSet::new()),
             selection_proofs,
+            accepted_subscriptions: parking_lot::Mutex::default(),
         }
     }
 
-    /// Drops the selection proofs below `slot`. See [`SelectionProofCache::evict_before`].
+    /// Drops the selection proofs below `slot` (see
+    /// [`SelectionProofCache::evict_before`]) and the accepted subscriptions
+    /// of each epoch (self-check S5). The runner calls this at the start of
+    /// each epoch.
     pub(crate) fn evict_selection_proofs_before(&self, slot: Slot) {
         self.selection_proofs.evict_before(slot);
+        self.accepted_subscriptions.lock().clear();
     }
 
     #[tracing::instrument(name = "orchestrator.fetch_epoch_duties", level = "debug", skip_all, fields(epoch = epoch))]
@@ -643,6 +664,12 @@ impl DutyManagementService {
     /// `timeouts.preparation` bound, from its start. A failed POST does not
     /// stop the other POSTs.
     ///
+    /// The service keeps the subscriptions of each accepted POST, with the
+    /// watch of the pass. A retry of a pass that did not complete sends only
+    /// the other subscriptions (self-check S5). A pass that returns `Ok`, a
+    /// move of the generation, and the eviction at the start of a runner
+    /// epoch clear them.
+    ///
     /// `Ok` when the epoch needs no further send: each POST went out, or there
     /// is nothing to send (no own duty, or the store gate closed for each
     /// one). After a move of the watch, the result is
@@ -691,7 +718,7 @@ impl DutyManagementService {
         }
 
         let signs = SUBSCRIPTION_SIGNS.min(self.config.dispatch_limits.concurrency as usize);
-        let subscriptions: Vec<BeaconCommitteeSubscription> = stream::iter(own_duties)
+        let mut subscriptions: Vec<BeaconCommitteeSubscription> = stream::iter(own_duties)
             .map(|(slot, duty_bytes, pubkey, duty)| async move {
                 // Same store gate as aggregate production: doppelganger-off
                 // signing allows every pubkey, so `enabled = false` must skip
@@ -798,15 +825,18 @@ impl DutyManagementService {
             .filter_map(std::future::ready)
             .collect()
             .await;
+        // Self-check S5: a retry sends only the subscriptions that no beacon
+        // node accepted in an earlier pass of the same generation.
+        self.with_accepted(epoch, duties_watch, |accepted| {
+            subscriptions
+                .retain(|subscription| !accepted.contains(&subscription_key(subscription)));
+        });
 
-        if subscriptions.is_empty() {
+        if subscriptions.is_empty() && !duties_watch.holds() {
             // A move after the duty read can skip each duty. Then the pass
             // has nothing to send, but the epoch is not complete: the runner
             // step must stay pending and read the duties again (Harper B1).
-            if !duties_watch.holds() {
-                return Err(revoked_after_the_duty_read(epoch, 0));
-            }
-            return Ok(());
+            return Err(revoked_after_the_duty_read(epoch, 0));
         }
 
         // Each chunk checks the watch when it starts. The first failed chunk
@@ -823,7 +853,12 @@ impl DutyManagementService {
             .collect()
             .await;
         sent.sort_unstable_by_key(|(index, _)| *index);
-        sent.into_iter().map(|(_, outcome)| outcome).fold(Ok(()), Result::and)
+        let sent = sent.into_iter().map(|(_, outcome)| outcome).fold(Ok(()), Result::and);
+        if sent.is_ok() {
+            // The epoch needs no retry. A later call sends each subscription.
+            self.accepted_subscriptions.lock().remove(&epoch);
+        }
+        sent
     }
 
     /// One committee-subscription POST, under `timeouts.preparation`. No POST
@@ -848,6 +883,9 @@ impl DutyManagementService {
         {
             TimedOutcome::Ok(()) => {
                 info!(count, epoch, "Sent committee subscriptions");
+                self.with_accepted(epoch, duties_watch, |accepted| {
+                    accepted.extend(subscriptions.iter().map(subscription_key));
+                });
                 Ok(())
             }
             TimedOutcome::Err(e) => {
@@ -863,6 +901,21 @@ impl DutyManagementService {
                 Err(OrchestratorError::OperationTimedOut { operation: COMMITTEE_SUBSCRIPTION })
             }
         }
+    }
+
+    /// Runs `apply` on the accepted subscriptions of `epoch` (self-check S5).
+    /// First it drops each entry from before a move of the generation: after
+    /// a revocation, a retry sends each subscription again.
+    fn with_accepted(
+        &self,
+        epoch: u64,
+        duties_watch: &beacon::DutyFence,
+        apply: impl FnOnce(&mut HashSet<SubscriptionKey>),
+    ) {
+        let mut accepted = self.accepted_subscriptions.lock();
+        accepted.retain(|_, (watch, _)| watch.holds());
+        let entry = accepted.entry(epoch).or_insert_with(|| (duties_watch.clone(), HashSet::new()));
+        apply(&mut entry.1);
     }
 
     /// `Ok` while the store gate of `pk_bytes` is open, and `fence` and
