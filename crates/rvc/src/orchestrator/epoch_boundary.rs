@@ -5351,4 +5351,98 @@ mod tests {
             "The accepted POSTs must finish the step."
         );
     }
+
+    /// This layer fetches the attester duties of the epoch of `slot` again
+    /// when the first `get_duties_for_slot` span of `slot` closes. A slot
+    /// task can do this fetch at the same point.
+    struct FetchAgainOnClose {
+        duty_tracker: Arc<DutyTracker>,
+        slot: Slot,
+        span: parking_lot::Mutex<Option<tracing::span::Id>>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FetchAgainOnClose {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut slot = SlotField(None);
+            attrs.record(&mut slot);
+            let wanted = attrs.metadata().name() == "duty_tracker.get_duties_for_slot"
+                && slot.0 == Some(self.slot);
+            if wanted && self.fetches.load(Ordering::Acquire) == 0 {
+                self.span.lock().get_or_insert_with(|| id.clone());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if self.span.lock().take_if(|span| *span == id).is_some() {
+                let fetch = self.duty_tracker.fetch_duties_for_epoch(self.slot / SLOTS_PER_EPOCH);
+                let fetched = futures::executor::block_on(tokio::task::unconstrained(fetch));
+                fetched.expect("The second fetch must return the duties.");
+                self.fetches.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Self-check S1 (#1043 R1): the step checks the cache of E and E+1.
+    /// Then the generation moves when the call for E ends. The cached duties
+    /// of E+1 are stale, and the call for E+1 reads no duty. After the read
+    /// of slot 65, the test fetches the duties of E+1 again. The step must
+    /// keep E+1 pending. The next pass must send the subscription of E again
+    /// and the subscription of E+1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revocation_before_the_call_for_e_plus_1_keeps_e_plus_1_pending() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let generation = f.mock.track_admission();
+        let name = "orchestrator.submit_committee_subscriptions";
+        let generation_moves = Arc::clone(&generation);
+        let revoke =
+            RevokeOnClose { name, slot: None, generation: generation_moves, span: Arc::default() };
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetch_again = FetchAgainOnClose {
+            duty_tracker: Arc::clone(&f.duty_tracker),
+            slot: 65,
+            span: parking_lot::Mutex::default(),
+            fetches: Arc::clone(&fetches),
+        };
+        let subscriber = tracing_subscriber::registry().with(revoke).with(fetch_again);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            (generation.load(Ordering::Acquire), fetches.load(Ordering::Acquire)),
+            (1, 1),
+            "The generation must move one time, and the test must fetch E+1 again one time."
+        );
+        assert!(f.duty_tracker.is_epoch_cached(2).await, "After the fetch, E+1 must be cached.");
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"]]),
+            "Only the POST of E must go out, before the move."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Failed), false),
+            "After the revocation, the subscription step must be failed and pending."
+        );
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["33"], &["33"], &["65"]]),
+            "The next pass must send the subscription of E again and the subscription of E+1."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POSTs must finish the step."
+        );
+    }
 }
