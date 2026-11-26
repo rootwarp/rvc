@@ -1714,8 +1714,10 @@ impl BeaconClient {
     /// result is [`BeaconError::RevokedInFlight`]. An error after `gate` fails
     /// is also `RevokedInFlight`. An `Ok` stays `Ok`. The POST follows no
     /// redirect: a 3xx response is an [`BeaconError::ApiError`]. Its errors
-    /// and its logs keep only the HTTP status and the error class, with no
-    /// response text and no endpoint (1044-B3).
+    /// keep only the HTTP status and the error class, with no response text
+    /// and no endpoint (1044-B3). Its 2 WARN events have no endpoint. The HTTP
+    /// span and the retry logs show the endpoint through `RedactedUrl`, which
+    /// hides only the user name and the password (self-check F3).
     pub async fn submit_beacon_committee_subscriptions_gated(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
@@ -1730,7 +1732,6 @@ impl BeaconClient {
                 err if gate() => err,
                 err => {
                     warn!(
-                        bn_url = %RedactedUrl(self.endpoint()),
                         error = %err,
                         "Request failed after the duty watch moved: the result is RevokedInFlight"
                     );
@@ -2076,7 +2077,6 @@ impl BeaconClient {
             // The gate check comes after each wait, just before the request.
             if gate.is_some_and(|holds| !holds()) {
                 warn!(
-                    endpoint = %RedactedUrl(endpoint),
                     attempt,
                     "HTTP request not sent: beacon node admission revoked after the duty read"
                 );
