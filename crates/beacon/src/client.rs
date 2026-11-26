@@ -2196,7 +2196,7 @@ impl BeaconClient {
         span.in_scope(|| {
             error!(
                 endpoint = %RedactedUrl(endpoint),
-                total_attempts = u64::from(policy.max_retries) + 1,
+                total_attempts = total_attempts(policy.max_retries),
                 last_error = %err,
                 "Request failed after all retries exhausted"
             )
@@ -2235,6 +2235,12 @@ fn without_text(err: BeaconError) -> BeaconError {
         BeaconError::InvalidUrl(_) => BeaconError::InvalidUrl("endpoint".to_string()),
         err => err,
     }
+}
+
+/// The first HTTP attempt and each retry. A `u64` holds the count of
+/// `u32::MAX` retries (RSA N2).
+fn total_attempts(max_retries: u32) -> u64 {
+    u64::from(max_retries) + 1
 }
 
 /// `true` when `last_error` is a failure a following 404 must not replace.
@@ -3646,6 +3652,7 @@ mod tests {
         assert!(logs_contain("duty watch moved"), "The test must record the fenced warn.");
         assert!(logs_contain("retries exhausted"), "The test must record the retry log.");
         assert!(logs_contain("total_attempts=2"), "The retry log must count 2 attempts.");
+        assert_eq!(total_attempts(u32::MAX), 1_u64 << 32, "u32::MAX retries must not wrap.");
         assert!(
             !logs_contain("424242"),
             "No line may contain the payload, the response text or the password."
@@ -3661,18 +3668,23 @@ mod tests {
         }
 
         let long = MockServer::start().await;
-        let text = ResponseTemplate::new(400).set_body_string("x".repeat(16 * 1024 + 1));
-        Mock::given(method("POST"))
-            .and(path(SUBSCRIPTIONS_PATH))
-            .respond_with(text)
-            .mount(&long)
-            .await;
+        for size in [16 * 1024, 16 * 1024 + 1] {
+            let text = ResponseTemplate::new(400).set_body_string("x".repeat(size));
+            Mock::given(method("POST"))
+                .and(path(SUBSCRIPTIONS_PATH))
+                .respond_with(text)
+                .up_to_n_times(1)
+                .mount(&long)
+                .await;
+        }
         let shared =
             BeaconClient::new(BeaconClientConfig::new(long.uri())).expect("The client must start.");
-        let kept = shared.submit_beacon_committee_subscriptions(payload).await;
-        assert!(
-            matches!(&kept, Err(BeaconError::ApiError { status: 400, message }) if message.len() <= 16 * 1024),
-            "A call with no watch must keep at most 16 KiB of response text."
-        );
+        for kept in [16 * 1024, 0] {
+            let sent = shared.submit_beacon_committee_subscriptions(payload).await;
+            assert!(
+                matches!(&sent, Err(BeaconError::ApiError { status: 400, message }) if message.len() == kept),
+                "A call with no watch must keep {kept} bytes of the response text."
+            );
+        }
     }
 }
