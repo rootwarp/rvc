@@ -1265,9 +1265,11 @@ mod tests {
 
     // -- The default subscription POST with a duty watch --
 
-    /// Counts the subscription POSTs. The tests do not use the other methods.
+    /// Counts the subscription POSTs. With a generation, each POST adds its
+    /// step to the generation and fails with 503. The tests do not use the
+    /// other methods.
     #[derive(Default)]
-    struct SubscriptionCounter(std::sync::atomic::AtomicUsize);
+    struct SubscriptionCounter(std::sync::atomic::AtomicUsize, Option<(Arc<AtomicU64>, u64)>);
 
     #[async_trait]
     impl AttestationApi for SubscriptionCounter {
@@ -1308,7 +1310,13 @@ mod tests {
             _subscriptions: &[BeaconCommitteeSubscription],
         ) -> Result<(), BeaconError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            match &self.1 {
+                Some((generation, step)) => {
+                    generation.fetch_add(*step, std::sync::atomic::Ordering::SeqCst);
+                    Err(BeaconError::ApiError { status: 503, message: String::new() })
+                }
+                None => Ok(()),
+            }
         }
 
         async fn submit_sync_committee_subscriptions(
@@ -1352,6 +1360,29 @@ mod tests {
         assert!(
             matches!(refused, Err(BeaconError::RevokedInFlight)),
             "After the move, the default must return RevokedInFlight: {refused:?}"
+        );
+    }
+
+    /// Self-check A1 (PR-A): the POST fails. While the duty watch holds, the
+    /// default returns the error of the node. When the POST moves the watch,
+    /// the default must return `RevokedInFlight`, not that error.
+    #[tokio::test]
+    async fn the_default_subscription_error_after_a_move_is_revoked_in_flight() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let watch = beacon::DutyFence::at(0, Arc::clone(&generation));
+        let failing =
+            |step| SubscriptionCounter(Default::default(), Some((Arc::clone(&generation), step)));
+
+        let held = failing(0).submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
+        let moved = failing(1).submit_beacon_committee_subscriptions_fenced(&[], &watch).await;
+
+        assert!(
+            matches!(held, Err(BeaconError::ApiError { status: 503, .. })),
+            "While the watch holds, the default must return the error of the node: {held:?}"
+        );
+        assert!(
+            matches!(moved, Err(BeaconError::RevokedInFlight)),
+            "When the POST moves the watch, the default must return RevokedInFlight: {moved:?}"
         );
     }
 }
