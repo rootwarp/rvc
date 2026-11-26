@@ -13005,7 +13005,14 @@ mod tests {
     /// it waits, node A loses its admission. The duty watch moves, and the
     /// stamp of node B still holds. When the permit comes, the chunk must not
     /// start its POST, and it must return `RevokedInFlight`.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    ///
+    /// 1044-B4 (RSA R1): before that, a first chunk waits in the same way. When
+    /// its permit comes, only the admission stamp of node B moves, as in
+    /// `revoke_at` before the duty generation moves. The duty watch holds. The
+    /// chunk then gets to its send gate. The first chunk must also
+    /// send no POST, and it must return `RevokedInFlight`. The test uses the
+    /// real clock, so a stale POST gets to node B (RSA N1).
+    #[tokio::test(flavor = "current_thread")]
     async fn a_subscription_chunk_that_waits_for_a_permit_does_not_post_after_a_revocation() {
         use std::collections::HashSet;
         use wiremock::matchers::{method, path};
@@ -13023,9 +13030,24 @@ mod tests {
             Arc::new(BnManager::new(config).expect("The beacon node manager must start."));
         let watch = BeaconNodeClient::revocation_watch(manager.as_ref());
 
+        let subscriptions = [committee_subscription()];
+        let held = HeldPermits::take(&manager, BnRole::Submission).await;
+        let mut first =
+            manager.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch);
+        assert!(futures::poll!(first.as_mut()).is_pending(), "The first chunk must wait.");
+        held.release().await;
+        manager.admission_generation[1].fetch_add(1, Ordering::SeqCst);
+        assert!(watch.holds(), "A move of the stamp of node B must not move the duty watch.");
+        let refused = first.await;
+        let to_b = node_b.received_requests().await.expect("Node B must record its requests.");
+        assert_eq!(to_b.len(), 0, "After the stamp of node B moves, the chunk must send no POST.");
+        assert!(
+            matches!(refused, Err(BeaconError::RevokedInFlight)),
+            "After the stamp of node B moves, the chunk must return RevokedInFlight: {refused:?}"
+        );
+
         let held = HeldPermits::take(&manager, BnRole::Submission).await;
 
-        let subscriptions = [committee_subscription()];
         let label = crate::metrics::endpoint_label(manager.clients[1].endpoint());
         let waits = crate::metrics::RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL
             .with_label_values(&[label.as_str()]);
