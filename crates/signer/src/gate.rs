@@ -436,7 +436,7 @@ impl SigningGate {
         {
             Ok(sig) => Ok(sig.to_bytes().to_vec()),
             // The gate passes no start gate, so the core does not return these.
-            Err(NonSlashableFailure::Refused(e)) => Err(e),
+            Err(NonSlashableFailure::Refused(e) | NonSlashableFailure::Dropped(e)) => Err(e),
             Err(NonSlashableFailure::Blocked) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),

@@ -97,9 +97,13 @@ pub enum NonSlashableFailure {
     /// The sign-start gate refused just before the backend call. The backend
     /// was not called.
     Refused(SigningGateError),
+    /// The backend returned a signature, and then the sign-start gate
+    /// refused. The signature is dropped.
+    Dropped(SigningGateError),
 }
 
-/// The sign-start gate: the checks just before the backend call.
+/// The sign-start gate: the checks just before the backend call and again
+/// after the backend returns.
 ///
 /// The store gate runs first, then the beacon admission. The store gate reads
 /// the validator store under its state lock, and the admission check reads the
@@ -116,7 +120,8 @@ pub(crate) struct StartGate<'a> {
 }
 
 impl StartGate<'_> {
-    /// The refusal for `duty`, or `None` when the sign can start.
+    /// The refusal for `duty`, or `None` when the sign can start or its
+    /// signature can go to the caller.
     pub(crate) fn refusal(
         &self,
         pubkey: &[u8; 48],
@@ -160,7 +165,9 @@ impl StartGate<'_> {
 /// finishes inside the timeout.
 ///
 /// For `SignerService`, the store gate and the beacon admission have a
-/// different boundary, the [`StartGate`] just before the backend call.
+/// different boundary, the [`StartGate`] just before the backend call. When it
+/// refuses after the backend returned, the signature is dropped
+/// ([`NonSlashableFailure::Dropped`]).
 ///
 /// [`signing_allowed`]: doppelganger::signing_allowed
 pub(crate) async fn sign_nonslashable_core(
@@ -255,7 +262,10 @@ async fn sign_nonslashable_inner(
 
     match sign_result {
         Err(_elapsed) => Err(NonSlashableFailure::TimedOut { after: sign_timeout }),
-        Ok(Ok(sig)) => Ok(sig),
+        Ok(Ok(sig)) => match check() {
+            Some(refusal) => Err(NonSlashableFailure::Dropped(refusal)),
+            None => Ok(sig),
+        },
         Ok(Err(SigningError::KeyNotFound(_))) => Err(NonSlashableFailure::KeyNotFound),
         Ok(Err(e)) => Err(NonSlashableFailure::Backend(e)),
     }

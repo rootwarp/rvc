@@ -1234,11 +1234,29 @@ impl SignerService {
         backend: Arc<dyn Signer>,
         fork_name: Option<ForkName>,
     ) -> Result<Signature, SignerError> {
+        self.sign_nonslashable_reporting(pubkey, signing_root, duty, op_name, backend, fork_name)
+            .await
+            .0
+    }
+
+    /// [`Self::sign_nonslashable`], and `true` when the backend returned a
+    /// signature that the sign-start gate then dropped.
+    async fn sign_nonslashable_reporting(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        duty: SigningDuty,
+        op_name: &str,
+        backend: Arc<dyn Signer>,
+        fork_name: Option<ForkName>,
+    ) -> (Result<Signature, SignerError>, bool) {
         // Same gate point as the slashable early check. `op_name` is only the
         // log and metrics label. The exit unlock is `duty`, matched exhaustively
         // inside `signing_allowed`. The admission barrier, when set, parks
         // before that check.
-        self.admit(pubkey, duty).await?;
+        if let Err(e) = self.admit(pubkey, duty).await {
+            return (Err(e), false);
+        }
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
@@ -1249,7 +1267,10 @@ impl SignerService {
             "Signing non-slashable duty"
         );
 
-        match self.sign_nonslashable_checked(backend.as_ref(), pubkey, signing_root, duty).await {
+        let outcome =
+            self.sign_nonslashable_checked(backend.as_ref(), pubkey, signing_root, duty).await;
+        let dropped = matches!(outcome, Err(NonSlashableFailure::Dropped(_)));
+        let result = match outcome {
             Ok(sig) => {
                 debug!(
                     duration_ms = start.elapsed().as_millis() as u64,
@@ -1265,6 +1286,15 @@ impl SignerService {
                     signing_type = op_name,
                     error = %e,
                     "SignerService: sign refused just before the backend call"
+                );
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
+            Err(NonSlashableFailure::Dropped(e)) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    signing_type = op_name,
+                    error = %e,
+                    "SignerService: signature dropped after the backend returned"
                 );
                 Err(Self::map_gate_error(e, &pubkey_hex))
             }
@@ -1299,7 +1329,8 @@ impl SignerService {
                 );
                 Err(e.into())
             }
-        }
+        };
+        (result, dropped)
     }
 
     /// Returns a reference to the underlying composite signer.
@@ -1759,8 +1790,8 @@ impl ValidatorSigner for SignerService {
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
 
         let mut guard = EnvelopeSlotGuard::reserve(&self.envelope_slots, pubkey.to_bytes(), slot)?;
-        let result = self
-            .sign_nonslashable(
+        let (result, dropped) = self
+            .sign_nonslashable_reporting(
                 pubkey,
                 signing_root,
                 SigningDuty::ExecutionPayloadEnvelope,
@@ -1769,8 +1800,9 @@ impl ValidatorSigner for SignerService {
                 Some(fork_name),
             )
             .await;
+        // A signature dropped after the backend returned keeps the slot.
         if let Err(e) = &result {
-            if envelope_slot_is_unambiguous_no_signature(e) {
+            if !dropped && envelope_slot_is_unambiguous_no_signature(e) {
                 guard.release();
             }
         }
