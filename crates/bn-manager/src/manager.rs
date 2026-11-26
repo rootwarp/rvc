@@ -13047,8 +13047,8 @@ mod tests {
     /// Harper B2 (#1043 R1): node A has the proposal role, and node B has
     /// the submission role. Four held broadcasts take the four permits of
     /// node B. A subscription chunk then waits for a permit of node B. While
-    /// it waits, node A loses its admission. The duty watch moves, and the
-    /// stamp of node B still holds. When the permit comes, the chunk must not
+    /// it waits, node A loses its admission. The duty watch moves. The stamp
+    /// of node B holds. When the permit comes, the chunk must not
     /// start its POST, and it must return `RevokedInFlight`.
     ///
     /// 1044-B4 (RSA R1): before that, a first chunk waits in the same way. When

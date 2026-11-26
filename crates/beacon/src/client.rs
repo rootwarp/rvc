@@ -3322,8 +3322,8 @@ mod tests {
 
     /// Harper B2 (#1043 R1): a subscription POST starts only while its duty
     /// watch holds. After the watch moves, the next call must send no POST,
-    /// and it must return `RevokedInFlight`. A call with no watch still sends
-    /// its POST.
+    /// and it must return `RevokedInFlight`. A call with no watch sends one
+    /// POST.
     #[tokio::test]
     async fn a_subscription_post_starts_only_while_the_duty_watch_holds() {
         use wiremock::matchers::{method, path};
