@@ -1508,6 +1508,10 @@ impl BnManager {
                 }
             };
             let client = &self.clients[i];
+            // Build the future after the deadline check (a zero timeout polls it one
+            // time) and before the stamp read. Its send gate then reads this stamp or
+            // an older one, not a newer one (self-check F4).
+            let fut = op(client);
             let stamp = self.admission_stamp(i);
             if !self.stamp_holds(stamp) {
                 // all_not_found: a revoke is not "the slot is empty".
@@ -1522,9 +1526,7 @@ impl BnManager {
                 bn_url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
-            // Build the future only after the deadline check. A zero timeout
-            // still polls once and would send the request.
-            let fut = op(client).instrument(attempt_span);
+            let fut = fut.instrument(attempt_span);
             let answer = match await_attempt(op_name, bound, fut).await {
                 Err(_) if !watch.holds() => Err(BeaconError::RevokedInFlight),
                 answer => answer,
@@ -2587,16 +2589,18 @@ impl BnManager {
         self.role_matching_indices(role)
             .into_iter()
             .filter_map(|index| {
+                let client = &self.clients[index];
+                // Build the attempt before the stamp read. Its send gate then reads
+                // this stamp or an older one, not a newer one (self-check F4).
+                let fut = op(client);
                 let stamp = self.admission_stamp(index);
                 if !self.stamp_holds(stamp) {
                     return None;
                 }
                 #[cfg(test)]
                 self.after_selection(index);
-                let client = &self.clients[index];
                 let admitted = Arc::clone(&admitted);
                 let generations = Arc::clone(&generations);
-                let fut = op(client);
                 let wrapped = Box::pin(async move {
                     let result = fut.await;
                     if !crate::admission::stamp_still_holds(&admitted, &generations, stamp) {
