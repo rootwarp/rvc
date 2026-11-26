@@ -3703,4 +3703,54 @@ mod tests {
             );
         }
     }
+
+    /// 1044-F1 (RSA fix1): the node is not reachable. A call with no watch logs
+    /// the reqwest error text in the field `error` of the connection WARN event.
+    /// The event of the fenced call must not have this field or this text.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fenced_connection_retry_event_logs_no_transport_error() {
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        /// Keeps the fields of each "Connection error, will retry" event.
+        struct ConnectionFields(Arc<Mutex<Vec<Vec<String>>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for ConnectionFields {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = Vec::new();
+                event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    fields.push(format!("{}={value:?}", field.name()));
+                });
+                if fields.contains(&"message=Connection error, will retry".to_string()) {
+                    self.0.lock().expect("The lock must not be poisoned.").push(fields);
+                }
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = ConnectionFields(Arc::clone(&events));
+        let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        let config = BeaconClientConfig::new("http://127.0.0.1:9").with_max_retries(0);
+        let client = BeaconClient::new(config).expect("The client must start.");
+        let (subscriptions, watch) = ([committee_subscription()], DutyFence::open());
+        let shared = client.submit_beacon_committee_subscriptions(&subscriptions).await;
+        let _ = client.submit_beacon_committee_subscriptions_fenced(&subscriptions, &watch).await;
+        let events = events.lock().expect("The lock must not be poisoned.");
+
+        let Err(BeaconError::HttpError(raw)) = &shared else {
+            panic!("A call with no watch must return the reqwest error: {shared:?}");
+        };
+        assert_eq!(events.len(), 2, "Each call must log one connection WARN event: {events:?}");
+        assert!(
+            events[0].contains(&format!("error={raw}")),
+            "A call with no watch must log the reqwest error in the field error: {events:?}"
+        );
+        assert!(
+            events[1].iter().all(|field| !field.starts_with("error=")),
+            "The fenced connection WARN event must not have the field error: {events:?}"
+        );
+        assert!(
+            events[1].iter().all(|field| !field.contains(raw.as_str())),
+            "A field value of the fenced WARN event must not contain the reqwest error text."
+        );
+    }
 }
