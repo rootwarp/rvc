@@ -50,9 +50,9 @@ pub enum SigningGateError {
     /// the reservation, so they write no slashing-DB row. The check after the
     /// reservation is the last check before BLS for a slashable sign; it
     /// deletes the row this call inserted, and if that delete fails, the row
-    /// is kept. For `SignerService`, the non-slashable core checks it just
-    /// before BLS too, and a move after BLS returned drops the signature and
-    /// keeps a slashable row.
+    /// is kept. For a `SignerService` with a store gate, the non-slashable
+    /// core checks it just before BLS too, and a move after BLS returned drops
+    /// the signature and keeps a slashable row.
     #[error("beacon node admission revoked")]
     BeaconAdmissionRevoked,
 

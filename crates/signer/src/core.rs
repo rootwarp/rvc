@@ -112,7 +112,8 @@ pub enum NonSlashableFailure {
 /// same state. The check and the backend call have no await between them, and
 /// the check holds no lock after it returns.
 ///
-/// Only `SignerService` has one. `SigningGate` (signer-server) passes none.
+/// Only a `SignerService` with a store gate has one. `SigningGate`
+/// (signer-server) passes none.
 pub(crate) struct StartGate<'a> {
     /// The store gate of the service.
     pub(crate) store: &'a crate::StoreGate,
@@ -505,7 +506,8 @@ pub struct SlashableSignSession {
     admission: crate::CapturedAdmission,
     /// Duty `admission` is checked for.
     duty: doppelganger::SigningDuty,
-    /// The VC store gate. `None` (`SigningGate`) has no sign-start gate.
+    /// The VC store gate. `None` (`SigningGate`, or a `SignerService` with no
+    /// store gate) has no sign-start gate.
     store: Option<crate::StoreGate>,
 }
 

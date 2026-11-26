@@ -219,8 +219,9 @@ const _: () = assert!(missing_admission_scope_revokes(), "a missing admission sc
 ///
 /// The VC installs the `enabled` flag of its `ValidatorStore` with
 /// [`SignerService::with_store_gate`]. The signer calls it just before each
-/// backend sign and again when the backend returns. The default store gate
-/// lets every key sign (test fixtures). `SigningGate` has no store gate.
+/// backend sign and again when the backend returns. A service with no store
+/// gate (test fixtures) has no sign-start gate and keeps the checks of the
+/// base. `SigningGate` has no store gate.
 pub type StoreGate = std::sync::Arc<dyn Fn(&[u8; 48], SigningDuty) -> bool + Send + Sync>;
 
 pub use error::{classify, GateErrClass, SigningGateError};
@@ -502,8 +503,9 @@ pub struct SignerService {
     /// Test-only park after the non-slashable enablement check, before the backend.
     #[cfg(any(test, feature = "test-utils"))]
     nonslashable_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
-    /// The validator store gate. The default lets every key sign.
-    store_gate: StoreGate,
+    /// The validator store gate. With `None` (the default), the service has
+    /// no sign-start gate.
+    store_gate: Option<StoreGate>,
 }
 
 /// Per-slot envelope reservation. In-flight is refused the same as signed so
@@ -872,7 +874,7 @@ impl SignerService {
             admission_barrier: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             nonslashable_barrier: parking_lot::Mutex::new(None),
-            store_gate: Arc::new(|_: &[u8; 48], _: SigningDuty| true),
+            store_gate: None,
         }
     }
 
@@ -934,10 +936,11 @@ impl SignerService {
     /// The sign-start gate calls it just before each backend sign, and again
     /// when the backend returns. A refusal is
     /// [`SignerError::BlockedByDoppelganger`], the error of the other
-    /// enablement gates. The default store gate lets every key sign.
+    /// enablement gates. With no store gate, the service has no sign-start
+    /// gate.
     #[must_use]
     pub fn with_store_gate(mut self, gate: StoreGate) -> Self {
-        self.store_gate = gate;
+        self.store_gate = Some(gate);
         self
     }
 
@@ -1160,8 +1163,7 @@ impl SignerService {
             #[cfg(any(test, feature = "test-utils"))]
             pre_reserve_barrier,
         };
-        let store = Some(Arc::clone(&self.store_gate));
-        let result = core::sign_slashable_with_store_gate(request, store).await;
+        let result = core::sign_slashable_with_store_gate(request, self.store_gate.clone()).await;
 
         match result {
             Ok(bytes) => {
@@ -1207,7 +1209,8 @@ impl SignerService {
         duty: SigningDuty,
     ) -> Result<Signature, NonSlashableFailure> {
         let admission = capture_admission();
-        let gate = Some(core::StartGate { store: &self.store_gate, admission: &admission });
+        let gate =
+            self.store_gate.as_ref().map(|store| core::StartGate { store, admission: &admission });
         #[cfg(any(test, feature = "test-utils"))]
         {
             return core::sign_nonslashable_core_paused(
