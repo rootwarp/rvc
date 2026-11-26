@@ -110,7 +110,9 @@ pub enum NonSlashableFailure {
 /// atomics, and the store gate reads the validator store under its state lock.
 /// When an admission moves or the store disables a key, the change writes the
 /// same state. The check and the backend call have no await between them, and
-/// the check holds no lock after it returns.
+/// the check holds no lock after it returns. So this check is the start
+/// boundary: a change that completes after it is a change during the backend
+/// call, and the check after the backend returns drops the signature.
 ///
 /// Only a `SignerService` with a store gate has one. `SigningGate`
 /// (signer-server) passes none.
@@ -166,9 +168,9 @@ impl StartGate<'_> {
 /// already started, including a request already sent to a remote signer, still
 /// finishes inside the timeout.
 ///
-/// For `SignerService`, the store gate and the beacon admission have a
-/// different boundary, the [`StartGate`] just before the backend call. When it
-/// refuses after the backend returned, the signature is dropped
+/// For a `SignerService` with a store gate, the beacon admission and the store
+/// gate have a different boundary, the [`StartGate`] just before the backend
+/// call. When it refuses after the backend returned, the signature is dropped
 /// ([`NonSlashableFailure::Dropped`]).
 ///
 /// [`signing_allowed`]: doppelganger::signing_allowed
@@ -754,7 +756,7 @@ impl SlashableSignSession {
             warn!(
                 pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
                 op = self.op_name,
-                "reserve_then_sign: the validator store disabled the key after reserve, before BLS"
+                "reserve_then_sign: the validator store refused the key after the signer reserved the row, before BLS"
             );
             return Err(SigningGateError::BlockedByDoppelganger);
         }
@@ -780,7 +782,7 @@ impl SlashableSignSession {
                         pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
                         op = self.op_name,
                         error = %refusal,
-                        "reserve_then_sign: signature dropped after BLS; reserved row retained"
+                        "reserve_then_sign: the signer dropped the signature after BLS and kept the reserved row"
                     );
                     return Err(refusal);
                 }

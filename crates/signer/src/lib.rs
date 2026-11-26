@@ -1026,22 +1026,28 @@ impl SignerService {
     ///
     /// # Sign-start gate
     ///
-    /// Just before the backend call, with no await between them, the signer
-    /// checks the admission and then the store gate ([`Self::with_store_gate`]).
-    /// A slashable sign runs them after the reservation and the doppelganger
-    /// check, so an admission refusal deletes the row that this call inserted.
-    /// A store refusal keeps the row, as a doppelganger refusal does.
-    /// `SigningGate` (signer-server) has no sign-start gate.
+    /// With a store gate ([`Self::with_store_gate`]), the signer checks the
+    /// admission and then the store gate just before the backend call, with no
+    /// await between them. A slashable sign runs them after the reservation
+    /// and the doppelganger check, so an admission refusal deletes the row that
+    /// this call inserted. A store refusal keeps the row, as a doppelganger
+    /// refusal does. With no store gate, and in `SigningGate` (signer-server),
+    /// there is no sign-start gate.
     ///
-    /// - When the store disables the key or the admission moves before that
-    ///   check, the sign stops with no backend call.
-    /// - A change after that check cannot stop a BLS call that has started,
-    ///   for example a request that a remote signer already received. That
+    /// - This synchronous check is the start boundary. When the store disables
+    ///   the key or the admission moves before it, the backend gets no call.
+    /// - A change that completes after this check is a change during the
+    ///   backend call. The check holds no lock, so the backend can get the
+    ///   call. A request that the client has queued or sent is a backend call
+    ///   in progress, also when it waits for the channel or for a retry. That
     ///   call finishes or hits the sign timeout.
-    /// - When the backend returns a signature, the signer checks both again.
-    ///   A refusal drops the signature, returns the refusal error and keeps a
-    ///   reserved row, because the backend can have signed. A change after
-    ///   that second check is after the sign.
+    /// - When the backend returns a signature, the signer checks both again
+    ///   and reads the store flag at that time. A refusal drops the signature,
+    ///   returns the refusal error and keeps a reserved row, because the
+    ///   backend can have signed. A disable and an enable of the key before the
+    ///   backend returns do not drop the signature.
+    /// - The use boundary is the time when the signer returns the signature. A
+    ///   change after the second check is after the sign.
     ///
     /// `duty` is the typed operation. An exit-only enablement stays closed
     /// for every variant except [`SigningDuty::VoluntaryExit`].
@@ -1305,7 +1311,7 @@ impl SignerService {
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     signing_type = op_name,
                     error = %e,
-                    "SignerService: sign refused just before the backend call"
+                    "SignerService: the sign-start gate refused the sign before the backend call"
                 );
                 Err(Self::map_gate_error(e, &pubkey_hex))
             }
@@ -1314,7 +1320,7 @@ impl SignerService {
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     signing_type = op_name,
                     error = %e,
-                    "SignerService: signature dropped after the backend returned"
+                    "SignerService: the signer dropped the signature after the backend returned"
                 );
                 Err(Self::map_gate_error(e, &pubkey_hex))
             }
