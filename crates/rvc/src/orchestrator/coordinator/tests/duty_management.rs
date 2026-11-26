@@ -3274,8 +3274,8 @@ fn abandoned_warns(run: &BoundaryRun) -> Vec<(Option<Slot>, &str)> {
 
 /// 653-AC2: each step has its own bound. With `duty_fetch` at 2 s and
 /// `preparation` at 60 s, every subscription POST is held past the
-/// subscription step's 2 s bound. The step ends `Failed` there, its POST is
-/// dropped before E+1's, and the next slot's pass sends it again. The
+/// subscription step's 2 s bound. The step ends `Failed` there, its POST for
+/// E+1 is dropped before E's, and the next slot's pass sends it again. The
 /// prepare POST takes 3 s, past `duty_fetch` but inside `preparation`: its
 /// step is done in one attempt.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -3301,7 +3301,7 @@ async fn test_step_timeout_leaves_step_pending() {
     assert_eq!(
         run.pass_slots("orchestrator.submit_committee_subscriptions"),
         [Some(32), Some(33), Some(34)],
-        "E's POST, cut at the step bound, is sent again in each next slot's pass"
+        "E+1's POST, cut at the step bound, is sent again in each next slot's pass"
     );
     let posts = run.mock.call_stamps().iter().filter(|stamp| stamp.method == subs).count();
     assert_eq!(posts, 3, "one subscription POST per pass");
@@ -3324,7 +3324,7 @@ async fn test_step_timeout_leaves_step_pending() {
 
 /// 653-AC2, recovery: only the first subscription POST is held past the
 /// 2 s step bound; later POSTs answer at once. The slot-32 pass is cut in
-/// E's POST. The slot-33 pass sends E and E+1 and finishes the step, so no
+/// E+1's POST. The slot-33 pass sends E+1 and E and finishes the step, so no
 /// pass runs at slot 34.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_step_timeout_retry_succeeds_then_stops() {
@@ -3354,9 +3354,9 @@ async fn test_step_timeout_retry_succeeds_then_stops() {
     assert_eq!(
         run.pass_slots("orchestrator.submit_committee_subscriptions"),
         [Some(32), Some(33), Some(33)],
-        "E cut at slot 32, then E and E+1 at slot 33"
+        "E+1 cut at slot 32, then E+1 and E at slot 33"
     );
-    assert_eq!(*sent.lock(), ["63", "95"], "E and E+1 answered at slot 33");
+    assert_eq!(*sent.lock(), ["95", "63"], "E+1 and E answered at slot 33");
     assert_eq!(
         run.pass_slots("epoch.boundary"),
         [Some(32), Some(33)],
@@ -3493,7 +3493,7 @@ async fn test_subscription_post_500_is_retried_at_the_next_slot() {
     assert_eq!(
         run.pass_slots("orchestrator.submit_committee_subscriptions"),
         [Some(32), Some(32), Some(33)],
-        "E (the 500) and E+1 (no duty) at slot 32, then E again at slot 33"
+        "E+1 (no duty) and E (the 500) at slot 32, then E again at slot 33"
     );
     let in_passes: Vec<&(Option<Slot>, String)> =
         run.warns.iter().filter(|(pass, _)| pass.is_some()).collect();
@@ -3511,6 +3511,64 @@ async fn test_subscription_post_500_is_retried_at_the_next_slot() {
         run.pass_slots("epoch.boundary"),
         [Some(32), Some(33)],
         "the retry at slot 33 finishes the step: no pass at slot 34"
+    );
+}
+
+/// 655-AC4, through `run`: the drive boots at slot 40 in epoch 1 and runs to
+/// slot 64. Validator 42 has one attester duty at slot 1 of each epoch, so
+/// the slot loop does not attest in the drive. These results must occur:
+///
+/// - At the boot, the first subscription POST is for epoch 2, and the second
+///   POST is for epoch 1.
+/// - At slot 64, the pass POSTs epoch 3, and it does not POST epoch 2 again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_subscription_step_skips_epoch_already_sent() {
+    let _metrics = m2_metric_lock().await;
+    let local = SecretKey::generate();
+    let local_hex = pubkey_hex(&local.public_key().to_bytes());
+    let posted: Captured<Vec<String>> = Captured::default();
+    let record = Arc::clone(&posted);
+    let mock = retirement_beacon()
+        .with_get_attester_duties(move |epoch, _indices| {
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                execution_optimistic: false,
+                data: vec![AttesterDuty {
+                    pubkey: local_hex.clone(),
+                    validator_index: BOUNDARY_INDEX.to_string(),
+                    committee_index: "1".to_string(),
+                    committee_length: "8".to_string(),
+                    committees_at_slot: "4".to_string(),
+                    validator_committee_index: "0".to_string(),
+                    slot: (epoch * ::timing::SLOTS_PER_EPOCH + 1).to_string(),
+                }],
+            })
+        })
+        .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+            record.lock().push(subscriptions.into_iter().map(|s| s.slot).collect());
+            Ok(())
+        });
+
+    let run = drive_boundary_with(mock, local, create_test_config().timeouts, 40, 64).await;
+
+    let posted = posted.lock().clone();
+    let slots = |posts: &[&str]| -> Vec<Vec<String>> {
+        posts.iter().map(|s| vec![s.to_string()]).collect()
+    };
+    assert_eq!(
+        posted.get(..2),
+        Some(slots(&["65", "33"]).as_slice()),
+        "At the boot, the first POST must be for epoch 2, and the second POST must be for epoch 1."
+    );
+    assert_eq!(
+        posted.get(2..),
+        Some(slots(&["97"]).as_slice()),
+        "At slot 64, the pass must POST epoch 3, and it must not POST epoch 2 again."
+    );
+    assert_eq!(
+        run.pass_slots("orchestrator.submit_committee_subscriptions"),
+        [Some(40), Some(40), Some(64)],
+        "The boot pass must call the step for epochs 2 and 1, and the slot-64 pass only for epoch 3."
     );
 }
 

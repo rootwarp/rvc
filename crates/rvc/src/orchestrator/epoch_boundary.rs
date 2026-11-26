@@ -16,7 +16,11 @@
 //! that finds the registry token moved since the step's last POST re-opens
 //! the step, done or not, so the re-checked indices are sent in the same
 //! epoch. `CommitteeSubscriptions` is
-//! `NotReady` until the attester duties of E and E+1 are cached.
+//! `NotReady` until the attester duties of E and E+1 are cached. Then it
+//! sends E+1 first, and E only when E did not go out before: the pass of
+//! the epoch before sent E as its next epoch. A revocation or a change of
+//! the count of keys with an index after that send makes the step send E
+//! again.
 //! `BuilderRegistration` runs in every epoch and needs no duties: it re-sends
 //! each builder key's registration and signs only the new or changed ones.
 //! `ProposerPreferences` runs from the epoch before Gloas. It is `NotReady`
@@ -51,7 +55,8 @@
 //! 3. `DutyFetch` (the uncached E and E+1 attester and proposer duties,
 //!    bounded by `timeouts.duty_fetch`; never waits on the slot loop's warm-up)
 //! 4. `PrepareProposers`
-//! 5. `CommitteeSubscriptions` (epoch E, then E+1)
+//! 5. `CommitteeSubscriptions` (epoch E+1, then E; an epoch that went out
+//!    before is not sent again)
 //! 6. `SyncCommitteeSubscriptions` (reserved, W4-E9b)
 //! 7. `BuilderRegistration` (every epoch)
 //! 8. `ProposerPreferences` (from the epoch before Gloas, until the proposer
@@ -263,14 +268,32 @@ pub(crate) enum StepOutcome {
     NotReady,
 }
 
+/// The inputs of the accepted committee subscriptions of one duty epoch.
+struct SubscribedEpoch {
+    /// The revocation watch that the step read before its cache check.
+    watch: beacon::DutyFence,
+    /// The local keys with a validator index when the step started.
+    resolved: usize,
+}
+
+impl SubscribedEpoch {
+    /// Whether the sent subscriptions are still current: the generation did
+    /// not move since the send, and `resolved` keys have an index, as then.
+    fn holds(&self, resolved: usize) -> bool {
+        self.watch.holds() && self.resolved == resolved
+    }
+}
+
 /// Steps done in `epoch`, and each step's latest outcome.
 pub(crate) struct EpochProgress {
     epoch: u64,
     done: BTreeSet<BoundaryStep>,
     /// Read by the warn for the steps the epoch did not finish.
     last_outcome: BTreeMap<BoundaryStep, StepOutcome>,
-    /// The duty epochs whose committee subscriptions went out.
-    subscribed: BTreeSet<u64>,
+    /// The duty epochs whose committee subscriptions went out. A new epoch
+    /// keeps the epochs from its own epoch on, and drops the older epochs
+    /// ([`EpochBoundaryRunner::begin_epoch`]).
+    subscribed_epochs: BTreeMap<u64, SubscribedEpoch>,
     /// The keys with a validator index when the last `Complete` or `Partial`
     /// prepare POST went out.
     prepared_count: Option<usize>,
@@ -286,7 +309,7 @@ impl EpochProgress {
             epoch,
             done: BTreeSet::new(),
             last_outcome: BTreeMap::new(),
-            subscribed: BTreeSet::new(),
+            subscribed_epochs: BTreeMap::new(),
             prepared_count: None,
             prepared_under: None,
         }
@@ -508,13 +531,18 @@ impl EpochBoundaryRunner {
 
     /// Moves the progress to `epoch` when that is later, drops the selection
     /// proofs below the epoch's first slot, and warns once for the steps the
-    /// old epoch did not finish. `true` when it moved.
+    /// old epoch did not finish. The new progress keeps the subscribed duty
+    /// epochs from `epoch` on, and drops the older ones. `true` when it moved.
     fn begin_epoch(&self, epoch: u64) -> bool {
         let mut progress = self.progress.lock();
         if progress.as_ref().is_some_and(|current| current.epoch >= epoch) {
             return false;
         }
-        let old = progress.replace(EpochProgress::new(epoch));
+        let mut next = EpochProgress::new(epoch);
+        if let Some(current) = progress.as_mut() {
+            next.subscribed_epochs = current.subscribed_epochs.split_off(&epoch);
+        }
+        let old = progress.replace(next);
         drop(progress);
         self.duty_management.evict_selection_proofs_before(epoch.saturating_mul(SLOTS_PER_EPOCH));
         if let Some(old) = old {
@@ -688,10 +716,18 @@ impl EpochBoundaryRunner {
         }
     }
 
-    /// `NotReady` until the attester duties of E and E+1 are cached; then
-    /// sends the subscriptions of E, then E+1, that did not go out yet in
-    /// this epoch. `Failed` while one of them did not: a failed or timed-out
-    /// POST, or a call with duties that are not cached after the call. A revocation
+    /// `NotReady` until the attester duties of E and E+1 are cached. Then it
+    /// sends the subscriptions of E+1 first, because their subnets need the
+    /// most lead time, and then those of E. It skips a duty epoch in
+    /// `subscribed_epochs`: the pass of the epoch before sent E as its next
+    /// epoch, and an earlier pass of this epoch can have sent either one. A
+    /// duty epoch goes into `subscribed_epochs` only after its call returned
+    /// `Ok`, that is, after the beacon node accepted each chunk POST. The
+    /// step sends a marked epoch again when the generation moved after the
+    /// mark, or when the count of keys with an index changed: the duties of
+    /// that epoch can be different now.
+    /// `Failed` while one of them did not go out: a failed or timed-out POST,
+    /// or a call with duties that are not cached after the call. A revocation
     /// makes the cached duties stale, and the next pass fetches the duties
     /// again (Harper B1). The step reads the revocation watch before its first
     /// cache check, and each call uses that watch. Thus a call after a move
@@ -701,6 +737,7 @@ impl EpochBoundaryRunner {
     /// (self-check T2).
     async fn committee_subscriptions(&self, epoch: u64) -> StepOutcome {
         let duties_watch = self.duty_management.revocation_watch();
+        let resolved = self.duty_management.resolved_proposer_count();
         for duty_epoch in [epoch, epoch + 1] {
             if !self.duty_tracker.is_epoch_cached(duty_epoch).await {
                 debug!(epoch, duty_epoch, "Committee subscriptions wait for cached duties");
@@ -708,8 +745,8 @@ impl EpochBoundaryRunner {
             }
         }
         let mut outcome = StepOutcome::Done;
-        for duty_epoch in [epoch, epoch + 1] {
-            if self.subscribed(epoch, duty_epoch) {
+        for duty_epoch in [epoch + 1, epoch] {
+            if self.subscribed(epoch, duty_epoch, resolved) {
                 continue;
             }
             let post = self
@@ -718,7 +755,8 @@ impl EpochBoundaryRunner {
             let sent = post.await.is_ok();
             let cached = sent && self.duty_tracker.is_epoch_cached(duty_epoch).await;
             if cached && duties_watch.holds() {
-                self.mark_subscribed(epoch, duty_epoch);
+                let watch = duties_watch.clone();
+                self.mark_subscribed(epoch, duty_epoch, SubscribedEpoch { watch, resolved });
             } else {
                 if sent {
                     warn!(
@@ -733,15 +771,21 @@ impl EpochBoundaryRunner {
         outcome
     }
 
-    /// Whether `duty_epoch`'s subscriptions went out in `epoch`.
-    fn subscribed(&self, epoch: u64, duty_epoch: u64) -> bool {
+    /// Whether `duty_epoch`'s subscriptions went out, in `epoch` or as the
+    /// next epoch of the epoch before, and are still current with `resolved`
+    /// keys with an index ([`SubscribedEpoch::holds`]).
+    fn subscribed(&self, epoch: u64, duty_epoch: u64, resolved: usize) -> bool {
         let progress = self.progress.lock();
-        progress.as_ref().is_some_and(|p| p.epoch == epoch && p.subscribed.contains(&duty_epoch))
+        progress
+            .as_ref()
+            .filter(|p| p.epoch == epoch)
+            .and_then(|p| p.subscribed_epochs.get(&duty_epoch))
+            .is_some_and(|sent| sent.holds(resolved))
     }
 
-    fn mark_subscribed(&self, epoch: u64, duty_epoch: u64) {
+    fn mark_subscribed(&self, epoch: u64, duty_epoch: u64, sent: SubscribedEpoch) {
         if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
-            current.subscribed.insert(duty_epoch);
+            current.subscribed_epochs.insert(duty_epoch, sent);
         }
     }
 
@@ -1373,7 +1417,7 @@ mod tests {
                 MockMethod::SubmitBeaconCommitteeSubscriptions,
             ]
         );
-        assert_eq!(*f.subscription_slots.lock(), [vec!["33".to_string()], vec!["65".to_string()]]);
+        assert_eq!(*f.subscription_slots.lock(), [vec!["65".to_string()], vec!["33".to_string()]]);
         logs_assert(|lines| match boundary_lines(lines).as_slice() {
             ["breaker", "proposer_duties", "proposer_duties", "prepare", "subscriptions", "subscriptions", "summary"] => {
                 Ok(())
@@ -1391,17 +1435,17 @@ mod tests {
             f.runner.run_pending(slot).await;
         }
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1);
-        assert_eq!(f.subscription_slots.lock().len(), 2, "one subscription pass: E and E+1");
+        assert_eq!(f.subscription_slots.lock().len(), 2, "one subscription pass: E+1 and E");
         logs_assert(|lines| expect_summaries(lines, 1));
 
         f.runner.run_pending(64).await;
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 2, "epoch 2 runs the steps");
-        assert_eq!(f.subscription_slots.lock().len(), 4);
+        assert_eq!(f.subscription_slots.lock().len(), 3, "Epoch 2 must send only epoch 3.");
         logs_assert(|lines| expect_summaries(lines, 2));
 
         f.runner.run_pending(32).await;
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 2, "an older epoch runs nothing");
-        assert_eq!(f.subscription_slots.lock().len(), 4);
+        assert_eq!(f.subscription_slots.lock().len(), 3);
         logs_assert(|lines| expect_summaries(lines, 2));
     }
 
@@ -1575,7 +1619,7 @@ mod tests {
         );
         assert_eq!(attester_epochs_since(&f.mock, attester_seeded), [1, 2, 2]);
         assert_eq!(f.mock.get_proposer_duties_calls()[proposer_seeded..], [1, 2, 2]);
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
 
         let calls = f.mock.call_stamps().len();
         assert_eq!(f.runner.duty_fetch(1).await, StepOutcome::Done, "all four entries are cached");
@@ -1634,7 +1678,7 @@ mod tests {
         assert_eq!(attester_epochs_since(&f.mock, attester_seeded), [1, 2, 2]);
         assert!(!f.duty_tracker.is_proposer_epoch_cached(1).await, "both E requests failed");
         assert!(f.duty_tracker.is_proposer_epoch_cached(2).await);
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
     }
 
     /// DutyFetch is `Done` only when all four entries, the attester and
@@ -1720,7 +1764,7 @@ mod tests {
             [(1, grown.clone()), (2, grown)],
             "DutyFetch requests the stale E again with the new index set, then E+1"
         );
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
     }
 
     /// Held on the prepare POST, so a cache entry can turn into a miss after
@@ -1755,8 +1799,8 @@ mod tests {
         f.runner.run_pending(33).await;
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["65"]]),
-            "the next wake fetches E+1, then POSTs E and E+1 once"
+            slots(&[&["65"], &["33"]]),
+            "the next wake fetches E+1, then POSTs E+1 and E once"
         );
         assert!(!f.runner.has_pending(34), "nothing is pending once both epochs are subscribed");
         logs_assert(|lines| expect_summaries(lines, 1));
@@ -1785,8 +1829,9 @@ mod tests {
         f.runner.run_pending(65).await;
         assert_eq!(
             f.subscription_slots.lock()[2..],
-            slots(&[&["65"], &["97"]]),
-            "DutyFetch refetched E at the next wake"
+            slots(&[&["97"]]),
+            "DutyFetch must fetch E again at the next wake. Then the pass must POST only E+1, \
+             because E went out in epoch 1."
         );
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 2, "one prepare per epoch");
         logs_assert(|lines| expect_summaries(lines, 2));
@@ -1826,7 +1871,7 @@ mod tests {
             [(1, grown.clone()), (2, grown)],
             "the next wake's DutyFetch requests E and E+1 with the new index set"
         );
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
         assert!(!f.runner.has_pending(34), "nothing is pending once both epochs are subscribed");
     }
 
@@ -1881,7 +1926,7 @@ mod tests {
             "DutyFetch's E+1 request, then the subscriptions; no done step runs again"
         );
         assert_eq!(attester_epochs_since(&f.mock, attester_seeded + 3), [2]);
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]), "E and E+1, once");
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]), "E and E+1, once");
         assert_eq!(
             step_state(&f.runner, DutyFetch),
             (Some(StepOutcome::Done), false),
@@ -1915,7 +1960,7 @@ mod tests {
         );
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["65"]]),
+            slots(&[&["65"], &["33"]]),
             "the subscriptions after the failed prepare go out in the same pass"
         );
         assert_eq!(
@@ -1957,7 +2002,7 @@ mod tests {
 
         f.runner.run_pending(32).await;
         assert_eq!(step_state(&f.runner, PrepareProposers), (Some(StepOutcome::Failed), false));
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
         f.breaker.record_miss();
 
         let seeded = f.mock.call_stamps().len();
@@ -2019,7 +2064,7 @@ mod tests {
 
         f.runner.run_pending(34).await;
         assert!(!f.runner.has_pending(35), "slot 34 finishes both");
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
         logs_assert(|lines| expect_summaries(lines, 1));
 
         f.runner.run_pending(64).await;
@@ -2107,7 +2152,7 @@ mod tests {
             (Some(StepOutcome::Failed), false),
             "timed out with E's proposer duties uncached: failed, and not done"
         );
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]), "the steps after ran");
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]), "the steps after ran");
     }
 
     /// DutyFetch calls the tracker directly. Eviction, PTC duties and the
@@ -2355,7 +2400,7 @@ mod tests {
             "the cancelled step is still pending: a fresh pass prepares again"
         );
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 1);
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
 
         // The first pass ends with E+1 uncached: ReorgCheck's and DutyFetch's
         // E+1 requests fail. The second pass starts at DutyFetch.
@@ -2372,7 +2417,7 @@ mod tests {
         assert!(f.runner.has_pending(33), "the cancelled step is still pending");
         f.runner.run_pending(33).await;
         assert_eq!(arrivals(&f.mock, MockMethod::GetAttesterDuties), fetches + 2);
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
 
         // A slot wake and shutdown ready at the task's first poll. Repeated:
         // an unbiased select picks a random first arm.
@@ -2616,7 +2661,7 @@ mod tests {
             "no shutdown: the same poll completes the held prepare"
         );
         assert!(prepare_done(&f.runner), "no shutdown: PrepareProposers is marked done");
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["65"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"], &["33"]]));
         runner.shutdown.send_replace(true);
         assert!(futures::poll!(runner.run.as_mut()).is_ready(), "shutdown ends the idle runner");
     }
@@ -2993,7 +3038,7 @@ mod tests {
         assert_eq!(f.mock.prepare_beacon_proposer_calls().len(), 2, "epoch 4's prepare ran");
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["65"], &["129"], &["161"]]),
+            slots(&[&["65"], &["33"], &["161"], &["129"]]),
             "epoch 4's subscriptions went out in the same pass"
         );
         assert!(!f.runner.has_pending(131), "every step of epoch 4 is done");
@@ -3057,10 +3102,11 @@ mod tests {
     // --- PR #982 R1: cancellation-safe retries ---
 
     /// RSA B2: a retry does not redo an epoch whose subscriptions went out,
-    /// nor a selection proof already signed. E's POST is answered and E+1's
-    /// is held past the 2 s step bound, so the step is `Failed` with E sent.
-    /// The slot-33 pass sends E+1 only, with the proof signed at slot 32,
-    /// and the step is done. Epoch 2 keeps only its own proofs.
+    /// nor a selection proof already signed. E+1's POST is answered and E's
+    /// is held past the 2 s step bound, so the step is `Failed` with E+1
+    /// sent. The slot-33 pass sends E only, with the proof signed at slot 32,
+    /// and the step is done. Epoch 2 keeps only its own proofs, and it sends
+    /// only epoch 3.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_subscription_retry_sends_only_the_epochs_not_sent() {
         use BoundaryStep::CommitteeSubscriptions;
@@ -3074,7 +3120,7 @@ mod tests {
 
         f.runner.run_pending(32).await;
 
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"]]), "E sent, E+1 held");
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"]]), "E+1 sent, E held");
         assert_eq!(
             step_state(&f.runner, CommitteeSubscriptions),
             (Some(StepOutcome::Failed), false)
@@ -3084,10 +3130,10 @@ mod tests {
 
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["65"]]),
-            "the retry sends E+1 only"
+            slots(&[&["65"], &["33"]]),
+            "the retry sends E only"
         );
-        assert_eq!(arrivals(&f.mock, subs), 3, "E, E+1 held, then E+1");
+        assert_eq!(arrivals(&f.mock, subs), 3, "E+1, E held, then E");
         assert_eq!(step_state(&f.runner, CommitteeSubscriptions), (Some(StepOutcome::Done), true));
         let signed = spans.0.lock().iter().filter(|name| **name == "sign.selection_proof").count();
         assert_eq!(signed, 2, "one selection proof each for E and E+1, signed once");
@@ -3100,7 +3146,7 @@ mod tests {
             "epoch 2 keeps the proofs of epochs 2 and 3"
         );
         let signed = spans.0.lock().iter().filter(|name| **name == "sign.selection_proof").count();
-        assert_eq!(signed, 3, "epoch 2 reuses the slot-65 proof that epoch 1 signed");
+        assert_eq!(signed, 3, "Epoch 2 must sign only the slot-97 proof of epoch 3.");
     }
 
     /// W4-E8a3: the first pass of epoch 2 drops the proofs below slot 64 and
@@ -3150,9 +3196,9 @@ mod tests {
 
     /// Harper B4 (#855 Decisions): a subscription POST cut by its own 3 s
     /// `preparation` bound, as by the step's, makes the step `Failed`, and
-    /// so does a POST error. With the default timeouts, E's first POST is
-    /// held 5 s, or answers 503. E+1's POST still goes out in that pass. The
-    /// slot-33 pass sends E only, and the step is done.
+    /// so does a POST error. With the default timeouts, the first POST, for
+    /// E+1, is held 5 s, or answers 503. E's POST still goes out in that
+    /// pass. The slot-33 pass sends E+1 only, and the step is done.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_failed_or_timed_out_subscription_post_is_a_failed_step() {
         use BoundaryStep::CommitteeSubscriptions;
@@ -3162,13 +3208,13 @@ mod tests {
                 "inner timeout",
                 Duration::from_secs(5),
                 0,
-                "Committee subscription timed out after 3s epoch=1",
+                "Committee subscription timed out after 3s epoch=2",
             ),
             (
                 "503",
                 Duration::ZERO,
                 1,
-                "Failed to send committee subscriptions epoch=1 \
+                "Failed to send committee subscriptions epoch=2 \
                  error=Beacon node returned error: 503 - unavailable",
             ),
         ] {
@@ -3182,17 +3228,17 @@ mod tests {
             assert_eq!(
                 step_state(&f.runner, CommitteeSubscriptions),
                 (Some(StepOutcome::Failed), false),
-                "{arm}: E's POST failed, so the step is failed, and not done"
+                "{arm}: E+1's POST failed, so the step is failed, and not done"
             );
-            assert_eq!(*f.subscription_slots.lock(), slots(&[&["65"]]), "{arm}: E+1 went out");
+            assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"]]), "{arm}: E went out");
             assert_eq!(warns.lines(), [warn], "{arm}: the POST's own warn, no step-bound warn");
 
             f.runner.run_pending(33).await;
 
             assert_eq!(
                 *f.subscription_slots.lock(),
-                slots(&[&["65"], &["33"]]),
-                "{arm}: the slot-33 pass sends E only"
+                slots(&[&["33"], &["65"]]),
+                "{arm}: the slot-33 pass sends E+1 only"
             );
             assert_eq!(
                 step_state(&f.runner, CommitteeSubscriptions),
@@ -3910,7 +3956,7 @@ mod tests {
             "slot 0's pass runs at once: DutyFetch's E+1 request and the subscriptions, \
              and it must not prepare again"
         );
-        assert_eq!(*f.subscription_slots.lock(), slots(&[&["1"], &["33"]]));
+        assert_eq!(*f.subscription_slots.lock(), slots(&[&["33"], &["1"]]));
         assert_eq!(arrivals(&f.mock, prep), 1, "slot 0 must not prepare again");
         assert!(!f.runner.has_pending(1), "every epoch-0 step is done");
         shut_down_within_budget(runner, "after slot 0").await;
@@ -4494,8 +4540,10 @@ mod tests {
         let duty_slot = |epoch: u64| vec![(epoch * SLOTS_PER_EPOCH + 1).to_string()];
         assert_eq!(
             *f.subscription_slots.lock(),
-            [duty_slot(gloas), duty_slot(gloas + 1), duty_slot(gloas + 1), duty_slot(gloas + 2)],
-            "Each of the two epochs must send the subscriptions of that epoch and the next epoch."
+            [duty_slot(gloas + 1), duty_slot(gloas), duty_slot(gloas + 2)],
+            "Epoch {gloas} must send the subscriptions of the next epoch, then of epoch {gloas}. \
+             Epoch {} must send only the subscriptions of the next epoch.",
+            gloas + 1
         );
         assert_eq!(
             f.registrations.preferences_calls(),
@@ -5313,18 +5361,18 @@ mod tests {
         );
     }
 
-    /// Harper B1 (#1043 R1): the generation moves after the read of slot 33
-    /// in the subscription step. Slot 33 is the duty slot of E. The call for
-    /// E reads its duty before the move, and the call for E+1 starts after
-    /// the move. The step must send no subscription, and it must stay
-    /// pending. The next pass must send the subscriptions of E and E+1, and
+    /// Harper B1 (#1043 R1): the generation moves after the read of slot 65
+    /// in the subscription step. Slot 65 is the duty slot of E+1. The call
+    /// for E+1 reads its duty before the move, and the call for E starts
+    /// after the move. The step must send no subscription, and it must stay
+    /// pending. The next pass must send the subscriptions of E+1 and E, and
     /// it must finish the step.
     #[tokio::test(flavor = "current_thread")]
     async fn a_revocation_during_the_subscription_step_keeps_it_pending() {
         use BoundaryStep::CommitteeSubscriptions;
         let f = fixture(proposer_duties_at(ROOT_A)).await;
         let generation = f.mock.track_admission();
-        let (name, slot) = ("duty_tracker.get_duties_for_slot", Some(33));
+        let (name, slot) = ("duty_tracker.get_duties_for_slot", Some(65));
         let revoke =
             RevokeOnClose { name, slot, generation: Arc::clone(&generation), span: Arc::default() };
         let _default =
@@ -5335,7 +5383,7 @@ mod tests {
         assert_eq!(
             generation.load(Ordering::Acquire),
             1,
-            "The generation must move one time, after the read of slot 33."
+            "The generation must move one time, after the read of slot 65."
         );
         assert!(
             f.subscription_slots.lock().is_empty(),
@@ -5351,8 +5399,8 @@ mod tests {
 
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["65"]]),
-            "The next pass must send the subscriptions of E and E+1."
+            slots(&[&["65"], &["33"]]),
+            "The next pass must send the subscriptions of E+1 and E."
         );
         assert_eq!(
             step_state(&f.runner, CommitteeSubscriptions),
@@ -5398,13 +5446,13 @@ mod tests {
     }
 
     /// Self-check S1 (#1043 R1): the step checks the cache of E and E+1.
-    /// Then the generation moves when the call for E ends. The cached duties
-    /// of E+1 are stale, and the call for E+1 reads no duty. After the read
-    /// of slot 65, the test fetches the duties of E+1 again. The step must
-    /// keep E+1 pending. The next pass must send the subscription of E again
-    /// and the subscription of E+1.
+    /// Then the generation moves when the call for E+1 ends. The cached
+    /// duties of E are stale, and the call for E reads no duty. After the
+    /// read of slot 33, the test fetches the duties of E again. The step must
+    /// keep E pending. The next pass must send the subscription of E+1 again
+    /// and the subscription of E.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_revocation_before_the_call_for_e_plus_1_keeps_e_plus_1_pending() {
+    async fn a_revocation_before_the_call_for_e_keeps_e_pending() {
         use BoundaryStep::CommitteeSubscriptions;
         let f = fixture(proposer_duties_at(ROOT_A)).await;
         let generation = f.mock.track_admission();
@@ -5415,7 +5463,7 @@ mod tests {
         let fetches = Arc::new(AtomicUsize::new(0));
         let fetch_again = FetchAgainOnClose {
             duty_tracker: Arc::clone(&f.duty_tracker),
-            slot: 65,
+            slot: 33,
             span: parking_lot::Mutex::default(),
             fetches: Arc::clone(&fetches),
         };
@@ -5427,13 +5475,13 @@ mod tests {
         assert_eq!(
             (generation.load(Ordering::Acquire), fetches.load(Ordering::Acquire)),
             (1, 1),
-            "The generation must move one time, and the test must fetch E+1 again one time."
+            "The generation must move one time, and the test must fetch E again one time."
         );
-        assert!(f.duty_tracker.is_epoch_cached(2).await, "After the fetch, E+1 must be cached.");
+        assert!(f.duty_tracker.is_epoch_cached(1).await, "After the fetch, E must be cached.");
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"]]),
-            "Only the POST of E must go out, before the move."
+            slots(&[&["65"]]),
+            "Only the POST of E+1 must go out, before the move."
         );
         assert_eq!(
             step_state(&f.runner, CommitteeSubscriptions),
@@ -5445,8 +5493,8 @@ mod tests {
 
         assert_eq!(
             *f.subscription_slots.lock(),
-            slots(&[&["33"], &["33"], &["65"]]),
-            "The next pass must send the subscription of E again and the subscription of E+1."
+            slots(&[&["65"], &["65"], &["33"]]),
+            "The next pass must send the subscription of E+1 again and the subscription of E."
         );
         assert_eq!(
             step_state(&f.runner, CommitteeSubscriptions),
@@ -5484,19 +5532,19 @@ mod tests {
         }
     }
 
-    /// Self-check T2 (#1043 phase C): the call for E sends its POST and
-    /// returns `Ok`. When the call ends, before the step marks E, the test
+    /// Self-check T2 (#1043 phase C): the call for E+1 sends its POST and
+    /// returns `Ok`. When the call ends, before the step marks E+1, the test
     /// makes one of these changes:
     ///
     /// - The generation moves, and the test fetches the duties of E and E+1
     ///   again, as a slot task can do. Thus these duties are in the cache
-    ///   again, and the call for E+1 must still use the watch of the step.
-    /// - The test removes the duties of E from the cache, with no move.
+    ///   again, and the call for E must still use the watch of the step.
+    /// - The test removes the duties of E+1 from the cache, with no move.
     ///
-    /// In each case, the step must keep E pending, and the next pass must
-    /// send the subscription of E again.
+    /// In each case, the step must keep E+1 pending, and the next pass must
+    /// send the subscription of E+1 again.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_change_after_the_subscription_call_for_e_keeps_e_pending() {
+    async fn a_change_after_the_subscription_call_for_e_plus_1_keeps_e_plus_1_pending() {
         use BoundaryStep::CommitteeSubscriptions;
         for (case, moved) in [("move and fetch", true), ("cache clear", false)] {
             let f = fixture(proposer_duties_at(ROOT_A)).await;
@@ -5512,7 +5560,7 @@ mod tests {
                         fetched.expect("The second fetch must return the duties.");
                     }
                 } else {
-                    let clear = duty_tracker.clear_epoch_cache(1);
+                    let clear = duty_tracker.clear_epoch_cache(2);
                     futures::executor::block_on(tokio::task::unconstrained(clear));
                 }
             };
@@ -5528,28 +5576,28 @@ mod tests {
             f.runner.run_pending(32).await;
 
             assert_eq!(
-                (generation.load(Ordering::Acquire), f.duty_tracker.is_epoch_cached(1).await),
+                (generation.load(Ordering::Acquire), f.duty_tracker.is_epoch_cached(2).await),
                 (u64::from(moved), moved),
-                "{case}: the test must make its change one time, when the call for E ends."
+                "{case}: the test must make its change one time, when the call for E+1 ends."
             );
-            let first = if moved { slots(&[&["33"]]) } else { slots(&[&["33"], &["65"]]) };
+            let first = if moved { slots(&[&["65"]]) } else { slots(&[&["65"], &["33"]]) };
             assert_eq!(
                 *f.subscription_slots.lock(),
                 first,
-                "{case}: the first pass must send E, and E+1 only when the generation stays."
+                "{case}: the first pass must send E+1, and E only when the generation stays."
             );
 
             f.runner.run_pending(33).await;
 
             let expected = if moved {
-                slots(&[&["33"], &["33"], &["65"]])
+                slots(&[&["65"], &["65"], &["33"]])
             } else {
-                slots(&[&["33"], &["65"], &["33"]])
+                slots(&[&["65"], &["33"], &["65"]])
             };
             assert_eq!(
                 *f.subscription_slots.lock(),
                 expected,
-                "{case}: the next pass must send the subscription of E again."
+                "{case}: the next pass must send the subscription of E+1 again."
             );
             assert_eq!(
                 step_state(&f.runner, CommitteeSubscriptions),
@@ -5557,5 +5605,382 @@ mod tests {
                 "{case}: the accepted POSTs must finish the step."
             );
         }
+    }
+
+    /// The duty epochs in the subscribed record of the runner's progress.
+    fn subscribed_epochs(runner: &EpochBoundaryRunner) -> BTreeSet<u64> {
+        let progress = runner.progress.lock();
+        progress.as_ref().map(|p| p.subscribed_epochs.keys().copied().collect()).unwrap_or_default()
+    }
+
+    /// 655-AC4, cold cache: the tracker starts empty, and no slot loop and no
+    /// warm-up run. ReorgCheck also fetches an epoch that is not cached. Thus
+    /// the test makes the first attester request for E and for E+1 answer
+    /// 503, and the requests that fill the cache are the requests of
+    /// DutyFetch. The first pass must POST E+1, then E.
+    ///
+    /// In the second arm, the two attester requests for E+1 in the first pass
+    /// answer 503: the request of ReorgCheck and the request of DutyFetch.
+    /// The step must be `NotReady` and send no POST. The next pass must send
+    /// E+1, then E.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscriptions_from_a_cold_cache_use_runner_fetched_duties() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        f.failing_attester.lock().extend([(1, 1), (2, 1)]);
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            attester_epochs_since(&f.mock, 0),
+            [1, 2, 1, 2],
+            "ReorgCheck must fail to fetch E and E+1, and then DutyFetch must fetch E and E+1."
+        );
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["65"], &["33"]]),
+            "The pass must POST E+1, then E, from the duties that DutyFetch fetched."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POSTs must finish the step."
+        );
+
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        f.failing_attester.lock().insert(2, 2);
+
+        f.runner.run_pending(32).await;
+
+        assert!(
+            f.subscription_slots.lock().is_empty(),
+            "Second arm: with E+1 not cached, the first pass must send no POST."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "Second arm: with E+1 not cached, the step must be not ready and pending."
+        );
+
+        f.runner.run_pending(33).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["65"], &["33"]]),
+            "Second arm: the next pass must fetch E+1, and then POST E+1, then E."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "Second arm: the accepted POSTs must finish the step."
+        );
+    }
+
+    /// 655-AC4: the first pass of a new epoch E keeps only the subscribed
+    /// duty epochs from E on. The pass of epoch 1 sends epochs 2 and 1. The
+    /// first pass of epoch 2 must POST only epoch 3, and the record must then
+    /// hold only epochs 2 and 3.
+    ///
+    /// In the second arm, the test adds epochs 0 and 3 to the record of epoch
+    /// 1. After the first pass of epoch 2, the record must hold only epochs 2
+    /// and 3, and that pass must send no POST.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_epochs_are_pruned_at_the_epoch_change() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.runner.run_pending(32).await;
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([1, 2]),
+            "After the pass of epoch 1, the record must hold epochs 1 and 2."
+        );
+
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["65"], &["33"], &["97"]]),
+            "The pass of epoch 1 must POST epochs 2 and 1, and the first pass of epoch 2 must \
+             POST only epoch 3."
+        );
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([2, 3]),
+            "After the first pass of epoch 2, the record must hold only epochs 2 and 3."
+        );
+
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.runner.run_pending(32).await;
+        f.runner.update_progress(1, |current| {
+            for duty_epoch in [0, 3] {
+                let sent = SubscribedEpoch { watch: beacon::DutyFence::open(), resolved: 1 };
+                current.subscribed_epochs.insert(duty_epoch, sent);
+            }
+        });
+
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([2, 3]),
+            "Second arm: after the first pass of epoch 2, the record must hold only epochs 2 \
+             and 3."
+        );
+        assert_eq!(
+            f.subscription_slots.lock().len(),
+            2,
+            "Second arm: the record holds epochs 2 and 3, so the first pass of epoch 2 must \
+             send no POST."
+        );
+    }
+
+    /// Lead decision Q2 (option B): no local key has an index, so the pass
+    /// of epoch 1 marks epochs 2 and 1 with no POST. Then the index of
+    /// validator 42 lands. The first pass of epoch 2 must POST epoch 3, and
+    /// then epoch 2 again, with the duty of validator 42 at slot 65.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_key_indexed_after_the_mark_keeps_its_e_plus_1_subscription() {
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), SecretKey::generate(), false, &[]).await;
+        let registry = std::mem::take(&mut *f.index_source.registry.write());
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([1, 2]),
+            "With no index, the pass of epoch 1 must mark epochs 1 and 2."
+        );
+        assert!(
+            f.subscription_slots.lock().is_empty(),
+            "With no index, the pass of epoch 1 must send no POST."
+        );
+
+        *f.index_source.registry.write() = registry;
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            *f.subscription_slots.lock(),
+            slots(&[&["97"], &["65"]]),
+            "After the index lands, the first pass of epoch 2 must POST epoch 3, and then epoch 2 \
+             again."
+        );
+    }
+
+    /// Lead decision Q2 (option B): the pass of epoch 1 sends epochs 2 and 1.
+    /// Then the generation moves, as a revocation does. The first pass of
+    /// epoch 2 must fetch the duties again, POST epoch 3, and then POST
+    /// epoch 2 again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revocation_after_the_mark_sends_the_epoch_again() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let generation = f.mock.track_admission();
+        f.runner.run_pending(32).await;
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([1, 2]),
+            "Before the revocation, the pass of epoch 1 must mark epochs 1 and 2."
+        );
+
+        generation.fetch_add(1, Ordering::AcqRel);
+        f.runner.run_pending(64).await;
+
+        assert_eq!(
+            f.subscription_slots.lock()[2..],
+            slots(&[&["97"], &["65"]]),
+            "After the revocation, the first pass of epoch 2 must POST epoch 3, and then epoch 2 \
+             again."
+        );
+    }
+
+    /// A remote BLS backend that answers each sign request at once with one
+    /// fixed signature. It counts the sign requests.
+    struct CountingRemote {
+        proof: crypto::Signature,
+        signs: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crypto::Signer for CountingRemote {
+        async fn sign(
+            &self,
+            _signing_root: &eth_types::Root,
+            _pubkey: &[u8; 48],
+        ) -> Result<crypto::Signature, crypto::SigningError> {
+            self.signs.fetch_add(1, Ordering::SeqCst);
+            Ok(self.proof.clone())
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            Vec::new()
+        }
+    }
+
+    /// The (validator index, slot) of each item of one subscription POST.
+    type PostItems = Vec<(String, String)>;
+
+    /// A runner over many local keys, with the items of each subscription
+    /// POST in the sequence of the answers.
+    struct ManyKeysRunner {
+        runner: EpochBoundaryRunner,
+        remote: Arc<CountingRemote>,
+        posts: Arc<parking_lot::Mutex<Vec<PostItems>>>,
+    }
+
+    /// A runner with `count` local keys that sign through one
+    /// [`CountingRemote`]. Key `i` has its attester duty at slot offset
+    /// `i % 32` of epoch 2. Epoch 1 has no duty. `answers[n]` is the answer to
+    /// subscription POST `n`, and a POST after the list gets `Ok`.
+    async fn many_keys_runner(
+        count: usize,
+        answers: Vec<Result<(), beacon::BeaconError>>,
+    ) -> ManyKeysRunner {
+        let pubkeys: Vec<crypto::PublicKey> =
+            (0..count).map(|_| SecretKey::generate().public_key()).collect();
+        let duties: Vec<beacon::AttesterDuty> = pubkeys
+            .iter()
+            .enumerate()
+            .map(|(i, pubkey)| beacon::AttesterDuty {
+                pubkey: format!("0x{}", hex::encode(pubkey.to_bytes())),
+                validator_index: i.to_string(),
+                committee_index: "0".to_string(),
+                committee_length: "128".to_string(),
+                committees_at_slot: "1".to_string(),
+                validator_committee_index: "0".to_string(),
+                slot: (2 * SLOTS_PER_EPOCH + i as u64 % SLOTS_PER_EPOCH).to_string(),
+            })
+            .collect();
+        let posts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let record = Arc::clone(&posts);
+        let answers = parking_lot::Mutex::new(std::collections::VecDeque::from(answers));
+        let mock = Arc::new(
+            proposer_duties_at(ROOT_A)
+                .with_get_attester_duties(move |epoch, _indices| {
+                    Ok(beacon::DependentRootResponse {
+                        dependent_root: ROOT_A.to_string(),
+                        execution_optimistic: false,
+                        data: if epoch == 2 { duties.clone() } else { Vec::new() },
+                    })
+                })
+                .with_submit_beacon_committee_subscriptions(move |subscriptions| {
+                    let items = subscriptions.into_iter().map(|s| (s.validator_index, s.slot));
+                    record.lock().push(items.collect());
+                    answers.lock().pop_front().unwrap_or(Ok(()))
+                }),
+        );
+        mock.track_admission();
+        let beacon: Arc<dyn BeaconNodeClient> = mock;
+        let indices = (0..count).map(|i| i.to_string()).collect();
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
+        let remote = Arc::new(CountingRemote {
+            proof: signer::mock_sig(b"fixed selection proof"),
+            signs: AtomicUsize::new(0),
+        });
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        for pubkey in &pubkeys {
+            composite.add_remote_key(pubkey.to_bytes(), remote.clone());
+            validator_store
+                .add_validator(ValidatorConfig::new(pubkey.to_bytes()))
+                .expect("The store must add each key.");
+        }
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("slashing db"));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(
+            pubkeys.into_iter().map(|pubkey| (pubkey.to_bytes(), pubkey)).collect(),
+        ));
+        let config = create_test_config();
+        let timeouts = config.timeouts.clone();
+        let fork_schedule = Arc::clone(&config.fork_schedule);
+        let genesis_validators_root = config.genesis_validators_root;
+        let duty_management = Arc::new(DutyManagementService::new(
+            signer,
+            beacon,
+            Arc::clone(&duty_tracker),
+            Arc::clone(&validator_store),
+            Arc::clone(&pubkey_map),
+            PubkeyIndexRegistry::shared(),
+            config,
+            Arc::default(),
+        ));
+        let runner = EpochBoundaryRunner::new(
+            duty_management,
+            Arc::new(CircuitBreakerState::new(BREAKER_CONSECUTIVE_LIMIT, 5)),
+            duty_tracker,
+            timeouts,
+            None,
+            fork_schedule,
+            pubkey_map,
+            validator_store,
+            genesis_validators_root,
+        );
+        ManyKeysRunner { runner, remote, posts }
+    }
+
+    /// 655-AC4: E+1 has 2,000 duties, so the step sends its subscriptions in
+    /// 4 chunk POSTs. The second POST answers 503. These results must occur:
+    ///
+    /// - The first pass is `Failed`, and E+1 does not go into the record.
+    /// - The next pass POSTs again only the items of the refused POST, and it
+    ///   signs no selection proof again.
+    /// - After that POST, E+1 is in the record, and the step is done.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_subscription_chunk_failure_retries_without_resigning() {
+        use BoundaryStep::CommitteeSubscriptions;
+        let f = many_keys_runner(2_000, vec![Ok(()), Err(unavailable())]).await;
+
+        f.runner.run_pending(32).await;
+
+        let first = f.posts.lock().clone();
+        let mut sizes: Vec<usize> = first.iter().map(Vec::len).collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [464, 512, 512, 512],
+            "The first pass must send the 2,000 subscriptions of E+1 in 4 chunk POSTs."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Failed), false),
+            "After the 503, the step must be failed and pending."
+        );
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([1]),
+            "E+1 must not go into the record before each of its chunk POSTs is accepted."
+        );
+        assert_eq!(
+            f.remote.signs.load(Ordering::SeqCst),
+            2_000,
+            "The first pass must sign one selection proof for each duty."
+        );
+
+        f.runner.run_pending(33).await;
+
+        let posts = f.posts.lock().clone();
+        assert_eq!(posts.len(), 5, "The next pass must send one POST.");
+        let sorted = |mut items: PostItems| {
+            items.sort();
+            items
+        };
+        assert_eq!(
+            sorted(posts[4].clone()),
+            sorted(first[1].clone()),
+            "The next pass must POST again only the items of the refused POST."
+        );
+        assert_eq!(
+            f.remote.signs.load(Ordering::SeqCst),
+            2_000,
+            "The next pass must sign no selection proof again."
+        );
+        assert_eq!(
+            subscribed_epochs(&f.runner),
+            BTreeSet::from([1, 2]),
+            "After the accepted retry, E+1 must be in the record."
+        );
+        assert_eq!(
+            step_state(&f.runner, CommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted retry must finish the step."
+        );
     }
 }

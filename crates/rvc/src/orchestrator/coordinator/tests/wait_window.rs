@@ -607,7 +607,7 @@ async fn run_zero_window(start_slot: Slot, run_for: Duration) -> ZeroWindowRun {
 /// window zero (the warm-up never runs) and the first attester request for
 /// each epoch failing. The runner's epoch-0 pass, woken by processed slot
 /// 10 at the end of slot 10, fetches epoch 1 itself and subscribes for both
-/// epochs before slot 32.
+/// epochs before slot 32: epoch 1 first, then epoch 0 (W4-E8c).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_cold_start_with_zero_post_duty_window_subscribes_for_the_boot_epoch() {
     let _metrics = m2_metric_lock().await;
@@ -617,8 +617,8 @@ async fn test_cold_start_with_zero_post_duty_window_subscribes_for_the_boot_epoc
     let end_of_slot_10 = slot_offset(10, 11);
     assert_eq!(
         run.subscriptions,
-        [(end_of_slot_10, duty_slots(["1"])), (end_of_slot_10, duty_slots(["33"]))],
-        "the epoch-0 and epoch-1 duties are subscribed in epoch 0"
+        [(end_of_slot_10, duty_slots(["33"])), (end_of_slot_10, duty_slots(["1"]))],
+        "The epoch-0 pass must subscribe for epoch 1, then for epoch 0."
     );
     assert_eq!(
         run.prepares(),
@@ -631,7 +631,8 @@ async fn test_cold_start_with_zero_post_duty_window_subscribes_for_the_boot_epoc
 /// 652-AC2: boot at slot 31, then slot 32 with a zero window. The epoch-1
 /// pass is woken by processed slot 32 when its last phase ends, at the end
 /// of slot 32, before slot 33's first phase: it prepares and subscribes for
-/// epochs 1 and 2 there although the warm-up never runs.
+/// epoch 2 there although the warm-up never runs. Epoch 1 went out in the
+/// epoch-0 pass, so the epoch-1 pass does not send it again (W4-E8c).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_zero_post_duty_window_at_slot_0_still_runs_boundary_steps() {
     let _metrics = m2_metric_lock().await;
@@ -642,12 +643,12 @@ async fn test_zero_post_duty_window_at_slot_0_still_runs_boundary_steps() {
     assert_eq!(
         run.subscriptions,
         [
-            (end_of_slot_31, duty_slots(["1"])),
             (end_of_slot_31, duty_slots(["33"])),
-            (end_of_slot_32, duty_slots(["33"])),
+            (end_of_slot_31, duty_slots(["1"])),
             (end_of_slot_32, duty_slots(["65"])),
         ],
-        "epoch 0's pass subscribes for epochs 0 and 1, epoch 1's for epochs 1 and 2"
+        "The epoch-0 pass must subscribe for epochs 1 and 0, and the epoch-1 pass only for \
+         epoch 2."
     );
     assert_eq!(
         run.prepares(),
