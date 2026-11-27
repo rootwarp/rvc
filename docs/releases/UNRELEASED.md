@@ -122,6 +122,8 @@ With no admitted node, the step does these three actions:
 
 **Migration:** Do not install an older release until you clear the detection. An older release does not read the owned fallback name. If both keystore writes fail, the owned fallback can be the only detection record.
 
+Before you remove a legacy file, make sure that no client uses that directory as its keystore directory. A keystore marker has the same name.
+
 ### Detection refusal: the exact clear command on every branch, a fallback-dir probe, and a bare DB file name
 
 #### Boot refusal prints the exact clear-detection command
