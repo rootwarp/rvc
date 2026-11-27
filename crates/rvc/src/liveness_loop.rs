@@ -327,6 +327,7 @@ impl LivenessObservationLoop {
 
         let mut shutdown_requested = false;
         crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.set(0);
+        crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(0);
 
         // detached: process-lifetime loop root; the tick is the exported span.
         let loop_span = tracing::debug_span!(parent: None, "liveness_loop");
@@ -432,9 +433,10 @@ impl LivenessObservationLoop {
     /// failed path. A loop with no detection paths has no keystore directory
     /// and no fallback. It logs one error and counts one failure. The machine
     /// gets the durable flag only from a durable report: a write and its fsync
-    /// returned `Ok` on at least one path. Otherwise the loop stays up and
-    /// latched, and the next tick writes again. Exit 12 waits for the flag. A
-    /// later read is not durability.
+    /// returned `Ok` on at least one path. Then the loop sets
+    /// [`crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE`] to 1. Otherwise
+    /// the loop stays up and latched, and the next tick writes again. Exit 12
+    /// waits for the flag. A later read is not durability.
     async fn persist_detection_marker(&self, epoch: Epoch, pubkeys: &[String]) {
         let Some(persister) = &self.detection_persister else {
             crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
@@ -453,6 +455,7 @@ impl LivenessObservationLoop {
         crate::detection_marker::log_persist_report(&report, "liveness loop");
         if report.durable() {
             self.machine.mark_detection_persisted();
+            crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(1);
         }
     }
 
@@ -3810,8 +3813,12 @@ mod tests {
 
     /// A failed marker write does not exit. The next tick retries, and exit 12
     /// follows only after the write succeeds.
+    /// W4-D3e: the test sets the durability gauge to 1 before the loop
+    /// starts. The loop must set it to 0 when it starts, keep it at 0 while
+    /// the write fails, and set it to 1 after the durable write.
     #[tokio::test(start_paused = true)]
     async fn detection_does_not_exit_until_the_marker_write_succeeds() {
+        crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(1);
         let dir = tempfile::tempdir().expect("temp");
         let not_a_dir = dir.path().join("file");
         std::fs::write(&not_a_dir, b"x").expect("file");
@@ -3842,6 +3849,12 @@ mod tests {
         );
         assert!(m.detected_latch(), "the latch stays set while the write is retried");
         assert!(!m.detection_persisted(), "a failed write must not set the durability flag");
+        assert_eq!(
+            crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.get(),
+            0,
+            "The loop must set the durability gauge to 0 when it starts. A failed write must not \
+             set it to 1."
+        );
 
         tokio::time::advance(Duration::from_secs(12)).await;
         poll_until_parked(&task).await;
@@ -3872,6 +3885,11 @@ mod tests {
             crate::detection_marker::inspect(&not_a_dir),
             crate::detection_marker::MarkerInspect::Present(_)
         ));
+        assert_eq!(
+            crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.get(),
+            1,
+            "The loop must set the durability gauge to 1 after the write and its fsync return Ok."
+        );
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
         task.await.expect("liveness loop");
@@ -4517,15 +4535,227 @@ mod tests {
     }
 
     /// Let the drain of `persister` run `rounds` failed rounds: wait for the
-    /// result of each round, then move paused time by the retry wait of 1 s.
+    /// result of each round, then move paused time by 30 s. The drain waits
+    /// at most 30 s between two rounds, so each step starts the next round.
     async fn advance_rounds(
         persister: &crate::detection_marker::DetectionPersister,
         rounds: usize,
     ) {
         for round in 1..=rounds {
             wait_for_rounds(persister, round).await;
-            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::advance(Duration::from_secs(30)).await;
         }
+    }
+
+    /// The text of the line that the drain logs one time, before its first
+    /// wait.
+    const UP_FRONT: &str = "will not exit until a detection record is durable";
+
+    /// The text of the warning that the drain logs for each repeated signal.
+    const REPEATED: &str = "shutdown already in progress";
+
+    /// Return the log lines of a `traced_test`. `logs_assert` must give its
+    /// argument to the `logs_assert` of that test.
+    fn traced_lines(logs_assert: impl Fn(&dyn Fn(&[&str]) -> Result<(), String>)) -> Vec<String> {
+        let logged = RefCell::new(Vec::new());
+        logs_assert(&|lines| {
+            logged.replace(lines.iter().map(ToString::to_string).collect());
+            Ok(())
+        });
+        logged.into_inner()
+    }
+
+    /// W4-D3e (746-7): each write of the drain fails. The keystore directory
+    /// is in a temporary directory, and the test does not create it. The
+    /// drain has no fallback. The test requires these results:
+    ///
+    /// - At 60 s, the drain still runs, and it has logged the "will not exit"
+    ///   line one time.
+    /// - At 60 s, the drain has run 6 rounds, at 0, 1, 3, 7, 15 and 31 s. Each
+    ///   round logs one error line for the keystore marker.
+    /// - At 61.5 s, the drain has run 7 rounds, because the wait after the
+    ///   sixth round is 30 s.
+    ///
+    /// The test waits on timers of paused time. Paused time goes to the next
+    /// timer only when no task can run. A blocking write stops that move
+    /// until it ends, thus a round takes no paused time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn drain_retry_backs_off_and_logs_once_up_front() {
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        let marker = crate::detection_marker::marker_path(&keys);
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock, and the test does not wait on the wall clock.
+        let detection = detection_shutdown(latched_machine(), keys, None, test_clock());
+        let persister = Arc::clone(&detection.persister);
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        let counts = |logged: &[String]| {
+            let up_front = logged.iter().filter(|line| line.contains(UP_FRONT)).count();
+            (up_front, persister.rounds(), path_errors(logged, &marker).len())
+        };
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let logged = traced_lines(|f| logs_assert(f));
+        assert_eq!(
+            (drain.is_finished(), counts(&logged)),
+            (false, (1, 6, 6)),
+            "At 60 s, the drain must still run. It must have logged the \"{UP_FRONT}\" line one \
+             time and run 6 rounds, at 0, 1, 3, 7, 15 and 31 s. Each round must log one error \
+             line for the keystore marker. The log is {logged:#?}."
+        );
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let logged = traced_lines(|f| logs_assert(f));
+        assert_eq!(
+            counts(&logged),
+            (1, 7, 7),
+            "At 61.5 s, the drain must have run 7 rounds, because the wait after the sixth round \
+             must be 30 s. The log is {logged:#?}."
+        );
+        drain.abort();
+    }
+
+    /// W4-D3e (746-7): each write of the drain fails until the test creates
+    /// the keystore directory. The test owns the channel of repeated signals.
+    /// The test requires these results:
+    ///
+    /// - The test sends two signals in the first wait. The drain logs two
+    ///   "shutdown already in progress" warnings and still runs. It does not
+    ///   start a second round before the wait ends, and the durability gauge
+    ///   stays 0.
+    /// - The test creates the keystore directory and moves paused time by
+    ///   30 s. Then the drain returns exit 12, the keystore marker is present,
+    ///   and the durability gauge is 1.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn repeated_signal_during_the_drain_retry_is_logged_and_does_not_exit() {
+        crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(0);
+        let root = tempfile::tempdir().expect("The test must create a temporary directory.");
+        let keys = root.path().join("keys");
+        let (signals, repeat_signals) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock, and the test does not wait on the wall clock.
+        let mut detection = detection_shutdown(latched_machine(), keys.clone(), None, test_clock());
+        detection.repeat_signals = Some(repeat_signals);
+        let persister = Arc::clone(&detection.persister);
+        let drain = tokio::spawn(async move {
+            crate::bootstrap::await_shutdown_and_drain_with_signal(
+                drain_inputs(executor, shutdown_rx, token, Some(detection)),
+                std::future::ready(()),
+            )
+            .await
+        });
+        // The first round fails at 0 s, and the first wait ends at 1 s.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..2 {
+            signals.send(()).expect("The drain must keep the receiver of the repeated signals.");
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let logged = traced_lines(|f| logs_assert(f));
+        let repeated = |line: &&String| line.contains(" WARN ") && line.contains(REPEATED);
+        let warnings = logged.iter().filter(repeated).count();
+        assert_eq!(
+            (
+                warnings,
+                drain.is_finished(),
+                persister.rounds(),
+                crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.get(),
+            ),
+            (2, false, 1, 0),
+            "Two signals in the first wait must give two \"{REPEATED}\" warnings. The drain must \
+             still run, it must not start a second round before the wait ends, and the \
+             durability gauge must stay 0. The log is {logged:#?}."
+        );
+        std::fs::create_dir(&keys).expect("The test must create the keystore directory.");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let (_outcome, res) = join_in_paused_time(drain).await;
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "After the test creates the keystore directory, the drain must return exit 12. The \
+             result is {res:?}."
+        );
+        assert!(
+            matches!(
+                crate::detection_marker::inspect(&keys),
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The keystore marker must be present after the drain."
+        );
+        assert_eq!(
+            crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.get(),
+            1,
+            "The drain must set the durability gauge to 1 after the keystore marker write and its \
+             fsync return Ok."
+        );
+    }
+
+    /// W4-D3e (746-7): only the drain sees the latch, because the loop does
+    /// not tick. The keystore directory is writable, thus the first round is
+    /// durable. The test sets the two gauges to 0 first. The test requires
+    /// these results:
+    ///
+    /// - The drain returns exit 12, and the keystore marker is present.
+    /// - The latch gauge and the durability gauge are 1.
+    /// - The drain does not log the "will not exit" line, because it does not
+    ///   wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn drain_sets_the_latch_and_durability_gauges() {
+        crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.set(0);
+        crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(0);
+        let keys = tempfile::tempdir().expect("The test must create the keystore directory.");
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        // The drain needs an epoch clock. `test_clock` reads
+        // `std::time::Instant::now()` one time to make it. No assertion uses
+        // that clock, and the test does not wait on the wall clock.
+        let detection =
+            detection_shutdown(latched_machine(), keys.path().to_path_buf(), None, test_clock());
+
+        let (_outcome, res) = crate::bootstrap::await_shutdown_and_drain_with_signal(
+            drain_inputs(executor, shutdown_rx, token, Some(detection)),
+            std::future::ready(()),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(crate::bootstrap::BootstrapError::DoppelgangerDetected)),
+            "The drain must return exit 12 after the keystore marker write. The result is {res:?}."
+        );
+        assert!(
+            matches!(
+                crate::detection_marker::inspect(keys.path()),
+                crate::detection_marker::MarkerInspect::Present(_)
+            ),
+            "The keystore marker must be present after the drain."
+        );
+        assert_eq!(
+            (
+                crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.get(),
+                crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.get(),
+            ),
+            (1, 1),
+            "The drain must set the latch gauge and the durability gauge to 1."
+        );
+        assert!(
+            !logs_contain(UP_FRONT),
+            "The drain must not log the \"{UP_FRONT}\" line when the first round is durable."
+        );
     }
 
     /// Return the `error` value of each `ERROR` line in `logged` that has the
@@ -5794,6 +6024,7 @@ mod tests {
             machine: Arc::clone(&hung.machine),
             persister: Arc::clone(&hung.persister),
             epoch_clock: test_clock(),
+            repeat_signals: closed_signals(),
         };
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
@@ -5947,7 +6178,9 @@ mod tests {
         if let Some(prepared) = prepared {
             spawn_liveness_loop(prepared, executor);
         }
-        detection.expect("A machine must give the drain its detection state.")
+        let mut detection = detection.expect("A machine must give the drain its detection state.");
+        detection.repeat_signals = closed_signals();
+        detection
     }
 
     /// W4-D3d2 (fix round 1, F4): the boot-wired loop leaves both keystore
@@ -6116,6 +6349,7 @@ mod tests {
             machine: Arc::clone(&hung.machine),
             persister: Arc::clone(&hung.persister),
             epoch_clock: test_clock(),
+            repeat_signals: closed_signals(),
         };
         let drain = tokio::spawn(async move {
             crate::bootstrap::await_shutdown_and_drain_with_signal(
@@ -6540,6 +6774,7 @@ mod tests {
                 machine: Arc::clone(&hung.machine),
                 persister: Arc::clone(&hung.persister),
                 epoch_clock: test_clock(),
+                repeat_signals: closed_signals(),
             };
             let drain = crate::bootstrap::await_shutdown_and_drain_with_signal(
                 drain_inputs(executor, shutdown_rx, token, Some(detection)),
@@ -6788,7 +7023,14 @@ mod tests {
     ) -> crate::bootstrap::DetectionShutdown {
         let paths = crate::detection_marker::DetectionPaths { keystore_dir, fallback };
         let persister = crate::detection_marker::DetectionPersister::new(paths);
-        crate::bootstrap::DetectionShutdown { machine, persister, epoch_clock }
+        let repeat_signals = closed_signals();
+        crate::bootstrap::DetectionShutdown { machine, persister, epoch_clock, repeat_signals }
+    }
+
+    /// A repeat-signal receiver whose sender is dropped. The drain gets no
+    /// repeated signal from it and installs no OS signal handler.
+    fn closed_signals() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        Some(tokio::sync::mpsc::unbounded_channel().1)
     }
 
     /// Return the fallback path for `slashing.sqlite` in `dir`.

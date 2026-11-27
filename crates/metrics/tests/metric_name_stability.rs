@@ -152,6 +152,11 @@
 //! parent check off for one slot. A slot whose walk-back is exhausted can also
 //! count a reason for the `head` fallback. Dashboards that watch an unchecked
 //! parent should bind this name.
+//! #896 adds `rvc_doppelganger_detection_durable` (family delta +1): 0 when the
+//! liveness loop starts, 1 after a write of the detection and its fsync
+//! returned `Ok` in this process. The loop and the shutdown drain set it. The
+//! metrics server does not run during the drain, so a scrape cannot read the
+//! value of the drain; the drain logs are the signal then. It has no labels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -212,6 +217,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_builder_circuit_breaker_trips_total",
     "rvc_builder_consecutive_misses",
     "rvc_builder_epoch_misses",
+    "rvc_doppelganger_detection_durable", // operator-facing: 1 after a detection write and its fsync returned Ok; not served during the shutdown drain (#896)
     "rvc_doppelganger_detection_latch", // operator-facing: 1 after this process stores the detection latch (#705)
     "rvc_doppelganger_marker_write_failures_total", // operator-facing: failed durable marker writes while the latch stays set (#705)
     "rvc_duties_fetched_total",
@@ -366,7 +372,7 @@ fn expected_metric_names_is_sorted_and_unique() {
         sorted.as_slice(),
         "EXPECTED_METRIC_NAMES must be sorted and unique (edit-only list)"
     );
-    assert_eq!(EXPECTED_METRIC_NAMES.len(), 72, "#721 adds rvc_bn_broadcast_inflight_waits_total");
+    assert_eq!(EXPECTED_METRIC_NAMES.len(), 73, "#896 adds rvc_doppelganger_detection_durable");
 }
 
 #[test]

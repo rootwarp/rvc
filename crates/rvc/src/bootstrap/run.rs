@@ -536,6 +536,12 @@ pub(crate) struct DetectionShutdown {
     pub(crate) persister: Arc<crate::detection_marker::DetectionPersister>,
     /// Epoch recorded in the marker.
     pub(crate) epoch_clock: Arc<doppelganger::MonotonicEpochClock>,
+    /// Operator signals that come while the drain waits between two rounds.
+    /// `None` in production: the first wait installs a new
+    /// [`ShutdownSignal`], so the signal that started the shutdown is not a
+    /// repeated signal. A test gives the receiver of its own channel, so it
+    /// installs no OS handler.
+    pub(crate) repeat_signals: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 /// Keep the keystore lock until the process exits when the drain returns
@@ -574,7 +580,12 @@ pub(crate) fn drain_detection(
             ),
         })
     });
-    Some(DetectionShutdown { machine, persister, epoch_clock: Arc::clone(epoch_clock) })
+    Some(DetectionShutdown {
+        machine,
+        persister,
+        epoch_clock: Arc::clone(epoch_clock),
+        repeat_signals: None,
+    })
 }
 
 /// Wait until an operator signal, a [`ShutdownReason`], or token cancel, then
@@ -624,7 +635,7 @@ pub(crate) async fn await_shutdown_and_drain_with_signal(
         mut shutdown_rx,
         shutdown_token,
         budget,
-        detection,
+        mut detection,
     } = inputs;
 
     let failed_task = tokio::select! {
@@ -678,7 +689,7 @@ pub(crate) async fn await_shutdown_and_drain_with_signal(
     // token cancel, or a task panic can arrive while the keystore write is
     // still failing and before the exit flag is stored. Leaving here with
     // `Ok` or exit 16 would restart the detected key with a fresh window.
-    if let Some(detection) = detection.as_ref() {
+    if let Some(detection) = detection.as_mut() {
         if persist_latched_detection(detection).await {
             doppelganger_exit.store(true, Ordering::SeqCst);
         }
@@ -710,8 +721,24 @@ async fn stop_boot_tasks(executor: TaskExecutor, err: BootstrapError) -> Bootstr
     err
 }
 
-/// How long the drain waits between attempts when nothing durable exists yet.
+/// The first wait of the drain between two rounds when nothing durable
+/// exists yet. Each later wait is two times the wait before it, up to
+/// [`MARKER_SHUTDOWN_RETRY_MAX`].
 const MARKER_SHUTDOWN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest wait of the drain between two rounds. A path that recovers is
+/// written again in at most this time.
+const MARKER_SHUTDOWN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The source of repeated operator signals while the drain waits.
+enum RepeatSignals {
+    /// The receiver of [`DetectionShutdown::repeat_signals`].
+    Channel(mpsc::UnboundedReceiver<()>),
+    /// The listener that the first wait installs.
+    Os(ShutdownSignal),
+    /// No listener, because [`ShutdownSignal::install`] failed.
+    Off,
+}
 
 /// Operator hint included in a refuse-to-start log: the `clear-detection`
 /// command for the keystore `keystore_dir` and the slashing database
@@ -768,14 +795,27 @@ fn shell_word(path: &std::path::Path) -> Option<String> {
 /// failed path. `true` only when this process has seen a write and its fsync
 /// return `Ok` (a rename also needs the directory fsync).
 /// A later rewrite failure does not retry. A read of the record or a marker
-/// is not durability, and neither is an unreadable file. Only a latch whose
-/// flag is still clear sleeps and retries. Exit 12 without a completed fsync
-/// is not safe: Compose `restart: unless-stopped` starts the process again,
-/// and the detected key would get a fresh window.
-async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
+/// is not durability. An unreadable file is not durability. Only a latch
+/// whose flag is still clear waits and retries. Exit 12 without a completed
+/// fsync is not safe: Compose `restart: unless-stopped` starts the process
+/// again, and the detected key would get a fresh window.
+///
+/// The drain sets [`crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH`] to 1
+/// when it sees the latch, and
+/// [`crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE`] to 1 after a
+/// durable round. The metrics server does not run during the drain, so the
+/// logs are the signal. Before the first wait, the drain logs one error with
+/// the configured paths. The first wait is [`MARKER_SHUTDOWN_RETRY`], and
+/// each later wait is two times the wait before it, up to
+/// [`MARKER_SHUTDOWN_RETRY_MAX`]. Each operator signal during a wait gives
+/// one warning, and the wait continues to its end.
+async fn persist_latched_detection(detection: &mut DetectionShutdown) -> bool {
     if !detection.machine.detected_latch() {
         return false;
     }
+    crate::metrics::RVC_DOPPELGANGER_DETECTION_LATCH.set(1);
+    let mut wait = MARKER_SHUTDOWN_RETRY;
+    let mut signals = None;
     loop {
         if detection.machine.detection_persisted() {
             return true;
@@ -789,9 +829,53 @@ async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
         crate::detection_marker::log_persist_report(&report, "shutdown drain");
         if report.durable() {
             detection.machine.mark_detection_persisted();
+            crate::metrics::RVC_DOPPELGANGER_DETECTION_DURABLE.set(1);
             return true;
         }
-        tokio::time::sleep(MARKER_SHUTDOWN_RETRY).await;
+        let signals = signals.get_or_insert_with(|| {
+            let paths = detection.persister.paths();
+            error!(
+                keystore_dir = %paths.keystore_dir.display(),
+                fallback_marker = ?paths.fallback.as_ref().map(|fallback| fallback.owned_path()),
+                "will not exit until a detection record is durable; SIGKILL now loses the latch; \
+                 watch the logs, metrics are not served during shutdown"
+            );
+            match detection.repeat_signals.take() {
+                Some(receiver) => RepeatSignals::Channel(receiver),
+                None => match ShutdownSignal::install() {
+                    Ok(signal) => RepeatSignals::Os(signal),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "cannot listen for a repeated shutdown signal; the drain does not log \
+                             a repeated signal"
+                        );
+                        RepeatSignals::Off
+                    }
+                },
+            }
+        });
+        let deadline = tokio::time::sleep(wait);
+        tokio::pin!(deadline);
+        loop {
+            let repeated = async {
+                match &mut *signals {
+                    RepeatSignals::Channel(receiver) => receiver.recv().await,
+                    RepeatSignals::Os(signal) => {
+                        signal.recv().await;
+                        Some(())
+                    }
+                    RepeatSignals::Off => None,
+                }
+            };
+            tokio::select! {
+                () = &mut deadline => break,
+                Some(()) = repeated => warn!(
+                    "shutdown already in progress; not exiting until a detection record is durable"
+                ),
+            }
+        }
+        wait = wait.saturating_mul(2).min(MARKER_SHUTDOWN_RETRY_MAX);
     }
 }
 
@@ -3877,7 +3961,8 @@ mod tests {
     /// persister for the keystore directory and the fallback of the config.
     /// With no machine, the drain gets no detection state. The test
     /// `boot_wired_drain_starts_no_second_write_on_a_parked_loop_path` checks
-    /// the persister of a loop.
+    /// the persister of a loop. W4-D3e: the production state has no
+    /// repeat-signal receiver.
     #[test]
     fn drain_detection_without_a_loop_uses_the_paths_of_the_config() {
         use crate::detection_marker::{DetectionPaths, FallbackMarkerPath};
@@ -3906,9 +3991,10 @@ mod tests {
         assert!(config_paths.fallback.is_some(), "The config must give a fallback marker.");
         assert!(
             own.is_some_and(|detection| *detection.persister.paths() == config_paths
-                && Arc::ptr_eq(&detection.machine, &machine)),
+                && Arc::ptr_eq(&detection.machine, &machine)
+                && detection.repeat_signals.is_none()),
             "With no loop, the drain must get the machine and a persister for the paths of the \
-             config."
+             config. It must get no repeat-signal receiver, so the first wait installs a listener."
         );
         assert!(
             drain_detection(None, None, &config, &clock).is_none(),

@@ -213,10 +213,26 @@ pub static RVC_KEYMANAGER_QUIESCE_WAIT_MS: LazyLock<Histogram> = LazyLock::new(|
 });
 
 /// 1 after this process stores the doppelganger detection latch. 0 before that.
+/// The liveness loop sets 0 when it starts and 1 when it stores the latch. The
+/// shutdown drain sets 1 when it sees the latch. The metrics server does not
+/// run during the drain, so a scrape cannot read the value that the drain sets.
 pub static RVC_DOPPELGANGER_DETECTION_LATCH: LazyLock<IntGauge> = LazyLock::new(|| {
     define_int_gauge(
         "rvc_doppelganger_detection_latch",
         "1 after the doppelganger detection latch is stored in this process",
+    )
+});
+
+/// 1 after a write of the doppelganger detection and its fsync returned `Ok`
+/// in this process (a rename also needs the directory fsync). The liveness
+/// loop sets 0 when it starts. The loop and the shutdown drain set 1 right
+/// after they set the durable flag of the machine. The metrics server does
+/// not run during the drain, so a scrape cannot read the value that the drain
+/// sets. The drain logs are the signal then.
+pub static RVC_DOPPELGANGER_DETECTION_DURABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge(
+        "rvc_doppelganger_detection_durable",
+        "1 after a doppelganger detection write and its fsync returned Ok in this process",
     )
 });
 
@@ -227,7 +243,9 @@ pub static RVC_DOPPELGANGER_DETECTION_LATCH: LazyLock<IntGauge> = LazyLock::new(
 /// each attempt. If the value increases, a write failed again. Do not stop
 /// the process then: `SIGKILL` before the first durable record loses the
 /// latch. Exit 12 still follows after a write of the in-place record or a
-/// marker and its fsync returned `Ok` in this process.
+/// marker and its fsync returned `Ok` in this process. The metrics server does
+/// not run during the drain, so a scrape cannot read the increments of the
+/// drain. The drain logs are the signal then.
 pub static RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> =
     LazyLock::new(|| {
         define_int_counter(
@@ -277,6 +295,7 @@ pub fn init() {
     LazyLock::force(&RVC_FORK_NEXT_ACTIVATION_EPOCH);
     LazyLock::force(&RVC_KEYMANAGER_QUIESCE_WAIT_MS);
     LazyLock::force(&RVC_DOPPELGANGER_DETECTION_LATCH);
+    LazyLock::force(&RVC_DOPPELGANGER_DETECTION_DURABLE);
     LazyLock::force(&RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
@@ -368,6 +387,20 @@ mod tests {
         assert!(
             results.contains(slashing_result::BLOCKED),
             "slashing blocked child must be force-registered at init, got {results:?}"
+        );
+    }
+
+    /// W4-D3e: `init` registers `rvc_doppelganger_detection_durable` with a
+    /// sample, so a scrape shows the gauge before the liveness loop starts.
+    /// Under nextest, no other test of this process reads the gauge first.
+    #[test]
+    fn init_registers_the_durability_gauge_with_a_sample() {
+        super::init();
+        let gathered = metrics::REGISTRY.gather();
+        assert!(
+            gathered.iter().any(|family| family.name() == "rvc_doppelganger_detection_durable"
+                && !family.get_metric().is_empty()),
+            "init must register rvc_doppelganger_detection_durable with a sample."
         );
     }
 }
