@@ -21,6 +21,10 @@
 //! the epoch before sent E as its next epoch. A revocation or a change of
 //! the count of keys with an index after that send makes the step send E
 //! again.
+//! `SyncCommitteeSubscriptions` subscribes the local members of the current
+//! sync-committee period in every epoch, and of the next period in the last
+//! `PREFETCH_LOOKAHEAD` (4) epochs of a period. It is `NotReady` until the
+//! sync-committee duties of each of these periods are cached.
 //! `BuilderRegistration` runs in every epoch and needs no duties: it re-sends
 //! each builder key's registration and signs only the new or changed ones.
 //! `ProposerPreferences` runs from the epoch before Gloas. It is `NotReady`
@@ -30,8 +34,8 @@
 //! `Failed` when no node is admitted. A proposer root change that
 //! ReorgCheck caches re-opens it, so it signs again with the new root.
 //! Each step with beacon-node work runs under its own bound,
-//! `timeouts.duty_fetch` for ReorgCheck, DutyFetch and
-//! CommitteeSubscriptions, `timeouts.preparation` for PrepareProposers, the
+//! `timeouts.duty_fetch` for ReorgCheck, DutyFetch, CommitteeSubscriptions
+//! and SyncCommitteeSubscriptions, `timeouts.preparation` for PrepareProposers, the
 //! builder service's `registration_step_timeout()` for BuilderRegistration
 //! and `PREFERENCES_STEP_TIMEOUT` for ProposerPreferences: a step that
 //! reaches it is dropped and `Failed`.
@@ -52,12 +56,14 @@
 //!
 //! 1. `BreakerReset`
 //! 2. `ReorgCheck` (re-opens `ProposerPreferences` on a proposer root change)
-//! 3. `DutyFetch` (the uncached E and E+1 attester and proposer duties,
+//! 3. `DutyFetch` (the uncached E and E+1 attester and proposer duties, and
+//!    the uncached sync-committee periods of `SyncCommitteeSubscriptions`,
 //!    bounded by `timeouts.duty_fetch`; never waits on the slot loop's warm-up)
 //! 4. `PrepareProposers`
 //! 5. `CommitteeSubscriptions` (epoch E+1, then E; an epoch that went out
 //!    before is not sent again)
-//! 6. `SyncCommitteeSubscriptions` (reserved, W4-E9b)
+//! 6. `SyncCommitteeSubscriptions` (the current sync-committee period, and the
+//!    next period in the last 4 epochs of a period)
 //! 7. `BuilderRegistration` (every epoch)
 //! 8. `ProposerPreferences` (from the epoch before Gloas, until the proposer
 //!    and builder broadcasts both succeed)
@@ -79,6 +85,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use beacon::SyncCommitteeSubscription;
 use bn_manager::OperationTimeouts;
 use builder::{legacy_proposer_ops_retired, BuilderService, BuilderServiceError, UpcomingProposal};
 use duty_tracker::DutyTracker;
@@ -91,7 +98,9 @@ use validator_store::ValidatorStore;
 
 use super::block_proposal::publish_circuit_breaker_metrics;
 use super::coordinator::PubkeyMap;
-use super::duty_management::{DutyManagementService, PrepareOutcome};
+use super::duty_management::{
+    DutyManagementService, PrepareOutcome, EPOCHS_PER_SYNC_COMMITTEE_PERIOD, PREFETCH_LOOKAHEAD,
+};
 use super::utils;
 use crate::pubkey_index::RegistryFreshness;
 
@@ -235,25 +244,46 @@ pub(crate) enum BoundaryStep {
     DutyFetch,
     PrepareProposers,
     CommitteeSubscriptions,
+    SyncCommitteeSubscriptions,
     BuilderRegistration,
     ProposerPreferences,
 }
 
 impl BoundaryStep {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::BreakerReset,
         Self::ReorgCheck,
         Self::DutyFetch,
         Self::PrepareProposers,
         Self::CommitteeSubscriptions,
+        Self::SyncCommitteeSubscriptions,
         Self::BuilderRegistration,
         Self::ProposerPreferences,
     ];
 
-    /// Reads E and E+1 duties from the cache, so DutyFetch runs before it.
+    /// Reads duties from the cache, so DutyFetch runs before it.
     fn needs_duties(self) -> bool {
-        matches!(self, Self::CommitteeSubscriptions | Self::ProposerPreferences)
+        matches!(
+            self,
+            Self::CommitteeSubscriptions
+                | Self::SyncCommitteeSubscriptions
+                | Self::ProposerPreferences
+        )
     }
+}
+
+/// The sync-committee periods that `epoch` subscribes: its own period, and
+/// the next period in the last `PREFETCH_LOOKAHEAD` epochs of a period.
+fn sync_subscription_periods(epoch: u64) -> impl Iterator<Item = u64> {
+    let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+    let lead_up = epoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        >= EPOCHS_PER_SYNC_COMMITTEE_PERIOD - PREFETCH_LOOKAHEAD;
+    std::iter::once(period).chain(lead_up.then_some(period + 1))
+}
+
+/// The first epoch of `period`.
+fn period_start(period: u64) -> u64 {
+    period.saturating_mul(EPOCHS_PER_SYNC_COMMITTEE_PERIOD)
 }
 
 /// How a step ended in one pass. `Failed` and `NotReady` retry the same way;
@@ -460,16 +490,15 @@ impl EpochBoundaryRunner {
     /// Once a slot of a later epoch is processed, the pass starts no further
     /// step.
     pub(crate) async fn run_pending(&self, slot: Slot) {
-        self.run_epoch_steps(slot / SLOTS_PER_EPOCH, slot).await;
+        self.run_epoch_steps(slot / SLOTS_PER_EPOCH).await;
     }
 
     /// [`Self::run_pending`] with no processed slot: epoch 0 before genesis.
-    /// The summary reads the epoch's first slot.
     pub(crate) async fn run_pending_for_epoch(&self, epoch: u64) {
-        self.run_epoch_steps(epoch, epoch.saturating_mul(SLOTS_PER_EPOCH)).await;
+        self.run_epoch_steps(epoch).await;
     }
 
-    async fn run_epoch_steps(&self, epoch: u64, slot: Slot) {
+    async fn run_epoch_steps(&self, epoch: u64) {
         let first_pass = self.begin_epoch(epoch);
         self.reopen_moved_prepare(epoch);
         for step in BoundaryStep::ALL {
@@ -502,13 +531,17 @@ impl EpochBoundaryRunner {
                     let subscriptions = self.committee_subscriptions(epoch);
                     bounded(epoch, step, self.timeouts.duty_fetch, subscriptions).await
                 }
+                BoundaryStep::SyncCommitteeSubscriptions => {
+                    let subscriptions = self.sync_committee_subscriptions(epoch);
+                    bounded(epoch, step, self.timeouts.duty_fetch, subscriptions).await
+                }
                 BoundaryStep::BuilderRegistration => self.builder_registration(epoch).await,
                 BoundaryStep::ProposerPreferences => self.proposer_preferences(epoch).await,
             };
             self.record(epoch, step, outcome);
         }
         if first_pass {
-            self.duty_management.log_epoch_boundary_summary(epoch, slot).await;
+            self.duty_management.log_epoch_boundary_summary(epoch).await;
         }
     }
 
@@ -600,14 +633,18 @@ impl EpochBoundaryRunner {
 
     /// Fetches the E and E+1 attester and proposer duties that are not
     /// cached, under one `timeouts.duty_fetch` bound for the whole step.
+    /// While SyncCommitteeSubscriptions is pending, it also fetches each of
+    /// that step's sync-committee periods that is not cached.
     ///
     /// Calls the tracker directly. Eviction, PTC duties and the next-period
     /// sync prefetch stay with the slot loop's warm-up. A failed fetch does
-    /// not stop the next one. `Done` when all four entries are cached after
-    /// the step, else `Failed`: a failed or timed-out request leaves its
-    /// entry uncached.
+    /// not stop the next one. `Done` when all four entries, and each needed
+    /// period, are cached after the step, else `Failed`: a failed or
+    /// timed-out request leaves its entry uncached.
     async fn duty_fetch(&self, epoch: u64) -> StepOutcome {
         let epochs = [epoch, epoch + 1];
+        let sync_pending = self.is_pending(epoch, BoundaryStep::SyncCommitteeSubscriptions);
+        let periods: Vec<u64> = sync_subscription_periods(epoch).filter(|_| sync_pending).collect();
         let fetch = async {
             for epoch in epochs {
                 if !self.duty_tracker.is_epoch_cached(epoch).await {
@@ -623,6 +660,21 @@ impl EpochBoundaryRunner {
                     }
                 }
             }
+            for &period in &periods {
+                let first_epoch = period_start(period);
+                if !self.duty_tracker.is_sync_period_cached(first_epoch).await {
+                    debug!(epoch, period, "Epoch boundary fetching sync committee duties");
+                    if let Err(e) = self.duty_tracker.fetch_sync_committee_duties(first_epoch).await
+                    {
+                        warn!(
+                            epoch,
+                            period,
+                            error = %e,
+                            "Epoch boundary sync committee duty fetch failed"
+                        );
+                    }
+                }
+            }
         };
         if tokio::time::timeout(self.timeouts.duty_fetch, fetch).await.is_err() {
             warn!(
@@ -635,6 +687,11 @@ impl EpochBoundaryRunner {
             if !self.duty_tracker.is_epoch_cached(epoch).await
                 || !self.duty_tracker.is_proposer_epoch_cached(epoch).await
             {
+                return StepOutcome::Failed;
+            }
+        }
+        for period in periods {
+            if !self.duty_tracker.is_sync_period_cached(period_start(period)).await {
                 return StepOutcome::Failed;
             }
         }
@@ -786,6 +843,56 @@ impl EpochBoundaryRunner {
     fn mark_subscribed(&self, epoch: u64, duty_epoch: u64, sent: SubscribedEpoch) {
         if let Some(current) = self.progress.lock().as_mut().filter(|p| p.epoch == epoch) {
             current.subscribed_epochs.insert(duty_epoch, sent);
+        }
+    }
+
+    /// Subscribes the local members of each sync committee that `epoch`
+    /// needs ([`sync_subscription_periods`]), with one POST. A subscription
+    /// is valid until the first epoch after its period. A local member is a
+    /// key in the pubkey map; the step does not read the signing gate,
+    /// because a subscription has no signature.
+    ///
+    /// `NotReady` while one of the periods is not cached, so in the last
+    /// epochs of a period the step does not send the current period alone.
+    /// `Done` with no call when no local key is in a needed committee, and
+    /// `Done` once the POST returns `Ok`. `Failed` on an error. The step
+    /// sends again in each epoch.
+    async fn sync_committee_subscriptions(&self, epoch: u64) -> StepOutcome {
+        let mut subscriptions = Vec::new();
+        for period in sync_subscription_periods(epoch) {
+            let tracker = &self.duty_tracker;
+            let Some(duties) = tracker.get_sync_committee_duties_for_period(period).await else {
+                debug!(epoch, period, "Sync committee subscriptions wait for cached period duties");
+                return StepOutcome::NotReady;
+            };
+            let until_epoch = period_start(period + 1);
+            subscriptions.extend(
+                duties
+                    .into_iter()
+                    .filter(|duty| {
+                        utils::find_pubkey_bytes(&self.pubkey_map, &duty.pubkey).is_some()
+                    })
+                    .map(|duty| SyncCommitteeSubscription {
+                        validator_index: duty.validator_index,
+                        sync_committee_indices: duty.validator_sync_committee_indices,
+                        until_epoch,
+                    }),
+            );
+        }
+        if subscriptions.is_empty() {
+            debug!(epoch, "No local sync committee member: no sync committee subscription POST");
+            return StepOutcome::Done;
+        }
+        let count = subscriptions.len();
+        match self.duty_management.submit_sync_committee_subscriptions(&subscriptions).await {
+            Ok(()) => {
+                info!(epoch, count, "Sent sync committee subscriptions");
+                StepOutcome::Done
+            }
+            Err(e) => {
+                warn!(epoch, count, error = %e, "Sync committee subscriptions failed");
+                StepOutcome::Failed
+            }
         }
     }
 
@@ -987,6 +1094,8 @@ mod tests {
 
     struct Fixture {
         mock: Arc<MockBeaconNodeClient>,
+        /// The public key of the local validator 42.
+        local: [u8; 48],
         duty_tracker: Arc<DutyTracker>,
         breaker: Arc<CircuitBreakerState>,
         runner: Arc<EpochBoundaryRunner>,
@@ -1000,6 +1109,15 @@ mod tests {
         failing_prepare: Arc<parking_lot::Mutex<usize>>,
         /// Subscription POSTs still to answer 503.
         failing_subscriptions: Arc<parking_lot::Mutex<usize>>,
+        /// The sync-committee duties of each period. A period with no
+        /// entry has no duty.
+        sync_committees: SyncCommittees,
+        /// The first epoch of each sync-duty request, in request order.
+        sync_duty_requests: Arc<parking_lot::Mutex<Vec<u64>>>,
+        /// Sync-duty requests still to answer 503, per period.
+        failing_sync_duties: FailPlan,
+        /// Sync-committee subscription POSTs still to answer 503.
+        failing_sync_subscriptions: Arc<parking_lot::Mutex<usize>>,
         /// The tracker's index source: the production one, over the fixture's
         /// pubkey map and index registry.
         index_source: Arc<PubkeyIndexSource>,
@@ -1081,6 +1199,9 @@ mod tests {
 
     /// Requests still to answer 503, per epoch.
     type FailPlan = Arc<parking_lot::Mutex<HashMap<u64, usize>>>;
+
+    /// The sync-committee duties of each period.
+    type SyncCommittees = Arc<parking_lot::Mutex<HashMap<u64, Vec<eth_types::SyncCommitteeDuty>>>>;
 
     /// Spends one armed failure for `epoch`; `true` means answer 503.
     fn take_failure(plan: &FailPlan, epoch: u64) -> bool {
@@ -1176,7 +1297,8 @@ mod tests {
         fixture_seeded(mock, local, with_builder, &[1, 2]).await
     }
 
-    /// [`fixture_with`], seeding the attester duties of `seed` only.
+    /// [`fixture_with`], seeding the attester duties of `seed` only, and, when
+    /// `seed` is not empty, the sync-committee duties of period 0.
     async fn fixture_seeded(
         mock: MockBeaconNodeClient,
         local: SecretKey,
@@ -1226,6 +1348,14 @@ mod tests {
         let prepare_failures = Arc::clone(&failing_prepare);
         let failing_subscriptions = Arc::new(parking_lot::Mutex::new(0_usize));
         let subscription_failures = Arc::clone(&failing_subscriptions);
+        let sync_committees = SyncCommittees::default();
+        let committees = Arc::clone(&sync_committees);
+        let sync_duty_requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sync_requests = Arc::clone(&sync_duty_requests);
+        let failing_sync_duties = FailPlan::default();
+        let sync_duty_failures = Arc::clone(&failing_sync_duties);
+        let failing_sync_subscriptions = Arc::new(parking_lot::Mutex::new(0_usize));
+        let sync_subscription_failures = Arc::clone(&failing_sync_subscriptions);
         let mock = Arc::new(
             mock.with_get_attester_duties(move |epoch, indices| {
                 if take_failure(&failing, epoch) {
@@ -1264,6 +1394,25 @@ mod tests {
                 }
                 recorded.lock().push(subscriptions.into_iter().map(|s| s.slot).collect());
                 Ok(())
+            })
+            .with_post_sync_committee_duties(move |epoch, _indices| {
+                sync_requests.lock().push(epoch);
+                let period = DutyTracker::sync_committee_period(epoch);
+                if take_failure(&sync_duty_failures, period) {
+                    return Err(unavailable());
+                }
+                Ok(bn_manager::SyncCommitteeDutiesResponse {
+                    execution_optimistic: false,
+                    data: committees.lock().get(&period).cloned().unwrap_or_default(),
+                })
+            })
+            .with_submit_sync_committee_subscriptions(move |_subscriptions| {
+                let mut left = sync_subscription_failures.lock();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(unavailable());
+                }
+                Ok(())
             }),
         );
         mock.track_admission();
@@ -1280,6 +1429,10 @@ mod tests {
             Arc::new(DutyTracker::new_with_source(beacon.clone(), index_source.clone()));
         for &epoch in seed {
             duty_tracker.fetch_duties_for_epoch(epoch).await.expect("seed attester duties");
+        }
+        if !seed.is_empty() {
+            let sync = duty_tracker.fetch_sync_committee_duties(0);
+            sync.await.expect("The fixture must seed the sync-committee duties of period 0.");
         }
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
@@ -1348,6 +1501,7 @@ mod tests {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, SLOT, SLOTS_PER_EPOCH));
         Fixture {
             mock,
+            local: pk_bytes,
             duty_tracker,
             breaker,
             runner,
@@ -1356,6 +1510,10 @@ mod tests {
             failing_attester,
             failing_prepare,
             failing_subscriptions,
+            sync_committees,
+            sync_duty_requests,
+            failing_sync_duties,
+            failing_sync_subscriptions,
             index_source,
             clock,
             registrations,
@@ -1387,6 +1545,10 @@ mod tests {
                     Some("subscriptions")
                 } else if line.contains("Sent proposer preparations") {
                     Some("prepare")
+                } else if line.contains("Sent sync committee subscriptions") {
+                    Some("sync_subscriptions")
+                } else if line.contains("Epoch builder registration completed") {
+                    Some("registration")
                 } else {
                     None
                 }
@@ -1397,7 +1559,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[tracing_test::traced_test]
     async fn run_pending_runs_steps_in_the_fixed_order() {
-        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let mock = proposer_duties_at(ROOT_A).with_register_validators(|_registrations| Ok(()));
+        let f = fixture_with(mock, SecretKey::generate(), true).await;
+        f.add_local_sync_duty(0, 3);
+        let sync = f.duty_tracker.fetch_sync_committee_duties(0);
+        sync.await.expect("The test must cache the local sync-committee duty of period 0.");
         let seeded = f.mock.call_stamps().len();
 
         f.runner.run_pending(32).await;
@@ -1415,11 +1581,15 @@ mod tests {
                 MockMethod::PrepareBeaconProposer,
                 MockMethod::SubmitBeaconCommitteeSubscriptions,
                 MockMethod::SubmitBeaconCommitteeSubscriptions,
-            ]
+                MockMethod::SubmitSyncCommitteeSubscriptions,
+                MockMethod::RegisterValidators,
+            ],
+            "The sync-committee subscriptions must go out after the committee subscriptions \
+             and before the builder registration."
         );
         assert_eq!(*f.subscription_slots.lock(), [vec!["65".to_string()], vec!["33".to_string()]]);
         logs_assert(|lines| match boundary_lines(lines).as_slice() {
-            ["breaker", "proposer_duties", "proposer_duties", "prepare", "subscriptions", "subscriptions", "summary"] => {
+            ["breaker", "proposer_duties", "proposer_duties", "prepare", "subscriptions", "subscriptions", "sync_subscriptions", "registration", "summary"] => {
                 Ok(())
             }
             seen => Err(format!("steps out of order, or the summary is not last: {seen:?}")),
@@ -2170,6 +2340,7 @@ mod tests {
         for call in [
             "self.duty_tracker.fetch_duties_for_epoch(",
             "self.duty_tracker.fetch_proposer_duties(",
+            "self.duty_tracker.fetch_sync_committee_duties(",
         ] {
             assert!(code.contains(call), "DutyFetch must call `{call}` itself");
         }
@@ -2894,7 +3065,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("pub(crate)fnhas_pending(").next())
             .expect("`run_pending`, then `has_pending`");
-        assert_eq!(run.matches("bounded(").count(), 3, "Three steps must run under a bound: {run}");
+        assert_eq!(run.matches("bounded(").count(), 4, "Four steps must run under a bound: {run}");
         for arm in [
             "BoundaryStep::BreakerReset=>self.breaker_reset(epoch),",
             "BoundaryStep::ReorgCheck=>{bounded(epoch,step,self.timeouts.duty_fetch,\
@@ -2904,6 +3075,9 @@ mod tests {
              bounded(epoch,step,self.timeouts.preparation,prepare).await}",
             "BoundaryStep::CommitteeSubscriptions=>{letsubscriptions=\
              self.committee_subscriptions(epoch);\
+             bounded(epoch,step,self.timeouts.duty_fetch,subscriptions).await}",
+            "BoundaryStep::SyncCommitteeSubscriptions=>{letsubscriptions=\
+             self.sync_committee_subscriptions(epoch);\
              bounded(epoch,step,self.timeouts.duty_fetch,subscriptions).await}",
             "BoundaryStep::BuilderRegistration=>self.builder_registration(epoch).await,",
             "BoundaryStep::ProposerPreferences=>self.proposer_preferences(epoch).await,",
@@ -2982,9 +3156,10 @@ mod tests {
 
     /// A cold cache that never fills is visible at the epoch end. Every
     /// attester request is held past `duty_fetch`, so in each pass of epoch
-    /// 1 ReorgCheck and DutyFetch end `Failed` at their bounds and the
-    /// subscription step is `NotReady`. Epoch 2's first pass warns once for
-    /// epoch 1, naming the three steps and their last outcomes.
+    /// 1 ReorgCheck and DutyFetch end `Failed` at their bounds, before
+    /// DutyFetch requests the sync-committee duties, and the two
+    /// subscription steps are `NotReady`. Epoch 2's first pass warns once
+    /// for epoch 1, naming the four steps and their last outcomes.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn duty_fetch_failure_is_named_in_the_abandoned_warn() {
         let held =
@@ -3007,10 +3182,9 @@ mod tests {
 
         assert_eq!(
             warns.abandoned(),
-            [
-                "epoch=1 abandoned_steps=[ReorgCheck, DutyFetch, CommitteeSubscriptions] \
-                 last_outcomes={ReorgCheck: Failed, DutyFetch: Failed, CommitteeSubscriptions: NotReady}"
-            ],
+            ["epoch=1 abandoned_steps=[ReorgCheck, DutyFetch, CommitteeSubscriptions, \
+                 SyncCommitteeSubscriptions] last_outcomes={ReorgCheck: Failed, DutyFetch: Failed, \
+                 CommitteeSubscriptions: NotReady, SyncCommitteeSubscriptions: NotReady}"],
             "one warn for epoch 1, at epoch 2's first pass"
         );
     }
@@ -3094,7 +3268,8 @@ mod tests {
         assert_eq!(
             warns.abandoned(),
             ["epoch=2 abandoned_steps=[ReorgCheck, PrepareProposers, CommitteeSubscriptions, \
-              BuilderRegistration, ProposerPreferences] last_outcomes={}"],
+              SyncCommitteeSubscriptions, BuilderRegistration, ProposerPreferences] \
+              last_outcomes={}"],
             "epoch 2's unattempted steps, with no outcome from epoch 1"
         );
     }
@@ -5981,6 +6156,192 @@ mod tests {
             step_state(&f.runner, CommitteeSubscriptions),
             (Some(StepOutcome::Done), true),
             "The accepted retry must finish the step."
+        );
+    }
+
+    // -- SyncCommitteeSubscriptions (W4-E9b) --
+
+    impl Fixture {
+        /// Gives the local key, validator 42, a sync-committee duty in
+        /// `period` with the sync-committee index `index`.
+        fn add_local_sync_duty(&self, period: u64, index: u64) {
+            let duty = eth_types::SyncCommitteeDuty {
+                pubkey: self.local,
+                validator_index: 42,
+                validator_sync_committee_indices: vec![index],
+            };
+            self.sync_committees.lock().entry(period).or_default().push(duty);
+        }
+
+        /// The sorted `until_epoch` values of each sync-committee
+        /// subscription POST, in POST order. A refused POST is in the list.
+        fn sync_posts(&self) -> Vec<Vec<u64>> {
+            let posts = self.mock.submit_sync_committee_subscriptions_calls();
+            let until = |post: &Vec<beacon::SyncCommitteeSubscription>| {
+                let mut epochs: Vec<u64> = post.iter().map(|row| row.until_epoch).collect();
+                epochs.sort_unstable();
+                epochs
+            };
+            posts.iter().map(until).collect()
+        }
+    }
+
+    /// At epoch 251, the POST has only the row of period 0, valid until
+    /// epoch 256. At each of epochs 252 to 255, the POST also has the row of
+    /// period 1, valid until epoch 512.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_next_period_sync_subscriptions_only_in_last_4_epochs() {
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.add_local_sync_duty(0, 3);
+        f.add_local_sync_duty(1, 7);
+        let sync = f.duty_tracker.fetch_sync_committee_duties(0);
+        sync.await.expect("The test must cache the local sync-committee duty of period 0.");
+
+        for epoch in 251..=255 {
+            f.runner.run_pending(epoch * SLOTS_PER_EPOCH).await;
+        }
+
+        let both = vec![256, 512];
+        assert_eq!(
+            f.sync_posts(),
+            [vec![256], both.clone(), both.clone(), both.clone(), both],
+            "Epoch 251 must POST only period 0 (until epoch 256). Each of epochs 252 to 255 \
+             must POST periods 0 and 1 (until epochs 256 and 512)."
+        );
+    }
+
+    /// M-5: an empty tracker, no slot loop and no warm-up, at epoch 252.
+    /// DutyFetch requests the duties of periods 0 and 1 from the first epoch
+    /// of each period, and the step POSTs the two periods in the same pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_subscriptions_from_a_cold_period_cache_use_runner_fetched_duties() {
+        let local = SecretKey::generate();
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), local, false, &[]).await;
+        f.add_local_sync_duty(0, 3);
+        f.add_local_sync_duty(1, 7);
+        assert!(f.sync_duty_requests.lock().is_empty(), "The tracker must start empty.");
+
+        f.runner.run_pending(252 * SLOTS_PER_EPOCH).await;
+
+        assert_eq!(
+            *f.sync_duty_requests.lock(),
+            [0, 256],
+            "DutyFetch must request period 0, then period 1, from the first epoch of each period."
+        );
+        let row = |index, until_epoch| beacon::SyncCommitteeSubscription {
+            validator_index: 42,
+            sync_committee_indices: vec![index],
+            until_epoch,
+        };
+        assert_eq!(
+            f.mock.submit_sync_committee_subscriptions_calls(),
+            [vec![row(3, 256), row(7, 512)]],
+            "The same pass must send one POST with the local rows of periods 0 and 1."
+        );
+        assert_eq!(
+            step_state(&f.runner, BoundaryStep::SyncCommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
+        );
+    }
+
+    /// The first request for period 0 fails: DutyFetch is `Failed`, and the
+    /// step is `NotReady` with no POST. The next pass requests the period
+    /// again and POSTs one time. Second arm: a cached period with no local
+    /// member is `Done` with no POST.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_sync_subscription_step_waits_for_cold_period_cache() {
+        use BoundaryStep::{DutyFetch, SyncCommitteeSubscriptions};
+        let local = SecretKey::generate();
+        let f = fixture_seeded(proposer_duties_at(ROOT_A), local, false, &[]).await;
+        f.add_local_sync_duty(0, 3);
+        f.failing_sync_duties.lock().insert(0, 1);
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(*f.sync_duty_requests.lock(), [0], "DutyFetch must request period 0.");
+        assert_eq!(
+            step_state(&f.runner, DutyFetch),
+            (Some(StepOutcome::Failed), false),
+            "The 503 must leave DutyFetch failed."
+        );
+        assert_eq!(
+            step_state(&f.runner, SyncCommitteeSubscriptions),
+            (Some(StepOutcome::NotReady), false),
+            "With period 0 not cached, the step must wait."
+        );
+        assert!(f.sync_posts().is_empty(), "With period 0 not cached, the step must not POST.");
+
+        f.runner.run_pending(33).await;
+        f.runner.run_pending(34).await;
+
+        assert_eq!(
+            *f.sync_duty_requests.lock(),
+            [0, 0],
+            "The next pass must request period 0 again, and the pass after it must not."
+        );
+        assert_eq!(f.sync_posts(), [vec![256]], "The next pass must POST period 0 one time.");
+        assert_eq!(
+            step_state(&f.runner, SyncCommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
+        );
+
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        let other = eth_types::SyncCommitteeDuty {
+            pubkey: [0x77; 48],
+            validator_index: 7,
+            validator_sync_committee_indices: vec![1],
+        };
+        f.sync_committees.lock().insert(0, vec![other]);
+        let sync = f.duty_tracker.fetch_sync_committee_duties(0);
+        sync.await.expect("The test must cache period 0 with no local member.");
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(
+            step_state(&f.runner, SyncCommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "Second arm: with no local member in period 0, the step must be done."
+        );
+        assert!(
+            f.sync_posts().is_empty(),
+            "Second arm: with no local member in period 0, the step must not POST."
+        );
+    }
+
+    /// A 503 on the sync-committee subscription POST makes the step `Failed`.
+    /// The next pass sends the POST again, one time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_subscription_failure_retries_next_slot() {
+        use BoundaryStep::SyncCommitteeSubscriptions;
+        let f = fixture(proposer_duties_at(ROOT_A)).await;
+        f.add_local_sync_duty(0, 3);
+        let sync = f.duty_tracker.fetch_sync_committee_duties(0);
+        sync.await.expect("The test must cache the local sync-committee duty of period 0.");
+        *f.failing_sync_subscriptions.lock() = 1;
+
+        f.runner.run_pending(32).await;
+
+        assert_eq!(f.sync_posts(), [vec![256]], "The first pass must send one POST.");
+        assert_eq!(
+            step_state(&f.runner, SyncCommitteeSubscriptions),
+            (Some(StepOutcome::Failed), false),
+            "After the 503, the step must be failed and pending."
+        );
+
+        f.runner.run_pending(33).await;
+        f.runner.run_pending(34).await;
+
+        assert_eq!(
+            f.sync_posts(),
+            [vec![256], vec![256]],
+            "The next pass must send the POST again one time, and the pass after it must not."
+        );
+        assert_eq!(
+            step_state(&f.runner, SyncCommitteeSubscriptions),
+            (Some(StepOutcome::Done), true),
+            "The accepted POST must finish the step."
         );
     }
 }

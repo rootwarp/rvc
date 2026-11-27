@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
-use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
+use beacon::{BeaconCommitteeSubscription, ProposerPreparation, SyncCommitteeSubscription};
 use bn_manager::BeaconNodeClient;
 use builder::legacy_proposer_ops_retired;
 use duty_tracker::DutyTracker;
@@ -24,10 +24,12 @@ use super::utils::{self, TimedOutcome};
 use crate::pubkey_index::{parse_pubkey_bytes, RegistryFreshness, SharedPubkeyIndexRegistry};
 
 /// Number of epochs in a single sync committee period.
-const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
+pub(crate) const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 
-/// How many epochs before the end of a period to start prefetching next-period duties.
-const PREFETCH_LOOKAHEAD: u64 = 2;
+/// The last epochs of a sync-committee period that need the duties of the
+/// next period: the warm-up prefetches them, and the epoch-boundary runner
+/// subscribes the next committee in these epochs.
+pub(crate) const PREFETCH_LOOKAHEAD: u64 = 4;
 
 /// The prepare POST, as timed and as named by a timeout.
 const PROPOSER_PREPARATION: &str = "proposer_preparation";
@@ -277,20 +279,18 @@ impl DutyManagementService {
         .await
     }
 
-    /// Prefetches sync committee duties for the next period when within the last
-    /// `PREFETCH_LOOKAHEAD` epochs of the current period.
+    /// Prefetches the sync-committee duties of the next period in the last
+    /// `PREFETCH_LOOKAHEAD` epochs of the current period (epochs 252 to 255
+    /// of a period).
     ///
-    /// Uses a `HashSet<Period>` guard to ensure the fetch happens at most once per period
-    /// even if called multiple times in the lookahead window. Failures are retried because
-    /// the period is only marked as done on a successful fetch.
+    /// The duties feed the next-period sync-committee subscriptions that the
+    /// epoch-boundary runner sends in these epochs. This is a warm-up only:
+    /// the runner's DutyFetch step fetches a period that is not cached.
     ///
-    /// Attester committee subscriptions for `next_period_first_epoch` are intentionally
-    /// NOT submitted here: at the time this prefetch fires (epoch `PERIOD - 2`), the
-    /// attester duty cache for `next_period_first_epoch` is not yet populated, so any
-    /// subscription call would be a no-op. The coordinator's normal epoch-boundary path
-    /// calls `submit_committee_subscriptions(current_epoch + 1)` at epoch `PERIOD - 1`,
-    /// which is still within the two-epoch lookahead window and has the attester cache
-    /// fully populated at that point.
+    /// A `HashSet<Period>` guard keeps the fetch to one per period, also when
+    /// the function runs more than one time in the window. The period goes
+    /// into the guard only after a fetch that succeeds, so a failed fetch is
+    /// tried again.
     async fn maybe_prefetch_next_sync_period(&self, current_epoch: u64) {
         let pos = current_epoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         if pos < EPOCHS_PER_SYNC_COMMITTEE_PERIOD - PREFETCH_LOOKAHEAD {
@@ -899,14 +899,23 @@ impl DutyManagementService {
         apply(&mut entry.1);
     }
 
+    /// Sends the sync-committee subscriptions of the runner's
+    /// SyncCommitteeSubscriptions step to the beacon nodes in one POST.
+    pub(crate) async fn submit_sync_committee_subscriptions(
+        &self,
+        subscriptions: &[SyncCommitteeSubscription],
+    ) -> Result<(), beacon::BeaconError> {
+        self.beacon.submit_sync_committee_subscriptions(subscriptions).await
+    }
+
     /// Count attester/proposer/sync duties for the epoch and emit the
     /// `Epoch boundary summary` info line.
     ///
     /// Iterates the slot range once (attester + proposer per slot) rather than
     /// two separate 32-slot loops.
-    pub(crate) async fn log_epoch_boundary_summary(&self, current_epoch: u64, current_slot: Slot) {
+    pub(crate) async fn log_epoch_boundary_summary(&self, current_epoch: u64) {
         let (attester_count, proposer_count, sync_count) =
-            self.epoch_boundary_summary_counts(current_epoch, current_slot).await;
+            self.epoch_boundary_summary_counts(current_epoch).await;
         info!(
             epoch = current_epoch,
             attester_count, proposer_count, sync_count, "Epoch boundary summary"
@@ -916,12 +925,10 @@ impl DutyManagementService {
     /// Counts used by the epoch-boundary summary.
     ///
     /// Single pass over `[epoch * 32, epoch * 32 + 32)` for attester and
-    /// proposer duties; sync committee duties are read for `current_slot`.
-    pub(crate) async fn epoch_boundary_summary_counts(
-        &self,
-        epoch: u64,
-        current_slot: Slot,
-    ) -> (usize, usize, usize) {
+    /// proposer duties. The sync-committee duties are those of the period of
+    /// `epoch`, also at the last slot of a period, where a message signs
+    /// with the committee of the next period.
+    pub(crate) async fn epoch_boundary_summary_counts(&self, epoch: u64) -> (usize, usize, usize) {
         let mut attester_count = 0usize;
         let mut proposer_count = 0usize;
         for slot_offset in 0..SLOTS_PER_EPOCH {
@@ -931,7 +938,9 @@ impl DutyManagementService {
                 proposer_count += 1;
             }
         }
-        let sync_count = self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
+        let period = DutyTracker::sync_committee_period(epoch);
+        let sync_duties = self.duty_tracker.get_sync_committee_duties_for_period(period).await;
+        let sync_count = sync_duties.map_or(0, |duties| duties.len());
         (attester_count, proposer_count, sync_count)
     }
 }
@@ -1020,7 +1029,7 @@ mod tests {
 
     // EPOCHS_PER_SYNC_COMMITTEE_PERIOD = 256.
     // Period 0 spans epochs 0..=255; period 1 spans epochs 256..=511.
-    // Lookahead window within period 0: epochs 254 and 255.
+    // Lookahead window within period 0: epochs 252 to 255.
     const PERIOD: u64 = EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
 
     fn make_fork_schedule() -> Arc<ForkSchedule> {
@@ -1084,26 +1093,28 @@ mod tests {
         )
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // test_prefetch_fires_in_last_2_epochs (RED → GREEN)
-    // ──────────────────────────────────────────────────────────────────────────
+    /// The POSTs that the server got for the duties of the next period.
+    async fn next_period_fetches(server: &MockServer) -> usize {
+        let route = format!("/eth/v1/validator/duties/sync/{PERIOD}");
+        let requests = server.received_requests().await.expect("wiremock records the requests");
+        requests.iter().filter(|request| request.url.path() == route).count()
+    }
 
-    /// Prefetch fires for epoch PERIOD-2 (pos = 254 = PERIOD - 2).
+    /// The warm-up at epoch PERIOD - 4, the first epoch of the window,
+    /// prefetches the duties of the next period one time.
     #[tokio::test]
-    async fn test_prefetch_fires_in_last_2_epochs() {
+    async fn test_prefetch_fires_in_last_4_epochs() {
         let server = MockServer::start().await;
-        // Must be called exactly once for the next period's first epoch
-        Mock::given(method("POST"))
-            .and(path(format!("/eth/v1/validator/duties/sync/{}", PERIOD)))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sync_duties_response()))
-            .expect(1)
-            .mount(&server)
-            .await;
+        mount_warm_up_routes(&server, PERIOD - 4).await;
 
         let service = build_service_no_validators(&server.uri()).await;
-        // epoch PERIOD-2 is the second-to-last epoch of period 0
-        service.maybe_prefetch_next_sync_period(PERIOD - 2).await;
-        // wiremock asserts expect(1) on drop
+        service.fetch_epoch_duties(PERIOD - 4).await;
+
+        assert_eq!(
+            next_period_fetches(&server).await,
+            1,
+            "At epoch PERIOD - 4, the warm-up must prefetch the duties of the next period one time."
+        );
     }
 
     /// Prefetch also fires for epoch PERIOD-1 (pos = 255 = PERIOD - 1).
@@ -1121,20 +1132,25 @@ mod tests {
         service.maybe_prefetch_next_sync_period(PERIOD - 1).await;
     }
 
-    /// Prefetch does NOT fire when outside the lookahead window (pos < PERIOD - 2).
+    /// The prefetch does not fire before the window: epoch PERIOD - 5 is the
+    /// last epoch before it.
     #[tokio::test]
     async fn test_prefetch_outside_window_does_not_fire() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!("/eth/v1/validator/duties/sync/{}", PERIOD)))
             .respond_with(ResponseTemplate::new(200).set_body_json(sync_duties_response()))
-            .expect(0)
             .mount(&server)
             .await;
 
         let service = build_service_no_validators(&server.uri()).await;
-        // epoch PERIOD-3: pos = 253 < 254 → must NOT fire
-        service.maybe_prefetch_next_sync_period(PERIOD - 3).await;
+        service.maybe_prefetch_next_sync_period(PERIOD - 5).await;
+
+        assert_eq!(
+            next_period_fetches(&server).await,
+            0,
+            "At epoch PERIOD - 5, the prefetch must not request the duties of the next period."
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1277,8 +1293,22 @@ mod tests {
     async fn test_fetch_epoch_duties_triggers_prefetch_in_window() {
         let server = MockServer::start().await;
         let current_epoch = PERIOD - 2;
+        mount_warm_up_routes(&server, current_epoch).await;
 
-        // Standard duty endpoints for the current epoch (no validators, so no real data needed)
+        let service = build_service_no_validators(&server.uri()).await;
+        service.fetch_epoch_duties(current_epoch).await;
+
+        assert_eq!(
+            next_period_fetches(&server).await,
+            1,
+            "At epoch PERIOD - 2, the warm-up must prefetch the duties of the next period one time."
+        );
+    }
+
+    /// The routes of one warm-up at `current_epoch` with no validators: the
+    /// attester, proposer and sync duties of `current_epoch`, and the sync
+    /// duties of the next period.
+    async fn mount_warm_up_routes(server: &MockServer, current_epoch: u64) {
         Mock::given(method("POST"))
             .and(path(format!("/eth/v1/validator/duties/attester/{}", current_epoch)))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1286,7 +1316,7 @@ mod tests {
                 "execution_optimistic": false,
                 "data": []
             })))
-            .mount(&server)
+            .mount(server)
             .await;
 
         Mock::given(method("GET"))
@@ -1296,27 +1326,22 @@ mod tests {
                 "execution_optimistic": false,
                 "data": []
             })))
-            .mount(&server)
+            .mount(server)
             .await;
 
-        // Sync duties for current period (period 0, epoch 254 → period 0)
+        // Sync duties of the current period (period 0)
         Mock::given(method("POST"))
             .and(path(format!("/eth/v1/validator/duties/sync/{}", current_epoch)))
             .respond_with(ResponseTemplate::new(200).set_body_json(sync_duties_response()))
-            .mount(&server)
+            .mount(server)
             .await;
 
         // Prefetch: sync duties for next period (period 1, first epoch = PERIOD = 256)
         Mock::given(method("POST"))
             .and(path(format!("/eth/v1/validator/duties/sync/{}", PERIOD)))
             .respond_with(ResponseTemplate::new(200).set_body_json(sync_duties_response()))
-            .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
-
-        let service = build_service_no_validators(&server.uri()).await;
-        service.fetch_epoch_duties(current_epoch).await;
-        // wiremock asserts expect(1) for PERIOD sync duties on drop
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1325,6 +1350,8 @@ mod tests {
 
     /// RF6-27: collapsing the two 32-slot loops into one pass must not change
     /// the attester/proposer/sync counts that feed `Epoch boundary summary`.
+    /// The epoch is the last epoch of period 0, and period 1 has a different
+    /// committee: the sync count is that of period 0, also at slot 8191.
     #[tokio::test]
     async fn test_epoch_boundary_summary_counts_match_dual_loop() {
         use bn_manager::{
@@ -1333,7 +1360,7 @@ mod tests {
         };
         use eth_types::SyncCommitteeDuty;
 
-        let epoch = 10u64;
+        let epoch = PERIOD - 1;
         let slot_base = epoch * SLOTS_PER_EPOCH;
         // 3 attester duties on two slots (2 + 1), 2 proposer slots, 1 sync duty.
         let attester_data = vec![
@@ -1377,11 +1404,13 @@ mod tests {
                 slot: (slot_base + 7).to_string(),
             },
         ];
-        let sync_data = vec![SyncCommitteeDuty {
+        let sync_duty = |validator_index| SyncCommitteeDuty {
             pubkey: [0x11; 48],
-            validator_index: 1,
+            validator_index,
             validator_sync_committee_indices: vec![0],
-        }];
+        };
+        let sync_data = vec![sync_duty(1)];
+        let next_sync_data = vec![sync_duty(1), sync_duty(2)];
 
         let beacon = Arc::new(
             MockBeaconNodeClient::new()
@@ -1405,14 +1434,12 @@ mod tests {
                         })
                     }
                 })
-                .with_post_sync_committee_duties({
-                    let data = sync_data.clone();
-                    move |_epoch, _indices| {
-                        Ok(SyncCommitteeDutiesResponse {
-                            execution_optimistic: false,
-                            data: data.clone(),
-                        })
-                    }
+                .with_post_sync_committee_duties(move |epoch, _indices| {
+                    let data = if epoch < PERIOD { &sync_data } else { &next_sync_data };
+                    Ok(SyncCommitteeDutiesResponse {
+                        execution_optimistic: false,
+                        data: data.clone(),
+                    })
                 }),
         ) as Arc<dyn BeaconNodeClient>;
 
@@ -1422,6 +1449,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
         duty_tracker.fetch_sync_committee_duties(epoch).await.unwrap();
+        duty_tracker.fetch_sync_committee_duties(PERIOD).await.unwrap();
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -1440,8 +1468,7 @@ mod tests {
             Arc::default(),
         );
 
-        let current_slot = slot_base;
-        let single_pass = service.epoch_boundary_summary_counts(epoch, current_slot).await;
+        let single_pass = service.epoch_boundary_summary_counts(epoch).await;
 
         // Dual-loop baseline: the pre-RF6-27 shape (two separate 32-slot walks).
         let mut dual_attester = 0usize;
@@ -1456,10 +1483,20 @@ mod tests {
                 dual_proposer += 1;
             }
         }
-        let dual_sync = duty_tracker.get_sync_committee_duties(current_slot).await.len();
+        let period_sync = duty_tracker.get_sync_committee_duties_for_period(0).await;
+        let dual_sync = period_sync.map_or(0, |duties| duties.len());
 
-        assert_eq!(single_pass, (dual_attester, dual_proposer, dual_sync));
-        assert_eq!(single_pass, (3, 2, 1), "known fixture counts");
+        assert_eq!(
+            single_pass,
+            (3, 2, 1),
+            "The summary of epoch 255 must count the 3 attester duties, the 2 proposer duties and \
+             the 1 sync duty of period 0."
+        );
+        assert_eq!(
+            single_pass,
+            (dual_attester, dual_proposer, dual_sync),
+            "The single pass must give the counts of the two loops."
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────

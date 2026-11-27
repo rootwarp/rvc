@@ -1060,6 +1060,12 @@ impl DutyTracker {
         Ok(response.data)
     }
 
+    /// The sync-committee duties of a message at `slot`.
+    ///
+    /// The spec rule: the committee of `slot + 1` signs the messages of
+    /// `slot`, and each message signs over `slot`. At the last slot of a
+    /// period, this gives the committee of the next period. Empty when that
+    /// period is not cached.
     #[tracing::instrument(
         name = "duty_tracker.get_sync_committee_duties",
         level = "debug",
@@ -1067,20 +1073,31 @@ impl DutyTracker {
         fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
     )]
     pub async fn get_sync_committee_duties(&self, slot: u64) -> Vec<SyncCommitteeDuty> {
-        let epoch = slot / SLOTS_PER_EPOCH;
+        let epoch = slot.saturating_add(1) / SLOTS_PER_EPOCH;
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let cache = self.sync_read().await;
-        let now = self.generation_now();
-        match servable(&cache, period, now) {
-            Some(period_cache) => {
+        match self.get_sync_committee_duties_for_period(period).await {
+            Some(duties) => {
                 debug!(slot, epoch, cache_type = "sync", "Cache hit");
-                period_cache.duties.clone()
+                duties
             }
             None => {
                 debug!(slot, epoch, cache_type = "sync", "Cache miss");
                 Vec::new()
             }
         }
+    }
+
+    /// The cached sync-committee duties of `period`. `None` when the period
+    /// is not cached, also when its entry is stamped under an older
+    /// revocation generation. `Some` with no duty when no local key is in
+    /// the committee.
+    pub async fn get_sync_committee_duties_for_period(
+        &self,
+        period: u64,
+    ) -> Option<Vec<SyncCommitteeDuty>> {
+        let cache = self.sync_read().await;
+        let now = self.generation_now();
+        servable(&cache, period, now).map(|period_cache| period_cache.duties.clone())
     }
 
     pub async fn is_sync_period_cached(&self, epoch: u64) -> bool {
@@ -2541,6 +2558,104 @@ mod tests {
         assert_eq!(DutyTracker::sync_committee_period(512), 2);
     }
 
+    /// The number of slots in one sync-committee period.
+    const PERIOD_SLOTS: u64 = SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+
+    /// Period 0 has a duty for validator 111. Each later period has a duty
+    /// for validator 222.
+    fn mock_sync_by_period() -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_post_sync_committee_duties(|epoch, _indices| {
+            let index = if DutyTracker::sync_committee_period(epoch) == 0 { 111 } else { 222 };
+            Ok(sync_response(vec![(index, mock_sync_pubkey(), vec![0])]))
+        })
+    }
+
+    fn validator_indices(duties: &[SyncCommitteeDuty]) -> Vec<u64> {
+        duties.iter().map(|duty| duty.validator_index).collect()
+    }
+
+    #[tokio::test]
+    async fn test_sync_duties_at_slot_8191_come_from_next_period() {
+        let indices = vec!["111".to_string(), "222".to_string()];
+        let tracker = DutyTracker::new(as_beacon(mock_sync_by_period()), indices);
+        tracker.fetch_sync_committee_duties(0).await.expect("The test must cache period 0.");
+        let period_1 = tracker.fetch_sync_committee_duties(EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+        period_1.await.expect("The test must cache period 1.");
+
+        assert_eq!(
+            validator_indices(&tracker.get_sync_committee_duties(PERIOD_SLOTS - 2).await),
+            [111],
+            "At slot 8190, the lookup must give the committee of period 0."
+        );
+        assert_eq!(
+            validator_indices(&tracker.get_sync_committee_duties(PERIOD_SLOTS - 1).await),
+            [222],
+            "At slot 8191, the last slot of period 0, the lookup must give the committee of period 1."
+        );
+    }
+
+    #[tokio::test]
+    async fn get_sync_committee_duties_for_period_is_none_when_uncached() {
+        let tracker = DutyTracker::new(as_beacon(mock_sync_by_period()), vec!["111".to_string()]);
+        tracker.fetch_sync_committee_duties(0).await.expect("The test must cache period 0.");
+
+        assert_eq!(
+            tracker.get_sync_committee_duties_for_period(1).await,
+            None,
+            "Period 1 is not cached, so the lookup must give None."
+        );
+        let cached = tracker.get_sync_committee_duties_for_period(0).await;
+        assert_eq!(
+            cached.as_deref().map(validator_indices),
+            Some(vec![111]),
+            "Period 0 is cached, so the lookup must give its duty."
+        );
+    }
+
+    #[tokio::test]
+    async fn get_sync_committee_duties_for_period_is_some_when_cached_even_if_empty() {
+        let tracker = DutyTracker::new(as_beacon(mock_sync(sync_response(vec![]))), vec![]);
+        tracker.fetch_sync_committee_duties(0).await.expect("The test must cache period 0.");
+
+        assert_eq!(
+            tracker.get_sync_committee_duties_for_period(0).await,
+            Some(Vec::new()),
+            "A cached period with no duty must give Some with no duty, not None."
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_lookup_saturates_at_u64_max() {
+        let tracker = DutyTracker::new(as_beacon(mock_sync_by_period()), vec!["222".to_string()]);
+        let last_epoch = u64::MAX / SLOTS_PER_EPOCH;
+        let last = tracker.fetch_sync_committee_duties(last_epoch);
+        last.await.expect("The test must cache the period of slot u64::MAX.");
+
+        assert_eq!(
+            validator_indices(&tracker.get_sync_committee_duties(u64::MAX).await),
+            [222],
+            "At slot u64::MAX, the lookup must stay in the period of that slot."
+        );
+    }
+
+    #[tokio::test]
+    async fn period_lookup_is_none_after_revocation() {
+        let (_mock, tracker, generation) = stamped(mock_sync_by_period());
+        tracker.fetch_sync_committee_duties(0).await.expect("The test must cache period 0.");
+        assert!(
+            tracker.get_sync_committee_duties_for_period(0).await.is_some(),
+            "Before the revocation, period 0 must be cached."
+        );
+
+        bump(&generation);
+
+        assert_eq!(
+            tracker.get_sync_committee_duties_for_period(0).await,
+            None,
+            "After the revocation, the stale entry of period 0 must give None."
+        );
+    }
+
     #[tokio::test]
     async fn test_get_duties_for_slot() {
         let beacon = as_beacon(mock_attester(attester_response(
@@ -3901,17 +4016,19 @@ mod tests {
         IsPtcEpochCached,
         PtcCount,
         SyncDuties,
+        SyncPeriodDuties,
         IsSyncPeriodCached,
         SyncCount,
     }
 
     impl PtcSyncReader {
-        const ALL: [Self; 7] = [
+        const ALL: [Self; 8] = [
             Self::PtcDuties,
             Self::PtcDependentRoot,
             Self::IsPtcEpochCached,
             Self::PtcCount,
             Self::SyncDuties,
+            Self::SyncPeriodDuties,
             Self::IsSyncPeriodCached,
             Self::SyncCount,
         ];
@@ -3936,6 +4053,10 @@ mod tests {
                 Self::IsPtcEpochCached => tracker.is_ptc_epoch_cached(STAMP_EPOCH).await,
                 Self::PtcCount => tracker.cached_duty_counts(STAMP_EPOCH).await.3 > 0,
                 Self::SyncDuties => !tracker.get_sync_committee_duties(STAMP_SLOT).await.is_empty(),
+                Self::SyncPeriodDuties => {
+                    let period = DutyTracker::sync_committee_period(STAMP_EPOCH);
+                    tracker.get_sync_committee_duties_for_period(period).await.is_some()
+                }
                 Self::IsSyncPeriodCached => tracker.is_sync_period_cached(STAMP_EPOCH).await,
                 Self::SyncCount => tracker.cached_duty_counts(STAMP_EPOCH).await.2 > 0,
             }
@@ -4458,7 +4579,7 @@ mod tests {
             "get_cached_ptc_dependent_root",
             "check_and_refetch_ptc_if_root_changed",
             "is_ptc_epoch_cached",
-            "get_sync_committee_duties",
+            "get_sync_committee_duties_for_period",
             "is_sync_period_cached",
         ] {
             assert_eq!(read_count(reader), 1, "the scan sees {reader}'s read");

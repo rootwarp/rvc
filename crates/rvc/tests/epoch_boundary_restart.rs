@@ -94,6 +94,11 @@ const EVENTS: &str = "/eth/v1/events";
 const PREPARE: &str = "/eth/v1/validator/prepare_beacon_proposer";
 const SUBSCRIPTIONS: &str = "/eth/v1/validator/beacon_committee_subscriptions";
 const REGISTRATION: &str = "/eth/v1/validator/register_validator";
+const SYNC_SUBSCRIPTIONS: &str = "/eth/v1/validator/sync_committee_subscriptions";
+/// The sync-committee index of the boot key, with `BootOpts::sync_duties`.
+const SYNC_COMMITTEE_INDEX: &str = "5";
+/// The number of epochs in one sync-committee period.
+const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 const RUNNER_TASK: &str = "epoch.boundary.runner";
 const ORCHESTRATOR_TASK: &str = "duty_orchestrator";
 /// Each drain aborts this Telemetry task, because it has no cooperative stop.
@@ -468,6 +473,32 @@ async fn assert_subscribed(boot: &Boot) {
     }
 }
 
+/// #656 AC2: a restart at slot 10, mid period 0, sends the sync-committee
+/// subscription of the boot key to the beacon node before slot 32. The
+/// subscription is valid until the first epoch of period 1.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_restart_sends_sync_subscriptions_in_the_restart_epoch() {
+    let boot = boot_at_slot(10, BootOpts { sync_duties: true, ..BootOpts::default() }).await;
+    let ledger = boot.recorders.ledger.clone();
+    watched(&ledger, async move {
+        boot.step_to(31, 11_900).await;
+        let period = 10 / SLOTS_PER_EPOCH / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let until_epoch = ((period + 1) * EPOCHS_PER_SYNC_COMMITTEE_PERIOD).to_string();
+        assert_eq!(
+            boot.posted(SYNC_SUBSCRIPTIONS).await,
+            [json!({
+                "validator_index": INDEX,
+                "sync_committee_indices": [SYNC_COMMITTEE_INDEX],
+                "until_epoch": until_epoch
+            })],
+            "The beacon node must receive one sync-committee subscription for the boot key \
+             before slot 32, valid until the first epoch of the next period."
+        );
+        boot.shut_down().await;
+    })
+    .await;
+}
+
 /// W4-D2c fix1: the Keymanager step fails after boot spawns the index
 /// resolver. Boot must cancel the process token and join the resolver before
 /// it returns the error. Nextest runs each test in its own process, so the
@@ -509,6 +540,9 @@ struct BootOpts {
     /// is in a directory that does not exist. Boot then fails at the
     /// Keymanager step, after it spawns the index resolver.
     missing_keymanager_token: bool,
+    /// The boot key has a sync-committee duty in each period, and the
+    /// beacon node accepts the sync-committee subscriptions.
+    sync_duties: bool,
 }
 
 /// This is one `run_with_slot_clock` process with a wiremock beacon node.
@@ -547,6 +581,9 @@ async fn boot_at_slot(start_slot: u64, opts: BootOpts) -> Boot {
 
     let server = MockServer::start().await;
     mount_beacon_node(&server, &pubkey).await;
+    if opts.sync_duties {
+        mount_sync_duties(&server, &pubkey).await;
+    }
     let mut config = Config {
         beacon_url: server.uri(),
         beacon_nodes: vec![server.uri()],
@@ -1048,6 +1085,30 @@ async fn mount_beacon_node(server: &MockServer, pubkey: &str) {
     Mock::given(method("GET"))
         .and(path(EVENTS))
         .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream"))
+        .mount(server)
+        .await;
+}
+
+/// Answers each sync-duty request with a duty of the boot key, before the
+/// answer with no duty of `mount_beacon_node`, and accepts the
+/// sync-committee subscriptions.
+async fn mount_sync_duties(server: &MockServer, pubkey: &str) {
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/eth/v1/validator/duties/sync/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey,
+                "validator_index": INDEX,
+                "validator_sync_committee_indices": [SYNC_COMMITTEE_INDEX]
+            }]
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SYNC_SUBSCRIPTIONS))
+        .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 }

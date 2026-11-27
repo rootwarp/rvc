@@ -45,7 +45,7 @@ async fn test_post_duty_window_runs_hosted_work_before_the_next_slot() {
 
     let hosted = async {
         // Simultaneous `&self` use of the owned duty-management field.
-        orchestrator.duty_management.epoch_boundary_summary_counts(0, 0).await;
+        orchestrator.duty_management.epoch_boundary_summary_counts(0).await;
         done.store(true, Ordering::SeqCst);
     };
 

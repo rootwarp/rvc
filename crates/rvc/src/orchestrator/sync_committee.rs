@@ -106,6 +106,7 @@ impl SyncCommitteeService {
         ctx: &SlotContext,
         slot_end: tokio::time::Instant,
     ) {
+        // The lookup gives the committee of `slot + 1`; the signatures stay over `slot`.
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
             return;
@@ -295,6 +296,7 @@ impl SyncCommitteeService {
         slot_end: tokio::time::Instant,
         permits: &Phase2SignerPermits,
     ) {
+        // The lookup gives the committee of `slot + 1`; the signatures stay over `slot`.
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
             return;
@@ -3139,5 +3141,80 @@ mod tests {
         .await;
         assert!(matches!(outcome, Err(SignStop::Stopped { bounded_by_overhang: true })));
         assert_eq!(polled.load(Ordering::SeqCst), 0, "a past deadline does not poll the signer");
+    }
+
+    /// The spec rule at the last slot of a period: the committee of
+    /// `slot + 1` signs. Member A is only in period 0, and member B is only
+    /// in period 1. At slot 8191, B signs one message over slot 8191, and A
+    /// signs nothing.
+    #[tokio::test]
+    async fn test_sync_message_at_slot_8191_is_signed_by_incoming_member_over_slot_8191() {
+        const LAST_SLOT: Slot = 256 * 32 - 1;
+        let (sk_a, sk_b) = (SecretKey::generate(), SecretKey::generate());
+        let (pk_a, pk_b) = (sk_a.public_key(), sk_b.public_key());
+        let member = |pk: &crypto::PublicKey, validator_index| SyncCommitteeDuty {
+            pubkey: pk.to_bytes(),
+            validator_index,
+            validator_sync_committee_indices: vec![0],
+        };
+        let (outgoing, incoming) = (member(&pk_a, 10), member(&pk_b, 11));
+        let signed = Arc::new(Mutex::new(Vec::<(u64, Slot)>::new()));
+        let recorded = Arc::clone(&signed);
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties(move |epoch, _indices| {
+                    let period_0 = DutyTracker::sync_committee_period(epoch) == 0;
+                    let duty = if period_0 { outgoing.clone() } else { incoming.clone() };
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![duty],
+                    })
+                })
+                .with_submit_sync_committee_messages(move |messages| {
+                    let mut seen = recorded.lock().unwrap();
+                    seen.extend(messages.iter().map(|m| (m.validator_index, m.slot)));
+                    Ok(())
+                }),
+        );
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        let mut key_manager = KeyManager::new();
+        let mut map = HashMap::new();
+        for (sk, pk) in [(sk_a, pk_a), (sk_b, pk_b)] {
+            store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
+            map.insert(pk.to_bytes(), pk);
+            key_manager.insert(sk);
+        }
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        // Upcast: wide object only.
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.expect("The test must cache period 0.");
+        let period_1 = duty_tracker.fetch_sync_committee_duties(256);
+        period_1.await.expect("The test must cache period 1.");
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+        let config = create_test_config();
+        let service =
+            SyncCommitteeService::new(signer, beacon, duty_tracker, pubkey_map, config, store);
+        let ctx = SlotContext {
+            slot: LAST_SLOT,
+            epoch: LAST_SLOT / 32,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
+        };
+
+        service
+            .maybe_produce_sync_messages(LAST_SLOT, LAST_SLOT / 32, &ctx, ample_slot_end())
+            .await;
+
+        assert_eq!(
+            *signed.lock().unwrap(),
+            [(11, LAST_SLOT)],
+            "At slot 8191, the incoming member B must sign one message over slot 8191, and the outgoing member A must sign nothing."
+        );
     }
 }

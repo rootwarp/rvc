@@ -64,6 +64,12 @@ fn replay_orchestrator(
                     execution_optimistic: false,
                     data: Vec::new(),
                 })
+            })
+            .with_post_sync_committee_duties(|_epoch, _indices| {
+                Ok(bn_manager::SyncCommitteeDutiesResponse {
+                    execution_optimistic: false,
+                    data: Vec::new(),
+                })
             }),
     );
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
