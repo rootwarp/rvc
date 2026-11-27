@@ -576,9 +576,16 @@ new directory entry. On copy-on-write or thin storage (btrfs, ZFS, thin LVM)
 it can still allocate a new block. It also writes
 `.rvc.doppelganger_detected` in the keystore directory
 and, when that directory is not the parent of `slashing_db_path`, the same
-marker beside the slashing database. Until one of those writes succeeds the
-process stays up and refuses every new signature. Each failed marker write
-increments `rvc_doppelganger_marker_write_failures_total`. From the moment of
+marker beside the slashing database. The running liveness loop writes the
+record, the keystore marker and that fallback marker on each attempt, as the
+shutdown drain does. Each path has its own blocking thread and a 5 s
+timeout. A path whose earlier write still runs gets no new write in that
+attempt. The loop requests exit 12 after each path returns or times out and
+at least one path is durable. Until one of those writes succeeds the
+process stays up and refuses every new signature. Each failed path logs one
+error line with its path and its error. It increments
+`rvc_doppelganger_marker_write_failures_total` one time. One attempt can add
+up to 3. From the moment of
 detection, new signatures are refused. A slashable signature is checked
 again after its slashing-protection row is reserved and before the BLS call.
 That check is the admission boundary. It is not atomic with the BLS call.
@@ -593,16 +600,23 @@ The marker is written in the validator data directory (the keystore
 directory). The file records the detected public keys, the epoch, and the
 time. `keystore_path` must be a persistent, writable volume. In the shipped
 compose file that is `/data/keystores` on the `rvc-data` volume. With
-detection enabled, startup refuses to run when that directory is not
-writable, and when the fixed-size detection record cannot be pre-allocated.
+detection enabled, startup refuses to run (exit 1) when that directory is not
+writable, when the slashing database directory is a different directory and
+cannot take a test write, and when the fixed-size detection record cannot be
+pre-allocated.
 The latch cannot be guaranteed without that file. The next start reads the
 marker and the record before a signer or the keymanager API is built and
-exits 12 again when the marker is present or the record is `detected`. While
-either is in that state, restart-skip and a keymanager import cannot skip
-the forward window. A file that cannot be read, a symlink or FIFO at that
+exits 12 again when the marker is present or the record is `detected`.
+Restart-skip and a keymanager import cannot skip the forward window while a
+marker is present, and a `detected` record stops boot before any key is
+registered. A file that cannot be read, a symlink or FIFO at that
 path, or a file that is not valid also refuses to start.
 
 Clear it only after the other instance is no longer signing these keys. The
+refusal log prints this command with the absolute keystore and database
+paths of the process that refused. Each path is in single quotes. If a path
+is not valid UTF-8 or has a control character, the log gives no command, and
+you type each path yourself. The
 command takes the keystore lock and refuses while a process holds it. A
 validator client started with `--disable-keystore-locking` holds no
 `.rvc.lock`, so the command cannot see that process. Stop it before
@@ -612,9 +626,17 @@ restart-skip. That forced window stays in force until every key loaded on
 that boot has finished one. The first key to finish does not clear it for
 the others.
 A key deleted mid-window through the keymanager API keeps `.rvc.doppelganger_force_window` until a forward window completes.
+A key that has no beacon index cannot finish a forward window. It keeps
+`.rvc.doppelganger_force_window` until it gets an index and finishes a window.
+
+When the database is in the keystore directory, `--slashing-db-path` has no
+effect, so one command fits both layouts:
 
 ```bash
-rvc doppelganger clear-detection --datadir /var/lib/rvc/keystores --confirm
+rvc doppelganger clear-detection \
+  --datadir /var/lib/rvc/keystores \
+  --slashing-db-path /var/lib/rvc/slashing_protection.sqlite \
+  --confirm
 ```
 
 If shutdown wrote a fallback marker beside the slashing database, pass that
@@ -627,22 +649,51 @@ rvc doppelganger clear-detection \
   --confirm
 ```
 
+If the keystore and database directories differ, the drain also writes the
+marker beside the database as `.rvc.doppelganger_detected.<db file name>`.
+The file records the keystore path. Earlier releases used the name
+`.rvc.doppelganger_detected` there. Nothing writes that name now. Boot stops
+while either file exists. The database path must be the only name of the
+database: no symlink and no `..` in the directory path, and one hard link for
+the database file. Else boot stops with exit code 1. For a bare file name,
+the marker is in the working directory.
+`clear-detection --slashing-db-path <db>` removes only the owned file that
+belongs to `--datadir`. Give `--datadir` with the same path as the validator
+client, because the file records that path. It keeps a file that belongs to
+another keystore and prints its path and owner. If the command cannot read or
+parse the owned
+file, if the file records no owner, or if a legacy file exists, the command
+stops and prints the path. Stop each validator client whose slashing
+database is in that directory. Make sure that its validators do not run in
+another place. Remove the file. Run the clear command for each of those
+clients before it starts again. Do not install an older release until you
+clear the detection.
+Before you remove a legacy file, make sure that no client uses that
+directory as its keystore directory. A keystore marker has the same name.
+
 Deleting only `.rvc.doppelganger_detected` by hand leaves a detected
 `.rvc.doppelganger_record` in place. The next start still exits 12, and that
 deletion does not force a fresh window.
 
-`clear-detection` resets a regular 4096-byte record in place. If the record
-is truncated, unreadable, a symlink, or a FIFO, the command returns an error
-and leaves the marker in place. Stop the process, remove that broken record,
-and run the command again:
+`clear-detection` resets a detected record in place. It replaces a record
+that does not parse when the record is a regular file. The command refuses a
+symlink, directory, or FIFO at the record path. The error names the path,
+and the marker stays. Stop the process. Remove that path. Run the command
+again:
 
 ```bash
-rm /var/lib/rvc/keystores/.rvc.doppelganger_record
-rvc doppelganger clear-detection --datadir /var/lib/rvc/keystores --confirm
+rm /var/lib/rvc/keystores/.rvc.doppelganger_record      # a symlink or a FIFO only
+rmdir /var/lib/rvc/keystores/.rvc.doppelganger_record   # an empty directory only
+rvc doppelganger clear-detection \
+  --datadir /var/lib/rvc/keystores \
+  --slashing-db-path /var/lib/rvc/slashing_protection.sqlite \
+  --confirm
 ```
 
-Do this only for a broken record. A valid `detected` record is reset by the
-command. Deleting that file by hand skips the force-window file.
+Do this only for a symlink, directory or FIFO at the record path. Examine a
+directory that is not empty before you remove it. A valid `detected` record
+is reset by the command. Deleting that file by hand skips the force-window
+file.
 
 systemd should not restart this exit:
 
@@ -653,8 +704,8 @@ RestartPreventExitStatus=12
 
 Docker Compose `restart: unless-stopped` cannot exclude one exit code. The
 process stays up and refuses signing until a write and its fsync have
-succeeded, then exits 12. A restarted container finds that record and exits
-12 again, which is why `keystore_path` has to survive the restart.
+succeeded, then exits 12. A restarted container finds that record or marker
+and exits 12 again, which is why `keystore_path` has to survive the restart.
 
 `SIGINT`, `SIGTERM`, or cancellation after a write and its fsync have
 succeeded exits 12. The drain overwrites the pre-allocated record first,
@@ -662,16 +713,24 @@ then tries the keystore marker and the fallback marker. Durability is that
 completed fsync, including the directory fsync after a marker rename. A
 later rewrite failure still exits 12 and does not retry. Reading the file
 back is not enough: a `pwrite` that reached the page cache and then failed
-to fsync is not durable, and neither is an unreadable file. The drain
-retries about once a second after tasks have been joined, and does not exit
+to fsync is not durable, and neither is an unreadable file. The drain retries
+with a back-off up to 30 s after tasks have been joined, and does not exit
 0 or 16, until a write returns success. `SIGKILL`, or any stop that does
 not let that first fsync finish, loses the latch: the next start has no
-durable record and can give the detected key a fresh window. Do not stop the
-node while `rvc_doppelganger_marker_write_failures_total` is rising. Boot
+durable record and can give the detected key a fresh window. On
+copy-on-write or thin storage (btrfs, ZFS, thin LVM), an overwrite can fail
+with `ENOSPC`. The drain then retries the write. Do not send `SIGKILL` during
+a retry. The metrics server does not run during the
+drain, so `rvc_doppelganger_marker_write_failures_total` is not served then.
+Watch the logs for the up-front line "will not exit until a detection record
+is durable". Do not stop the node after that line
+appears until it exits 12. Boot
 still reads the files and refuses a detected record or a marker before a
 signer is built and again after the keystore lock. A panic in a registered
 task while the latch is set takes the same path. The counter counts each
-failed marker attempt.
+failed path of each attempt, in the running loop and in the drain. A second `SIGINT` or `SIGTERM` does not force an exit
+while the drain waits for a durable record. The process exits 12 only after
+a write and its fsync return success.
 
 ## Example Configurations
 
