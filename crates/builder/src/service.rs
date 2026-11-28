@@ -22,11 +22,15 @@ use crate::traits::{BuilderBeaconClient, RegistrationSigner};
 /// Fixed part of [`BuilderService::registration_step_timeout`].
 const REGISTRATION_STEP_BASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Whether Gloas retired `prepare_beacon_proposer` / `register_validator`.
+/// Whether `fork` uses proposer and builder preferences (Gloas or later).
 ///
-/// The only input is the resolved [`ForkName`]; BN status codes, features, and
-/// env vars do not participate. Open-ended so a later fork keeps the retirement.
-pub fn legacy_proposer_ops_retired(fork: ForkName) -> bool {
+/// From Gloas on, rvc also broadcasts proposer and builder preferences for
+/// the proposals of that fork. This does not stop `prepare_beacon_proposer`
+/// or `register_validator` (#1053). The only input is the resolved
+/// [`ForkName`]. Beacon-node status codes, features and env vars do not
+/// change the result. The check is open-ended, so a later fork keeps the
+/// preferences.
+pub fn proposer_preferences_active(fork: ForkName) -> bool {
     fork >= ForkName::Gloas
 }
 
@@ -212,8 +216,9 @@ impl BuilderService {
     /// entry or its fee recipient or gas limit changed, so a re-send keeps its
     /// signed timestamp. Each signature is cached before any send; a changed
     /// key whose re-sign fails loses its old entry. Every cached builder key is
-    /// then sent in the configured batches, and every batch is tried. From
-    /// Gloas on this is a no-op. The runner's BuilderRegistration step calls
+    /// then sent in the configured batches, and every batch is tried. Gloas
+    /// does not stop the registration: the beacon node can take the fee
+    /// recipient from it (#1053). The runner's BuilderRegistration step calls
     /// it in each epoch.
     ///
     /// # Errors
@@ -225,11 +230,6 @@ impl BuilderService {
     ///   and the system clock reads before 1970.
     #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size, epoch = epoch))]
     pub async fn submit_epoch_registrations(&self, epoch: u64) -> Result<(), BuilderServiceError> {
-        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
-        if legacy_proposer_ops_retired(fork) {
-            info!(epoch, fork = fork.as_ref(), "Skipping builder registrations at Gloas");
-            return Ok(());
-        }
         let builder_keys = self.builder_keys();
 
         let to_sign: Vec<([u8; 48], [u8; 20], u64)> = {
@@ -438,18 +438,14 @@ impl BuilderService {
         BatchReport { failed: batch_failures, total: num_batches }
     }
 
+    /// POSTs `prepare_beacon_proposer` for each enabled key that has an
+    /// index in `validator_indices`. Gloas does not stop this call (#1053).
     #[tracing::instrument(name = "builder.prepare_proposers", skip_all, fields(epoch = epoch))]
     pub async fn prepare_proposers(
         &self,
         epoch: u64,
         validator_indices: &HashMap<[u8; 48], u64>,
     ) -> Result<(), BuilderServiceError> {
-        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
-        if legacy_proposer_ops_retired(fork) {
-            info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
-            return Ok(());
-        }
-
         let enabled_pubkeys = self.validator_store.list_enabled_pubkeys();
 
         let preparations: Vec<ProposerPreparation> = enabled_pubkeys
@@ -534,7 +530,7 @@ impl BuilderService {
                         p.proposal_slot / SLOTS_PER_EPOCH,
                         &self.fork_schedule,
                     );
-                    legacy_proposer_ops_retired(slot_fork)
+                    proposer_preferences_active(slot_fork)
                 })
                 .filter(|p| {
                     let fee_recipient = self.validator_store.effective_fee_recipient(&p.pubkey);
@@ -689,7 +685,7 @@ impl BuilderService {
             .filter(|p| {
                 let slot_fork =
                     ForkName::from_epoch(p.proposal_slot / SLOTS_PER_EPOCH, &self.fork_schedule);
-                legacy_proposer_ops_retired(slot_fork)
+                proposer_preferences_active(slot_fork)
             })
             .collect();
 
@@ -2031,10 +2027,12 @@ mod tests {
         assert!(cached_keys(&service).await.is_empty());
     }
 
-    /// Gloas: `Ok`, no sign, no POST, also for a key cached before Gloas.
+    /// #1053: Gloas does not stop the registration. A key signed at Gloas-1
+    /// must go out again at Gloas and at Gloas+1. Each POST must carry the
+    /// same signed registration, and the key must get no new signature.
     #[tokio::test]
-    async fn test_submit_epoch_registrations_skipped_at_gloas() {
-        let (_pks, store) = builder_keys_store(1);
+    async fn test_submit_epoch_registrations_sent_at_gloas() {
+        let (pks, store) = builder_keys_store(1);
         let bn = Arc::new(MockBn::new());
         let signer = Arc::new(MockSigner::new());
         let gloas_epoch = 10;
@@ -2048,17 +2046,22 @@ mod tests {
             gloas_at(gloas_epoch),
         );
 
-        service.submit_epoch_registrations(gloas_epoch).await.unwrap();
-        assert_eq!((signer.sign_calls.lock().len(), bn.register_calls.lock().len()), (0, 0));
+        for epoch in [gloas_epoch - 1, gloas_epoch, gloas_epoch + 1] {
+            service.submit_epoch_registrations(epoch).await.unwrap();
+        }
 
-        service.submit_epoch_registrations(gloas_epoch - 1).await.unwrap();
-        assert_eq!((signer.sign_calls.lock().len(), bn.register_calls.lock().len()), (1, 1));
-
-        service.submit_epoch_registrations(gloas_epoch + 1).await.unwrap();
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 3, "Each epoch must send one register_validator POST.");
+        assert_eq!(signer.sign_calls.lock().len(), 1, "The key must get one signature only.");
+        assert_eq!(sent_keys(&calls[0]), key_set(&pks));
+        let message = &calls[0][0].message;
         assert_eq!(
-            (signer.sign_calls.lock().len(), bn.register_calls.lock().len()),
-            (1, 1),
-            "a key cached before Gloas is not re-sent"
+            (message.fee_recipient, message.gas_limit),
+            (test_fee_recipient(0xab), 30_000_000)
+        );
+        assert!(
+            calls.iter().all(|call| *call == calls[0]),
+            "Each POST must carry the same signed registration."
         );
     }
 
@@ -2179,33 +2182,43 @@ mod tests {
         assert_eq!(sent_keys(&calls[2]), key_set(&pks));
     }
 
-    // --- Gloas retirement + preferences broadcast ---
+    // --- Gloas: legacy calls stay on, preferences broadcast starts ---
 
     #[test]
-    fn test_legacy_proposer_ops_retired_reads_only_fork_name() {
+    fn test_proposer_preferences_active_reads_only_fork_name() {
         for fork in ForkName::ALL {
             if fork < ForkName::Gloas {
-                assert!(!legacy_proposer_ops_retired(fork), "{fork:?} is pre-Gloas");
+                assert!(!proposer_preferences_active(fork), "{fork:?} is pre-Gloas");
             } else {
-                assert!(legacy_proposer_ops_retired(fork), "{fork:?} inherits Gloas retirement");
+                assert!(proposer_preferences_active(fork), "{fork:?} keeps the Gloas preferences");
             }
         }
 
         let mut schedule = ForkSchedule::unscheduled_gloas();
         schedule.gloas_fork_epoch = 42;
-        assert!(!legacy_proposer_ops_retired(ForkName::from_epoch(41, &schedule)));
-        assert!(legacy_proposer_ops_retired(ForkName::from_epoch(42, &schedule)));
-        assert!(legacy_proposer_ops_retired(ForkName::from_epoch(43, &schedule)));
+        assert!(!proposer_preferences_active(ForkName::from_epoch(41, &schedule)));
+        assert!(proposer_preferences_active(ForkName::from_epoch(42, &schedule)));
+        assert!(proposer_preferences_active(ForkName::from_epoch(43, &schedule)));
     }
 
+    /// #1053: at a Gloas epoch, the service must send register_validator and
+    /// prepare_beacon_proposer with the payload of a pre-Gloas epoch. The
+    /// beacon node takes the fee recipient of a local payload from this data.
     #[tokio::test]
-    async fn test_register_and_prepare_skipped_at_gloas_epoch() {
+    async fn test_register_and_prepare_sent_at_gloas_epoch() {
         let pk = gen_pubkey_bytes();
-        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        let fee_recipient = test_fee_recipient(0x5e);
+        let store = test_store_with_builder_validators(&[(
+            pk,
+            true,
+            Some(fee_recipient),
+            Some(36_000_000),
+        )]);
         let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
         let gloas_epoch = 10;
         let service = BuilderService::new(
-            Arc::new(MockSigner::new()),
+            signer.clone(),
             bn.clone(),
             Arc::new(store),
             GENESIS_FORK,
@@ -2213,12 +2226,28 @@ mod tests {
         );
 
         service.submit_epoch_registrations(gloas_epoch).await.unwrap();
-        let mut indices = HashMap::new();
-        indices.insert(pk, 1u64);
+        let indices = HashMap::from([(pk, 1u64)]);
         service.prepare_proposers(gloas_epoch, &indices).await.unwrap();
 
-        assert!(bn.register_calls.lock().is_empty());
-        assert!(bn.prepare_calls.lock().is_empty());
+        let register = bn.register_calls.lock();
+        assert_eq!(register.len(), 1, "Gloas must send one register_validator POST.");
+        assert_eq!(sent_keys(&register[0]), key_set(&[pk]));
+        let signed = &register[0][0];
+        assert_eq!(
+            (signed.message.fee_recipient, signed.message.gas_limit),
+            (fee_recipient, 36_000_000),
+            "The registration must carry the key's fee recipient and gas limit."
+        );
+        assert_eq!(signed.signature, signer.signature_bytes());
+        let expected = ProposerPreparation {
+            validator_index: "1".to_string(),
+            fee_recipient: format!("0x{}", hex::encode(fee_recipient)),
+        };
+        assert_eq!(
+            *bn.prepare_calls.lock(),
+            vec![vec![expected]],
+            "Gloas must send one prepare_beacon_proposer POST with the key's fee recipient."
+        );
     }
 
     #[tokio::test]
@@ -2603,8 +2632,11 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
+    /// With Gloas at the `u64::MAX` sentinel, a late epoch must send
+    /// register_validator and prepare_beacon_proposer, and it must send no
+    /// proposer preferences.
     #[tokio::test]
-    async fn test_sentinel_gloas_epoch_does_not_retire_or_broadcast() {
+    async fn test_sentinel_gloas_epoch_registers_and_broadcasts_no_preferences() {
         let pk = gen_pubkey_bytes();
         let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
         let bn = Arc::new(MockBn::new());
@@ -2623,6 +2655,8 @@ mod tests {
 
         service.submit_epoch_registrations(epoch).await.unwrap();
         assert_eq!(bn.register_calls.lock().len(), 1);
+        service.prepare_proposers(epoch, &HashMap::from([(pk, 1u64)])).await.unwrap();
+        assert_eq!(bn.prepare_calls.lock().len(), 1);
 
         let proposals = vec![upcoming_for(pk, epoch, 1)];
         service.broadcast_proposer_preferences(epoch, &proposals, &TEST_GVR).await.unwrap();

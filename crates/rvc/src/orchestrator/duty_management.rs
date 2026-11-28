@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation, SyncCommitteeSubscription};
 use bn_manager::BeaconNodeClient;
-use builder::legacy_proposer_ops_retired;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
 use observability::logging::TruncatedPubkey;
@@ -482,8 +481,11 @@ impl DutyManagementService {
     /// POSTs `prepare_beacon_proposer` for the local keys whose validator
     /// index is known.
     ///
-    /// [`PrepareOutcome::Complete`] at Gloas (the call is retired), with no
-    /// local key, or after a POST that covered every local key. `Partial`
+    /// Gloas does not stop this call: the beacon node takes the fee recipient
+    /// of a local payload from it (#1053).
+    ///
+    /// [`PrepareOutcome::Complete`] with no local key, or after a POST that
+    /// covered every local key. `Partial`
     /// after a POST of the keys with an index while others have none yet,
     /// and `NoIndices`, with no POST, while no key has one. A failed POST is
     /// [`OrchestratorError::Beacon`], and one cut by `timeouts.preparation`
@@ -499,12 +501,6 @@ impl DutyManagementService {
         &self,
         epoch: u64,
     ) -> Result<PrepareOutcome, OrchestratorError> {
-        let fork = ForkName::from_epoch(epoch, &self.config.fork_schedule);
-        if legacy_proposer_ops_retired(fork) {
-            info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
-            return Ok(PrepareOutcome::Complete);
-        }
-
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
         let (token, preparations, unresolved) = {

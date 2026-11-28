@@ -1040,7 +1040,7 @@ async fn test_prepare_proposers_index_lookups_are_linear_in_validators() {
     );
 }
 
-// --- Gloas retirement of prepare_beacon_proposer / register_validators ---
+// --- Gloas: prepare_beacon_proposer / register_validators continue (#1053) ---
 
 const ZERO_DEPENDENT_ROOT: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -1245,8 +1245,12 @@ fn retirement_deps(
     (deps, mock)
 }
 
+/// #305 and #1053: the runner must send prepare_beacon_proposer and
+/// register_validator at Gloas-1 and at Gloas, with the same payload. From
+/// Gloas-1, it must also broadcast the proposer and builder preferences of
+/// the Gloas slots.
 #[tokio::test]
-async fn test_prepare_and_register_retired_only_at_gloas() {
+async fn test_prepare_and_register_sent_before_and_at_gloas() {
     let gloas_epoch = 100u64;
     let schedule = near_gloas_schedule(gloas_epoch);
     assert_eq!(ForkName::from_epoch(gloas_epoch - 1, &schedule), ForkName::Fulu);
@@ -1255,7 +1259,7 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
     let expected_fee = format!("0x{}", hex::encode([0xffu8; 20]));
     let slots = ::timing::SLOTS_PER_EPOCH;
 
-    for (epoch, retired) in [(gloas_epoch - 1, false), (gloas_epoch, true)] {
+    for (epoch, gloas) in [(gloas_epoch - 1, false), (gloas_epoch, true)] {
         let local = SecretKey::generate();
         let disabled = SecretKey::generate();
         let foreign = SecretKey::generate();
@@ -1277,33 +1281,15 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
         let register = driven.mock.register_validators_calls();
         let prefs = driven.mock.submit_proposer_preferences_calls();
         let builder_prefs = driven.mock.submit_builder_preferences_calls();
-        if retired {
-            assert!(
-                prepare.is_empty(),
-                "Gloas epoch {epoch}: prepare_beacon_proposer must not be called"
-            );
-            let (gloas, _handle, gloas_mock) = retirement_orchestrator(
-                epoch,
-                schedule.clone(),
-                retirement_beacon(),
-                (SecretKey::generate(), true),
-                vec![],
-                vec![],
-            )
-            .await;
-            let outcome = gloas.duty_management.prepare_proposers(epoch).await;
-            assert!(
-                matches!(outcome, Ok(PrepareOutcome::Complete)),
-                "Gloas epoch {epoch}: nothing more to send: {outcome:?}"
-            );
-            assert!(
-                gloas_mock.call_stamps().is_empty(),
-                "Gloas epoch {epoch}: no beacon-node call"
-            );
-            assert!(
-                register.is_empty(),
-                "Gloas epoch {epoch}: register_validators must not be called"
-            );
+        assert_eq!(prepare.len(), 1, "Epoch {epoch}: one prepare_beacon_proposer POST");
+        assert_eq!(prepare[0].len(), 1, "Epoch {epoch}: only the local key with an index");
+        assert_eq!(prepare[0][0].validator_index, "42");
+        assert_eq!(prepare[0][0].fee_recipient, expected_fee, "Epoch {epoch}: the fee recipient");
+        assert_eq!(register.len(), 1, "Epoch {epoch}: one register_validator POST");
+        assert_eq!(register[0].len(), 1, "Epoch {epoch}: only the enabled builder key");
+        assert_eq!(register[0][0].message.fee_recipient, [0xffu8; 20]);
+        assert_eq!(register[0][0].message.gas_limit, 30_000_000);
+        if gloas {
             assert_eq!(prefs.len(), 1, "Gloas epoch {epoch}: one preferences POST");
             assert_eq!(prefs[0].len(), 2, "Gloas arm: current + next epoch local slots only");
             let current_slot = gloas_epoch * slots + 5;
@@ -1328,14 +1314,6 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
                 assert_eq!(entry.url, "https://builder.example.com");
             }
         } else {
-            assert_eq!(prepare.len(), 1, "pre-Gloas prepare call count");
-            assert_eq!(prepare[0].len(), 1);
-            assert_eq!(prepare[0][0].validator_index, "42");
-            assert_eq!(prepare[0][0].fee_recipient, expected_fee);
-            assert_eq!(register.len(), 1, "pre-Gloas register call count");
-            assert_eq!(register[0].len(), 1);
-            assert_eq!(register[0][0].message.fee_recipient, [0xffu8; 20]);
-            assert_eq!(register[0][0].message.gas_limit, 30_000_000);
             assert_eq!(prefs.len(), 1, "Gloas-1 must submit preferences for Gloas slots");
             assert_eq!(prefs[0].len(), 1);
             assert_eq!(prefs[0][0].message.proposal_slot, gloas_epoch * slots + 5);
@@ -1360,6 +1338,47 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
             assert_ne!(signed.message.validator_index, 43, "disabled local must not be signed");
         }
     }
+}
+
+/// #1053: `DutyManagementService::prepare_proposers` must POST
+/// prepare_beacon_proposer at Gloas and at Gloas+1. Each POST must carry the
+/// validator index and the fee recipient of the local key. Before the fix,
+/// this call sent no POST from Gloas on, and the beacon node used a junk fee
+/// recipient for the local proposals.
+#[tokio::test]
+async fn test_prepare_proposers_sends_the_fee_recipient_at_gloas() {
+    let gloas_epoch = 100u64;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    assert_eq!(ForkName::from_epoch(gloas_epoch, &schedule), ForkName::Gloas);
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let fee_recipient = [0x5eu8; 20];
+    let (deps, mock) =
+        retirement_deps(gloas_epoch, schedule, retirement_beacon(), (local, true), vec![], vec![]);
+    let update = validator_store::ValidatorConfigUpdate {
+        fee_recipient: Some(Some(fee_recipient)),
+        ..Default::default()
+    };
+    deps.validator_store.update_config(&local_pk, update).expect("The store has the local key.");
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    for epoch in [gloas_epoch, gloas_epoch + 1] {
+        let outcome = orchestrator.duty_management.prepare_proposers(epoch).await;
+        assert!(
+            matches!(outcome, Ok(PrepareOutcome::Complete)),
+            "Epoch {epoch}: the POST must cover the local key: {outcome:?}"
+        );
+    }
+
+    let expected = beacon::ProposerPreparation {
+        validator_index: "42".to_string(),
+        fee_recipient: format!("0x{}", hex::encode(fee_recipient)),
+    };
+    assert_eq!(
+        mock.prepare_beacon_proposer_calls(),
+        vec![vec![expected.clone()], vec![expected]],
+        "Gloas and Gloas+1 must each send one POST with the fee recipient of the local key."
+    );
 }
 
 #[tokio::test]
@@ -1392,14 +1411,14 @@ async fn test_legacy_404_or_501_does_not_retire_prepare_or_register() {
 }
 
 #[test]
-fn test_retirement_gate_reads_only_fork_name_from_epoch() {
+fn test_preferences_gate_reads_only_fork_name_from_epoch() {
     let gloas_epoch = 100u64;
     let schedule = near_gloas_schedule(gloas_epoch);
-    assert!(!::builder::legacy_proposer_ops_retired(ForkName::from_epoch(
+    assert!(!::builder::proposer_preferences_active(ForkName::from_epoch(
         gloas_epoch - 1,
         &schedule
     )));
-    assert!(::builder::legacy_proposer_ops_retired(ForkName::from_epoch(gloas_epoch, &schedule)));
+    assert!(::builder::proposer_preferences_active(ForkName::from_epoch(gloas_epoch, &schedule)));
 }
 
 /// 654-AC6: a proposer root change re-opens the preferences step through
