@@ -232,7 +232,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/builder/src/service.rs",
-        "legacy_proposer_ops_retired",
+        "proposer_preferences_active",
         Class::GeForkName,
         false,
         "fork >= ForkName::Gloas",

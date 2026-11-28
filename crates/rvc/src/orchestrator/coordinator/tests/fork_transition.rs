@@ -2652,6 +2652,21 @@ fn post_hits(requests: &[wiremock::Request], path: &str) -> usize {
         .count()
 }
 
+/// The JSON body of each POST to `path`, in request order.
+fn post_bodies<T: serde::de::DeserializeOwned>(
+    requests: &[wiremock::Request],
+    path: &str,
+) -> Vec<T> {
+    requests
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == path)
+        .map(|r| {
+            serde_json::from_slice(&r.body)
+                .unwrap_or_else(|e| panic!("The body of POST {path} must be valid JSON: {e}"))
+        })
+        .collect()
+}
+
 fn signed_proposer_preferences(
     requests: &[wiremock::Request],
 ) -> Vec<eth_types::SignedProposerPreferences> {
@@ -2695,8 +2710,9 @@ async fn setup_proposer_duty_http(
 }
 
 /// `SignedProposerPreferences` is advertised one epoch ahead of a Gloas
-/// proposal (slot 2240 during epoch 69) and supersedes
-/// `prepare_beacon_proposer` / `register_validator` at epoch 70.
+/// proposal (slot 2240 during epoch 69). At Gloas epoch 70, rvc must also
+/// send `prepare_beacon_proposer` and `register_validator`, with the payload
+/// of epoch 69 (#1053).
 ///
 /// RED: with `builder_service: None` the slot-2240 preferences assertion fails.
 #[tokio::test]
@@ -2804,7 +2820,7 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         "pre-Gloas epoch 69 must issue register_validator once"
     );
 
-    // Cold registration cache: a missing Gloas gate would POST register again.
+    // Cold registration cache: epoch 70 must sign the registration again.
     orchestrator
         .builder_service
         .as_ref()
@@ -2831,14 +2847,35 @@ async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
         1,
         "slot 2240 preferences must remain exactly once after epoch 70"
     );
+    let prepare_path = "/eth/v1/validator/prepare_beacon_proposer";
+    let prepare_69: Vec<Vec<beacon::ProposerPreparation>> = post_bodies(&after_69, prepare_path);
+    let prepare_70: Vec<Vec<beacon::ProposerPreparation>> = post_bodies(epoch_70, prepare_path);
+    assert_eq!(prepare_70.len(), 1, "Gloas epoch 70 must call prepare_beacon_proposer once");
+    assert_eq!(prepare_70, prepare_69, "Epoch 70 must send the prepare body of epoch 69");
+    let index = PROPOSER_INDEX.to_string();
+    let fee_recipient = format!("0x{}", hex::encode([0u8; 20]));
     assert_eq!(
-        post_hits(epoch_70, "/eth/v1/validator/prepare_beacon_proposer"),
-        0,
-        "epoch 70 must not call prepare_beacon_proposer"
+        (&prepare_70[0][0].validator_index, &prepare_70[0][0].fee_recipient),
+        (&index, &fee_recipient),
+        "The prepare body must carry the index and the fee recipient of the local key"
     );
+
+    let register_path = "/eth/v1/validator/register_validator";
+    let messages =
+        |requests: &[wiremock::Request]| -> Vec<Vec<eth_types::ValidatorRegistrationV1>> {
+            post_bodies::<Vec<eth_types::SignedValidatorRegistration>>(requests, register_path)
+                .into_iter()
+                .map(|post| post.into_iter().map(|signed| signed.message).collect())
+                .collect()
+        };
+    let (register_69, register_70) = (messages(&after_69), messages(epoch_70));
+    assert_eq!(register_70.len(), 1, "Gloas epoch 70 must call register_validator once");
+    assert_eq!(register_70[0].len(), 1, "The registration must carry the one builder key");
+    let same_fields =
+        |m: &eth_types::ValidatorRegistrationV1| (m.pubkey, m.fee_recipient, m.gas_limit);
     assert_eq!(
-        post_hits(epoch_70, "/eth/v1/validator/register_validator"),
-        0,
-        "epoch 70 must not call register_validator"
+        same_fields(&register_70[0][0]),
+        same_fields(&register_69[0][0]),
+        "Epoch 70 must register the pubkey, fee recipient and gas limit of epoch 69"
     );
 }

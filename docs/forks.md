@@ -120,7 +120,7 @@ inventory in [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md)):
 | Deadline set | `crates/timing/src/clock.rs` | 29–35 | `DeadlineSchedule::for_fork`: `>= Gloas` selects the six Gloas `*_DUE_BPS*` offsets. |
 | Coordinator attestation offset | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 162–165, 587–589 | `from_epoch` then `for_fork`; one resolved fork per slot. |
 | PTC phase | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 1479–1514 | `run_payload_attestation_phase`: open-ended `>= Gloas` waits then calls `crates/rvc/src/orchestrator/payload_attestation.rs`. |
-| Legacy proposer ops | `crates/builder/src/service.rs` | 26–28 | `legacy_proposer_ops_retired`: `>= Gloas` retires `prepare_beacon_proposer` / `register_validator`. |
+| Proposer preferences | `crates/builder/src/service.rs` | 25–35 | `proposer_preferences_active`: `>= Gloas` broadcasts proposer and builder preferences for the Gloas slots, from the epoch before Gloas. `prepare_beacon_proposer` and `register_validator` continue after Gloas (#1053). |
 | Signer header RPC | `crates/signer/src/lib.rs` | 988 | `>= Gloas` uses `SignBlockHeader` (no Gloas body SSZ into a legacy decoder). |
 | Signer aggregate RPC | `crates/signer/src/lib.rs` | 1264, 1318 | `>= Gloas` rejects legacy `sign_aggregate_and_proof` / `sign_electra_aggregate_and_proof` (`UnsupportedDuty`); Gloas signs via the root RPC (`sign_aggregate_and_proof_root` 1283). |
 | Typed-signer aggregate reject | `crates/crypto/src/typed_signer.rs` | 342, 361 | Same `>= Gloas` `UnsupportedDuty` on the local typed path. |

@@ -87,7 +87,7 @@ use std::time::Duration;
 
 use beacon::SyncCommitteeSubscription;
 use bn_manager::OperationTimeouts;
-use builder::{legacy_proposer_ops_retired, BuilderService, BuilderServiceError, UpcomingProposal};
+use builder::{proposer_preferences_active, BuilderService, BuilderServiceError, UpcomingProposal};
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use signer::CircuitBreakerState;
@@ -420,8 +420,7 @@ pub(crate) struct EpochBoundaryRunner {
     /// Registers the builder keys and broadcasts the preferences; none
     /// without a builder service.
     builder_service: Option<Arc<BuilderService>>,
-    /// Gloas retired the registration, and the epoch before it starts the
-    /// preferences.
+    /// The epoch before Gloas starts the preferences.
     fork_schedule: Arc<ForkSchedule>,
     /// The local keys whose proposals get preferences.
     pubkey_map: PubkeyMap,
@@ -714,8 +713,8 @@ impl EpochBoundaryRunner {
     /// `Untracked` sample can equal a later token only if the POST was read
     /// under that token. A `Stale` sample is not kept, because two stale
     /// intervals give the same value. The next pass then re-opens the step.
-    /// So a needed re-send is never suppressed. Before Gloas, a registry that
-    /// stays stale keeps the step pending until the epoch ends.
+    /// So a needed re-send is never suppressed. A registry that stays stale
+    /// keeps the step pending until the epoch ends, also after Gloas (#1053).
     async fn prepare_proposers(&self, epoch: u64) -> StepOutcome {
         let under = self.duty_management.index_freshness();
         let resolved = self.duty_management.resolved_proposer_count();
@@ -900,14 +899,12 @@ impl EpochBoundaryRunner {
     /// `submit_epoch_registrations`, which signs only new or changed keys,
     /// under the builder service's `registration_step_timeout()`. `Done` once
     /// it returns `Ok`, and `Failed` on an error or at the bound. With no
-    /// builder service, or from Gloas on, `Done` with no call.
+    /// builder service, `Done` with no call. Gloas does not stop this step
+    /// (#1053).
     async fn builder_registration(&self, epoch: u64) -> StepOutcome {
         let Some(builder) = &self.builder_service else {
             return StepOutcome::Done;
         };
-        if legacy_proposer_ops_retired(ForkName::from_epoch(epoch, &self.fork_schedule)) {
-            return StepOutcome::Done;
-        }
         let registration = async {
             match builder.submit_epoch_registrations(epoch).await {
                 Ok(()) => {
@@ -939,7 +936,7 @@ impl EpochBoundaryRunner {
         let Some(builder) = &self.builder_service else {
             return StepOutcome::Done;
         };
-        if !legacy_proposer_ops_retired(ForkName::from_epoch(epoch + 1, &self.fork_schedule)) {
+        if !proposer_preferences_active(ForkName::from_epoch(epoch + 1, &self.fork_schedule)) {
             return StepOutcome::Done;
         }
         for duty_epoch in [epoch, epoch + 1] {
@@ -4275,14 +4272,16 @@ mod tests {
     }
 
     /// W4-E6a: the registration step runs in every epoch. The first pass is
-    /// in epoch 2. These conditions must hold:
+    /// in epoch 2, or in the Gloas epoch for the Gloas arms. These conditions
+    /// must hold:
     ///
     /// - The step must run in epochs 2 and 3.
     /// - In the held arm, the first POST must reach
     ///   `registration_step_timeout()`, and the step must be `Failed`.
     /// - The slot-65 pass must retry the failed step.
     /// - Without a builder service, the step must finish without a call.
-    /// - From Gloas, the step must finish without a call.
+    /// - At Gloas and Gloas+1, the step must call `register_validators`
+    ///   (#1053). Without a builder service, it must finish without a call.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn registration_runs_every_epoch() {
         use BoundaryStep::BuilderRegistration;
@@ -4292,7 +4291,8 @@ mod tests {
             ("boot epoch 2", true, 2, false, 1, 1),
             ("boot epoch 2, first POST held", true, 2, true, 2, 1),
             ("no builder service", false, 2, false, 0, 0),
-            ("Gloas boot epoch", true, gloas, false, 0, 0),
+            ("Gloas boot epoch", true, gloas, false, 1, 1),
+            ("Gloas boot epoch, no builder service", false, gloas, false, 0, 0),
         ] {
             let delays = if held { vec![HOLD] } else { Vec::new() };
             let mock = proposer_duties_at(ROOT_A)

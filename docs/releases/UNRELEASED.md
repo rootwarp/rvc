@@ -16,7 +16,7 @@ The code of the changes below is in v0.9.0. The v0.9.0 release notes do not desc
   can reach the node with old indices. rvc sends the corrected indices after revalidation. It
   sends them in the same epoch. It does this also when the preparation for that epoch was already
   done. It does this also when the number of resolved keys does not change. If a revocation occurs
-  during a preparation POST, rvc does not count that POST as done. Before Gloas, if the registry
+  during a preparation POST, rvc does not count that POST as done. If the registry
   stays stale until the end of the epoch, the existing end-of-epoch warning names
   `PrepareProposers`. Proposals in that window use the default fee recipient of the beacon node. A
   beacon node can keep a preparation from before the revocation until that preparation expires on
@@ -380,3 +380,7 @@ Operators do not need to make changes for the items below:
 ## DevNet: Lighthouse v8.3.3 for Gloas (produceBlockV4, the query form of payload attestation data, EIP-7688 roots)
 
 After Gloas, rvc needs a beacon node that serves `POST /eth/v4/validator/blocks/{slot}`, `GET /eth/v1/validator/payload_attestation_data?slot=`, and the EIP-7688 progressive containers of consensus-specs `v1.7.0-beta.2` or later. Lighthouse `v8.2.x` does not. With Lighthouse `v8.2.x`, rvc proposes no block and sends no payload attestation, and its aggregates fail with `InvalidSignature`. Use Lighthouse `v8.3.0` or later. The local DevNet now uses `sigp/lighthouse:v8.3.3@sha256:53f9063d98c3d3a2d290207873f019ea2298cfc02f8cd58d87c33b04aab856d1` (the index digest) in `scripts/devnet/devnet.env` (#1051). rvc behavior does not change.
+
+## Gloas: `prepare_beacon_proposer` and `register_validator` continue after the fork
+
+After Gloas, rvc again sends `prepare_beacon_proposer` in each epoch. When builder registration is on, it also sends `register_validator` in each epoch. rvc sends these calls in addition to the proposer preferences. The Beacon API deprecates both calls from Gloas, and beacon-node support for them is optional after Gloas. A Lighthouse beacon node still uses this data for the fee recipient of a local payload. Before this fix, the beacon node used a junk fee recipient for rvc proposals after Gloas, and the execution fees of those blocks went to that address (#1053).
