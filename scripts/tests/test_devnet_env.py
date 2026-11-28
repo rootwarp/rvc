@@ -55,7 +55,7 @@ def test_every_img_pinned_by_index_digest(env: dict[str, str]):
     for key, value in img.items():
         assert IMG_PIN_RE.fullmatch(value), f"{key}={value}"
     assert env["IMG_GETH"].startswith("ethereum/client-go:v1.17.5@sha256:")
-    assert env["IMG_LIGHTHOUSE"].startswith("sigp/lighthouse:v8.2.2@sha256:")
+    assert env["IMG_LIGHTHOUSE"].startswith("sigp/lighthouse:v8.3.3@sha256:")
     assert env["IMG_GENESIS"].startswith(
         "ethpandaops/ethereum-genesis-generator:6.2.1@sha256:"
     )

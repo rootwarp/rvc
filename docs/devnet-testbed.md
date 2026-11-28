@@ -37,7 +37,7 @@ echo "${CHAIN_ID:-1337}"
 unset CHAIN_ID
 ```
 
-Images are pinned in `scripts/devnet/devnet.env` as `repo:tag@sha256:<index digest>` (geth `v1.17.5`, Lighthouse `v8.2.2`, genesis-generator `6.2.1`). First preflight pulls them; later runs skip a present pin unless `--force`.
+Images are pinned in `scripts/devnet/devnet.env` as `repo:tag@sha256:<index digest>` (geth `v1.17.5`, Lighthouse `v8.3.3`, genesis-generator `6.2.1`). First preflight pulls them; later runs skip a present pin unless `--force`. Lighthouse `v8.3.0` or later is necessary after Gloas (produceBlockV4, the query form of producePayloadAttestationData, EIP-7688 signing roots); see #1051.
 
 Defaults: `NUM_VALIDATORS=64`, `RVC_KEYS=16` (Lighthouse VC gets derivation `[0, 48)`, RVC gets `[48, 64)`), `CHAIN_ID=1337`, Electra at epoch 0, 12 s × 32 slots.
 

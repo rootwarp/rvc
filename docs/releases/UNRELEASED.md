@@ -376,3 +376,7 @@ Operators do not need to make changes for the items below:
 - A crash during the first record write leaves no partial record. With a bare database file name, the fallback marker is in the working directory (W4-D1b, W4-D2a).
 - The liveness loop starts after the last boot step that can fail. If the process cannot install the signal handlers, boot stops with exit 1. With detection on, the HTTP remote-signer probe reports each Gloas sign type as unknown (W4-D2c).
 - Each detection path is written on its own blocking thread, with a 5 s timeout. On exit 12, rvc keeps the keystore lock until the process ends (W4-D3d2).
+
+## DevNet: Lighthouse v8.3.3 for Gloas (produceBlockV4, the query form of payload attestation data, EIP-7688 roots)
+
+After Gloas, rvc needs a beacon node that serves `POST /eth/v4/validator/blocks/{slot}`, `GET /eth/v1/validator/payload_attestation_data?slot=`, and the EIP-7688 progressive containers of consensus-specs `v1.7.0-beta.2` or later. Lighthouse `v8.2.x` does not. With Lighthouse `v8.2.x`, rvc proposes no block and sends no payload attestation, and its aggregates fail with `InvalidSignature`. Use Lighthouse `v8.3.0` or later. The local DevNet now uses `sigp/lighthouse:v8.3.3@sha256:53f9063d98c3d3a2d290207873f019ea2298cfc02f8cd58d87c33b04aab856d1` (the index digest) in `scripts/devnet/devnet.env` (#1051). rvc behavior does not change.

@@ -2618,6 +2618,68 @@ async fn test_produce_block_v4_posts_path_body_and_declared_query_names() {
     assert!(pairs.iter().any(|(n, v)| n == QUERY_GRAFFITI && v == "0xgraf"));
 }
 
+/// Wiremock matcher: the `Accept` request header names `application/octet-stream`.
+struct AcceptNamesSsz;
+
+impl wiremock::Match for AcceptNamesSsz {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        request
+            .headers
+            .get_all("Accept")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .filter_map(|range| range.split(';').next())
+            .any(|media_type| media_type.trim().eq_ignore_ascii_case("application/octet-stream"))
+    }
+}
+
+/// #1051: Lighthouse v8.2.2 returns HTTP 400 "Unsupported endpoint version: v4" to this POST.
+#[tokio::test]
+async fn test_produce_block_v4_request_matches_lighthouse_v8_3_route() {
+    let mock_server = MockServer::start().await;
+    let slot = 102u64;
+    let expected_body = json!({"min_bid": "0", "builder_boost_factor": "100", "builders": []});
+
+    Mock::given(method("POST"))
+        .and(path(format!("/eth/v4/validator/blocks/{slot}")))
+        .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+        .and(wiremock::matchers::query_param("include_payload", "true"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .and(wiremock::matchers::header("Content-Type", "application/json"))
+        .and(AcceptNamesSsz)
+        .and(body_json(&expected_body))
+        .respond_with(v4_json_success(slot))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(path(format!("/eth/v3/validator/blocks/{slot}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let response = client
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .expect("the v8.3 route must accept the rvc v4 request");
+    assert_eq!(response.consensus_version, "gloas");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "rvc must send one v4 POST and no v3 request");
+    let sent: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("BuilderConfig JSON body");
+    assert_eq!(sent, expected_body, "the body must have the Lighthouse BuilderConfig shape");
+    for field in ["min_bid", "builder_boost_factor"] {
+        assert!(sent[field].is_string(), "{field} must be a quoted u64 (a JSON string)");
+    }
+    assert_v4_query_names(&requests[0]);
+}
+
 #[tokio::test]
 async fn test_produce_block_v4_include_payload_true_without_graffiti() {
     let mock_server = MockServer::start().await;
@@ -5989,6 +6051,54 @@ async fn test_get_payload_attestation_data_200_parses_data() {
     assert!(result.data.payload_present);
     assert!(!result.data.blob_data_available);
     assert_eq!(result.data.beacon_block_root, [0x11; 32]);
+}
+
+/// #1051: Lighthouse v8.2.2 returns HTTP 400 "Invalid slot" to the query form of this GET.
+#[tokio::test]
+async fn test_get_payload_attestation_data_uses_query_form_not_path_form() {
+    let mock_server = MockServer::start().await;
+    let slot = 43u64;
+    let root = format!("0x{}", "22".repeat(32));
+
+    let response_body = serde_json::json!({
+        "version": "gloas",
+        "data": {
+            "beacon_block_root": root,
+            "slot": slot.to_string(),
+            "payload_present": true,
+            "blob_data_available": false
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", slot.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(path(format!("/eth/v1/validator/payload_attestation_data/{slot}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client
+        .get_payload_attestation_data(slot)
+        .await
+        .expect("the query form must return Ok")
+        .expect("HTTP 200 must give Some data");
+    assert_eq!(result.data.slot, slot);
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "rvc must send one query-form GET and no path-form GET");
+    assert_eq!(requests[0].url.path(), "/eth/v1/validator/payload_attestation_data");
+    let expected_query = format!("slot={slot}");
+    assert_eq!(requests[0].url.query(), Some(expected_query.as_str()));
 }
 
 #[tokio::test]
